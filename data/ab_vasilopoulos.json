@@ -1,0 +1,6 @@
+[
+  {"category": "Φρούτα & Λαχανικά", "description": "Tomata ελληνική χύμα", "price": 1.49, "unit": "kg"},
+  {"category": "Γαλακτοκομικά", "description": "Fresh milk full 1lt", "price": 1.38, "unit": "L"},
+  {"category": "Αρτοποιείο", "description": "Ψωμί Τοστ Ολικής 680gr", "price": 2.05, "unit": "τεμ"},
+  {"category": "Βασικά Τρόφιμα", "description": "Ριζι Carolina 500g", "price": 1.24, "unit": "τεμ"}
+]

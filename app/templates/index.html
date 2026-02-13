@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Greek Supermarket Price Finder</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>Greek Supermarket Price Finder</h1>
+    <p>Σύγκριση τιμών από ελληνικά supermarket με έξυπνο matching προϊόντων.</p>
+
+    <section class="card">
+      <h2>Find best prices for your basket</h2>
+      <textarea id="basketItems" rows="4" placeholder="One item per line, e.g.&#10;γάλα 1 λίτρο&#10;τομάτες&#10;ρύζι καρολίνα"></textarea>
+      <button id="findDealsBtn">Find Best Deals</button>
+      <div id="dealsResult"></div>
+    </section>
+
+    <section class="card">
+      <h2>Search similar product descriptions</h2>
+      <div class="row">
+        <input id="searchInput" placeholder="Type product description" />
+        <button id="searchBtn">Search</button>
+      </div>
+      <div id="searchResult"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
