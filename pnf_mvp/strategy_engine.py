@@ -209,6 +209,80 @@ def _quality_grade(score: int) -> str:
     return "D"
 
 
+def _compute_continuation_strength_v1_long(
+    *,
+    breakout_context: Optional[str],
+    trend_regime: Optional[str],
+    pullback_quality: Optional[str],
+    is_extended: bool,
+    impulse_boxes: Optional[float],
+    pullback_boxes: Optional[float],
+    impulse_to_pullback_ratio: Optional[float],
+) -> Optional[float]:
+    is_long_continuation_context = breakout_context in (BREAKOUT_POST_BULLISH_PULLBACK, BREAKOUT_FRESH_BULLISH)
+    if not is_long_continuation_context:
+        return None
+
+    score = 50.0
+
+    if impulse_boxes is not None:
+        score += min(20.0, max(0.0, impulse_boxes) * 3.0)
+
+    if pullback_boxes is not None:
+        pb = max(0.0, pullback_boxes)
+        if pb <= 1.0:
+            score += 12.0
+        elif pb <= 2.0:
+            score += 6.0
+        elif pb <= 3.0:
+            score += 0.0
+        elif pb <= 4.0:
+            score -= 8.0
+        else:
+            score -= 15.0
+
+    if impulse_to_pullback_ratio is not None:
+        ratio = impulse_to_pullback_ratio
+        if ratio >= 3.0:
+            score += 18.0
+        elif ratio >= 2.0:
+            score += 10.0
+        elif ratio >= 1.3:
+            score += 3.0
+        elif ratio >= 1.0:
+            score -= 6.0
+        else:
+            score -= 16.0
+
+    if breakout_context == BREAKOUT_POST_BULLISH_PULLBACK:
+        score += 10.0
+    elif breakout_context == BREAKOUT_FRESH_BULLISH:
+        score += 4.0
+    elif breakout_context == BREAKOUT_LATE_EXTENSION:
+        score -= 12.0
+
+    if pullback_quality == PULLBACK_HEALTHY:
+        score += 8.0
+    elif pullback_quality == PULLBACK_SHALLOW:
+        score -= 2.0
+    elif pullback_quality == PULLBACK_DEEP:
+        score -= 8.0
+    elif pullback_quality == PULLBACK_BROKEN:
+        score -= 20.0
+
+    if trend_regime == "BULLISH_REGIME":
+        score += 8.0
+    elif trend_regime == "RANGE_REGIME":
+        score -= 5.0
+    elif trend_regime == "BEARISH_REGIME":
+        score -= 10.0
+
+    if is_extended:
+        score -= 8.0
+
+    return float(max(0.0, min(100.0, score)))
+
+
 def _base_result(
     *,
     symbol: str,
@@ -231,6 +305,7 @@ def _base_result(
     reward_quality: Optional[str] = None,
     quality_score: Optional[float] = None,
     quality_grade: Optional[str] = None,
+    continuation_strength_v1: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -251,6 +326,7 @@ def _base_result(
         "reward_quality": reward_quality,
         "quality_score": quality_score,
         "quality_grade": quality_grade,
+        "continuation_strength_v1": continuation_strength_v1,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -280,6 +356,9 @@ def evaluate_pullback_retest_long(
     active_leg_boxes = int(structure_state.get("active_leg_boxes") or 0)
     current_kind = structure_state.get("current_column_kind")
     current_bottom = _safe_float(structure_state.get("current_column_bottom"))
+    impulse_boxes = _safe_float(structure_state.get("impulse_boxes"))
+    pullback_boxes = _safe_float(structure_state.get("pullback_boxes"))
+    impulse_to_pullback_ratio = _safe_float(structure_state.get("impulse_to_pullback_ratio"))
 
     current = _current_column(columns)
     if current is None:
@@ -339,6 +418,15 @@ def evaluate_pullback_retest_long(
         rr2=rr2,
     )
     grade = _quality_grade(strength)
+    continuation_strength_v1 = _compute_continuation_strength_v1_long(
+        breakout_context=breakout_context,
+        trend_regime=trend_regime,
+        pullback_quality=pullback_quality,
+        is_extended=is_extended,
+        impulse_boxes=impulse_boxes,
+        pullback_boxes=pullback_boxes,
+        impulse_to_pullback_ratio=impulse_to_pullback_ratio,
+    )
 
     if pullback_quality == PULLBACK_BROKEN:
         status = STATUS_REJECT
@@ -379,6 +467,7 @@ def evaluate_pullback_retest_long(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=pullback_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
+        continuation_strength_v1=continuation_strength_v1,
     )
 
 
@@ -526,4 +615,5 @@ def evaluate_pullback_retest_short(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=rebound_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
+        continuation_strength_v1=None,
     )
