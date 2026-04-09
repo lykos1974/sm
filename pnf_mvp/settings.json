@@ -1,0 +1,80 @@
+{
+  "database_path": "H:\\pnf screener\\market_collector\\market_collector\\market_collector\\market_data.db",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "MEXC_FUT:SUIUSDT",
+    "MEXC_FUT:TAOUSDT",
+    "MEXC_FUT:HYPEUSDT",
+    "MEXC_FUT:BTCUSDT",
+    "MEXC_FUT:ETHUSDT",
+    "MEXC_FUT:ENAUSDT",
+    "MEXC_FUT:SOLUSDT"
+  ],
+  "profiles": {
+    "BTCUSDT": {
+      "box_size": 100,
+      "reversal_boxes": 3
+    },
+    "ETHUSDT": {
+      "box_size": 5,
+      "reversal_boxes": 3
+    },
+    "BNBUSDT": {
+      "box_size": 2,
+      "reversal_boxes": 3
+    },
+    "SOLUSDT": {
+      "box_size": 0.25,
+      "reversal_boxes": 3
+    },
+    "XRPUSDT": {
+      "box_size": 0.005,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:BTCUSDT": {
+      "box_size": 100,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:ETHUSDT": {
+      "box_size": 5,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:SOLUSDT": {
+      "box_size": 0.25,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:SUIUSDT": {
+      "box_size": 0.0025,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:TAOUSDT": {
+      "box_size": 1,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:HYPEUSDT": {
+      "box_size": 0.1,
+      "reversal_boxes": 3
+    },
+    "MEXC_FUT:ENAUSDT": {
+      "box_size": 0.00025,
+      "reversal_boxes": 3
+    }
+  },
+  "history_bars": 5000,
+  "refresh_seconds": 2,
+  "alert_filters": {
+    "allowed_types": [
+      "DOUBLE_TOP_BREAKOUT",
+      "DOUBLE_BOTTOM_BREAKDOWN"
+    ],
+    "minimum_priority": "HIGH",
+    "minimum_score": 85,
+    "allowed_symbols": [
+      "ALL"
+    ]
+  }
+}
