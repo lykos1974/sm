@@ -518,15 +518,23 @@ def build_continuation_strength_v1_breakdown(active: pd.DataFrame) -> pd.DataFra
         if pd.isna(x):
             return "UNKNOWN"
         v = float(x)
-        if v < 35:
-            return "0-34"
+        if v < 20:
+            return "00-19"
+        if v < 30:
+            return "20-29"
+        if v < 40:
+            return "30-39"
         if v < 50:
-            return "35-49"
-        if v < 65:
-            return "50-64"
+            return "40-49"
+        if v < 60:
+            return "50-59"
+        if v < 70:
+            return "60-69"
         if v < 80:
-            return "65-79"
-        return "80-100"
+            return "70-79"
+        if v < 90:
+            return "80-89"
+        return "90-100"
 
     bucketed["group"] = bucketed["continuation_strength_v1"].apply(cs_bucket)
 
@@ -544,7 +552,18 @@ def build_continuation_strength_v1_breakdown(active: pd.DataFrame) -> pd.DataFra
     out["tp1_rate"] = out["tp1_touched"] / out["trades"]
     out["tp2_rate"] = out["tp2"] / out["trades"]
     out.insert(0, "section", "continuation_strength_v1")
-    order = {"0-34": 1, "35-49": 2, "50-64": 3, "65-79": 4, "80-100": 5, "UNKNOWN": 99}
+    order = {
+        "00-19": 1,
+        "20-29": 2,
+        "30-39": 3,
+        "40-49": 4,
+        "50-59": 5,
+        "60-69": 6,
+        "70-79": 7,
+        "80-89": 8,
+        "90-100": 9,
+        "UNKNOWN": 99,
+    }
     out["_ord"] = out["group"].map(order).fillna(999)
     out = out.sort_values("_ord").drop(columns="_ord")
     return out
