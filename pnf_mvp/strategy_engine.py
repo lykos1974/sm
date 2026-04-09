@@ -231,6 +231,7 @@ def _base_result(
     reward_quality: Optional[str] = None,
     quality_score: Optional[float] = None,
     quality_grade: Optional[str] = None,
+    continuation_strength_v1: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -251,6 +252,7 @@ def _base_result(
         "reward_quality": reward_quality,
         "quality_score": quality_score,
         "quality_grade": quality_grade,
+        "continuation_strength_v1": continuation_strength_v1,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -379,6 +381,7 @@ def evaluate_pullback_retest_long(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=pullback_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
+        continuation_strength_v1=float(strength),
     )
 
 
@@ -526,4 +529,5 @@ def evaluate_pullback_retest_short(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=rebound_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
+        continuation_strength_v1=float(strength),
     )
