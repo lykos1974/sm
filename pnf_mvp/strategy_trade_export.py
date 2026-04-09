@@ -12,6 +12,7 @@ Exports:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import List
@@ -116,6 +117,7 @@ def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
             "resolution_note",
             "max_favorable_excursion",
             "max_adverse_excursion",
+            "raw_setup_json",
         ]
 
         select_expr = []
@@ -158,6 +160,7 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "reward_quality",
         "quality_score",
         "quality_grade",
+        "continuation_strength_v1",
         "ideal_entry",
         "activated_ts",
         "activated_price",
@@ -260,6 +263,24 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         return "OK"
 
     out["consistency_flag"] = out.apply(consistency_flag, axis=1)
+
+    def extract_continuation_strength_v1(row: pd.Series):
+        raw = row.get("raw_setup_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                value = parsed.get("continuation_strength_v1")
+                if value is not None:
+                    return value
+            except Exception:
+                pass
+        return row.get("continuation_strength_v1")
+
+    out["continuation_strength_v1"] = pd.to_numeric(
+        out.apply(extract_continuation_strength_v1, axis=1),
+        errors="coerce",
+    )
+
     return out[[c for c in cols if c in out.columns]]
 
 
@@ -487,6 +508,48 @@ def build_active_leg_boxes_breakdown(active: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_continuation_strength_v1_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    if active.empty:
+        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
+
+    bucketed = active.copy()
+
+    def cs_bucket(x: float) -> str:
+        if pd.isna(x):
+            return "UNKNOWN"
+        v = float(x)
+        if v < 35:
+            return "0-34"
+        if v < 50:
+            return "35-49"
+        if v < 65:
+            return "50-64"
+        if v < 80:
+            return "65-79"
+        return "80-100"
+
+    bucketed["group"] = bucketed["continuation_strength_v1"].apply(cs_bucket)
+
+    out = (
+        bucketed.groupby("group")
+        .agg(
+            trades=("setup_id", "count"),
+            tp1_touched=("tp1_hit", "sum"),
+            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
+            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
+            avg_r=("realized_r_multiple", "mean"),
+        )
+        .reset_index()
+    )
+    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
+    out["tp2_rate"] = out["tp2"] / out["trades"]
+    out.insert(0, "section", "continuation_strength_v1")
+    order = {"0-34": 1, "35-49": 2, "50-64": 3, "65-79": 4, "80-100": 5, "UNKNOWN": 99}
+    out["_ord"] = out["group"].map(order).fillna(999)
+    out = out.sort_values("_ord").drop(columns="_ord")
+    return out
+
+
 def build_tp1_to_tp2_conversion(active: pd.DataFrame) -> pd.DataFrame:
     tp1_df = active[active["tp1_hit"] == 1].copy()
     if tp1_df.empty:
@@ -628,6 +691,7 @@ def print_breakdowns(df: pd.DataFrame) -> None:
     print(by_context.to_string())
 
     print_df("SCORE BUCKET BREAKDOWN", build_score_bucket_breakdown(active))
+    print_df("CONTINUATION STRENGTH V1 BREAKDOWN", build_continuation_strength_v1_breakdown(active))
     print_df("PULLBACK + SIDE BREAKDOWN", build_pullback_side_breakdown(active))
     print_df("ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(active))
     print_df("TP1 -> TP2 CONVERSION", build_tp1_to_tp2_conversion(active))
@@ -642,6 +706,7 @@ def export_csv(df: pd.DataFrame, csv_path: str) -> str:
 def build_diagnostics_export(active: pd.DataFrame) -> pd.DataFrame:
     tables = [
         build_score_bucket_breakdown(active),
+        build_continuation_strength_v1_breakdown(active),
         build_pullback_side_breakdown(active),
         build_active_leg_boxes_breakdown(active),
     ]
