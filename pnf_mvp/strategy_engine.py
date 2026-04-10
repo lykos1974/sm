@@ -283,6 +283,61 @@ def _compute_continuation_strength_v1_long(
     return float(max(0.0, min(100.0, score)))
 
 
+def _derive_cs_geometry_component(
+    *,
+    pullback_quality: Optional[str],
+    impulse_to_pullback_ratio: Optional[float],
+    impulse_boxes: Optional[float],
+    pullback_boxes: Optional[float],
+) -> str:
+    if pullback_quality == PULLBACK_BROKEN:
+        return "BROKEN_STRUCTURE"
+    if impulse_to_pullback_ratio is not None:
+        ratio = float(impulse_to_pullback_ratio)
+        if ratio >= 3.0:
+            return "STRONG_IMPULSE_SHALLOW_PULLBACK"
+        if ratio >= 2.0:
+            return "GOOD_IMPULSE_BALANCED_PULLBACK"
+        if ratio >= 1.3:
+            return "MODEST_IMPULSE_BALANCED_PULLBACK"
+        if ratio >= 1.0:
+            return "WEAK_IMPULSE_DEEPER_PULLBACK"
+        return "PULLBACK_DOMINANT_GEOMETRY"
+    if impulse_boxes is not None and pullback_boxes is not None:
+        if float(pullback_boxes) <= 0:
+            return "NO_PULLBACK_MEASURED"
+        ratio = float(impulse_boxes) / max(float(pullback_boxes), 1e-9)
+        if ratio >= 2.0:
+            return "IMPULSE_DOMINANT_GEOMETRY"
+        return "PULLBACK_HEAVY_GEOMETRY"
+    if pullback_quality:
+        return f"{pullback_quality}_GEOMETRY"
+    return "UNCLASSIFIED_GEOMETRY"
+
+
+def _derive_cs_profile_tag(
+    *,
+    side: str,
+    breakout_context: Optional[str],
+    trend_regime: Optional[str],
+    is_extended: bool,
+) -> str:
+    tag = f"{side}_"
+    if breakout_context:
+        tag += str(breakout_context)
+    else:
+        tag += "NO_BREAKOUT_CONTEXT"
+    if trend_regime:
+        tag += f"__{trend_regime}"
+    else:
+        tag += "__NO_TREND_REGIME"
+    if is_extended:
+        tag += "__EXTENDED"
+    else:
+        tag += "__NON_EXTENDED"
+    return tag
+
+
 def _base_result(
     *,
     symbol: str,
@@ -306,6 +361,8 @@ def _base_result(
     quality_score: Optional[float] = None,
     quality_grade: Optional[str] = None,
     continuation_strength_v1: Optional[float] = None,
+    cs_geometry_component: Optional[str] = None,
+    cs_profile_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -327,6 +384,8 @@ def _base_result(
         "quality_score": quality_score,
         "quality_grade": quality_grade,
         "continuation_strength_v1": continuation_strength_v1,
+        "cs_geometry_component": cs_geometry_component,
+        "cs_profile_tag": cs_profile_tag,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -427,6 +486,18 @@ def evaluate_pullback_retest_long(
         pullback_boxes=pullback_boxes,
         impulse_to_pullback_ratio=impulse_to_pullback_ratio,
     )
+    cs_geometry_component = _derive_cs_geometry_component(
+        pullback_quality=pullback_quality,
+        impulse_to_pullback_ratio=impulse_to_pullback_ratio,
+        impulse_boxes=impulse_boxes,
+        pullback_boxes=pullback_boxes,
+    )
+    cs_profile_tag = _derive_cs_profile_tag(
+        side="LONG",
+        breakout_context=breakout_context,
+        trend_regime=trend_regime,
+        is_extended=is_extended,
+    )
 
     if pullback_quality == PULLBACK_BROKEN:
         status = STATUS_REJECT
@@ -468,6 +539,8 @@ def evaluate_pullback_retest_long(
         rr1=rr1, rr2=rr2, pullback_quality=pullback_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
         continuation_strength_v1=continuation_strength_v1,
+        cs_geometry_component=cs_geometry_component,
+        cs_profile_tag=cs_profile_tag,
     )
 
 
@@ -496,6 +569,9 @@ def evaluate_pullback_retest_short(
     current_top = _safe_float(structure_state.get("current_column_top"))
     latest_signal_name = str(structure_state.get("latest_signal_name") or "")
     market_state = str(structure_state.get("market_state") or "")
+    impulse_boxes = _safe_float(structure_state.get("impulse_boxes"))
+    pullback_boxes = _safe_float(structure_state.get("pullback_boxes"))
+    impulse_to_pullback_ratio = _safe_float(structure_state.get("impulse_to_pullback_ratio"))
 
     current = _current_column(columns)
     if current is None:
@@ -575,6 +651,18 @@ def evaluate_pullback_retest_short(
         strength = min(100, strength + 5)
 
     grade = _quality_grade(strength)
+    cs_geometry_component = _derive_cs_geometry_component(
+        pullback_quality=rebound_quality,
+        impulse_to_pullback_ratio=impulse_to_pullback_ratio,
+        impulse_boxes=impulse_boxes,
+        pullback_boxes=pullback_boxes,
+    )
+    cs_profile_tag = _derive_cs_profile_tag(
+        side="SHORT",
+        breakout_context=breakout_context,
+        trend_regime=trend_regime,
+        is_extended=is_extended,
+    )
 
     if rebound_quality == PULLBACK_BROKEN:
         status = STATUS_REJECT
@@ -615,5 +703,5 @@ def evaluate_pullback_retest_short(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=rebound_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
-        continuation_strength_v1=None,
+        continuation_strength_v1=None, cs_geometry_component=cs_geometry_component, cs_profile_tag=cs_profile_tag,
     )
