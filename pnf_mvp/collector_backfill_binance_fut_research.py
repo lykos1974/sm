@@ -102,13 +102,22 @@ def backfill_symbol(
     inserted = 0
 
     while cursor < end_ms:
-        rows = fetch_klines(symbol, interval, cursor, end_ms, limit)
+        page_end = min(end_ms, cursor + (step_ms * limit) - 1)
+        rows = fetch_klines(symbol, interval, cursor, page_end, limit)
         if not rows:
             break
 
+        prev_open_time: int | None = None
         for row in rows:
             open_time = int(row[0])
             close_time = int(row[6])
+            if prev_open_time is not None and open_time - prev_open_time != step_ms:
+                raise RuntimeError(
+                    "Non-continuous kline page for "
+                    f"{symbol} {interval}: prev_open={prev_open_time} "
+                    f"current_open={open_time} expected_step_ms={step_ms} "
+                    f"window_start={cursor} window_end={page_end}"
+                )
             storage.insert_candle(
                 symbol=ns_symbol,
                 interval=interval,
@@ -121,6 +130,7 @@ def backfill_symbol(
                 volume=float(row[5]),
             )
             inserted += 1
+            prev_open_time = open_time
 
         last_open = int(rows[-1][0])
         next_cursor = last_open + step_ms
