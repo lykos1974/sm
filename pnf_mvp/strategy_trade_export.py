@@ -103,6 +103,8 @@ def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
             "reward_quality",
             "quality_score",
             "quality_grade",
+            "cs_geometry_component",
+            "cs_profile_tag",
             "reason",
             "reject_reason",
             "activation_status",
@@ -161,6 +163,8 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "quality_score",
         "quality_grade",
         "continuation_strength_v1",
+        "cs_geometry_component",
+        "cs_profile_tag",
         "ideal_entry",
         "activated_ts",
         "activated_price",
@@ -280,6 +284,51 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         out.apply(extract_continuation_strength_v1, axis=1),
         errors="coerce",
     )
+
+    def extract_cs_geometry_component(row: pd.Series):
+        raw = row.get("raw_setup_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                value = parsed.get("cs_geometry_component")
+                if isinstance(value, str) and value.strip():
+                    return value
+            except Exception:
+                pass
+
+        existing = row.get("cs_geometry_component")
+        if isinstance(existing, str) and existing.strip():
+            return existing
+
+        pq = str(row.get("pullback_quality") or "").strip().upper()
+        if pq:
+            return f"{pq}_GEOMETRY"
+        return "UNCLASSIFIED_GEOMETRY"
+
+    def extract_cs_profile_tag(row: pd.Series):
+        raw = row.get("raw_setup_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                value = parsed.get("cs_profile_tag")
+                if isinstance(value, str) and value.strip():
+                    return value
+            except Exception:
+                pass
+
+        existing = row.get("cs_profile_tag")
+        if isinstance(existing, str) and existing.strip():
+            return existing
+
+        side = str(row.get("side") or "UNKNOWN_SIDE").upper()
+        breakout_context = str(row.get("breakout_context") or "NO_BREAKOUT_CONTEXT").upper()
+        trend_regime = str(row.get("trend_regime") or "NO_TREND_REGIME").upper()
+        is_extended = int(row.get("is_extended_move") or 0)
+        ext_tag = "EXTENDED" if is_extended else "NON_EXTENDED"
+        return f"{side}_{breakout_context}__{trend_regime}__{ext_tag}"
+
+    out["cs_geometry_component"] = out.apply(extract_cs_geometry_component, axis=1)
+    out["cs_profile_tag"] = out.apply(extract_cs_profile_tag, axis=1)
 
     return out[[c for c in cols if c in out.columns]]
 
