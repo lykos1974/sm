@@ -22,7 +22,7 @@ from strategy_validation import StrategyValidationStore
 # BE module (ready for future integration)
 from trade_management_be import BE_MODE, BE_TRIGGER_R
 
-VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE"}
+VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE", "WATCH"}
 
 
 def load_settings(settings_path: str) -> dict:
