@@ -618,6 +618,75 @@ def build_continuation_strength_v1_breakdown(active: pd.DataFrame) -> pd.DataFra
     return out
 
 
+def build_categorical_breakdown(active: pd.DataFrame, *, section: str, source_col: str, unknown_label: str) -> pd.DataFrame:
+    if active.empty:
+        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
+
+    bucketed = active.copy()
+    bucketed["group"] = bucketed[source_col].fillna(unknown_label).astype(str)
+    bucketed["group"] = bucketed["group"].replace("", unknown_label)
+
+    out = (
+        bucketed.groupby("group")
+        .agg(
+            trades=("setup_id", "count"),
+            tp1_touched=("tp1_hit", "sum"),
+            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
+            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
+            avg_r=("realized_r_multiple", "mean"),
+        )
+        .reset_index()
+    )
+    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
+    out["tp2_rate"] = out["tp2"] / out["trades"]
+    out.insert(0, "section", section)
+    return out.sort_values("group")
+
+
+def build_cs_geometry_component_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    return build_categorical_breakdown(
+        active,
+        section="cs_geometry_component",
+        source_col="cs_geometry_component",
+        unknown_label="UNKNOWN",
+    )
+
+
+def build_cs_profile_tag_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    return build_categorical_breakdown(
+        active,
+        section="cs_profile_tag",
+        source_col="cs_profile_tag",
+        unknown_label="UNKNOWN_CONTEXT",
+    )
+
+
+def build_pullback_quality_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    return build_categorical_breakdown(
+        active,
+        section="pullback_quality",
+        source_col="pullback_quality",
+        unknown_label="UNKNOWN",
+    )
+
+
+def filter_long_candidates(active: pd.DataFrame) -> pd.DataFrame:
+    if active.empty:
+        return active
+    return active[
+        (active["side"].fillna("").astype(str).str.upper() == "LONG")
+        & (active["status"].fillna("").astype(str).str.upper() == "CANDIDATE")
+    ].copy()
+
+
+def with_section_name(table: pd.DataFrame, section_name: str) -> pd.DataFrame:
+    if table.empty:
+        return table
+    out = table.copy()
+    out["section"] = section_name
+    return out
+
+
 def build_tp1_to_tp2_conversion(active: pd.DataFrame) -> pd.DataFrame:
     tp1_df = active[active["tp1_hit"] == 1].copy()
     if tp1_df.empty:
@@ -760,9 +829,17 @@ def print_breakdowns(df: pd.DataFrame) -> None:
 
     print_df("SCORE BUCKET BREAKDOWN", build_score_bucket_breakdown(active))
     print_df("CONTINUATION STRENGTH V1 BREAKDOWN", build_continuation_strength_v1_breakdown(active))
+    print_df("CS GEOMETRY COMPONENT BREAKDOWN", build_cs_geometry_component_breakdown(active))
+    print_df("CS PROFILE TAG BREAKDOWN", build_cs_profile_tag_breakdown(active))
     print_df("PULLBACK + SIDE BREAKDOWN", build_pullback_side_breakdown(active))
     print_df("ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(active))
     print_df("TP1 -> TP2 CONVERSION", build_tp1_to_tp2_conversion(active))
+
+    long_candidate = filter_long_candidates(active)
+    print_df("LONG CANDIDATE – CS GEOMETRY COMPONENT BREAKDOWN", build_cs_geometry_component_breakdown(long_candidate))
+    print_df("LONG CANDIDATE – CONTINUATION STRENGTH V1 BREAKDOWN", build_continuation_strength_v1_breakdown(long_candidate))
+    print_df("LONG CANDIDATE – ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(long_candidate))
+    print_df("LONG CANDIDATE – PULLBACK QUALITY BREAKDOWN", build_pullback_quality_breakdown(long_candidate))
 
 
 def export_csv(df: pd.DataFrame, csv_path: str) -> str:
@@ -775,9 +852,33 @@ def build_diagnostics_export(active: pd.DataFrame) -> pd.DataFrame:
     tables = [
         build_score_bucket_breakdown(active),
         build_continuation_strength_v1_breakdown(active),
+        build_cs_geometry_component_breakdown(active),
+        build_cs_profile_tag_breakdown(active),
+        build_pullback_quality_breakdown(active),
         build_pullback_side_breakdown(active),
         build_active_leg_boxes_breakdown(active),
     ]
+    long_candidate = filter_long_candidates(active)
+    tables.extend(
+        [
+            with_section_name(
+                build_cs_geometry_component_breakdown(long_candidate),
+                "long_candidate_cs_geometry_component",
+            ),
+            with_section_name(
+                build_continuation_strength_v1_breakdown(long_candidate),
+                "long_candidate_continuation_strength_v1",
+            ),
+            with_section_name(
+                build_active_leg_boxes_breakdown(long_candidate),
+                "long_candidate_active_leg_boxes",
+            ),
+            with_section_name(
+                build_pullback_quality_breakdown(long_candidate),
+                "long_candidate_pullback_quality",
+            ),
+        ]
+    )
     merged = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
 
     conv = build_tp1_to_tp2_conversion(active)
