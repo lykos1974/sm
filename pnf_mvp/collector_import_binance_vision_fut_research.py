@@ -123,6 +123,10 @@ def download_month_rows(symbol: str, ym: YearMonth) -> list[list[str]] | None:
 def import_symbol_month(storage: Storage, ns_symbol: str, rows: list[list[str]]) -> int:
     upserts = 0
     for row in rows:
+        if not row:
+            continue
+        if row[0].strip().lower() == "open_time":
+            continue
         # Binance kline row:
         # 0 open_time, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 close_time, ...
         open_time = int(row[0])
