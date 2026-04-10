@@ -12,6 +12,7 @@ Exports:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import List
@@ -116,6 +117,7 @@ def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
             "resolution_note",
             "max_favorable_excursion",
             "max_adverse_excursion",
+            "raw_setup_json",
         ]
 
         select_expr = []
@@ -158,6 +160,12 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "reward_quality",
         "quality_score",
         "quality_grade",
+        "continuation_strength_v1",
+        "cs_context_component",
+        "cs_geometry_component",
+        "cs_penalty_component",
+        "cs_data_quality_flag",
+        "cs_profile_tag",
         "ideal_entry",
         "activated_ts",
         "activated_price",
@@ -260,6 +268,127 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         return "OK"
 
     out["consistency_flag"] = out.apply(consistency_flag, axis=1)
+
+    def extract_continuation_strength_v1(row: pd.Series):
+        raw = row.get("raw_setup_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                value = parsed.get("continuation_strength_v1")
+                if value is not None:
+                    return value
+            except Exception:
+                pass
+        return row.get("continuation_strength_v1")
+
+    out["continuation_strength_v1"] = pd.to_numeric(
+        out.apply(extract_continuation_strength_v1, axis=1),
+        errors="coerce",
+    )
+
+    def parse_raw_setup(raw: object) -> dict:
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    parsed_setup = out["raw_setup_json"].apply(parse_raw_setup)
+
+    def fallback_context_component(row: pd.Series):
+        breakout_context = row.get("breakout_context")
+        trend_regime = row.get("trend_regime")
+        if breakout_context is None and trend_regime is None:
+            return None
+        score = 0.0
+        if breakout_context == "POST_BREAKOUT_PULLBACK":
+            score += 65.0
+        elif breakout_context == "FRESH_BULLISH_BREAKOUT":
+            score += 50.0
+        elif breakout_context == "LATE_EXTENSION":
+            score += 15.0
+        else:
+            score += 25.0
+
+        if trend_regime == "BULLISH_REGIME":
+            score += 35.0
+        elif trend_regime == "RANGE_REGIME":
+            score += 15.0
+        elif trend_regime == "BEARISH_REGIME":
+            score += 5.0
+        else:
+            score += 10.0
+        return max(0.0, min(100.0, score))
+
+    def fallback_penalty_component(row: pd.Series):
+        pullback_quality = row.get("pullback_quality")
+        is_extended = int(row.get("is_extended_move") or 0) == 1
+        score = 0.0
+        if is_extended:
+            score += 40.0
+        if pullback_quality == "BROKEN":
+            score += 60.0
+        elif pullback_quality == "DEEP":
+            score += 30.0
+        elif pullback_quality == "SHALLOW":
+            score += 10.0
+        return max(0.0, min(100.0, score))
+
+    raw_context = pd.to_numeric(parsed_setup.apply(lambda d: d.get("cs_context_component")), errors="coerce")
+    raw_geometry = pd.to_numeric(parsed_setup.apply(lambda d: d.get("cs_geometry_component")), errors="coerce")
+    raw_penalty = pd.to_numeric(parsed_setup.apply(lambda d: d.get("cs_penalty_component")), errors="coerce")
+
+    out["cs_context_component"] = raw_context.where(raw_context.notna(), out.apply(fallback_context_component, axis=1))
+    out["cs_geometry_component"] = raw_geometry
+    out["cs_penalty_component"] = raw_penalty.where(raw_penalty.notna(), out.apply(fallback_penalty_component, axis=1))
+
+    def derive_quality_flag(row: pd.Series) -> str:
+        raw_flag = parsed_setup.loc[row.name].get("cs_data_quality_flag")
+        if isinstance(raw_flag, str) and raw_flag.strip():
+            return raw_flag
+        present = sum(
+            1
+            for v in (
+                row.get("cs_context_component"),
+                row.get("cs_geometry_component"),
+                row.get("cs_penalty_component"),
+            )
+            if pd.notna(v)
+        )
+        if present == 3:
+            return "COMPLETE"
+        if present > 0:
+            return "PARTIAL"
+        return "MISSING"
+
+    def derive_profile_tag(row: pd.Series) -> str:
+        raw_tag = parsed_setup.loc[row.name].get("cs_profile_tag")
+        if isinstance(raw_tag, str) and raw_tag.strip():
+            return raw_tag
+        context_component = row.get("cs_context_component")
+        geometry_component = row.get("cs_geometry_component")
+        penalty_component = row.get("cs_penalty_component")
+        data_quality_flag = row.get("cs_data_quality_flag")
+        if data_quality_flag != "COMPLETE":
+            return "UNKNOWN_CONTEXT"
+        if pd.isna(context_component) or pd.isna(geometry_component) or pd.isna(penalty_component):
+            return "UNKNOWN_CONTEXT"
+        if geometry_component >= 70.0 and penalty_component >= 35.0:
+            return "HIGH_GEOMETRY_HIGH_PENALTY"
+        if context_component >= 70.0 and geometry_component >= 45.0 and penalty_component < 20.0:
+            return "HIGH_CONTEXT_MEDIUM_GEOMETRY"
+        if geometry_component >= 70.0 and penalty_component < 20.0:
+            return "HIGH_GEOMETRY_LOW_PENALTY"
+        if penalty_component >= 45.0:
+            return "PENALTY_DOMINANT"
+        return "BALANCED_PROFILE"
+
+    out["cs_data_quality_flag"] = out.apply(derive_quality_flag, axis=1)
+    out["cs_profile_tag"] = out.apply(derive_profile_tag, axis=1)
+
     return out[[c for c in cols if c in out.columns]]
 
 
@@ -487,6 +616,131 @@ def build_active_leg_boxes_breakdown(active: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_continuation_strength_v1_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    if active.empty:
+        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
+
+    bucketed = active.copy()
+
+    def cs_bucket(x: float) -> str:
+        if pd.isna(x):
+            return "UNKNOWN"
+        v = float(x)
+        if v < 20:
+            return "00-19"
+        if v < 30:
+            return "20-29"
+        if v < 40:
+            return "30-39"
+        if v < 50:
+            return "40-49"
+        if v < 60:
+            return "50-59"
+        if v < 70:
+            return "60-69"
+        if v < 80:
+            return "70-79"
+        if v < 90:
+            return "80-89"
+        return "90-100"
+
+    bucketed["group"] = bucketed["continuation_strength_v1"].apply(cs_bucket)
+
+    out = (
+        bucketed.groupby("group")
+        .agg(
+            trades=("setup_id", "count"),
+            tp1_touched=("tp1_hit", "sum"),
+            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
+            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
+            avg_r=("realized_r_multiple", "mean"),
+        )
+        .reset_index()
+    )
+    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
+    out["tp2_rate"] = out["tp2"] / out["trades"]
+    out.insert(0, "section", "continuation_strength_v1")
+    order = {
+        "00-19": 1,
+        "20-29": 2,
+        "30-39": 3,
+        "40-49": 4,
+        "50-59": 5,
+        "60-69": 6,
+        "70-79": 7,
+        "80-89": 8,
+        "90-100": 9,
+        "UNKNOWN": 99,
+    }
+    out["_ord"] = out["group"].map(order).fillna(999)
+    out = out.sort_values("_ord").drop(columns="_ord")
+    return out
+
+
+def build_cs_profile_tag_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    if active.empty:
+        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
+
+    bucketed = active.copy()
+    bucketed["group"] = bucketed["cs_profile_tag"].fillna("UNKNOWN_CONTEXT").astype(str)
+    out = (
+        bucketed.groupby("group")
+        .agg(
+            trades=("setup_id", "count"),
+            tp1_touched=("tp1_hit", "sum"),
+            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
+            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
+            avg_r=("realized_r_multiple", "mean"),
+        )
+        .reset_index()
+    )
+    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
+    out["tp2_rate"] = out["tp2"] / out["trades"]
+    out.insert(0, "section", "cs_profile_tag")
+    return out.sort_values("group")
+
+
+def _component_bucket_10(x: float) -> str:
+    if pd.isna(x):
+        return "UNKNOWN"
+    v = float(x)
+    if v < 20:
+        return "00-19"
+    if v < 40:
+        return "20-39"
+    if v < 60:
+        return "40-59"
+    if v < 80:
+        return "60-79"
+    return "80-100"
+
+
+def build_cs_component_breakdown(active: pd.DataFrame, column: str, section: str) -> pd.DataFrame:
+    if active.empty:
+        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
+
+    bucketed = active.copy()
+    bucketed["group"] = bucketed[column].apply(_component_bucket_10)
+    out = (
+        bucketed.groupby("group")
+        .agg(
+            trades=("setup_id", "count"),
+            tp1_touched=("tp1_hit", "sum"),
+            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
+            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
+            avg_r=("realized_r_multiple", "mean"),
+        )
+        .reset_index()
+    )
+    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
+    out["tp2_rate"] = out["tp2"] / out["trades"]
+    out.insert(0, "section", section)
+    order = {"00-19": 1, "20-39": 2, "40-59": 3, "60-79": 4, "80-100": 5, "UNKNOWN": 99}
+    out["_ord"] = out["group"].map(order).fillna(999)
+    out = out.sort_values("_ord").drop(columns="_ord")
+    return out
+
+
 def build_tp1_to_tp2_conversion(active: pd.DataFrame) -> pd.DataFrame:
     tp1_df = active[active["tp1_hit"] == 1].copy()
     if tp1_df.empty:
@@ -628,6 +882,11 @@ def print_breakdowns(df: pd.DataFrame) -> None:
     print(by_context.to_string())
 
     print_df("SCORE BUCKET BREAKDOWN", build_score_bucket_breakdown(active))
+    print_df("CONTINUATION STRENGTH V1 BREAKDOWN", build_continuation_strength_v1_breakdown(active))
+    print_df("CS CONTEXT COMPONENT BREAKDOWN", build_cs_component_breakdown(active, "cs_context_component", "cs_context_component"))
+    print_df("CS GEOMETRY COMPONENT BREAKDOWN", build_cs_component_breakdown(active, "cs_geometry_component", "cs_geometry_component"))
+    print_df("CS PENALTY COMPONENT BREAKDOWN", build_cs_component_breakdown(active, "cs_penalty_component", "cs_penalty_component"))
+    print_df("CS PROFILE TAG BREAKDOWN", build_cs_profile_tag_breakdown(active))
     print_df("PULLBACK + SIDE BREAKDOWN", build_pullback_side_breakdown(active))
     print_df("ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(active))
     print_df("TP1 -> TP2 CONVERSION", build_tp1_to_tp2_conversion(active))
@@ -642,6 +901,11 @@ def export_csv(df: pd.DataFrame, csv_path: str) -> str:
 def build_diagnostics_export(active: pd.DataFrame) -> pd.DataFrame:
     tables = [
         build_score_bucket_breakdown(active),
+        build_continuation_strength_v1_breakdown(active),
+        build_cs_component_breakdown(active, "cs_context_component", "cs_context_component"),
+        build_cs_component_breakdown(active, "cs_geometry_component", "cs_geometry_component"),
+        build_cs_component_breakdown(active, "cs_penalty_component", "cs_penalty_component"),
+        build_cs_profile_tag_breakdown(active),
         build_pullback_side_breakdown(active),
         build_active_leg_boxes_breakdown(active),
     ]

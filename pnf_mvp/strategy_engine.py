@@ -209,6 +209,202 @@ def _quality_grade(score: int) -> str:
     return "D"
 
 
+def _compute_continuation_strength_v1_long(
+    *,
+    breakout_context: Optional[str],
+    trend_regime: Optional[str],
+    pullback_quality: Optional[str],
+    is_extended: bool,
+    impulse_boxes: Optional[float],
+    pullback_boxes: Optional[float],
+    impulse_to_pullback_ratio: Optional[float],
+) -> Optional[float]:
+    is_long_continuation_context = breakout_context in (BREAKOUT_POST_BULLISH_PULLBACK, BREAKOUT_FRESH_BULLISH)
+    if not is_long_continuation_context:
+        return None
+
+    score = 50.0
+
+    if impulse_boxes is not None:
+        score += min(20.0, max(0.0, impulse_boxes) * 3.0)
+
+    if pullback_boxes is not None:
+        pb = max(0.0, pullback_boxes)
+        if pb <= 1.0:
+            score += 12.0
+        elif pb <= 2.0:
+            score += 6.0
+        elif pb <= 3.0:
+            score += 0.0
+        elif pb <= 4.0:
+            score -= 8.0
+        else:
+            score -= 15.0
+
+    if impulse_to_pullback_ratio is not None:
+        ratio = impulse_to_pullback_ratio
+        if ratio >= 3.0:
+            score += 18.0
+        elif ratio >= 2.0:
+            score += 10.0
+        elif ratio >= 1.3:
+            score += 3.0
+        elif ratio >= 1.0:
+            score -= 6.0
+        else:
+            score -= 16.0
+
+    if breakout_context == BREAKOUT_POST_BULLISH_PULLBACK:
+        score += 10.0
+    elif breakout_context == BREAKOUT_FRESH_BULLISH:
+        score += 4.0
+    elif breakout_context == BREAKOUT_LATE_EXTENSION:
+        score -= 12.0
+
+    if pullback_quality == PULLBACK_HEALTHY:
+        score += 8.0
+    elif pullback_quality == PULLBACK_SHALLOW:
+        score -= 2.0
+    elif pullback_quality == PULLBACK_DEEP:
+        score -= 8.0
+    elif pullback_quality == PULLBACK_BROKEN:
+        score -= 20.0
+
+    if trend_regime == "BULLISH_REGIME":
+        score += 8.0
+    elif trend_regime == "RANGE_REGIME":
+        score -= 5.0
+    elif trend_regime == "BEARISH_REGIME":
+        score -= 10.0
+
+    if is_extended:
+        score -= 8.0
+
+    return float(max(0.0, min(100.0, score)))
+
+
+def _compute_cs_context_component(
+    *,
+    breakout_context: Optional[str],
+    trend_regime: Optional[str],
+) -> Optional[float]:
+    if breakout_context is None and trend_regime is None:
+        return None
+
+    score = 0.0
+    if breakout_context == BREAKOUT_POST_BULLISH_PULLBACK:
+        score += 65.0
+    elif breakout_context == BREAKOUT_FRESH_BULLISH:
+        score += 50.0
+    elif breakout_context == BREAKOUT_LATE_EXTENSION:
+        score += 15.0
+    else:
+        score += 25.0
+
+    if trend_regime == "BULLISH_REGIME":
+        score += 35.0
+    elif trend_regime == "RANGE_REGIME":
+        score += 15.0
+    elif trend_regime == "BEARISH_REGIME":
+        score += 5.0
+    else:
+        score += 10.0
+
+    return float(max(0.0, min(100.0, score)))
+
+
+def _compute_cs_geometry_component(
+    *,
+    impulse_boxes: Optional[float],
+    pullback_boxes: Optional[float],
+    impulse_to_pullback_ratio: Optional[float],
+) -> Optional[float]:
+    if impulse_boxes is None or pullback_boxes is None or impulse_to_pullback_ratio is None:
+        return None
+
+    score = 0.0
+    score += min(40.0, max(0.0, impulse_boxes) * 6.0)
+
+    ratio = impulse_to_pullback_ratio
+    if ratio >= 3.0:
+        score += 60.0
+    elif ratio >= 2.0:
+        score += 50.0
+    elif ratio >= 1.5:
+        score += 40.0
+    elif ratio >= 1.0:
+        score += 25.0
+    else:
+        score += 10.0
+
+    return float(max(0.0, min(100.0, score)))
+
+
+def _compute_cs_penalty_component(
+    *,
+    pullback_quality: Optional[str],
+    is_extended: bool,
+    pullback_boxes: Optional[float],
+) -> Optional[float]:
+    score = 0.0
+
+    if is_extended:
+        score += 40.0
+
+    if pullback_quality == PULLBACK_BROKEN:
+        score += 60.0
+    elif pullback_quality == PULLBACK_DEEP:
+        score += 30.0
+    elif pullback_quality == PULLBACK_SHALLOW:
+        score += 10.0
+
+    if pullback_boxes is not None:
+        if pullback_boxes > 4.0:
+            score += 30.0
+        elif pullback_boxes > 3.0:
+            score += 20.0
+
+    return float(max(0.0, min(100.0, score)))
+
+
+def _compute_cs_data_quality_flag(
+    *,
+    impulse_boxes: Optional[float],
+    pullback_boxes: Optional[float],
+    impulse_to_pullback_ratio: Optional[float],
+) -> str:
+    present = sum(
+        1 for x in (impulse_boxes, pullback_boxes, impulse_to_pullback_ratio) if x is not None
+    )
+    if present == 3:
+        return "COMPLETE"
+    if present > 0:
+        return "PARTIAL"
+    return "MISSING"
+
+
+def _compute_cs_profile_tag(
+    *,
+    context_component: Optional[float],
+    geometry_component: Optional[float],
+    penalty_component: Optional[float],
+    data_quality_flag: str,
+) -> str:
+    if data_quality_flag != "COMPLETE":
+        return "UNKNOWN_CONTEXT"
+    if geometry_component is None or penalty_component is None or context_component is None:
+        return "UNKNOWN_CONTEXT"
+    if geometry_component >= 70.0 and penalty_component >= 35.0:
+        return "HIGH_GEOMETRY_HIGH_PENALTY"
+    if context_component >= 70.0 and geometry_component >= 45.0 and penalty_component < 20.0:
+        return "HIGH_CONTEXT_MEDIUM_GEOMETRY"
+    if geometry_component >= 70.0 and penalty_component < 20.0:
+        return "HIGH_GEOMETRY_LOW_PENALTY"
+    if penalty_component >= 45.0:
+        return "PENALTY_DOMINANT"
+    return "BALANCED_PROFILE"
+
+
 def _base_result(
     *,
     symbol: str,
@@ -231,6 +427,12 @@ def _base_result(
     reward_quality: Optional[str] = None,
     quality_score: Optional[float] = None,
     quality_grade: Optional[str] = None,
+    continuation_strength_v1: Optional[float] = None,
+    cs_context_component: Optional[float] = None,
+    cs_geometry_component: Optional[float] = None,
+    cs_penalty_component: Optional[float] = None,
+    cs_data_quality_flag: Optional[str] = None,
+    cs_profile_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -251,6 +453,12 @@ def _base_result(
         "reward_quality": reward_quality,
         "quality_score": quality_score,
         "quality_grade": quality_grade,
+        "continuation_strength_v1": continuation_strength_v1,
+        "cs_context_component": cs_context_component,
+        "cs_geometry_component": cs_geometry_component,
+        "cs_penalty_component": cs_penalty_component,
+        "cs_data_quality_flag": cs_data_quality_flag,
+        "cs_profile_tag": cs_profile_tag,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -280,6 +488,9 @@ def evaluate_pullback_retest_long(
     active_leg_boxes = int(structure_state.get("active_leg_boxes") or 0)
     current_kind = structure_state.get("current_column_kind")
     current_bottom = _safe_float(structure_state.get("current_column_bottom"))
+    impulse_boxes = _safe_float(structure_state.get("impulse_boxes"))
+    pullback_boxes = _safe_float(structure_state.get("pullback_boxes"))
+    impulse_to_pullback_ratio = _safe_float(structure_state.get("impulse_to_pullback_ratio"))
 
     current = _current_column(columns)
     if current is None:
@@ -339,6 +550,40 @@ def evaluate_pullback_retest_long(
         rr2=rr2,
     )
     grade = _quality_grade(strength)
+    continuation_strength_v1 = _compute_continuation_strength_v1_long(
+        breakout_context=breakout_context,
+        trend_regime=trend_regime,
+        pullback_quality=pullback_quality,
+        is_extended=is_extended,
+        impulse_boxes=impulse_boxes,
+        pullback_boxes=pullback_boxes,
+        impulse_to_pullback_ratio=impulse_to_pullback_ratio,
+    )
+    cs_context_component = _compute_cs_context_component(
+        breakout_context=breakout_context,
+        trend_regime=trend_regime,
+    )
+    cs_geometry_component = _compute_cs_geometry_component(
+        impulse_boxes=impulse_boxes,
+        pullback_boxes=pullback_boxes,
+        impulse_to_pullback_ratio=impulse_to_pullback_ratio,
+    )
+    cs_penalty_component = _compute_cs_penalty_component(
+        pullback_quality=pullback_quality,
+        is_extended=is_extended,
+        pullback_boxes=pullback_boxes,
+    )
+    cs_data_quality_flag = _compute_cs_data_quality_flag(
+        impulse_boxes=impulse_boxes,
+        pullback_boxes=pullback_boxes,
+        impulse_to_pullback_ratio=impulse_to_pullback_ratio,
+    )
+    cs_profile_tag = _compute_cs_profile_tag(
+        context_component=cs_context_component,
+        geometry_component=cs_geometry_component,
+        penalty_component=cs_penalty_component,
+        data_quality_flag=cs_data_quality_flag,
+    )
 
     if pullback_quality == PULLBACK_BROKEN:
         status = STATUS_REJECT
@@ -379,6 +624,12 @@ def evaluate_pullback_retest_long(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=pullback_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
+        continuation_strength_v1=continuation_strength_v1,
+        cs_context_component=cs_context_component,
+        cs_geometry_component=cs_geometry_component,
+        cs_penalty_component=cs_penalty_component,
+        cs_data_quality_flag=cs_data_quality_flag,
+        cs_profile_tag=cs_profile_tag,
     )
 
 
@@ -526,4 +777,10 @@ def evaluate_pullback_retest_short(
         ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
         rr1=rr1, rr2=rr2, pullback_quality=rebound_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
+        continuation_strength_v1=None,
+        cs_context_component=None,
+        cs_geometry_component=None,
+        cs_penalty_component=None,
+        cs_data_quality_flag="MISSING",
+        cs_profile_tag="UNKNOWN_CONTEXT",
     )

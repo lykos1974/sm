@@ -125,6 +125,21 @@ def _active_leg_boxes(columns: List[Any], box_size: float) -> int:
     return int(round(span / box_size))
 
 
+def _column_span_boxes(col: Optional[Any], box_size: float) -> Optional[float]:
+    if col is None or box_size <= 0:
+        return None
+    span = abs(_col_top(col) - _col_bottom(col))
+    return span / box_size
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None:
+        return None
+    if denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
 def _detect_swing_direction(columns: List[Any]) -> str:
     x_highs = _last_two_meaningful_x_highs(columns)
     o_lows = _last_two_meaningful_o_lows(columns)
@@ -349,6 +364,9 @@ def build_structure_state(
             "breakout_context": BREAKOUT_NONE,
             "is_extended_move": False,
             "active_leg_boxes": 0,
+            "impulse_boxes": None,
+            "pullback_boxes": None,
+            "impulse_to_pullback_ratio": None,
             "last_meaningful_x_high": None,
             "last_meaningful_o_low": None,
             "current_column_kind": None,
@@ -377,6 +395,20 @@ def build_structure_state(
     )
 
     current = columns[-1]
+    prev_x = _last_of_kind(columns, "X", before_index=len(columns) - 1)
+
+    impulse_boxes = None
+    pullback_boxes = None
+    impulse_to_pullback_ratio = None
+
+    if (
+        breakout_context == BREAKOUT_POST_BULLISH_PULLBACK
+        and _col_kind(current) == "O"
+        and immediate_slope == SLOPE_BEARISH_PULLBACK
+    ):
+        impulse_boxes = _column_span_boxes(prev_x, box_size)
+        pullback_boxes = _column_span_boxes(current, box_size)
+        impulse_to_pullback_ratio = _safe_ratio(impulse_boxes, pullback_boxes)
 
     return {
         "symbol": symbol,
@@ -389,6 +421,9 @@ def build_structure_state(
         "breakout_context": breakout_context,
         "is_extended_move": is_extended_move,
         "active_leg_boxes": active_leg_boxes,
+        "impulse_boxes": impulse_boxes,
+        "pullback_boxes": pullback_boxes,
+        "impulse_to_pullback_ratio": impulse_to_pullback_ratio,
         "last_meaningful_x_high": _last_meaningful_x_high(columns),
         "last_meaningful_o_low": _last_meaningful_o_low(columns),
         "current_column_kind": _col_kind(current),
