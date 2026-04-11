@@ -1,0 +1,46 @@
+{
+  "database_path": "data/pnf_mvp_research_clean.sqlite3",
+  "strategy_validation_db_path": "data/strategy_validation_research_clean.sqlite3",
+  "symbols": [
+    "BINANCE_FUT:BTCUSDT",
+    "BINANCE_FUT:ETHUSDT",
+    "BINANCE_FUT:BNBUSDT",
+    "BINANCE_FUT:SOLUSDT",
+    "BINANCE_FUT:XRPUSDT"
+  ],
+  "profiles": {
+    "BINANCE_FUT:BTCUSDT": {
+      "box_size": 100,
+      "reversal_boxes": 3
+    },
+    "BINANCE_FUT:ETHUSDT": {
+      "box_size": 5,
+      "reversal_boxes": 3
+    },
+    "BINANCE_FUT:BNBUSDT": {
+      "box_size": 2,
+      "reversal_boxes": 3
+    },
+    "BINANCE_FUT:SOLUSDT": {
+      "box_size": 0.25,
+      "reversal_boxes": 3
+    },
+    "BINANCE_FUT:XRPUSDT": {
+      "box_size": 0.005,
+      "reversal_boxes": 3
+    }
+  },
+  "history_bars": 5000,
+  "refresh_seconds": 2,
+  "alert_filters": {
+    "allowed_types": [
+      "DOUBLE_TOP_BREAKOUT",
+      "DOUBLE_BOTTOM_BREAKDOWN"
+    ],
+    "minimum_priority": "HIGH",
+    "minimum_score": 85,
+    "allowed_symbols": [
+      "ALL"
+    ]
+  }
+}
