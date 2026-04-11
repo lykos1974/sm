@@ -12,6 +12,7 @@ Exports:
 
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 from pathlib import Path
@@ -895,14 +896,18 @@ def build_diagnostics_export(active: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Activation-aware trade export from strategy_validation.db")
+    parser.add_argument("--db-path", default=DB_PATH, help="Path to strategy validation sqlite database")
+    args = parser.parse_args()
+
     try:
-        raw = load_resolved_trades(DB_PATH)
+        raw = load_resolved_trades(args.db_path)
     except Exception as exc:
         print(f"ERROR: {exc}")
         return
 
     trades = compute_trade_metrics(raw)
-    print(f"Loaded {len(trades)} resolved rows from {DB_PATH} / table={TABLE_NAME}")
+    print(f"Loaded {len(trades)} resolved rows from {args.db_path} / table={TABLE_NAME}")
 
     print_summary("ALL RESOLVED ROWS", build_summary_all_resolved(trades))
     print_summary("ACTIVATED TRADES ONLY", build_summary_activated_only(trades))
