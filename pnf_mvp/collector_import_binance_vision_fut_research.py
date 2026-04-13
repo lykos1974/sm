@@ -13,6 +13,7 @@ import io
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -98,18 +99,36 @@ def build_month_zip_url(symbol: str, ym: YearMonth) -> str:
     )
 
 
-def download_month_rows(symbol: str, ym: YearMonth) -> list[list[str]] | None:
+def build_local_zip_candidates(local_root: str, symbol: str, ym: YearMonth) -> list[Path]:
+    token = ym.to_token()
+    root = Path(local_root)
+    return [
+        root / symbol / DEFAULT_INTERVAL / f"{symbol}-{DEFAULT_INTERVAL}-{token}.zip",
+        root / f"{symbol}-{DEFAULT_INTERVAL}-{token}.zip",
+    ]
+
+
+def load_month_zip_payload(symbol: str, ym: YearMonth, local_root: str | None) -> tuple[bytes | None, str]:
+    if local_root:
+        candidates = build_local_zip_candidates(local_root, symbol, ym)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.read_bytes(), str(candidate)
+        return None, f"LOCAL_MISSING ({candidates[0]} | {candidates[1]})"
+
     url = build_month_zip_url(symbol, ym)
     try:
         with urlopen(url, timeout=30) as response:
-            payload = response.read()
+            return response.read(), f"REMOTE {url}"
     except HTTPError as exc:
         if exc.code == 404:
-            return None
+            return None, f"REMOTE_404 {url}"
         raise
     except URLError:
         raise
 
+
+def parse_month_rows_from_payload(payload: bytes) -> list[list[str]]:
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         names = archive.namelist()
         if not names:
@@ -118,6 +137,14 @@ def download_month_rows(symbol: str, ym: YearMonth) -> list[list[str]] | None:
             text_stream = io.TextIOWrapper(fh, encoding="utf-8")
             reader = csv.reader(text_stream)
             return [row for row in reader if row]
+
+
+def download_month_rows(symbol: str, ym: YearMonth, local_root: str | None = None) -> tuple[list[list[str]] | None, str]:
+    payload, source = load_month_zip_payload(symbol, ym, local_root)
+    if payload is None:
+        return None, source
+
+    return parse_month_rows_from_payload(payload), source
 
 
 def import_symbol_month(storage: Storage, ns_symbol: str, rows: list[list[str]]) -> int:
@@ -146,8 +173,15 @@ def import_symbol_month(storage: Storage, ns_symbol: str, rows: list[list[str]])
     return upserts
 
 
-def run(db_path: str, symbols: list[str], start_month: YearMonth, end_month: YearMonth) -> int:
-    storage = Storage(db_path)
+def run(
+    db_path: str,
+    symbols: list[str],
+    start_month: YearMonth,
+    end_month: YearMonth,
+    local_root: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    storage = None if dry_run else Storage(db_path)
     months = iter_months(start_month, end_month)
     total_upserts = 0
 
@@ -155,25 +189,40 @@ def run(db_path: str, symbols: list[str], start_month: YearMonth, end_month: Yea
         symbol = raw_symbol.upper().strip()
         ns_symbol = namespace_symbol(symbol)
 
-        storage.upsert_symbol(
-            symbol=ns_symbol,
-            exchange="BINANCE_FUT",
-            asset_type="PERP",
-            base_quote=resolve_base_quote(symbol),
-        )
+        if not dry_run and storage is not None:
+            storage.upsert_symbol(
+                symbol=ns_symbol,
+                exchange="BINANCE_FUT",
+                asset_type="PERP",
+                base_quote=resolve_base_quote(symbol),
+            )
 
         symbol_upserts = 0
         found_any_month = False
 
         for ym in months:
-            rows = download_month_rows(symbol, ym)
+            rows, source = download_month_rows(symbol, ym, local_root=local_root)
+            month_token = ym.to_token()
+
+            if dry_run:
+                if rows is None:
+                    print(f"[DRY-RUN] [{symbol}] {month_token} SKIP {source}")
+                else:
+                    print(f"[DRY-RUN] [{symbol}] {month_token} USE {source} rows={len(rows)}")
+
             if rows is None:
+                if local_root:
+                    print(f"[{symbol}] {month_token} missing local ZIP -> skip")
                 continue
             found_any_month = True
-            symbol_upserts += import_symbol_month(storage, ns_symbol, rows)
+            if not dry_run and storage is not None:
+                symbol_upserts += import_symbol_month(storage, ns_symbol, rows)
 
         if not found_any_month:
-            print("symbol not available on Binance Vision")
+            if local_root:
+                print(f"[{symbol}] no matching local monthly ZIP files in --local-root")
+            else:
+                print("symbol not available on Binance Vision")
 
         total_upserts += symbol_upserts
         print(f"[{symbol}] upserts={symbol_upserts}")
@@ -187,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite output DB path")
     parser.add_argument("--start-month", required=True, help="Inclusive start month, format YYYY-MM")
     parser.add_argument("--end-month", required=True, help="Inclusive end month, format YYYY-MM")
+    parser.add_argument(
+        "--local-root",
+        default=None,
+        help="Optional local root for monthly ZIP files; when set, remote download is disabled",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List symbol/month/file decisions without writing to DB",
+    )
     parser.add_argument(
         "--symbols",
         default=",".join(DEFAULT_SYMBOLS),
@@ -208,6 +267,8 @@ def main() -> int:
         symbols=symbols,
         start_month=start_month,
         end_month=end_month,
+        local_root=args.local_root,
+        dry_run=bool(args.dry_run),
     )
     return 0
 
