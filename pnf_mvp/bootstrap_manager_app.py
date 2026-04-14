@@ -302,12 +302,25 @@ class BootstrapManagerApp:
             self._append_log("Inspect Only is read-only; use Inspect / Preview.")
             return
 
+        if mode == "Import From Local Cache":
+            self._execute_import_from_local_cache()
         if mode == "Download Only":
             self._execute_download_only()
             return
 
         self._append_log(f"{mode} execution is not implemented yet.")
 
+    def _execute_import_from_local_cache(self) -> None:
+        db_path = self.db_path_var.get().strip()
+        if db_path != DEFAULT_DB_PATH:
+            self._append_log(
+                f"WARNING: Import From Local Cache is restricted to {DEFAULT_DB_PATH} for MVP. Aborting."
+            )
+            return
+
+        local_root = self.local_cache_var.get().strip()
+        if not local_root:
+            self._append_log("ERROR: Local cache root is required for Import From Local Cache mode.")
     def _execute_download_only(self) -> None:
         local_root = self.local_cache_var.get().strip()
         if not local_root:
@@ -323,52 +336,63 @@ class BootstrapManagerApp:
         success = 0
         failed = 0
         skipped_months = 0
-        downloaded_zips = 0
-        reused_local_zips = 0
+        imported_months = 0
+        overwritten_partial_months = 0
         failed_months = 0
 
-        self._update_progress(processed, total, "Download Only", success, failed)
+        self._update_progress(processed, total, "Import From Local Cache", success, failed)
+        storage = Storage(db_path)
 
         for row in plan_rows:
             processed += 1
-            result = "SKIPPED"
+            result = "FAILED"
 
-            if row["status"] == "PRESENT":
-                skipped_months += 1
-                success += 1
-            elif row["source"] == "LOCAL":
-                reused_local_zips += 1
-                skipped_months += 1
-                success += 1
-            else:
-                ym = YearMonth(row["year"], row["month"])
-                target_path = resolve_local_month_zip_path(local_root, row["symbol"], ym)
-                try:
-                    download_month_zip_to_path(row["symbol"], ym, target_path)
-                    downloaded_zips += 1
+            try:
+                if row["status"] == "PRESENT":
+                    skipped_months += 1
                     success += 1
-                    result = "DOWNLOADED"
-                except (HTTPError, URLError, OSError) as exc:
+                    result = "SKIPPED"
+                elif row["source"] == "LOCAL":
+                    ym = YearMonth(row["year"], row["month"])
+                    rows = self._load_local_month_rows(local_root=local_root, symbol=row["symbol"], ym=ym)
+                    if rows is None:
+                        raise FileNotFoundError("Local ZIP not found for requested month.")
+
+                    ns_symbol = namespace_symbol(row["symbol"])
+                    import_symbol_month(storage, ns_symbol, rows)
+
+                    if row["status"] == "PARTIAL":
+                        overwritten_partial_months += 1
+                        result = "OVERWRITTEN"
+                    else:
+                        imported_months += 1
+                        result = "IMPORTED"
+                    success += 1
+                else:
                     failed += 1
                     failed_months += 1
                     result = "FAILED"
-                    self._append_log(
-                        f"ERROR: {row['symbol']} | {row['month_token']} download failed: {exc}"
-                    )
+            except Exception as exc:
+                failed += 1
+                failed_months += 1
+                result = "FAILED"
+                self._append_log(
+                    f"ERROR: {row['symbol']} | {row['month_token']} import failed: {exc}"
+                )
 
             self._append_log(
                 f"{row['symbol']} | {row['month_token']} | {row['status']} | {row['action']} | "
                 f"source={row['source']} | rows={row['rows']} | first={row['first']} | last={row['last']} | result={result}"
             )
-            self._update_progress(processed, total, "Download Only", success, failed)
+            self._update_progress(processed, total, "Import From Local Cache", success, failed)
 
         self.summary_var.set(
             " | ".join(
                 [
                     f"processed_months={processed}",
                     f"skipped_months={skipped_months}",
-                    f"downloaded_zips={downloaded_zips}",
-                    f"reused_local_zips={reused_local_zips}",
+                    f"imported_months={imported_months}",
+                    f"overwritten_partial_months={overwritten_partial_months}",
                     f"failed_months={failed_months}",
                 ]
             )
