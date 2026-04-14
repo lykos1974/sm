@@ -221,20 +221,21 @@ class BootstrapManagerApp:
         db_path = Path(self.db_path_var.get().strip())
         symbols = self._selected_symbols()
         local_root = self.local_cache_var.get().strip()
+        plan_rows: list[dict] = []
 
         if not symbols:
             self._append_log("WARNING: No symbols selected.")
-            return
+            return None
 
         if not db_path.exists():
             self._append_log(f"ERROR: DB file not found: {db_path}")
-            return
+            return None
 
         try:
             months = self._iter_month_tokens(self.start_month_var.get(), self.end_month_var.get())
         except ValueError as exc:
             self._append_log(f"ERROR: {exc}")
-            return
+            return None
 
         self._append_log(
             f"Inspecting coverage | db={db_path} | symbols={','.join(symbols)} | months={months[0][2]}..{months[-1][2]}"
