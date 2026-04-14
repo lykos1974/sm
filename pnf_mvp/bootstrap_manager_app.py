@@ -174,9 +174,37 @@ class BootstrapManagerApp:
             return "PRESENT"
         return "PARTIAL"
 
+    @staticmethod
+    def _local_zip_candidates(local_root: str, symbol: str, month_token: str) -> list[Path]:
+        root = Path(local_root)
+        filename = f"{symbol}-1m-{month_token}.zip"
+        return [
+            root / symbol / "1m" / filename,
+            root / filename,
+        ]
+
+    def _build_action(self, status: str, symbol: str, month_token: str, local_root: str) -> tuple[str, str]:
+        if status == "PRESENT":
+            return "SKIP", "NONE"
+
+        has_local = False
+        if local_root.strip():
+            for candidate in self._local_zip_candidates(local_root, symbol, month_token):
+                try:
+                    if candidate.exists():
+                        has_local = True
+                        break
+                except OSError:
+                    has_local = False
+
+        if has_local:
+            return "USE_LOCAL", "LOCAL"
+        return "DOWNLOAD", "REMOTE"
+
     def inspect_preview(self) -> None:
         db_path = Path(self.db_path_var.get().strip())
         symbols = self._selected_symbols()
+        local_root = self.local_cache_var.get().strip()
 
         if not symbols:
             self._append_log("WARNING: No symbols selected.")
@@ -213,8 +241,13 @@ class BootstrapManagerApp:
                         last_ts = int(row[2]) if row[2] is not None else None
                         expected_rows = self._expected_rows_for_month(year, month)
                         status = self._classify(count, expected_rows)
+                        action, source = self._build_action(status, symbol, month_token, local_root)
+
                         self._append_log(
-                            f"{symbol} | {month_token} | {status} | rows={count} | first={self._ms_to_utc_text(first_ts)} | last={self._ms_to_utc_text(last_ts)}"
+                            f"{symbol} | {month_token} | {status} | {action} | source={source}"
+                        )
+                        self._append_log(
+                            f"  details: rows={count} | first={self._ms_to_utc_text(first_ts)} | last={self._ms_to_utc_text(last_ts)}"
                         )
         except sqlite3.Error as exc:
             self._append_log(f"ERROR: SQLite failure during inspection: {exc}")
