@@ -22,6 +22,7 @@ PLACEHOLDER_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 MODES = [
     "Inspect Only",
     "Download Only",
+    "Dry-Run Preview",
     "Import From Local Cache",
     "Download + Import",
 ]
@@ -188,6 +189,15 @@ class BootstrapManagerApp:
             return "PRESENT"
         return "PARTIAL"
 
+    @staticmethod
+    def _local_zip_candidates(local_root: str, symbol: str, month_token: str) -> list[Path]:
+        root = Path(local_root)
+        filename = f"{symbol}-1m-{month_token}.zip"
+        return [
+            root / symbol / "1m" / filename,
+            root / filename,
+        ]
+
     def _build_action(self, status: str, symbol: str, month_token: str, local_root: str) -> tuple[str, str]:
         if status == "PRESENT":
             return "SKIP", "NONE"
@@ -214,17 +224,17 @@ class BootstrapManagerApp:
 
         if not symbols:
             self._append_log("WARNING: No symbols selected.")
-            return None
+            return
 
         if not db_path.exists():
             self._append_log(f"ERROR: DB file not found: {db_path}")
-            return None
+            return
 
         try:
             months = self._iter_month_tokens(self.start_month_var.get(), self.end_month_var.get())
         except ValueError as exc:
             self._append_log(f"ERROR: {exc}")
-            return None
+            return
 
         self._append_log(
             f"Inspecting coverage | db={db_path} | symbols={','.join(symbols)} | months={months[0][2]}..{months[-1][2]}"
@@ -235,7 +245,6 @@ class BootstrapManagerApp:
             "FROM candles WHERE symbol=? AND interval='1m' AND open_time>=? AND open_time<=?"
         )
 
-        plan_rows: list[dict] = []
         try:
             with sqlite3.connect(str(db_path)) as conn:
                 for symbol in symbols:
