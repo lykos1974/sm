@@ -108,6 +108,23 @@ def build_local_zip_candidates(local_root: str, symbol: str, ym: YearMonth) -> l
     ]
 
 
+def resolve_local_month_zip_path(local_root: str, symbol: str, ym: YearMonth) -> Path:
+    token = ym.to_token()
+    root = Path(local_root)
+    return root / symbol / DEFAULT_INTERVAL / f"{symbol}-{DEFAULT_INTERVAL}-{token}.zip"
+
+
+def download_month_zip_to_path(symbol: str, ym: YearMonth, target_path: str | Path) -> str:
+    url = build_month_zip_url(symbol, ym)
+    with urlopen(url, timeout=30) as response:
+        payload = response.read()
+
+    out_path = Path(target_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(payload)
+    return url
+
+
 def load_month_zip_payload(symbol: str, ym: YearMonth, local_root: str | None) -> tuple[bytes | None, str]:
     if local_root:
         candidates = build_local_zip_candidates(local_root, symbol, ym)
