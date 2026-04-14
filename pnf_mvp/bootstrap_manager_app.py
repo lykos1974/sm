@@ -22,6 +22,7 @@ PLACEHOLDER_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 MODES = [
     "Inspect Only",
     "Download Only",
+    "Dry-Run Preview",
     "Import From Local Cache",
     "Download + Import",
 ]
@@ -187,6 +188,15 @@ class BootstrapManagerApp:
         if count >= int(expected_rows * 0.95):
             return "PRESENT"
         return "PARTIAL"
+
+    @staticmethod
+    def _local_zip_candidates(local_root: str, symbol: str, month_token: str) -> list[Path]:
+        root = Path(local_root)
+        filename = f"{symbol}-1m-{month_token}.zip"
+        return [
+            root / symbol / "1m" / filename,
+            root / filename,
+        ]
 
     def _build_action(self, status: str, symbol: str, month_token: str, local_root: str) -> tuple[str, str]:
         if status == "PRESENT":
