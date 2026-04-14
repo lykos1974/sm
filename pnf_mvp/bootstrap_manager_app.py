@@ -244,10 +244,8 @@ class BootstrapManagerApp:
                         action, source = self._build_action(status, symbol, month_token, local_root)
 
                         self._append_log(
-                            f"{symbol} | {month_token} | {status} | {action} | source={source}"
-                        )
-                        self._append_log(
-                            f"  details: rows={count} | first={self._ms_to_utc_text(first_ts)} | last={self._ms_to_utc_text(last_ts)}"
+                            f"{symbol} | {month_token} | {status} | {action} | source={source} | "
+                            f"rows={count} | first={self._ms_to_utc_text(first_ts)} | last={self._ms_to_utc_text(last_ts)}"
                         )
         except sqlite3.Error as exc:
             self._append_log(f"ERROR: SQLite failure during inspection: {exc}")
