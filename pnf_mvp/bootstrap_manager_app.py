@@ -4,26 +4,25 @@ from __future__ import annotations
 
 import calendar
 from datetime import datetime, timezone
-import io
 from pathlib import Path
 import sqlite3
 import tkinter as tk
 from tkinter import ttk
-import zipfile
-import csv
+from urllib.error import HTTPError, URLError
 
 from collector_import_binance_vision_fut_research import (
     YearMonth,
-    import_symbol_month,
-    namespace_symbol,
+    build_local_zip_candidates,
+    download_month_zip_to_path,
+    resolve_local_month_zip_path,
 )
-from storage import Storage
 
 DEFAULT_DB_PATH = "data/pnf_mvp_research_clean.sqlite3"
 PLACEHOLDER_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 MODES = [
     "Inspect Only",
     "Download Only",
+    "Dry-Run Preview",
     "Import From Local Cache",
     "Download + Import",
 ]
@@ -190,6 +189,15 @@ class BootstrapManagerApp:
             return "PRESENT"
         return "PARTIAL"
 
+    @staticmethod
+    def _local_zip_candidates(local_root: str, symbol: str, month_token: str) -> list[Path]:
+        root = Path(local_root)
+        filename = f"{symbol}-1m-{month_token}.zip"
+        return [
+            root / symbol / "1m" / filename,
+            root / filename,
+        ]
+
     def _build_action(self, status: str, symbol: str, month_token: str, local_root: str) -> tuple[str, str]:
         if status == "PRESENT":
             return "SKIP", "NONE"
@@ -197,7 +205,7 @@ class BootstrapManagerApp:
         has_local = False
         if local_root.strip():
             ym = YearMonth(*self._parse_month(month_token))
-            for candidate in self._local_zip_candidates(local_root, symbol, ym):
+            for candidate in build_local_zip_candidates(local_root, symbol, ym):
                 try:
                     if candidate.exists():
                         has_local = True
@@ -208,30 +216,6 @@ class BootstrapManagerApp:
         if has_local:
             return "USE_LOCAL", "LOCAL"
         return "DOWNLOAD", "REMOTE"
-
-    @staticmethod
-    def _local_zip_candidates(local_root: str, symbol: str, ym: YearMonth) -> list[Path]:
-        token = ym.to_token()
-        root = Path(local_root)
-        return [
-            root / symbol / "1m" / f"{symbol}-1m-{token}.zip",
-            root / f"{symbol}-1m-{token}.zip",
-        ]
-
-    def _load_local_month_rows(self, local_root: str, symbol: str, ym: YearMonth) -> list[list[str]] | None:
-        for candidate in self._local_zip_candidates(local_root, symbol, ym):
-            if not candidate.exists():
-                continue
-            payload = candidate.read_bytes()
-            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                names = archive.namelist()
-                if not names:
-                    return []
-                with archive.open(names[0], "r") as fh:
-                    text_stream = io.TextIOWrapper(fh, encoding="utf-8")
-                    reader = csv.reader(text_stream)
-                    return [row for row in reader if row]
-        return None
 
     def _collect_plan_rows(self) -> list[dict] | None:
         db_path = Path(self.db_path_var.get().strip())
@@ -320,6 +304,8 @@ class BootstrapManagerApp:
 
         if mode == "Import From Local Cache":
             self._execute_import_from_local_cache()
+        if mode == "Download Only":
+            self._execute_download_only()
             return
 
         self._append_log(f"{mode} execution is not implemented yet.")
@@ -335,6 +321,10 @@ class BootstrapManagerApp:
         local_root = self.local_cache_var.get().strip()
         if not local_root:
             self._append_log("ERROR: Local cache root is required for Import From Local Cache mode.")
+    def _execute_download_only(self) -> None:
+        local_root = self.local_cache_var.get().strip()
+        if not local_root:
+            self._append_log("ERROR: Local cache root is required for Download Only mode.")
             return
 
         plan_rows = self._collect_plan_rows()
