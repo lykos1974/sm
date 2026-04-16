@@ -4,38 +4,19 @@ strategy_validation.py
 PnF Strategy Validation Store
 =============================
 
-Execution model
----------------
-- activation is close-confirmed
-- backtest fill price is ideal_entry
-- TP/SL resolution uses candle high/low
-- no time-based expiry
-- default execution constraint: one open trade per symbol
-- optional multiple-trades mode via settings.json:
-    "allow_multiple_trades_per_symbol": true
+Optimized execution model
+-------------------------
+- same schema
+- same activation / resolution logic
+- reduced DB overhead:
+  - in-memory cache for pending trades per symbol
+  - deferred / batched commits
+  - no full pending SELECT on every candle
 
-Partial-exit model
-------------------
-- TP1 closes 50% of the position
-- after TP1, remaining 50% stop moves to breakeven + fees
-- fees buffer = 0.02%
-- final outcomes:
-    STOPPED
-    TP2
-    TP1_PARTIAL_THEN_BE
-    AMBIGUOUS
-
-Important rules
----------------
-- TP2 always implies TP1 happened first
-- same-candle TP1 + TP2 is treated as sequential TP1 -> TP2
-- same-candle STOP + TP1/TP2 remains AMBIGUOUS
-
-Snapshot support
-----------------
-This file supports storing:
-- active_column_index
-- snapshot_path
+Behavioral intent
+-----------------
+This file preserves the original trade logic and DB layout while making
+historical backfill materially faster.
 """
 
 from __future__ import annotations
@@ -63,6 +44,7 @@ FEES_RATE = 0.0002
 BE_MODE = True
 BE_TRIGGER_R = 1.5
 
+DEFAULT_COMMIT_EVERY = 1000
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -88,6 +70,7 @@ class StrategyValidationStore:
         self,
         db_path: str = "strategy_validation.db",
         allow_multiple_trades_per_symbol: Optional[bool] = None,
+        commit_every: int = DEFAULT_COMMIT_EVERY,
     ):
         self.db_path = str(Path(db_path))
         self.allow_multiple_trades_per_symbol = (
@@ -95,6 +78,8 @@ class StrategyValidationStore:
             if allow_multiple_trades_per_symbol is None
             else bool(allow_multiple_trades_per_symbol)
         )
+        self._commit_every = max(1, int(commit_every))
+        self._dirty_writes = 0
 
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -103,6 +88,9 @@ class StrategyValidationStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
+
+        self._pending_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        self._pending_loaded_symbols: set[str] = set()
 
     def _load_allow_multiple_from_settings(self) -> bool:
         settings_path = Path("settings.json")
@@ -245,18 +233,46 @@ class StrategyValidationStore:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
-    def has_open_trade_for_symbol(self, symbol: str) -> bool:
-        row = self._conn.execute(
+    def _mark_dirty(self, units: int = 1) -> None:
+        self._dirty_writes += max(1, int(units))
+        if self._dirty_writes >= self._commit_every:
+            self._conn.commit()
+            self._dirty_writes = 0
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty_writes:
+                self._conn.commit()
+                self._dirty_writes = 0
+
+    def close(self) -> None:
+        with self._lock:
+            self.flush()
+            self._conn.close()
+
+    def _row_to_pending_dict(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        return dict(row)
+
+    def _ensure_pending_loaded(self, symbol: str) -> None:
+        if symbol in self._pending_loaded_symbols:
+            return
+        rows = self._conn.execute(
             """
-            SELECT 1
+            SELECT *
             FROM strategy_setups
             WHERE symbol = ?
               AND resolution_status = ?
-            LIMIT 1
+            ORDER BY reference_ts ASC
             """,
             (symbol, RESOLUTION_PENDING),
-        ).fetchone()
-        return row is not None
+        ).fetchall()
+        self._pending_by_symbol[symbol] = [self._row_to_pending_dict(r) for r in rows]
+        self._pending_loaded_symbols.add(symbol)
+
+    def has_open_trade_for_symbol(self, symbol: str) -> bool:
+        with self._lock:
+            self._ensure_pending_loaded(symbol)
+            return bool(self._pending_by_symbol.get(symbol))
 
     def register_setup(
         self,
@@ -270,7 +286,9 @@ class StrategyValidationStore:
         now_ts = int(reference_ts)
 
         with self._lock:
-            if not self.allow_multiple_trades_per_symbol and self.has_open_trade_for_symbol(symbol):
+            self._ensure_pending_loaded(symbol)
+
+            if not self.allow_multiple_trades_per_symbol and self._pending_by_symbol.get(symbol):
                 return None
 
             setup_id = self._make_setup_id(symbol, setup, structure_state, now_ts)
@@ -319,13 +337,25 @@ class StrategyValidationStore:
                 "reason": setup.get("reason"),
                 "reject_reason": setup.get("reject_reason"),
                 "activation_status": ACTIVATION_PENDING,
+                "activated_ts": None,
+                "activated_price": None,
+                "tp1_hit": 0,
+                "tp1_hit_ts": None,
+                "tp1_price": None,
+                "max_favorable_excursion": None,
+                "max_adverse_excursion": None,
+                "resolution_status": RESOLUTION_PENDING,
+                "resolved_ts": None,
+                "resolved_price": None,
+                "resolution_note": None,
+                "first_outcome_ts": None,
+                "last_outcome_ts": None,
                 "snapshot_path": snapshot_path,
                 "raw_setup_json": json.dumps(setup, ensure_ascii=False, sort_keys=True),
                 "raw_structure_json": json.dumps(structure_state, ensure_ascii=False, sort_keys=True),
-                "resolution_status": RESOLUTION_PENDING,
             }
 
-            self._conn.execute(
+            cur = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO strategy_setups (
                     setup_id, created_ts, updated_ts, symbol, strategy, side, status,
@@ -354,20 +384,21 @@ class StrategyValidationStore:
                     :zone_low, :zone_high, :ideal_entry, :invalidation, :risk, :tp1, :tp2, :rr1, :rr2,
                     :pullback_quality, :risk_quality, :reward_quality, :quality_score, :quality_grade,
                     :reason, :reject_reason,
-                    :activation_status, NULL, NULL,
-                    0, NULL, NULL,
-                    NULL, NULL,
-                    :resolution_status, NULL, NULL, NULL,
-                    NULL, NULL,
+                    :activation_status, :activated_ts, :activated_price,
+                    :tp1_hit, :tp1_hit_ts, :tp1_price,
+                    :max_favorable_excursion, :max_adverse_excursion,
+                    :resolution_status, :resolved_ts, :resolved_price, :resolution_note,
+                    :first_outcome_ts, :last_outcome_ts,
                     :snapshot_path,
                     :raw_setup_json, :raw_structure_json
                 )
                 """,
                 row,
             )
-            self._conn.commit()
-
-        return setup_id
+            if cur.rowcount and cur.rowcount > 0:
+                self._pending_by_symbol.setdefault(symbol, []).append(dict(row))
+                self._mark_dirty()
+            return setup_id
 
     def _should_activate(self, side: str, close_price: float, ideal_entry: Optional[float]) -> bool:
         if ideal_entry is None:
@@ -447,31 +478,30 @@ class StrategyValidationStore:
         close_price = float(close_price)
 
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT *
-                FROM strategy_setups
-                WHERE symbol = ?
-                  AND resolution_status = ?
-                  AND reference_ts < ?
-                ORDER BY reference_ts ASC
-                """,
-                (symbol, RESOLUTION_PENDING, close_ts),
-            ).fetchall()
+            self._ensure_pending_loaded(symbol)
+            pending = self._pending_by_symbol.get(symbol, [])
+            if not pending:
+                return
 
-            for row in rows:
-                bars_observed = int(row["bars_observed"] or 0) + 1
-                side = str(row["side"] or "").upper()
-                ideal_entry = _safe_float(row["ideal_entry"])
-                invalidation = _safe_float(row["invalidation"])
-                tp1 = _safe_float(row["tp1"])
-                tp2 = _safe_float(row["tp2"])
-                activation_status = str(row["activation_status"] or ACTIVATION_PENDING).upper()
-                tp1_hit = bool(int(row["tp1_hit"] or 0))
+            still_pending: list[dict[str, Any]] = []
 
-                max_fav = _safe_float(row["max_favorable_excursion"])
-                max_adv = _safe_float(row["max_adverse_excursion"])
-                first_outcome_ts = row["first_outcome_ts"] if row["first_outcome_ts"] is not None else close_ts
+            for row in pending:
+                if int(row.get("reference_ts") or 0) >= close_ts:
+                    still_pending.append(row)
+                    continue
+
+                bars_observed = int(row.get("bars_observed") or 0) + 1
+                side = str(row.get("side") or "").upper()
+                ideal_entry = _safe_float(row.get("ideal_entry"))
+                invalidation = _safe_float(row.get("invalidation"))
+                tp1 = _safe_float(row.get("tp1"))
+                tp2 = _safe_float(row.get("tp2"))
+                activation_status = str(row.get("activation_status") or ACTIVATION_PENDING).upper()
+                tp1_hit = bool(int(row.get("tp1_hit") or 0))
+
+                max_fav = _safe_float(row.get("max_favorable_excursion"))
+                max_adv = _safe_float(row.get("max_adverse_excursion"))
+                first_outcome_ts = row.get("first_outcome_ts") if row.get("first_outcome_ts") is not None else close_ts
                 last_outcome_ts = close_ts
 
                 if activation_status == ACTIVATION_PENDING:
@@ -489,8 +519,26 @@ class StrategyValidationStore:
                                 last_outcome_ts = ?
                             WHERE setup_id = ?
                             """,
-                            (close_ts, bars_observed, ACTIVATION_ACTIVE, close_ts, activated_price, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                            (
+                                close_ts,
+                                bars_observed,
+                                ACTIVATION_ACTIVE,
+                                close_ts,
+                                activated_price,
+                                first_outcome_ts,
+                                last_outcome_ts,
+                                row["setup_id"],
+                            ),
                         )
+                        row["updated_ts"] = close_ts
+                        row["bars_observed"] = bars_observed
+                        row["activation_status"] = ACTIVATION_ACTIVE
+                        row["activated_ts"] = close_ts
+                        row["activated_price"] = activated_price
+                        row["first_outcome_ts"] = first_outcome_ts
+                        row["last_outcome_ts"] = last_outcome_ts
+                        still_pending.append(row)
+                        self._mark_dirty()
                         continue
 
                     self._conn.execute(
@@ -504,12 +552,19 @@ class StrategyValidationStore:
                         """,
                         (close_ts, bars_observed, first_outcome_ts, last_outcome_ts, row["setup_id"]),
                     )
+                    row["updated_ts"] = close_ts
+                    row["bars_observed"] = bars_observed
+                    row["first_outcome_ts"] = first_outcome_ts
+                    row["last_outcome_ts"] = last_outcome_ts
+                    still_pending.append(row)
+                    self._mark_dirty()
                     continue
 
                 if activation_status != ACTIVATION_ACTIVE:
+                    still_pending.append(row)
                     continue
 
-                entry_price = _safe_float(row["activated_price"])
+                entry_price = _safe_float(row.get("activated_price"))
                 if entry_price is None:
                     entry_price = ideal_entry
 
@@ -530,7 +585,6 @@ class StrategyValidationStore:
                 resolution_note = None
 
                 if not tp1_hit:
-                    # --- BE ARM BEFORE TP1 ---
                     if BE_MODE and entry_price is not None:
                         risk = abs(entry_price - invalidation) if invalidation is not None else None
                         if risk and risk > 0:
@@ -573,6 +627,17 @@ class StrategyValidationStore:
                             """,
                             (close_ts, bars_observed, close_ts, tp1, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
                         )
+                        row["updated_ts"] = close_ts
+                        row["bars_observed"] = bars_observed
+                        row["tp1_hit"] = 1
+                        row["tp1_hit_ts"] = close_ts
+                        row["tp1_price"] = tp1
+                        row["max_favorable_excursion"] = max_fav
+                        row["max_adverse_excursion"] = max_adv
+                        row["first_outcome_ts"] = first_outcome_ts
+                        row["last_outcome_ts"] = last_outcome_ts
+                        still_pending.append(row)
+                        self._mark_dirty()
                         continue
 
                     if mark_tp1_hit and resolution_status is not None:
@@ -610,9 +675,24 @@ class StrategyValidationStore:
                                 row["setup_id"],
                             ),
                         )
+                        row["updated_ts"] = close_ts
+                        row["bars_observed"] = bars_observed
+                        row["tp1_hit"] = 1
+                        row["tp1_hit_ts"] = close_ts
+                        row["tp1_price"] = tp1
+                        row["max_favorable_excursion"] = max_fav
+                        row["max_adverse_excursion"] = max_adv
+                        row["resolution_status"] = resolution_status
+                        row["resolved_ts"] = close_ts
+                        row["resolved_price"] = resolved_price
+                        row["resolution_note"] = resolution_note
+                        row["first_outcome_ts"] = first_outcome_ts
+                        row["last_outcome_ts"] = last_outcome_ts
+                        self._mark_dirty()
                         continue
                 else:
                     if entry_price is None:
+                        still_pending.append(row)
                         continue
                     be_price = self._breakeven_price(side, entry_price)
 
@@ -639,6 +719,14 @@ class StrategyValidationStore:
                         """,
                         (close_ts, bars_observed, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
                     )
+                    row["updated_ts"] = close_ts
+                    row["bars_observed"] = bars_observed
+                    row["max_favorable_excursion"] = max_fav
+                    row["max_adverse_excursion"] = max_adv
+                    row["first_outcome_ts"] = first_outcome_ts
+                    row["last_outcome_ts"] = last_outcome_ts
+                    still_pending.append(row)
+                    self._mark_dirty()
                 else:
                     self._conn.execute(
                         """
@@ -655,7 +743,30 @@ class StrategyValidationStore:
                             last_outcome_ts = ?
                         WHERE setup_id = ?
                         """,
-                        (close_ts, bars_observed, max_fav, max_adv, resolution_status, close_ts, resolved_price, resolution_note, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                        (
+                            close_ts,
+                            bars_observed,
+                            max_fav,
+                            max_adv,
+                            resolution_status,
+                            close_ts,
+                            resolved_price,
+                            resolution_note,
+                            first_outcome_ts,
+                            last_outcome_ts,
+                            row["setup_id"],
+                        ),
                     )
+                    row["updated_ts"] = close_ts
+                    row["bars_observed"] = bars_observed
+                    row["max_favorable_excursion"] = max_fav
+                    row["max_adverse_excursion"] = max_adv
+                    row["resolution_status"] = resolution_status
+                    row["resolved_ts"] = close_ts
+                    row["resolved_price"] = resolved_price
+                    row["resolution_note"] = resolution_note
+                    row["first_outcome_ts"] = first_outcome_ts
+                    row["last_outcome_ts"] = last_outcome_ts
+                    self._mark_dirty()
 
-            self._conn.commit()
+            self._pending_by_symbol[symbol] = [r for r in still_pending if str(r.get("resolution_status") or "").upper() == RESOLUTION_PENDING]

@@ -165,7 +165,8 @@ def download_month_rows(symbol: str, ym: YearMonth, local_root: str | None = Non
 
 
 def import_symbol_month(storage: Storage, ns_symbol: str, rows: list[list[str]]) -> int:
-    upserts = 0
+    batch: list[tuple[object, ...]] = []
+
     for row in rows:
         if not row:
             continue
@@ -173,21 +174,39 @@ def import_symbol_month(storage: Storage, ns_symbol: str, rows: list[list[str]])
             continue
         # Binance kline row:
         # 0 open_time, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 close_time, ...
-        open_time = int(row[0])
-        close_time = int(row[6])
-        storage.insert_candle(
-            symbol=ns_symbol,
-            interval=DEFAULT_INTERVAL,
-            open_time=open_time,
-            close_time=close_time,
-            open_price=float(row[1]),
-            high=float(row[2]),
-            low=float(row[3]),
-            close=float(row[4]),
-            volume=float(row[5]),
+        batch.append(
+            (
+                ns_symbol,
+                DEFAULT_INTERVAL,
+                int(row[0]),
+                int(row[6]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
+            )
         )
-        upserts += 1
-    return upserts
+
+    if not batch:
+        return 0
+
+    storage.conn.executemany(
+        """
+        INSERT INTO candles(symbol, interval, open_time, close_time, open, high, low, close, volume)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+          close_time=excluded.close_time,
+          open=excluded.open,
+          high=excluded.high,
+          low=excluded.low,
+          close=excluded.close,
+          volume=excluded.volume
+        """,
+        batch,
+    )
+    storage.conn.commit()
+    return len(batch)
 
 
 def run(
