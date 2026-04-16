@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite
+
+exports/
+test_cache/
+
+strategy_trades_export.csv
+strategy_tp2_review.csv
+strategy_stopped_review.csv
+strategy_diagnostics_breakdowns.csv
