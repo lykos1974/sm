@@ -400,14 +400,24 @@ class StrategyValidationStore:
                 self._mark_dirty()
             return setup_id
 
-    def _should_activate(self, side: str, close_price: float, ideal_entry: Optional[float]) -> bool:
+    def _should_activate(
+        self,
+        side: str,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        ideal_entry: Optional[float],
+    ) -> bool:
         if ideal_entry is None:
             return False
         side = str(side or "").upper()
+        entry = float(ideal_entry)
+        high_price = float(high_price)
+        low_price = float(low_price)
         if side == "LONG":
-            return float(close_price) <= float(ideal_entry)
+            return low_price <= entry
         if side == "SHORT":
-            return float(close_price) >= float(ideal_entry)
+            return high_price >= entry
         return False
 
     def _breakeven_price(self, side: str, entry_price: float) -> float:
@@ -505,7 +515,13 @@ class StrategyValidationStore:
                 last_outcome_ts = close_ts
 
                 if activation_status == ACTIVATION_PENDING:
-                    if self._should_activate(side=side, close_price=close_price, ideal_entry=ideal_entry):
+                    if self._should_activate(
+                        side=side,
+                        high_price=high_price,
+                        low_price=low_price,
+                        close_price=close_price,
+                        ideal_entry=ideal_entry,
+                    ):
                         activated_price = ideal_entry if ideal_entry is not None else close_price
                         self._conn.execute(
                             """
