@@ -15,7 +15,6 @@ FILTER_RULES = {
     "side": "LONG",
     "breakout_context": "POST_BREAKOUT_PULLBACK",
     "active_leg_boxes": 2,
-    "status": "CANDIDATE",
     "quality_grade": "A",
 }
 
@@ -46,7 +45,6 @@ def _as_int(value: Any) -> int | None:
 def _matches_profitable_family(row: dict[str, Any]) -> bool:
     side = str(row.get("side") or "").upper()
     breakout_context = str(row.get("breakout_context") or "").upper()
-    status = str(row.get("status") or "").upper()
     quality_grade = str(row.get("quality_grade") or "").upper()
     active_leg_boxes = _as_int(row.get("active_leg_boxes"))
 
@@ -54,7 +52,6 @@ def _matches_profitable_family(row: dict[str, Any]) -> bool:
         side == FILTER_RULES["side"]
         and breakout_context == FILTER_RULES["breakout_context"]
         and active_leg_boxes == FILTER_RULES["active_leg_boxes"]
-        and status == FILTER_RULES["status"]
         and quality_grade == FILTER_RULES["quality_grade"]
     )
 

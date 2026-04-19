@@ -106,6 +106,10 @@ def run_export(args: argparse.Namespace) -> dict[str, Any]:
         reference_ts_from=args.reference_ts_from,
         reference_ts_to=args.reference_ts_to,
     )
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        status_key = str(row.get("status") or "").upper() or "UNKNOWN"
+        status_counts[status_key] = status_counts.get(status_key, 0) + 1
 
     run_id = f"run_{utc_timestamp_label()}"
     preferred_ext = "parquet" if args.format in {"auto", "parquet"} else "csv"
@@ -126,6 +130,8 @@ def run_export(args: argparse.Namespace) -> dict[str, Any]:
             "notes": args.notes,
             "dry_run": bool(args.dry_run),
             "column_order": list(EXPORT_COLUMNS),
+            "status_preservation": "status column is exported exactly as stored in strategy_setups",
+            "status_counts": status_counts,
         },
     )
 

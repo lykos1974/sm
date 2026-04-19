@@ -519,10 +519,31 @@ def evaluate_pullback_retest_long(
         status = STATUS_WATCH
         reason = "Bullish setup exists but deep pullback is restricted to WATCH by promotion policy"
         reject_reason = None
-    elif strength >= 65 and pullback_quality == PULLBACK_HEALTHY and active_leg_boxes == 2 and breakout_context == BREAKOUT_POST_BULLISH_PULLBACK:
-        status = STATUS_CANDIDATE
-        reason = "Bullish pullback near support with acceptable close-confirmed risk profile"
-        reject_reason = None
+    elif (
+        pullback_quality == PULLBACK_HEALTHY
+        and active_leg_boxes == 2
+        and breakout_context == BREAKOUT_POST_BULLISH_PULLBACK
+    ):
+        if grade != "A":
+            status = STATUS_WATCH
+            reason = "Bullish continuation family matched but quality grade below A"
+            reject_reason = None
+        elif continuation_strength_v1 is None or continuation_strength_v1 < 70.0:
+            status = STATUS_WATCH
+            reason = "Bullish continuation family matched but continuation strength is not confirmed"
+            reject_reason = None
+        elif impulse_to_pullback_ratio is not None and impulse_to_pullback_ratio < 2.0:
+            status = STATUS_WATCH
+            reason = "Bullish continuation family matched but impulse/pullback ratio is too weak"
+            reject_reason = None
+        elif pullback_boxes is not None and pullback_boxes > 2.5:
+            status = STATUS_WATCH
+            reason = "Bullish continuation family matched but pullback is stalling too deep for continuation"
+            reject_reason = None
+        else:
+            status = STATUS_CANDIDATE
+            reason = "Bullish continuation family confirmed with strong continuation-ready profile"
+            reject_reason = None
     elif strength >= 35:
         status = STATUS_WATCH
         reason = "Bullish setup exists but quality is not yet strong enough"
