@@ -162,6 +162,7 @@ def evaluate_setup_outcome_v1(
     symbol = str(setup_row.get("symbol") or "")
     side = _side_normalized(setup_row.get("side"))
     reference_ts = _safe_int(setup_row.get("reference_ts"))
+    # reference_ts and candle close_time are expected in milliseconds.
     ideal_entry = _safe_float(setup_row.get("ideal_entry"))
     invalidation = _safe_float(setup_row.get("invalidation"))
     tp1 = _safe_float(setup_row.get("tp1"))
@@ -351,6 +352,7 @@ def run_labeling(args: argparse.Namespace) -> dict[str, Any]:
             continue
 
         reference_ts = _safe_int(setup_row.get("reference_ts"))
+    # reference_ts and candle close_time are expected in milliseconds.
         if reference_ts is None:
             future_candles: list[dict[str, Any]] = []
         else:

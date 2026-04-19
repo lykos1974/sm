@@ -72,8 +72,8 @@ def fetch_future_candles(
     interval: str = "1m",
 ) -> list[dict[str, Any]]:
     """Load future candles in read-only mode for one symbol/setup horizon."""
-    horizon_seconds = max(1, int(horizon_minutes)) * 60
-    max_close_ts = int(reference_ts) + horizon_seconds
+    horizon_ms = max(1, int(horizon_minutes)) * 60 * 1000
+    max_close_ts = int(reference_ts) + horizon_ms
 
     uri = f"file:{db_path.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)

@@ -15,23 +15,32 @@ def connect_duckdb(database: str = ":memory:"):
     return duckdb.connect(database=database)
 
 
-def register_labeled_dataset_view(conn: Any, input_path: Path, view_name: str = "labeled") -> None:
+def _sql_string_literal(value: str) -> str:
+    """Return SQL-safe single-quoted string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _dataset_view_sql(input_path: Path, view_name: str = "labeled") -> str:
+    """Build CREATE VIEW SQL for supported frozen dataset formats.
+
+    DuckDB does not accept prepared parameters for read_csv_auto/read_parquet
+    in this statement form, so the path must be embedded as a SQL literal.
+    """
     suffix = input_path.suffix.lower()
+    path_literal = _sql_string_literal(str(input_path))
+
     if suffix == ".parquet":
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet(?)",
-            [str(input_path)],
-        )
-        return
+        return f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet({path_literal})"
 
     if suffix == ".csv":
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_csv_auto(?, HEADER=TRUE)",
-            [str(input_path)],
-        )
-        return
+        return f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_csv_auto({path_literal}, HEADER=TRUE)"
 
     raise ValueError(f"Unsupported dataset format for DuckDB path: {input_path}")
+
+
+def register_labeled_dataset_view(conn: Any, input_path: Path, view_name: str = "labeled") -> None:
+    sql = _dataset_view_sql(input_path=input_path, view_name=view_name)
+    conn.execute(sql)
 
 
 def query_rows(conn: Any, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
