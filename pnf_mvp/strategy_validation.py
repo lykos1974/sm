@@ -213,6 +213,7 @@ class StrategyValidationStore:
         self._ensure_column("strategy_setups", "tp1_price", "REAL")
         self._ensure_column("strategy_setups", "current_column_index", "INTEGER")
         self._ensure_column("strategy_setups", "snapshot_path", "TEXT")
+        self._ensure_column("strategy_setups", "continuation_strength_v1", "REAL")
 
     def _make_setup_id(self, symbol: str, setup: Dict[str, Any], structure_state: Dict[str, Any], reference_ts: int) -> str:
         payload = {
@@ -334,6 +335,7 @@ class StrategyValidationStore:
                 "reward_quality": setup.get("reward_quality"),
                 "quality_score": _safe_float(setup.get("quality_score")),
                 "quality_grade": setup.get("quality_grade"),
+                "continuation_strength_v1": _safe_float(setup.get("continuation_strength_v1")),
                 "reason": setup.get("reason"),
                 "reject_reason": setup.get("reject_reason"),
                 "activation_status": ACTIVATION_PENDING,
@@ -365,7 +367,7 @@ class StrategyValidationStore:
                     current_column_index, current_column_kind, current_column_top, current_column_bottom,
                     support_level, resistance_level,
                     zone_low, zone_high, ideal_entry, invalidation, risk, tp1, tp2, rr1, rr2,
-                    pullback_quality, risk_quality, reward_quality, quality_score, quality_grade,
+                    pullback_quality, risk_quality, reward_quality, quality_score, quality_grade, continuation_strength_v1,
                     reason, reject_reason,
                     activation_status, activated_ts, activated_price,
                     tp1_hit, tp1_hit_ts, tp1_price,
@@ -382,7 +384,7 @@ class StrategyValidationStore:
                     :current_column_index, :current_column_kind, :current_column_top, :current_column_bottom,
                     :support_level, :resistance_level,
                     :zone_low, :zone_high, :ideal_entry, :invalidation, :risk, :tp1, :tp2, :rr1, :rr2,
-                    :pullback_quality, :risk_quality, :reward_quality, :quality_score, :quality_grade,
+                    :pullback_quality, :risk_quality, :reward_quality, :quality_score, :quality_grade, :continuation_strength_v1,
                     :reason, :reject_reason,
                     :activation_status, :activated_ts, :activated_price,
                     :tp1_hit, :tp1_hit_ts, :tp1_price,

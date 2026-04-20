@@ -16,6 +16,7 @@ EXPORT_COLUMNS: tuple[str, ...] = (
     "strategy",
     "reason",
     "reject_reason",
+    "continuation_strength_v1",
     "quality_score",
     "quality_grade",
     "trend_state",
