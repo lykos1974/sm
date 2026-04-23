@@ -1,3 +1,4 @@
+
 """
 strategy_engine.py
 
@@ -6,7 +7,7 @@ Long profitable baseline + experimental short reversal branch
 
 Important
 ---------
-- Long side keeps the currently profitable baseline behavior.
+- Long side keeps the structurally tight profitable baseline behavior.
 - Short side is NOT a continuation mirror.
 - Short side is an experimental FAILED BREAKOUT / REVERSAL branch.
 - Compatible with:
@@ -16,8 +17,9 @@ Important
 Philosophy
 ----------
 LONG:
-- keep the profitable filtered baseline
-- only LONG healthy, 2-leg, non-extended, post-breakout pullback promotes
+- only LONG healthy, 2-leg, non-extended, post-breakout pullback is tradeable
+- continuation_strength_v1 is preserved as analysis metadata only
+- CS does NOT change status classification in this version
 
 SHORT:
 - separate logic
@@ -507,46 +509,25 @@ def evaluate_pullback_retest_long(
         status = STATUS_REJECT
         reason = "Reward-to-risk below minimum threshold"
         reject_reason = "rr_too_low"
-    elif breakout_context == BREAKOUT_LATE_EXTENSION or is_extended:
-        status = STATUS_WATCH
-        reason = "Bullish setup exists but extended structure is restricted to WATCH by promotion policy"
-        reject_reason = None
-    elif active_leg_boxes >= 3:
-        status = STATUS_WATCH
-        reason = "Bullish setup exists but late leg count is restricted to WATCH by promotion policy"
-        reject_reason = None
-    elif pullback_quality == PULLBACK_DEEP:
-        status = STATUS_WATCH
-        reason = "Bullish setup exists but deep pullback is restricted to WATCH by promotion policy"
-        reject_reason = None
-    elif (
-        pullback_quality == PULLBACK_HEALTHY
-        and active_leg_boxes == 2
-        and breakout_context == BREAKOUT_POST_BULLISH_PULLBACK
-    ):
-        if grade != "A":
-            status = STATUS_WATCH
-            reason = "Bullish continuation family matched but quality grade below A"
-            reject_reason = None
-        elif continuation_strength_v1 is None or continuation_strength_v1 < 70.0:
-            status = STATUS_WATCH
-            reason = "Bullish continuation family matched but continuation strength is not confirmed"
-            reject_reason = None
-        elif impulse_to_pullback_ratio is not None and impulse_to_pullback_ratio < 2.0:
-            status = STATUS_WATCH
-            reason = "Bullish continuation family matched but impulse/pullback ratio is too weak"
-            reject_reason = None
-        elif pullback_boxes is not None and pullback_boxes > 2.5:
-            status = STATUS_WATCH
-            reason = "Bullish continuation family matched but pullback is stalling too deep for continuation"
-            reject_reason = None
-        else:
-            status = STATUS_CANDIDATE
-            reason = "Bullish continuation family confirmed with strong continuation-ready profile"
-            reject_reason = None
-    elif strength >= 35:
-        status = STATUS_WATCH
-        reason = "Bullish setup exists but quality is not yet strong enough"
+    elif breakout_context != BREAKOUT_POST_BULLISH_PULLBACK:
+        status = STATUS_REJECT
+        reason = "Only post-breakout pullback continuation setups are tradeable in the long baseline"
+        reject_reason = "wrong_breakout_context"
+    elif is_extended:
+        status = STATUS_REJECT
+        reason = "Extended bullish continuation is not tradeable in the long baseline"
+        reject_reason = "extended_move"
+    elif active_leg_boxes != 2:
+        status = STATUS_REJECT
+        reason = "Long baseline requires exactly 2 active leg boxes"
+        reject_reason = "wrong_active_leg_boxes"
+    elif pullback_quality != PULLBACK_HEALTHY:
+        status = STATUS_REJECT
+        reason = "Long baseline requires a healthy pullback"
+        reject_reason = "pullback_not_healthy"
+    elif strength >= 65:
+        status = STATUS_CANDIDATE
+        reason = "Bullish continuation family confirmed with intact structure and controlled pullback"
         reject_reason = None
     else:
         status = STATUS_REJECT

@@ -1,9 +1,4 @@
-# strategy_historical_backfill.py (BE-ready integration scaffold + funnel diagnostics)
-
-# NOTE:
-# This version prepares BE integration but does NOT alter resolution logic inside StrategyValidationStore.
-# To fully enable BE, StrategyValidationStore must be extended.
-# This file keeps baseline setup logic unchanged and adds research diagnostics only.
+# strategy_historical_backfill.py (candidate-only execution + safe DB options)
 
 from __future__ import annotations
 
@@ -64,6 +59,12 @@ def load_settings(settings_path: str) -> dict:
         return json.load(f)
 
 
+def _resolve_path_from_settings(settings_path: str, raw_path: str) -> str:
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((Path(settings_path).resolve().parent / candidate).resolve())
+
 
 def build_profiles(settings: dict) -> Dict[str, PnFProfile]:
     profiles: Dict[str, PnFProfile] = {}
@@ -77,7 +78,6 @@ def build_profiles(settings: dict) -> Dict[str, PnFProfile]:
     return profiles
 
 
-
 def split_symbols(settings: dict, symbols_arg: str | None) -> List[str]:
     if not symbols_arg:
         return list(settings["symbols"])
@@ -85,11 +85,9 @@ def split_symbols(settings: dict, symbols_arg: str | None) -> List[str]:
     return [s for s in settings["symbols"] if s in wanted]
 
 
-
 def load_all_closed_candles(storage: Storage, symbol: str) -> List[dict]:
     candles = storage.load_recent_candles(symbol, None)
     return candles[:-1] if len(candles) > 1 else []
-
 
 
 def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict]]:
@@ -120,14 +118,12 @@ def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tupl
     return structure, setups
 
 
-
 def reset_validation_db(validation_db_path: str) -> None:
     base = Path(validation_db_path)
     for suffix in ("", "-shm", "-wal"):
         p = Path(str(base) + suffix)
         if p.exists():
             p.unlink()
-
 
 
 def table_row_count(db_path: str, table_name: str = "strategy_setups") -> int:
@@ -146,18 +142,8 @@ def table_row_count(db_path: str, table_name: str = "strategy_setups") -> int:
         conn.close()
 
 
-
-def _safe_json(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        return ""
-
-
-
 def _coerce_bool_int(value: Any) -> int:
     return 1 if bool(value) else 0
-
 
 
 def build_funnel_row(
@@ -169,7 +155,7 @@ def build_funnel_row(
     blocked_by_existing_open_trade: bool,
     registered_to_validation: bool,
 ) -> Dict[str, Any]:
-    row = {
+    return {
         "symbol": symbol,
         "reference_ts": int(reference_ts),
         "side": setup.get("side"),
@@ -199,8 +185,6 @@ def build_funnel_row(
         "blocked_by_existing_open_trade": 1 if blocked_by_existing_open_trade else 0,
         "registered_to_validation": 1 if registered_to_validation else 0,
     }
-    return row
-
 
 
 def write_funnel_csv(rows: List[Dict[str, Any]], csv_path: str) -> str:
@@ -212,7 +196,6 @@ def write_funnel_csv(rows: List[Dict[str, Any]], csv_path: str) -> str:
         for row in rows:
             writer.writerow(row)
     return str(out_path.resolve())
-
 
 
 def status_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -239,12 +222,21 @@ def status_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Historical validation backfill for strategy_validation.db")
     parser.add_argument("--settings", default="settings.json")
     parser.add_argument("--symbols", default=None)
     parser.add_argument("--reset-validation-db", action="store_true")
+    parser.add_argument(
+        "--allow-multiple-trades",
+        action="store_true",
+        help="Allow multiple concurrent trades per symbol (research mode)",
+    )
+    parser.add_argument(
+        "--validation-db-path",
+        default=None,
+        help="Optional override for validation DB path; use this to write to a new DB without touching the old one.",
+    )
     parser.add_argument(
         "--funnel-csv",
         default=DEFAULT_FUNNEL_CSV_PATH,
@@ -252,18 +244,34 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    settings = load_settings(args.settings)
-    validation_db_path = settings.get("strategy_validation_db_path", "strategy_validation.db")
+    settings_path = str(Path(args.settings).resolve())
+    settings = load_settings(settings_path)
+
+    configured_validation_db = settings.get("strategy_validation_db_path", "strategy_validation.db")
+    validation_db_path = _resolve_path_from_settings(
+        settings_path,
+        args.validation_db_path if args.validation_db_path else str(configured_validation_db),
+    )
+    database_path = _resolve_path_from_settings(
+        settings_path,
+        str(settings["database_path"]),
+    )
 
     if args.reset_validation_db:
         reset_validation_db(validation_db_path)
 
-    storage = Storage(settings["database_path"])
-    validation_store = StrategyValidationStore(validation_db_path)
+    storage = Storage(database_path)
+    validation_store = StrategyValidationStore(
+        validation_db_path,
+        allow_multiple_trades_per_symbol=args.allow_multiple_trades,
+    )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)
 
     print(f"BE MODE: {BE_MODE} | BE_TRIGGER_R: {BE_TRIGGER_R}")
+    print(f"[BACKFILL] candles_db={database_path}")
+    print(f"[BACKFILL] validation_db={validation_db_path}")
+    print(f"[BACKFILL] allow_multiple_trades={validation_store.allow_multiple_trades_per_symbol}")
 
     funnel_rows: List[Dict[str, Any]] = []
 
@@ -280,7 +288,6 @@ def main() -> None:
 
             engine.update_from_price(close_ts, close_price)
 
-            # CURRENT resolution (unchanged)
             validation_store.update_pending_with_candle(
                 symbol=symbol,
                 close_ts=close_ts,
@@ -292,8 +299,13 @@ def main() -> None:
             structure, setups = evaluate_setups(symbol, profile, engine)
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
-                eligible_for_validation = status in VALIDATION_ELIGIBLE_STATUSES
 
+                # Candidate-only execution:
+                # WATCH is informational only, never traded.
+                if status != "CANDIDATE":
+                    continue
+
+                eligible_for_validation = True
                 blocked_by_open_trade = False
                 registered_to_validation = False
 
@@ -325,6 +337,7 @@ def main() -> None:
                     )
                 )
 
+    validation_store.flush()
     csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
     counts = status_counts(funnel_rows)
 
