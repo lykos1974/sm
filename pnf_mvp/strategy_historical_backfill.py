@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -25,6 +26,7 @@ from trade_management_be import BE_MODE, BE_TRIGGER_R
 
 VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE", "WATCH"}
 DEFAULT_FUNNEL_CSV_PATH = "exports/strategy_funnel_diagnostics.csv"
+DEFAULT_PERF_JSON_PATH = "exports/strategy_perf_summary.json"
 
 
 FUNNEL_FIELD_ORDER = [
@@ -92,7 +94,9 @@ def load_all_closed_candles(storage: Storage, symbol: str) -> List[dict]:
 
 
 
-def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict]]:
+def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict], Dict[str, float]]:
+    t_start = time.perf_counter()
+    t0 = time.perf_counter()
     structure = build_structure_state(
         symbol=symbol,
         profile=profile,
@@ -101,23 +105,35 @@ def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tupl
         market_state=engine.market_state(),
         last_price=getattr(engine, "last_price", None),
     )
+    elapsed_build_structure_s = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     setup_long = evaluate_pullback_retest_long(
         symbol=symbol,
         profile=profile,
         columns=engine.columns,
         structure_state=structure,
     )
+    elapsed_eval_long_s = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     setup_short = evaluate_pullback_retest_short(
         symbol=symbol,
         profile=profile,
         columns=engine.columns,
         structure_state=structure,
     )
+    elapsed_eval_short_s = time.perf_counter() - t0
 
     setups = [s for s in (setup_long, setup_short) if s]
-    return structure, setups
+    elapsed_total_s = time.perf_counter() - t_start
+    timings = {
+        "elapsed_build_structure_s": elapsed_build_structure_s,
+        "elapsed_eval_long_s": elapsed_eval_long_s,
+        "elapsed_eval_short_s": elapsed_eval_short_s,
+        "elapsed_total_s": elapsed_total_s,
+    }
+    return structure, setups, timings
 
 
 
@@ -144,14 +160,6 @@ def table_row_count(db_path: str, table_name: str = "strategy_setups") -> int:
         return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
     finally:
         conn.close()
-
-
-
-def _safe_json(value: Any) -> str:
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        return ""
 
 
 
@@ -250,6 +258,17 @@ def main() -> None:
         default=DEFAULT_FUNNEL_CSV_PATH,
         help="CSV path for evaluated-setup funnel diagnostics export",
     )
+    parser.add_argument(
+        "--perf-json",
+        default=DEFAULT_PERF_JSON_PATH,
+        help="JSON path for performance instrumentation summary export",
+    )
+    parser.add_argument(
+        "--perf-progress-every",
+        type=int,
+        default=1000,
+        help="Emit perf progress log every N candles per symbol",
+    )
     args = parser.parse_args()
 
     settings = load_settings(args.settings)
@@ -266,21 +285,52 @@ def main() -> None:
     print(f"BE MODE: {BE_MODE} | BE_TRIGGER_R: {BE_TRIGGER_R}")
 
     funnel_rows: List[Dict[str, Any]] = []
+    run_perf: Dict[str, Any] = {
+        "symbols": {},
+        "totals": {
+            "candles": 0,
+            "elapsed_engine_update_s": 0.0,
+            "elapsed_update_pending_s": 0.0,
+            "elapsed_eval_s": 0.0,
+            "elapsed_register_s": 0.0,
+            "setups_evaluated": 0,
+            "register_calls": 0,
+            "elapsed_build_structure_s": 0.0,
+            "elapsed_eval_long_s": 0.0,
+            "elapsed_eval_short_s": 0.0,
+        },
+    }
 
     for symbol in symbols:
         profile = profiles[symbol]
         engine = PnFEngine(profile)
         candles = load_all_closed_candles(storage, symbol)
+        symbol_perf = {
+            "candles": 0,
+            "elapsed_engine_update_s": 0.0,
+            "elapsed_update_pending_s": 0.0,
+            "elapsed_eval_s": 0.0,
+            "elapsed_register_s": 0.0,
+            "setups_evaluated": 0,
+            "register_calls": 0,
+            "elapsed_build_structure_s": 0.0,
+            "elapsed_eval_long_s": 0.0,
+            "elapsed_eval_short_s": 0.0,
+        }
+        progress_every = max(1, int(args.perf_progress_every))
 
-        for candle in candles:
+        for i, candle in enumerate(candles, start=1):
             close_ts = int(candle["close_time"])
             close_price = float(candle["close"])
             high_price = float(candle["high"])
             low_price = float(candle["low"])
 
+            t0 = time.perf_counter()
             engine.update_from_price(close_ts, close_price)
+            symbol_perf["elapsed_engine_update_s"] += time.perf_counter() - t0
 
             # CURRENT resolution (unchanged)
+            t0 = time.perf_counter()
             validation_store.update_pending_with_candle(
                 symbol=symbol,
                 close_ts=close_ts,
@@ -288,8 +338,17 @@ def main() -> None:
                 low_price=low_price,
                 close_price=close_price,
             )
+            symbol_perf["elapsed_update_pending_s"] += time.perf_counter() - t0
 
-            structure, setups = evaluate_setups(symbol, profile, engine)
+            t0 = time.perf_counter()
+            structure, setups, eval_timings = evaluate_setups(symbol, profile, engine)
+            symbol_perf["elapsed_eval_s"] += time.perf_counter() - t0
+            symbol_perf["setups_evaluated"] += len(setups)
+            symbol_perf["candles"] += 1
+            symbol_perf["elapsed_build_structure_s"] += float(eval_timings["elapsed_build_structure_s"])
+            symbol_perf["elapsed_eval_long_s"] += float(eval_timings["elapsed_eval_long_s"])
+            symbol_perf["elapsed_eval_short_s"] += float(eval_timings["elapsed_eval_short_s"])
+
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
                 eligible_for_validation = status in VALIDATION_ELIGIBLE_STATUSES
@@ -304,12 +363,15 @@ def main() -> None:
                     ):
                         blocked_by_open_trade = True
                     else:
+                        t0 = time.perf_counter()
                         setup_id = validation_store.register_setup(
                             symbol=symbol,
                             setup=setup,
                             structure_state=structure,
                             reference_ts=close_ts,
                         )
+                        symbol_perf["elapsed_register_s"] += time.perf_counter() - t0
+                        symbol_perf["register_calls"] += 1
                         registered_to_validation = setup_id is not None
                         if setup_id is None and not validation_store.allow_multiple_trades_per_symbol:
                             blocked_by_open_trade = True
@@ -324,6 +386,61 @@ def main() -> None:
                         registered_to_validation=registered_to_validation,
                     )
                 )
+
+            if i % progress_every == 0:
+                perf_snapshot = validation_store.get_perf_snapshot()
+                up = perf_snapshot["update_pending"].get(symbol, {})
+                elapsed_update_pending_ms = symbol_perf["elapsed_update_pending_s"] * 1000.0
+                elapsed_eval_ms = symbol_perf["elapsed_eval_s"] * 1000.0
+                elapsed_register_ms = symbol_perf["elapsed_register_s"] * 1000.0
+                print(
+                    "[PERF] "
+                    f"symbol={symbol} i={i} pending={up.get('current_pending_count', 0)} "
+                    f"scanned={up.get('trades_scanned', 0)} updated={up.get('trades_updated', 0)} "
+                    f"activated={up.get('trades_activated', 0)} resolved={up.get('trades_resolved', 0)} "
+                    f"sql_updates={up.get('sql_update_count', 0)} sql_inserts={up.get('sql_insert_count', 0)} "
+                    f"sql_selects={up.get('sql_select_count', 0)} "
+                    f"elapsed_update_pending_ms={elapsed_update_pending_ms:.3f} "
+                    f"elapsed_eval_ms={elapsed_eval_ms:.3f} "
+                    f"elapsed_register_ms={elapsed_register_ms:.3f} "
+                    f"elapsed_build_structure_ms={symbol_perf['elapsed_build_structure_s'] * 1000.0:.3f} "
+                    f"elapsed_eval_long_ms={symbol_perf['elapsed_eval_long_s'] * 1000.0:.3f} "
+                    f"elapsed_eval_short_ms={symbol_perf['elapsed_eval_short_s'] * 1000.0:.3f}"
+                )
+
+        run_perf["symbols"][symbol] = symbol_perf
+        run_perf["totals"]["candles"] += int(symbol_perf["candles"])
+        run_perf["totals"]["elapsed_engine_update_s"] += float(symbol_perf["elapsed_engine_update_s"])
+        run_perf["totals"]["elapsed_update_pending_s"] += float(symbol_perf["elapsed_update_pending_s"])
+        run_perf["totals"]["elapsed_eval_s"] += float(symbol_perf["elapsed_eval_s"])
+        run_perf["totals"]["elapsed_register_s"] += float(symbol_perf["elapsed_register_s"])
+        run_perf["totals"]["setups_evaluated"] += int(symbol_perf["setups_evaluated"])
+        run_perf["totals"]["register_calls"] += int(symbol_perf["register_calls"])
+        run_perf["totals"]["elapsed_build_structure_s"] += float(symbol_perf["elapsed_build_structure_s"])
+        run_perf["totals"]["elapsed_eval_long_s"] += float(symbol_perf["elapsed_eval_long_s"])
+        run_perf["totals"]["elapsed_eval_short_s"] += float(symbol_perf["elapsed_eval_short_s"])
+
+        perf_snapshot = validation_store.get_perf_snapshot()
+        up = perf_snapshot["update_pending"].get(symbol, {})
+        avg_pending = (
+            float(up.get("pending_count_total", 0)) / float(up.get("call_count", 1))
+            if up.get("call_count", 0) > 0
+            else 0.0
+        )
+        print(
+            "[PERF_SUMMARY] "
+            f"symbol={symbol} candles={symbol_perf['candles']} max_pending={up.get('max_pending_count', 0)} "
+            f"avg_pending={avg_pending:.4f} total_scanned={up.get('trades_scanned', 0)} "
+            f"total_updated={up.get('trades_updated', 0)} total_resolved={up.get('trades_resolved', 0)} "
+            f"total_sql_updates={up.get('sql_update_count', 0)} total_sql_inserts={up.get('sql_insert_count', 0)} "
+            f"total_sql_selects={up.get('sql_select_count', 0)} "
+            f"elapsed_update_pending_s={symbol_perf['elapsed_update_pending_s']:.6f} "
+            f"elapsed_eval_s={symbol_perf['elapsed_eval_s']:.6f} "
+            f"elapsed_register_s={symbol_perf['elapsed_register_s']:.6f} "
+            f"elapsed_build_structure_s={symbol_perf['elapsed_build_structure_s']:.6f} "
+            f"elapsed_eval_long_s={symbol_perf['elapsed_eval_long_s']:.6f} "
+            f"elapsed_eval_short_s={symbol_perf['elapsed_eval_short_s']:.6f}"
+        )
 
     csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
     counts = status_counts(funnel_rows)
@@ -342,6 +459,58 @@ def main() -> None:
             ]
         )
     )
+
+    perf_snapshot = validation_store.get_perf_snapshot()
+    hottest_symbol = None
+    hottest_symbol_elapsed = -1.0
+    for symbol, sp in run_perf["symbols"].items():
+        total_elapsed = (
+            float(sp["elapsed_engine_update_s"])
+            + float(sp["elapsed_update_pending_s"])
+            + float(sp["elapsed_eval_s"])
+            + float(sp["elapsed_register_s"])
+        )
+        if total_elapsed > hottest_symbol_elapsed:
+            hottest_symbol_elapsed = total_elapsed
+            hottest_symbol = symbol
+
+    stage_totals = {
+        "engine_update": run_perf["totals"]["elapsed_engine_update_s"],
+        "update_pending": run_perf["totals"]["elapsed_update_pending_s"],
+        "evaluate_setups": run_perf["totals"]["elapsed_eval_s"],
+        "register_setup": run_perf["totals"]["elapsed_register_s"],
+        "build_structure_state": run_perf["totals"]["elapsed_build_structure_s"],
+        "evaluate_pullback_retest_long": run_perf["totals"]["elapsed_eval_long_s"],
+        "evaluate_pullback_retest_short": run_perf["totals"]["elapsed_eval_short_s"],
+    }
+    hottest_stage = max(stage_totals.items(), key=lambda kv: kv[1])[0] if stage_totals else "n/a"
+    update_pending_total_scanned = sum(
+        int(v.get("trades_scanned", 0)) for v in perf_snapshot["update_pending"].values()
+    )
+    update_pending_total_sql_updates = sum(
+        int(v.get("sql_update_count", 0)) for v in perf_snapshot["update_pending"].values()
+    )
+
+    print(
+        "[PERF_RUN] "
+        f"symbols={len(symbols)} total_candles={run_perf['totals']['candles']} "
+        f"total_scanned={update_pending_total_scanned} total_sql_updates={update_pending_total_sql_updates} "
+        f"hottest_symbol={hottest_symbol} hottest_stage={hottest_stage}"
+    )
+
+    perf_output = {
+        "run": run_perf,
+        "validation_store_perf": perf_snapshot,
+        "stage_totals": stage_totals,
+        "hottest_symbol": hottest_symbol,
+        "hottest_stage": hottest_stage,
+        "update_pending_total_scanned": update_pending_total_scanned,
+        "update_pending_total_sql_updates": update_pending_total_sql_updates,
+    }
+    perf_json_path = Path(args.perf_json)
+    perf_json_path.parent.mkdir(parents=True, exist_ok=True)
+    perf_json_path.write_text(json.dumps(perf_output, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"perf_json={str(perf_json_path.resolve())}")
     print("DONE")
 
 

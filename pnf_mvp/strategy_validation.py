@@ -25,6 +25,8 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -91,6 +93,90 @@ class StrategyValidationStore:
 
         self._pending_by_symbol: dict[str, list[dict[str, Any]]] = {}
         self._pending_loaded_symbols: set[str] = set()
+        self._perf_lock = threading.Lock()
+        self._perf: dict[str, Any] = {
+            "update_pending": defaultdict(
+                lambda: {
+                    "call_count": 0,
+                    "elapsed_s": 0.0,
+                    "trades_scanned": 0,
+                    "trades_updated": 0,
+                    "trades_resolved": 0,
+                    "trades_activated": 0,
+                    "tp1_hits": 0,
+                    "tp2_hits": 0,
+                    "stop_hits": 0,
+                    "ambiguous_hits": 0,
+                    "sql_update_count": 0,
+                    "sql_insert_count": 0,
+                    "sql_select_count": 0,
+                    "current_pending_count": 0,
+                    "pending_count_total": 0,
+                    "max_pending_count": 0,
+                }
+            ),
+            "register_setup": {
+                "call_count": 0,
+                "elapsed_s": 0.0,
+                "successful_inserts": 0,
+                "duplicate_noop_inserts": 0,
+                "sql_statement_count": 0,
+                "sql_update_count": 0,
+                "sql_insert_count": 0,
+                "sql_select_count": 0,
+            },
+        }
+
+    def _perf_counter(self, category: str, symbol: Optional[str] = None) -> dict[str, Any]:
+        if category == "update_pending":
+            if symbol is None:
+                raise ValueError("symbol is required for update_pending perf counters")
+            return self._perf["update_pending"][symbol]
+        return self._perf["register_setup"]
+
+    def _perf_inc(
+        self,
+        category: str,
+        key: str,
+        amount: float | int = 1,
+        symbol: Optional[str] = None,
+    ) -> None:
+        with self._perf_lock:
+            counter = self._perf_counter(category, symbol)
+            counter[key] = counter.get(key, 0) + amount
+
+    def _perf_set(self, category: str, key: str, value: Any, symbol: Optional[str] = None) -> None:
+        with self._perf_lock:
+            counter = self._perf_counter(category, symbol)
+            counter[key] = value
+
+    def _count_sql(self, category: str, sql: str, symbol: Optional[str] = None) -> None:
+        stmt = str(sql or "").lstrip().upper()
+        self._perf_inc(category, "sql_statement_count", 1, symbol=symbol)
+        if stmt.startswith("SELECT"):
+            self._perf_inc(category, "sql_select_count", 1, symbol=symbol)
+        elif stmt.startswith("INSERT"):
+            self._perf_inc(category, "sql_insert_count", 1, symbol=symbol)
+        elif stmt.startswith("UPDATE"):
+            self._perf_inc(category, "sql_update_count", 1, symbol=symbol)
+
+    def _execute_counted(
+        self,
+        category: str,
+        sql: str,
+        params: Any = None,
+        symbol: Optional[str] = None,
+    ) -> sqlite3.Cursor:
+        self._count_sql(category, sql, symbol=symbol)
+        if params is None:
+            return self._conn.execute(sql)
+        return self._conn.execute(sql, params)
+
+    def get_perf_snapshot(self) -> Dict[str, Any]:
+        with self._perf_lock:
+            update_pending = {k: dict(v) for k, v in self._perf["update_pending"].items()}
+            register_setup = dict(self._perf["register_setup"])
+        return {"update_pending": update_pending, "register_setup": register_setup}
 
     def _load_allow_multiple_from_settings(self) -> bool:
         settings_path = Path("settings.json")
@@ -253,10 +339,11 @@ class StrategyValidationStore:
     def _row_to_pending_dict(self, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         return dict(row)
 
-    def _ensure_pending_loaded(self, symbol: str) -> None:
+    def _ensure_pending_loaded(self, symbol: str, perf_category: str = "update_pending") -> None:
         if symbol in self._pending_loaded_symbols:
             return
-        rows = self._conn.execute(
+        rows = self._execute_counted(
+            perf_category,
             """
             SELECT *
             FROM strategy_setups
@@ -265,13 +352,14 @@ class StrategyValidationStore:
             ORDER BY reference_ts ASC
             """,
             (symbol, RESOLUTION_PENDING),
+            symbol=symbol,
         ).fetchall()
         self._pending_by_symbol[symbol] = [self._row_to_pending_dict(r) for r in rows]
         self._pending_loaded_symbols.add(symbol)
 
     def has_open_trade_for_symbol(self, symbol: str) -> bool:
         with self._lock:
-            self._ensure_pending_loaded(symbol)
+            self._ensure_pending_loaded(symbol, perf_category="register_setup")
             return bool(self._pending_by_symbol.get(symbol))
 
     def register_setup(
@@ -284,11 +372,15 @@ class StrategyValidationStore:
         active_column_index: Optional[int] = None,
     ) -> Optional[str]:
         now_ts = int(reference_ts)
+        started = time.perf_counter()
 
         with self._lock:
-            self._ensure_pending_loaded(symbol)
+            self._perf_inc("register_setup", "call_count", 1)
+            self._ensure_pending_loaded(symbol, perf_category="register_setup")
 
             if not self.allow_multiple_trades_per_symbol and self._pending_by_symbol.get(symbol):
+                elapsed = time.perf_counter() - started
+                self._perf_inc("register_setup", "elapsed_s", elapsed)
                 return None
 
             setup_id = self._make_setup_id(symbol, setup, structure_state, now_ts)
@@ -355,7 +447,8 @@ class StrategyValidationStore:
                 "raw_structure_json": json.dumps(structure_state, ensure_ascii=False, sort_keys=True),
             }
 
-            cur = self._conn.execute(
+            cur = self._execute_counted(
+                "register_setup",
                 """
                 INSERT OR IGNORE INTO strategy_setups (
                     setup_id, created_ts, updated_ts, symbol, strategy, side, status,
@@ -398,6 +491,11 @@ class StrategyValidationStore:
             if cur.rowcount and cur.rowcount > 0:
                 self._pending_by_symbol.setdefault(symbol, []).append(dict(row))
                 self._mark_dirty()
+                self._perf_inc("register_setup", "successful_inserts", 1)
+            else:
+                self._perf_inc("register_setup", "duplicate_noop_inserts", 1)
+            elapsed = time.perf_counter() - started
+            self._perf_inc("register_setup", "elapsed_s", elapsed)
             return setup_id
 
     def _should_activate(self, side: str, close_price: float, ideal_entry: Optional[float]) -> bool:
@@ -472,20 +570,30 @@ class StrategyValidationStore:
         low_price: float,
         close_price: float,
     ):
+        started = time.perf_counter()
         close_ts = int(close_ts)
         high_price = float(high_price)
         low_price = float(low_price)
         close_price = float(close_price)
 
         with self._lock:
-            self._ensure_pending_loaded(symbol)
+            self._perf_inc("update_pending", "call_count", 1, symbol=symbol)
+            self._ensure_pending_loaded(symbol, perf_category="update_pending")
             pending = self._pending_by_symbol.get(symbol, [])
+            pending_count = len(pending)
+            self._perf_set("update_pending", "current_pending_count", pending_count, symbol=symbol)
+            self._perf_inc("update_pending", "pending_count_total", pending_count, symbol=symbol)
+            with self._perf_lock:
+                counter = self._perf_counter("update_pending", symbol=symbol)
+                counter["max_pending_count"] = max(counter.get("max_pending_count", 0), pending_count)
             if not pending:
+                self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
                 return
 
             still_pending: list[dict[str, Any]] = []
 
             for row in pending:
+                self._perf_inc("update_pending", "trades_scanned", 1, symbol=symbol)
                 if int(row.get("reference_ts") or 0) >= close_ts:
                     still_pending.append(row)
                     continue
@@ -507,7 +615,8 @@ class StrategyValidationStore:
                 if activation_status == ACTIVATION_PENDING:
                     if self._should_activate(side=side, close_price=close_price, ideal_entry=ideal_entry):
                         activated_price = ideal_entry if ideal_entry is not None else close_price
-                        self._conn.execute(
+                        self._execute_counted(
+                            "update_pending",
                             """
                             UPDATE strategy_setups
                             SET updated_ts = ?,
@@ -529,6 +638,7 @@ class StrategyValidationStore:
                                 last_outcome_ts,
                                 row["setup_id"],
                             ),
+                            symbol=symbol,
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -539,9 +649,12 @@ class StrategyValidationStore:
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
                         self._mark_dirty()
+                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                        self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
                         continue
 
-                    self._conn.execute(
+                    self._execute_counted(
+                        "update_pending",
                         """
                         UPDATE strategy_setups
                         SET updated_ts = ?,
@@ -551,6 +664,7 @@ class StrategyValidationStore:
                         WHERE setup_id = ?
                         """,
                         (close_ts, bars_observed, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                        symbol=symbol,
                     )
                     row["updated_ts"] = close_ts
                     row["bars_observed"] = bars_observed
@@ -558,6 +672,7 @@ class StrategyValidationStore:
                     row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
                     self._mark_dirty()
+                    self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                     continue
 
                 if activation_status != ACTIVATION_ACTIVE:
@@ -611,7 +726,8 @@ class StrategyValidationStore:
                         mark_tp1_hit = False
 
                     if mark_tp1_hit and resolution_status is None:
-                        self._conn.execute(
+                        self._execute_counted(
+                            "update_pending",
                             """
                             UPDATE strategy_setups
                             SET updated_ts = ?,
@@ -626,6 +742,7 @@ class StrategyValidationStore:
                             WHERE setup_id = ?
                             """,
                             (close_ts, bars_observed, close_ts, tp1, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                            symbol=symbol,
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -638,10 +755,13 @@ class StrategyValidationStore:
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
                         self._mark_dirty()
+                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                        self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
                         continue
 
                     if mark_tp1_hit and resolution_status is not None:
-                        self._conn.execute(
+                        self._execute_counted(
+                            "update_pending",
                             """
                             UPDATE strategy_setups
                             SET updated_ts = ?,
@@ -674,6 +794,7 @@ class StrategyValidationStore:
                                 last_outcome_ts,
                                 row["setup_id"],
                             ),
+                            symbol=symbol,
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -689,6 +810,15 @@ class StrategyValidationStore:
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         self._mark_dirty()
+                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                        self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
+                        self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
+                        if resolution_status == RESOLUTION_TP2:
+                            self._perf_inc("update_pending", "tp2_hits", 1, symbol=symbol)
+                        elif resolution_status == RESOLUTION_STOPPED:
+                            self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
+                        elif resolution_status == RESOLUTION_AMBIGUOUS:
+                            self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
                         continue
                 else:
                     if entry_price is None:
@@ -706,7 +836,8 @@ class StrategyValidationStore:
                         )
 
                 if resolution_status is None:
-                    self._conn.execute(
+                    self._execute_counted(
+                        "update_pending",
                         """
                         UPDATE strategy_setups
                         SET updated_ts = ?,
@@ -718,6 +849,7 @@ class StrategyValidationStore:
                         WHERE setup_id = ?
                         """,
                         (close_ts, bars_observed, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                        symbol=symbol,
                     )
                     row["updated_ts"] = close_ts
                     row["bars_observed"] = bars_observed
@@ -727,8 +859,10 @@ class StrategyValidationStore:
                     row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
                     self._mark_dirty()
+                    self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                 else:
-                    self._conn.execute(
+                    self._execute_counted(
+                        "update_pending",
                         """
                         UPDATE strategy_setups
                         SET updated_ts = ?,
@@ -756,6 +890,7 @@ class StrategyValidationStore:
                             last_outcome_ts,
                             row["setup_id"],
                         ),
+                        symbol=symbol,
                     )
                     row["updated_ts"] = close_ts
                     row["bars_observed"] = bars_observed
@@ -768,5 +903,14 @@ class StrategyValidationStore:
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
                     self._mark_dirty()
+                    self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                    self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
+                    if resolution_status == RESOLUTION_TP2:
+                        self._perf_inc("update_pending", "tp2_hits", 1, symbol=symbol)
+                    elif resolution_status == RESOLUTION_STOPPED:
+                        self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
+                    elif resolution_status == RESOLUTION_AMBIGUOUS:
+                        self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
 
             self._pending_by_symbol[symbol] = [r for r in still_pending if str(r.get("resolution_status") or "").upper() == RESOLUTION_PENDING]
+            self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
