@@ -94,7 +94,9 @@ def load_all_closed_candles(storage: Storage, symbol: str) -> List[dict]:
 
 
 
-def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict]]:
+def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict], Dict[str, float]]:
+    t_start = time.perf_counter()
+    t0 = time.perf_counter()
     structure = build_structure_state(
         symbol=symbol,
         profile=profile,
@@ -103,23 +105,35 @@ def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tupl
         market_state=engine.market_state(),
         last_price=getattr(engine, "last_price", None),
     )
+    elapsed_build_structure_s = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     setup_long = evaluate_pullback_retest_long(
         symbol=symbol,
         profile=profile,
         columns=engine.columns,
         structure_state=structure,
     )
+    elapsed_eval_long_s = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     setup_short = evaluate_pullback_retest_short(
         symbol=symbol,
         profile=profile,
         columns=engine.columns,
         structure_state=structure,
     )
+    elapsed_eval_short_s = time.perf_counter() - t0
 
     setups = [s for s in (setup_long, setup_short) if s]
-    return structure, setups
+    elapsed_total_s = time.perf_counter() - t_start
+    timings = {
+        "elapsed_build_structure_s": elapsed_build_structure_s,
+        "elapsed_eval_long_s": elapsed_eval_long_s,
+        "elapsed_eval_short_s": elapsed_eval_short_s,
+        "elapsed_total_s": elapsed_total_s,
+    }
+    return structure, setups, timings
 
 
 
@@ -281,6 +295,9 @@ def main() -> None:
             "elapsed_register_s": 0.0,
             "setups_evaluated": 0,
             "register_calls": 0,
+            "elapsed_build_structure_s": 0.0,
+            "elapsed_eval_long_s": 0.0,
+            "elapsed_eval_short_s": 0.0,
         },
     }
 
@@ -296,6 +313,9 @@ def main() -> None:
             "elapsed_register_s": 0.0,
             "setups_evaluated": 0,
             "register_calls": 0,
+            "elapsed_build_structure_s": 0.0,
+            "elapsed_eval_long_s": 0.0,
+            "elapsed_eval_short_s": 0.0,
         }
         progress_every = max(1, int(args.perf_progress_every))
 
@@ -321,10 +341,13 @@ def main() -> None:
             symbol_perf["elapsed_update_pending_s"] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            structure, setups = evaluate_setups(symbol, profile, engine)
+            structure, setups, eval_timings = evaluate_setups(symbol, profile, engine)
             symbol_perf["elapsed_eval_s"] += time.perf_counter() - t0
             symbol_perf["setups_evaluated"] += len(setups)
             symbol_perf["candles"] += 1
+            symbol_perf["elapsed_build_structure_s"] += float(eval_timings["elapsed_build_structure_s"])
+            symbol_perf["elapsed_eval_long_s"] += float(eval_timings["elapsed_eval_long_s"])
+            symbol_perf["elapsed_eval_short_s"] += float(eval_timings["elapsed_eval_short_s"])
 
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
@@ -379,7 +402,10 @@ def main() -> None:
                     f"sql_selects={up.get('sql_select_count', 0)} "
                     f"elapsed_update_pending_ms={elapsed_update_pending_ms:.3f} "
                     f"elapsed_eval_ms={elapsed_eval_ms:.3f} "
-                    f"elapsed_register_ms={elapsed_register_ms:.3f}"
+                    f"elapsed_register_ms={elapsed_register_ms:.3f} "
+                    f"elapsed_build_structure_ms={symbol_perf['elapsed_build_structure_s'] * 1000.0:.3f} "
+                    f"elapsed_eval_long_ms={symbol_perf['elapsed_eval_long_s'] * 1000.0:.3f} "
+                    f"elapsed_eval_short_ms={symbol_perf['elapsed_eval_short_s'] * 1000.0:.3f}"
                 )
 
         run_perf["symbols"][symbol] = symbol_perf
@@ -390,11 +416,14 @@ def main() -> None:
         run_perf["totals"]["elapsed_register_s"] += float(symbol_perf["elapsed_register_s"])
         run_perf["totals"]["setups_evaluated"] += int(symbol_perf["setups_evaluated"])
         run_perf["totals"]["register_calls"] += int(symbol_perf["register_calls"])
+        run_perf["totals"]["elapsed_build_structure_s"] += float(symbol_perf["elapsed_build_structure_s"])
+        run_perf["totals"]["elapsed_eval_long_s"] += float(symbol_perf["elapsed_eval_long_s"])
+        run_perf["totals"]["elapsed_eval_short_s"] += float(symbol_perf["elapsed_eval_short_s"])
 
         perf_snapshot = validation_store.get_perf_snapshot()
         up = perf_snapshot["update_pending"].get(symbol, {})
         avg_pending = (
-            float(up.get("current_pending_count", 0)) / float(up.get("call_count", 1))
+            float(up.get("pending_count_total", 0)) / float(up.get("call_count", 1))
             if up.get("call_count", 0) > 0
             else 0.0
         )
@@ -407,7 +436,10 @@ def main() -> None:
             f"total_sql_selects={up.get('sql_select_count', 0)} "
             f"elapsed_update_pending_s={symbol_perf['elapsed_update_pending_s']:.6f} "
             f"elapsed_eval_s={symbol_perf['elapsed_eval_s']:.6f} "
-            f"elapsed_register_s={symbol_perf['elapsed_register_s']:.6f}"
+            f"elapsed_register_s={symbol_perf['elapsed_register_s']:.6f} "
+            f"elapsed_build_structure_s={symbol_perf['elapsed_build_structure_s']:.6f} "
+            f"elapsed_eval_long_s={symbol_perf['elapsed_eval_long_s']:.6f} "
+            f"elapsed_eval_short_s={symbol_perf['elapsed_eval_short_s']:.6f}"
         )
 
     csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
@@ -447,6 +479,9 @@ def main() -> None:
         "update_pending": run_perf["totals"]["elapsed_update_pending_s"],
         "evaluate_setups": run_perf["totals"]["elapsed_eval_s"],
         "register_setup": run_perf["totals"]["elapsed_register_s"],
+        "build_structure_state": run_perf["totals"]["elapsed_build_structure_s"],
+        "evaluate_pullback_retest_long": run_perf["totals"]["elapsed_eval_long_s"],
+        "evaluate_pullback_retest_short": run_perf["totals"]["elapsed_eval_short_s"],
     }
     hottest_stage = max(stage_totals.items(), key=lambda kv: kv[1])[0] if stage_totals else "n/a"
     update_pending_total_scanned = sum(

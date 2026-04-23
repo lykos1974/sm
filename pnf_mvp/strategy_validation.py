@@ -111,6 +111,7 @@ class StrategyValidationStore:
                     "sql_insert_count": 0,
                     "sql_select_count": 0,
                     "current_pending_count": 0,
+                    "pending_count_total": 0,
                     "max_pending_count": 0,
                 }
             ),
@@ -143,6 +144,11 @@ class StrategyValidationStore:
         with self._perf_lock:
             counter = self._perf_counter(category, symbol)
             counter[key] = counter.get(key, 0) + amount
+
+    def _perf_set(self, category: str, key: str, value: Any, symbol: Optional[str] = None) -> None:
+        with self._perf_lock:
+            counter = self._perf_counter(category, symbol)
+            counter[key] = value
 
     def _count_sql(self, category: str, sql: str, symbol: Optional[str] = None) -> None:
         stmt = str(sql or "").lstrip().upper()
@@ -575,7 +581,8 @@ class StrategyValidationStore:
             self._ensure_pending_loaded(symbol, perf_category="update_pending")
             pending = self._pending_by_symbol.get(symbol, [])
             pending_count = len(pending)
-            self._perf_inc("update_pending", "current_pending_count", pending_count, symbol=symbol)
+            self._perf_set("update_pending", "current_pending_count", pending_count, symbol=symbol)
+            self._perf_inc("update_pending", "pending_count_total", pending_count, symbol=symbol)
             with self._perf_lock:
                 counter = self._perf_counter("update_pending", symbol=symbol)
                 counter["max_pending_count"] = max(counter.get("max_pending_count", 0), pending_count)
