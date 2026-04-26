@@ -28,6 +28,10 @@ if str(PNF_MVP_DIR) not in sys.path:
 from pnf_engine import PnFEngine, PnFProfile  # noqa: E402
 from structure_engine import build_structure_state  # noqa: E402
 
+from research_v2.structure_validation.incremental_structure_state import (  # noqa: E402
+    IncrementalStructureState,
+)
+
 
 _MISSING = object()
 _FLOAT_PRECISION = 10
@@ -175,9 +179,15 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
     rows_per_symbol: dict[str, int] = {}
     total_rows = 0
 
+    mode = str(args.mode)
+    implementation_status: dict[str, Any] = {}
+
     for symbol in symbols:
         profile = _profile_for_symbol(settings_payload, symbol)
         engine = PnFEngine(profile)
+        incremental_state = (
+            IncrementalStructureState(symbol=symbol, profile=profile) if mode == "incremental" else None
+        )
         closed_candles = _load_closed_candles_read_only(db_path, symbol, max_candles)
 
         symbol_rows = 0
@@ -195,8 +205,18 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
                 last_price=getattr(engine, "last_price", None),
             )
 
-            # Placeholder until incremental implementation is available.
-            new_state = old_state
+            if mode == "placeholder":
+                new_state = old_state
+            else:
+                assert incremental_state is not None
+                incremental_state.update_from_engine(
+                    engine=engine,
+                    latest_signal_name=engine.latest_signal_name(),
+                    market_state=engine.market_state(),
+                    last_price=getattr(engine, "last_price", None),
+                )
+                new_state = incremental_state.snapshot(engine=engine)
+                implementation_status[symbol] = incremental_state.implementation_status()
 
             normalized_old, normalized_new = _normalize_pair(old_state, new_state)
             if normalized_old != normalized_new:
@@ -240,6 +260,11 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
         "mismatch_log_path": str(mismatch_log_path) if mismatch_log_path else None,
         "deterministic": True,
         "db_mode": "read_only",
+        "mode": mode,
+        "implementation_status": implementation_status if mode == "incremental" else {
+            "snapshot_strategy": "placeholder_equals_legacy",
+            "delegated_fields": "all",
+        },
     }
 
 
@@ -252,6 +277,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mismatch-log",
         default=None,
         help="Optional JSONL output path for mismatch rows; if omitted, no mismatch file is written",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["placeholder", "incremental"],
+        default="placeholder",
+        help="Comparison mode: placeholder mirrors legacy; incremental uses IncrementalStructureState prototype",
     )
     return parser
 
