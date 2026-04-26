@@ -11,8 +11,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from structure_engine import (
-    BREAKOUT_POST_BULLISH_PULLBACK,
+    REGIME_BEARISH,
+    REGIME_BULLISH,
+    SLOPE_BEARISH_PUSH,
     SLOPE_BEARISH_PULLBACK,
+    SLOPE_BULLISH_PUSH,
+    SLOPE_BULLISH_REBOUND,
+    SLOPE_FLAT,
+    TREND_BEARISH,
+    TREND_BULLISH,
     StructureConfig,
     build_structure_state,
 )
@@ -35,11 +42,33 @@ class IncrementalStructureState:
     _delegated_snapshot_fields: tuple[str, ...] = (
         "trend_state",
         "trend_regime",
-        "immediate_slope",
         "swing_direction",
         "breakout_context",
         "notes",
     )
+
+    @staticmethod
+    def _detect_immediate_slope_from_cached_values(
+        current_column_kind: str | None,
+        trend_regime: str | None,
+        trend_state: str | None,
+    ) -> str:
+        """Mirror legacy `_detect_immediate_slope(...)` semantics exactly."""
+        if current_column_kind == "X":
+            if trend_state == TREND_BULLISH or trend_regime == REGIME_BULLISH:
+                return SLOPE_BULLISH_PUSH
+            if trend_state == TREND_BEARISH or trend_regime == REGIME_BEARISH:
+                return SLOPE_BULLISH_REBOUND
+            return SLOPE_BULLISH_REBOUND
+
+        if current_column_kind == "O":
+            if trend_state == TREND_BULLISH or trend_regime == REGIME_BULLISH:
+                return SLOPE_BEARISH_PULLBACK
+            if trend_state == TREND_BEARISH or trend_regime == REGIME_BEARISH:
+                return SLOPE_BEARISH_PUSH
+            return SLOPE_BEARISH_PULLBACK
+
+        return SLOPE_FLAT
 
     def update_from_engine(
         self,
@@ -152,73 +181,22 @@ class IncrementalStructureState:
             last_price=self.last_price,
             config=self.config,
         )
-        delegated_state["symbol"] = self._cached_fields.get(
-            "symbol",
-            delegated_state.get("symbol"),
+
+        immediate_slope = self._detect_immediate_slope_from_cached_values(
+            current_column_kind=self._cached_fields.get(
+                "current_column_kind",
+                delegated_state.get("current_column_kind"),
+            ),
+            trend_regime=delegated_state.get("trend_regime"),
+            trend_state=delegated_state.get("trend_state"),
         )
-        delegated_state["latest_signal_name"] = self._cached_fields.get(
-            "latest_signal_name",
-            delegated_state.get("latest_signal_name"),
-        )
-        delegated_state["market_state"] = self._cached_fields.get(
-            "market_state",
-            delegated_state.get("market_state"),
-        )
-        delegated_state["last_price"] = self._cached_fields.get(
-            "last_price",
-            delegated_state.get("last_price"),
-        )
-        delegated_state["current_column_kind"] = self._cached_fields.get(
-            "current_column_kind",
-            delegated_state.get("current_column_kind"),
-        )
-        delegated_state["current_column_top"] = self._cached_fields.get(
-            "current_column_top",
-            delegated_state.get("current_column_top"),
-        )
-        delegated_state["current_column_bottom"] = self._cached_fields.get(
-            "current_column_bottom",
-            delegated_state.get("current_column_bottom"),
-        )
-        delegated_state["active_leg_boxes"] = self._cached_fields.get(
-            "active_leg_boxes",
-            delegated_state.get("active_leg_boxes"),
-        )
-        delegated_state["is_extended_move"] = self._cached_fields.get(
-            "is_extended_move",
-            delegated_state.get("is_extended_move"),
-        )
-        delegated_state["last_meaningful_x_high"] = self._cached_fields.get(
-            "last_meaningful_x_high",
-            delegated_state.get("last_meaningful_x_high"),
-        )
-        delegated_state["last_meaningful_o_low"] = self._cached_fields.get(
-            "last_meaningful_o_low",
-            delegated_state.get("last_meaningful_o_low"),
-        )
-        delegated_state["support_level"] = self._cached_fields.get("last_meaningful_o_low")
-        delegated_state["resistance_level"] = self._cached_fields.get("last_meaningful_x_high")
-        impulse_boxes = None
-        pullback_boxes = None
-        impulse_to_pullback_ratio = None
-        if (
-            delegated_state.get("breakout_context") == BREAKOUT_POST_BULLISH_PULLBACK
-            and delegated_state.get("immediate_slope") == SLOPE_BEARISH_PULLBACK
-            and self._cached_fields.get("current_column_kind") == "O"
-        ):
-            impulse_boxes = self._cached_fields.get("prev_x_span_boxes")
-            pullback_boxes = self._cached_fields.get("current_column_span_boxes")
-            if impulse_boxes is not None and pullback_boxes is not None and pullback_boxes > 0:
-                impulse_to_pullback_ratio = float(impulse_boxes) / float(pullback_boxes)
-        delegated_state["impulse_boxes"] = impulse_boxes
-        delegated_state["pullback_boxes"] = pullback_boxes
-        delegated_state["impulse_to_pullback_ratio"] = impulse_to_pullback_ratio
+        delegated_state["immediate_slope"] = immediate_slope
+        self._cached_fields["immediate_slope"] = immediate_slope
         return delegated_state
 
     def implementation_status(self) -> dict[str, Any]:
         """Expose which parts are cached incrementally vs delegated."""
         cached_fields = set(self._cached_fields.keys())
-        cached_fields.update({"support_level", "resistance_level"})
         return {
             "cached_fields": sorted(cached_fields),
             "delegated_fields": list(self._delegated_snapshot_fields),
