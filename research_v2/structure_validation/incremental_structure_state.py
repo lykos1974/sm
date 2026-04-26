@@ -38,8 +38,6 @@ class IncrementalStructureState:
         "impulse_boxes",
         "pullback_boxes",
         "impulse_to_pullback_ratio",
-        "last_meaningful_x_high",
-        "last_meaningful_o_low",
         "notes",
     )
 
@@ -62,7 +60,38 @@ class IncrementalStructureState:
         self.latest_signal_name = latest_signal_name
         self.market_state = market_state
         self.last_price = last_price
+        previous_columns_count = self._last_columns_count
         self._last_columns_count = len(columns)
+
+        completed_columns = columns[:-1] if columns else []
+        cached_last_meaningful_x_high = self._cached_fields.get("last_meaningful_x_high")
+        cached_last_meaningful_o_low = self._cached_fields.get("last_meaningful_o_low")
+
+        if not completed_columns:
+            cached_last_meaningful_x_high = None
+            cached_last_meaningful_o_low = None
+        else:
+            needs_bootstrap_scan = (
+                len(columns) < previous_columns_count
+                or "last_meaningful_x_high" not in self._cached_fields
+                or "last_meaningful_o_low" not in self._cached_fields
+            )
+            if needs_bootstrap_scan:
+                cached_last_meaningful_x_high = None
+                cached_last_meaningful_o_low = None
+                for column in completed_columns:
+                    column_kind = getattr(column, "kind", "")
+                    if column_kind == "X":
+                        cached_last_meaningful_x_high = float(getattr(column, "top", 0.0))
+                    elif column_kind == "O":
+                        cached_last_meaningful_o_low = float(getattr(column, "bottom", 0.0))
+            else:
+                last_completed = completed_columns[-1]
+                last_completed_kind = getattr(last_completed, "kind", "")
+                if last_completed_kind == "X":
+                    cached_last_meaningful_x_high = float(getattr(last_completed, "top", 0.0))
+                elif last_completed_kind == "O":
+                    cached_last_meaningful_o_low = float(getattr(last_completed, "bottom", 0.0))
 
         current = columns[-1] if columns else None
         if current is None:
@@ -90,6 +119,8 @@ class IncrementalStructureState:
             "current_column_bottom": current_column_bottom,
             "active_leg_boxes": active_leg_boxes,
             "is_extended_move": is_extended_move,
+            "last_meaningful_x_high": cached_last_meaningful_x_high,
+            "last_meaningful_o_low": cached_last_meaningful_o_low,
         }
 
     def snapshot(self, engine: Any) -> dict[str, Any]:
@@ -142,6 +173,14 @@ class IncrementalStructureState:
         delegated_state["is_extended_move"] = self._cached_fields.get(
             "is_extended_move",
             delegated_state.get("is_extended_move"),
+        )
+        delegated_state["last_meaningful_x_high"] = self._cached_fields.get(
+            "last_meaningful_x_high",
+            delegated_state.get("last_meaningful_x_high"),
+        )
+        delegated_state["last_meaningful_o_low"] = self._cached_fields.get(
+            "last_meaningful_o_low",
+            delegated_state.get("last_meaningful_o_low"),
         )
         return delegated_state
 
