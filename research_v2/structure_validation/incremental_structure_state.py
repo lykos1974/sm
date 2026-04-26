@@ -28,7 +28,6 @@ class IncrementalStructureState:
 
     # Phase 5 incrementally computes a small, stable subset of snapshot fields.
     _delegated_snapshot_fields: tuple[str, ...] = (
-        "symbol",
         "trend_state",
         "trend_regime",
         "immediate_slope",
@@ -41,9 +40,6 @@ class IncrementalStructureState:
         "impulse_to_pullback_ratio",
         "last_meaningful_x_high",
         "last_meaningful_o_low",
-        "latest_signal_name",
-        "market_state",
-        "last_price",
         "notes",
     )
 
@@ -110,6 +106,22 @@ class IncrementalStructureState:
             market_state=str(self.market_state or ""),
             last_price=self.last_price,
             config=self.config,
+        )
+        delegated_state["symbol"] = self._cached_fields.get(
+            "symbol",
+            delegated_state.get("symbol"),
+        )
+        delegated_state["latest_signal_name"] = self._cached_fields.get(
+            "latest_signal_name",
+            delegated_state.get("latest_signal_name"),
+        )
+        delegated_state["market_state"] = self._cached_fields.get(
+            "market_state",
+            delegated_state.get("market_state"),
+        )
+        delegated_state["last_price"] = self._cached_fields.get(
+            "last_price",
+            delegated_state.get("last_price"),
         )
         delegated_state["current_column_kind"] = self._cached_fields.get(
             "current_column_kind",
