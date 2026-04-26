@@ -10,7 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from structure_engine import StructureConfig, build_structure_state
+from structure_engine import (
+    BREAKOUT_POST_BULLISH_PULLBACK,
+    SLOPE_BEARISH_PULLBACK,
+    StructureConfig,
+    build_structure_state,
+)
 
 
 @dataclass
@@ -33,9 +38,6 @@ class IncrementalStructureState:
         "immediate_slope",
         "swing_direction",
         "breakout_context",
-        "impulse_boxes",
-        "pullback_boxes",
-        "impulse_to_pullback_ratio",
         "notes",
     )
 
@@ -98,6 +100,7 @@ class IncrementalStructureState:
             current_column_bottom = None
             active_leg_boxes = 0
             is_extended_move = False
+            current_column_span_boxes = None
         else:
             current_column_kind = getattr(current, "kind", "")
             current_column_top = float(getattr(current, "top", 0.0))
@@ -105,6 +108,17 @@ class IncrementalStructureState:
             span = abs(current_column_top - current_column_bottom)
             active_leg_boxes = int(round(span / box_size)) if box_size > 0 else 0
             is_extended_move = active_leg_boxes >= extension_threshold
+            current_column_span_boxes = (span / box_size) if box_size > 0 else None
+
+        prev_x_span_boxes = None
+        if box_size > 0:
+            for column in reversed(completed_columns):
+                if getattr(column, "kind", "") == "X":
+                    prev_x_span_boxes = abs(
+                        float(getattr(column, "top", 0.0))
+                        - float(getattr(column, "bottom", 0.0))
+                    ) / box_size
+                    break
 
         self._cached_fields = {
             "symbol": self.symbol,
@@ -119,6 +133,8 @@ class IncrementalStructureState:
             "is_extended_move": is_extended_move,
             "last_meaningful_x_high": cached_last_meaningful_x_high,
             "last_meaningful_o_low": cached_last_meaningful_o_low,
+            "prev_x_span_boxes": prev_x_span_boxes,
+            "current_column_span_boxes": current_column_span_boxes,
         }
 
     def snapshot(self, engine: Any) -> dict[str, Any]:
@@ -182,6 +198,21 @@ class IncrementalStructureState:
         )
         delegated_state["support_level"] = self._cached_fields.get("last_meaningful_o_low")
         delegated_state["resistance_level"] = self._cached_fields.get("last_meaningful_x_high")
+        impulse_boxes = None
+        pullback_boxes = None
+        impulse_to_pullback_ratio = None
+        if (
+            delegated_state.get("breakout_context") == BREAKOUT_POST_BULLISH_PULLBACK
+            and delegated_state.get("immediate_slope") == SLOPE_BEARISH_PULLBACK
+            and self._cached_fields.get("current_column_kind") == "O"
+        ):
+            impulse_boxes = self._cached_fields.get("prev_x_span_boxes")
+            pullback_boxes = self._cached_fields.get("current_column_span_boxes")
+            if impulse_boxes is not None and pullback_boxes is not None and pullback_boxes > 0:
+                impulse_to_pullback_ratio = float(impulse_boxes) / float(pullback_boxes)
+        delegated_state["impulse_boxes"] = impulse_boxes
+        delegated_state["pullback_boxes"] = pullback_boxes
+        delegated_state["impulse_to_pullback_ratio"] = impulse_to_pullback_ratio
         return delegated_state
 
     def implementation_status(self) -> dict[str, Any]:
