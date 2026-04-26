@@ -32,8 +32,6 @@ class IncrementalStructureState:
         "trend_regime",
         "immediate_slope",
         "swing_direction",
-        "support_level",
-        "resistance_level",
         "breakout_context",
         "impulse_boxes",
         "pullback_boxes",
@@ -182,12 +180,16 @@ class IncrementalStructureState:
             "last_meaningful_o_low",
             delegated_state.get("last_meaningful_o_low"),
         )
+        delegated_state["support_level"] = self._cached_fields.get("last_meaningful_o_low")
+        delegated_state["resistance_level"] = self._cached_fields.get("last_meaningful_x_high")
         return delegated_state
 
     def implementation_status(self) -> dict[str, Any]:
         """Expose which parts are cached incrementally vs delegated."""
+        cached_fields = set(self._cached_fields.keys())
+        cached_fields.update({"support_level", "resistance_level"})
         return {
-            "cached_fields": sorted(self._cached_fields.keys()),
+            "cached_fields": sorted(cached_fields),
             "delegated_fields": list(self._delegated_snapshot_fields),
             "snapshot_strategy": "delegated_to_build_structure_state",
             "columns_observed": self._last_columns_count,
