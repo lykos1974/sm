@@ -11,6 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from structure_engine import (
+    BREAKOUT_FRESH_BEARISH,
+    BREAKOUT_FRESH_BULLISH,
+    BREAKOUT_LATE_EXTENSION,
+    BREAKOUT_NONE,
+    BREAKOUT_POST_BEARISH_REBOUND,
+    BREAKOUT_POST_BULLISH_PULLBACK,
     REGIME_BEARISH,
     REGIME_BULLISH,
     REGIME_EARLY,
@@ -46,7 +52,6 @@ class IncrementalStructureState:
 
     # Phase 5 incrementally computes a small, stable subset of snapshot fields.
     _delegated_snapshot_fields: tuple[str, ...] = (
-        "breakout_context",
         "notes",
     )
 
@@ -214,6 +219,50 @@ class IncrementalStructureState:
 
         return TREND_RANGE
 
+    @staticmethod
+    def _detect_breakout_context_from_cached_values(
+        *,
+        columns_count: int,
+        active_leg_boxes: int,
+        extension_boxes_threshold: int,
+        current_column_kind: str | None,
+        current_column_top: float | None,
+        current_column_bottom: float | None,
+        trend_regime: str | None,
+        previous_x_top_before_current: float | None,
+        previous_o_bottom_before_current: float | None,
+    ) -> str:
+        """Mirror legacy `_detect_breakout_context(...)` semantics exactly."""
+        if columns_count < 3:
+            return BREAKOUT_NONE
+
+        if active_leg_boxes >= extension_boxes_threshold:
+            return BREAKOUT_LATE_EXTENSION
+
+        if trend_regime == REGIME_BULLISH:
+            if (
+                current_column_kind == "X"
+                and previous_x_top_before_current is not None
+                and current_column_top is not None
+                and current_column_top > previous_x_top_before_current
+            ):
+                return BREAKOUT_FRESH_BULLISH
+            if current_column_kind == "O":
+                return BREAKOUT_POST_BULLISH_PULLBACK
+
+        if trend_regime == REGIME_BEARISH:
+            if (
+                current_column_kind == "O"
+                and previous_o_bottom_before_current is not None
+                and current_column_bottom is not None
+                and current_column_bottom < previous_o_bottom_before_current
+            ):
+                return BREAKOUT_FRESH_BEARISH
+            if current_column_kind == "X":
+                return BREAKOUT_POST_BEARISH_REBOUND
+
+        return BREAKOUT_NONE
+
     def update_from_engine(
         self,
         engine: Any,
@@ -319,6 +368,8 @@ class IncrementalStructureState:
             current_column_span_boxes = (span / box_size) if box_size > 0 else None
 
         prev_x_span_boxes = None
+        previous_x_top_before_current = None
+        previous_o_bottom_before_current = None
         if box_size > 0:
             for column in reversed(completed_columns):
                 if getattr(column, "kind", "") == "X":
@@ -327,6 +378,14 @@ class IncrementalStructureState:
                         - float(getattr(column, "bottom", 0.0))
                     ) / box_size
                     break
+        for column in reversed(completed_columns):
+            column_kind = getattr(column, "kind", "")
+            if previous_x_top_before_current is None and column_kind == "X":
+                previous_x_top_before_current = float(getattr(column, "top", 0.0))
+            if previous_o_bottom_before_current is None and column_kind == "O":
+                previous_o_bottom_before_current = float(getattr(column, "bottom", 0.0))
+            if previous_x_top_before_current is not None and previous_o_bottom_before_current is not None:
+                break
 
         self._cached_fields = {
             "symbol": self.symbol,
@@ -347,6 +406,8 @@ class IncrementalStructureState:
             "completed_column_kinds": cached_completed_column_kinds,
             "prev_x_span_boxes": prev_x_span_boxes,
             "current_column_span_boxes": current_column_span_boxes,
+            "previous_x_top_before_current": previous_x_top_before_current,
+            "previous_o_bottom_before_current": previous_o_bottom_before_current,
         }
 
     def snapshot(self, engine: Any) -> dict[str, Any]:
@@ -413,6 +474,20 @@ class IncrementalStructureState:
         )
         delegated_state["trend_state"] = trend_state
         self._cached_fields["trend_state"] = trend_state
+
+        breakout_context = self._detect_breakout_context_from_cached_values(
+            columns_count=int(self._cached_fields.get("columns_count", len(getattr(engine, "columns", []) or []))),
+            active_leg_boxes=int(self._cached_fields.get("active_leg_boxes", 0) or 0),
+            extension_boxes_threshold=int(getattr(cfg, "extension_boxes_threshold", StructureConfig().extension_boxes_threshold)),
+            current_column_kind=self._cached_fields.get("current_column_kind"),
+            current_column_top=self._cached_fields.get("current_column_top"),
+            current_column_bottom=self._cached_fields.get("current_column_bottom"),
+            trend_regime=trend_regime,
+            previous_x_top_before_current=self._cached_fields.get("previous_x_top_before_current"),
+            previous_o_bottom_before_current=self._cached_fields.get("previous_o_bottom_before_current"),
+        )
+        delegated_state["breakout_context"] = breakout_context
+        self._cached_fields["breakout_context"] = breakout_context
         return delegated_state
 
     def implementation_status(self) -> dict[str, Any]:
