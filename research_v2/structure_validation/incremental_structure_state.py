@@ -42,10 +42,37 @@ class IncrementalStructureState:
     _delegated_snapshot_fields: tuple[str, ...] = (
         "trend_state",
         "trend_regime",
-        "swing_direction",
         "breakout_context",
         "notes",
     )
+
+    @staticmethod
+    def _detect_swing_direction_from_cached_values(
+        *,
+        last_two_meaningful_x_highs: list[float] | None,
+        last_two_meaningful_o_lows: list[float] | None,
+        last_completed_kind: str | None,
+        columns_count: int,
+    ) -> str:
+        """Mirror legacy `_detect_swing_direction(...)` semantics exactly."""
+        x_highs = list(last_two_meaningful_x_highs or [])
+        o_lows = list(last_two_meaningful_o_lows or [])
+
+        up = len(x_highs) >= 2 and x_highs[-1] > x_highs[-2]
+        down = len(o_lows) >= 2 and o_lows[-1] < o_lows[-2]
+
+        if up and not down:
+            return "UP"
+        if down and not up:
+            return "DOWN"
+
+        if columns_count >= 2:
+            if last_completed_kind == "X":
+                return "UP"
+            if last_completed_kind == "O":
+                return "DOWN"
+
+        return "NEUTRAL"
 
     @staticmethod
     def _detect_immediate_slope_from_cached_values(
@@ -93,34 +120,64 @@ class IncrementalStructureState:
         self._last_columns_count = len(columns)
 
         completed_columns = columns[:-1] if columns else []
+        previous_completed_columns_count = max(previous_columns_count - 1, 0)
+        completed_columns_count = len(completed_columns)
         cached_last_meaningful_x_high = self._cached_fields.get("last_meaningful_x_high")
         cached_last_meaningful_o_low = self._cached_fields.get("last_meaningful_o_low")
+        cached_last_two_meaningful_x_highs = list(self._cached_fields.get("last_two_meaningful_x_highs") or [])
+        cached_last_two_meaningful_o_lows = list(self._cached_fields.get("last_two_meaningful_o_lows") or [])
+        cached_last_completed_kind = self._cached_fields.get("last_completed_kind")
 
         if not completed_columns:
             cached_last_meaningful_x_high = None
             cached_last_meaningful_o_low = None
+            cached_last_two_meaningful_x_highs = []
+            cached_last_two_meaningful_o_lows = []
+            cached_last_completed_kind = None
         else:
             needs_bootstrap_scan = (
                 len(columns) < previous_columns_count
                 or "last_meaningful_x_high" not in self._cached_fields
                 or "last_meaningful_o_low" not in self._cached_fields
+                or "last_two_meaningful_x_highs" not in self._cached_fields
+                or "last_two_meaningful_o_lows" not in self._cached_fields
+                or "last_completed_kind" not in self._cached_fields
             )
             if needs_bootstrap_scan:
                 cached_last_meaningful_x_high = None
                 cached_last_meaningful_o_low = None
+                cached_last_two_meaningful_x_highs = []
+                cached_last_two_meaningful_o_lows = []
                 for column in completed_columns:
                     column_kind = getattr(column, "kind", "")
                     if column_kind == "X":
-                        cached_last_meaningful_x_high = float(getattr(column, "top", 0.0))
+                        x_high = float(getattr(column, "top", 0.0))
+                        cached_last_meaningful_x_high = x_high
+                        cached_last_two_meaningful_x_highs.append(x_high)
+                        cached_last_two_meaningful_x_highs = cached_last_two_meaningful_x_highs[-2:]
                     elif column_kind == "O":
-                        cached_last_meaningful_o_low = float(getattr(column, "bottom", 0.0))
+                        o_low = float(getattr(column, "bottom", 0.0))
+                        cached_last_meaningful_o_low = o_low
+                        cached_last_two_meaningful_o_lows.append(o_low)
+                        cached_last_two_meaningful_o_lows = cached_last_two_meaningful_o_lows[-2:]
+                cached_last_completed_kind = getattr(completed_columns[-1], "kind", "")
             else:
-                last_completed = completed_columns[-1]
-                last_completed_kind = getattr(last_completed, "kind", "")
-                if last_completed_kind == "X":
-                    cached_last_meaningful_x_high = float(getattr(last_completed, "top", 0.0))
-                elif last_completed_kind == "O":
-                    cached_last_meaningful_o_low = float(getattr(last_completed, "bottom", 0.0))
+                if completed_columns_count > previous_completed_columns_count:
+                    last_completed = completed_columns[-1]
+                    last_completed_kind = getattr(last_completed, "kind", "")
+                    cached_last_completed_kind = last_completed_kind
+                    if last_completed_kind == "X":
+                        x_high = float(getattr(last_completed, "top", 0.0))
+                        cached_last_meaningful_x_high = x_high
+                        cached_last_two_meaningful_x_highs.append(x_high)
+                        cached_last_two_meaningful_x_highs = cached_last_two_meaningful_x_highs[-2:]
+                    elif last_completed_kind == "O":
+                        o_low = float(getattr(last_completed, "bottom", 0.0))
+                        cached_last_meaningful_o_low = o_low
+                        cached_last_two_meaningful_o_lows.append(o_low)
+                        cached_last_two_meaningful_o_lows = cached_last_two_meaningful_o_lows[-2:]
+                else:
+                    cached_last_completed_kind = getattr(completed_columns[-1], "kind", "")
 
         current = columns[-1] if columns else None
         if current is None:
@@ -162,6 +219,9 @@ class IncrementalStructureState:
             "is_extended_move": is_extended_move,
             "last_meaningful_x_high": cached_last_meaningful_x_high,
             "last_meaningful_o_low": cached_last_meaningful_o_low,
+            "last_two_meaningful_x_highs": cached_last_two_meaningful_x_highs,
+            "last_two_meaningful_o_lows": cached_last_two_meaningful_o_lows,
+            "last_completed_kind": cached_last_completed_kind,
             "prev_x_span_boxes": prev_x_span_boxes,
             "current_column_span_boxes": current_column_span_boxes,
         }
@@ -192,6 +252,13 @@ class IncrementalStructureState:
         )
         delegated_state["immediate_slope"] = immediate_slope
         self._cached_fields["immediate_slope"] = immediate_slope
+        delegated_state["swing_direction"] = self._detect_swing_direction_from_cached_values(
+            last_two_meaningful_x_highs=self._cached_fields.get("last_two_meaningful_x_highs"),
+            last_two_meaningful_o_lows=self._cached_fields.get("last_two_meaningful_o_lows"),
+            last_completed_kind=self._cached_fields.get("last_completed_kind"),
+            columns_count=int(self._cached_fields.get("columns_count", len(getattr(engine, "columns", []) or []))),
+        )
+        self._cached_fields["swing_direction"] = delegated_state["swing_direction"]
         return delegated_state
 
     def implementation_status(self) -> dict[str, Any]:
