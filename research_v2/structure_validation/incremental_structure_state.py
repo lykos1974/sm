@@ -24,6 +24,8 @@ from structure_engine import (
     SWING_UP,
     TREND_BEARISH,
     TREND_BULLISH,
+    TREND_EARLY,
+    TREND_RANGE,
     StructureConfig,
     build_structure_state,
 )
@@ -44,7 +46,6 @@ class IncrementalStructureState:
 
     # Phase 5 incrementally computes a small, stable subset of snapshot fields.
     _delegated_snapshot_fields: tuple[str, ...] = (
-        "trend_state",
         "breakout_context",
         "notes",
     )
@@ -163,6 +164,55 @@ class IncrementalStructureState:
                 return REGIME_BEARISH
 
         return REGIME_RANGE
+
+    @staticmethod
+    def _detect_trend_state_from_cached_values(
+        *,
+        columns_count: int,
+        market_state: str | None,
+        swing_direction: str | None,
+        trend_regime: str | None,
+        config: StructureConfig,
+        last_two_meaningful_x_highs: list[float] | None,
+        last_two_meaningful_o_lows: list[float] | None,
+    ) -> str:
+        """Mirror legacy `_detect_trend_state(...)` semantics exactly."""
+        if columns_count < config.early_min_columns:
+            return TREND_EARLY
+
+        x_highs = list(last_two_meaningful_x_highs or [])
+        o_lows = list(last_two_meaningful_o_lows or [])
+
+        bullish_structure = (
+            len(x_highs) >= 2
+            and len(o_lows) >= 2
+            and x_highs[-1] > x_highs[-2]
+            and o_lows[-1] > o_lows[-2]
+        )
+        bearish_structure = (
+            len(x_highs) >= 2
+            and len(o_lows) >= 2
+            and x_highs[-1] < x_highs[-2]
+            and o_lows[-1] < o_lows[-2]
+        )
+
+        if bullish_structure:
+            return TREND_BULLISH
+        if bearish_structure:
+            return TREND_BEARISH
+
+        if trend_regime == REGIME_BULLISH and swing_direction == SWING_UP:
+            return TREND_BULLISH
+        if trend_regime == REGIME_BEARISH and swing_direction == SWING_DOWN:
+            return TREND_BEARISH
+
+        ms = (market_state or "").upper()
+        if "BULLISH" in ms:
+            return TREND_BULLISH
+        if "BEARISH" in ms:
+            return TREND_BEARISH
+
+        return TREND_RANGE
 
     def update_from_engine(
         self,
@@ -351,6 +401,18 @@ class IncrementalStructureState:
         )
         delegated_state["immediate_slope"] = immediate_slope
         self._cached_fields["immediate_slope"] = immediate_slope
+
+        trend_state = self._detect_trend_state_from_cached_values(
+            columns_count=int(self._cached_fields.get("columns_count", len(getattr(engine, "columns", []) or []))),
+            market_state=self.market_state,
+            swing_direction=swing_direction,
+            trend_regime=trend_regime,
+            config=cfg,
+            last_two_meaningful_x_highs=self._cached_fields.get("last_two_meaningful_x_highs"),
+            last_two_meaningful_o_lows=self._cached_fields.get("last_two_meaningful_o_lows"),
+        )
+        delegated_state["trend_state"] = trend_state
+        self._cached_fields["trend_state"] = trend_state
         return delegated_state
 
     def implementation_status(self) -> dict[str, Any]:
