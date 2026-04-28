@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sqlite3
 import sys
 import time
@@ -29,6 +30,11 @@ if TYPE_CHECKING:
     from research_v2.structure_validation.incremental_structure_state import IncrementalStructureState
 
 VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE", "WATCH"}
+OPTIONAL_DIAGNOSTIC_SETUP_FIELDS = {
+    "continuation_strength_v1",
+    "cs_geometry_component",
+    "cs_profile_tag",
+}
 DEFAULT_FUNNEL_CSV_PATH = "exports/strategy_funnel_diagnostics.csv"
 DEFAULT_PERF_JSON_PATH = "exports/strategy_perf_summary.json"
 
@@ -124,7 +130,78 @@ def _build_shadow_mismatch_details(legacy_structure: dict, incremental_structure
     }
 
 
-def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict], Dict[str, float]]:
+def _is_numeric(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _values_equal_with_tolerance(legacy_value: Any, shadow_value: Any, tolerance: float = 1e-9) -> bool:
+    if _is_numeric(legacy_value) and _is_numeric(shadow_value):
+        legacy_float = float(legacy_value)
+        shadow_float = float(shadow_value)
+        if math.isnan(legacy_float) and math.isnan(shadow_float):
+            return True
+        return abs(legacy_float - shadow_float) <= tolerance
+    return legacy_value == shadow_value
+
+
+def _compare_strategy_results(legacy_result: Any, shadow_result: Any) -> Dict[str, Any]:
+    if legacy_result is None and shadow_result is None:
+        return {
+            "is_mismatch": False,
+            "differing_fields": [],
+            "status_mismatch": False,
+            "registration_impact_mismatch": False,
+        }
+
+    if (legacy_result is None) != (shadow_result is None):
+        legacy_status = str((legacy_result or {}).get("status") or "").upper()
+        shadow_status = str((shadow_result or {}).get("status") or "").upper()
+        return {
+            "is_mismatch": True,
+            "differing_fields": ["__presence__"],
+            "status_mismatch": legacy_status != shadow_status,
+            "registration_impact_mismatch": (
+                (legacy_status in VALIDATION_ELIGIBLE_STATUSES)
+                != (shadow_status in VALIDATION_ELIGIBLE_STATUSES)
+            ),
+        }
+
+    legacy_map = dict(legacy_result)
+    shadow_map = dict(shadow_result)
+    keys = sorted(set(legacy_map.keys()) | set(shadow_map.keys()))
+    differing_fields: List[str] = []
+    for key in keys:
+        legacy_has = key in legacy_map
+        shadow_has = key in shadow_map
+        legacy_value = legacy_map.get(key)
+        shadow_value = shadow_map.get(key)
+
+        if legacy_has and shadow_has and _values_equal_with_tolerance(legacy_value, shadow_value):
+            continue
+
+        if key in OPTIONAL_DIAGNOSTIC_SETUP_FIELDS and (
+            (not legacy_has and shadow_has and shadow_value is None)
+            or (legacy_has and not shadow_has and legacy_value is None)
+        ):
+            continue
+
+        differing_fields.append(key)
+
+    legacy_status = str(legacy_map.get("status") or "").upper()
+    shadow_status = str(shadow_map.get("status") or "").upper()
+    return {
+        "is_mismatch": bool(differing_fields),
+        "differing_fields": differing_fields,
+        "status_mismatch": legacy_status != shadow_status,
+        "registration_impact_mismatch": (
+            (legacy_status in VALIDATION_ELIGIBLE_STATUSES) != (shadow_status in VALIDATION_ELIGIBLE_STATUSES)
+        ),
+    }
+
+
+def evaluate_setups(
+    symbol: str, profile: PnFProfile, engine: PnFEngine
+) -> Tuple[dict, List[dict], Dict[str, float], Dict[str, Any]]:
     t_start = time.perf_counter()
     t0 = time.perf_counter()
     structure = build_structure_state(
@@ -163,7 +240,7 @@ def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tupl
         "elapsed_eval_short_s": elapsed_eval_short_s,
         "elapsed_total_s": elapsed_total_s,
     }
-    return structure, setups, timings
+    return structure, setups, timings, {"LONG": setup_long, "SHORT": setup_short}
 
 
 
@@ -343,6 +420,11 @@ def main() -> None:
                 "incremental_shadow_first_mismatch": None,
                 "incremental_shadow_update_s": 0.0,
                 "incremental_shadow_snapshot_s": 0.0,
+                "strategy_shadow_rows": 0,
+                "strategy_shadow_mismatches": 0,
+                "strategy_shadow_first_mismatch": None,
+                "strategy_shadow_status_mismatches": 0,
+                "strategy_shadow_registration_impact_mismatches": 0,
             }
         )
 
@@ -370,6 +452,11 @@ def main() -> None:
                     "incremental_shadow_first_mismatch": None,
                     "incremental_shadow_update_s": 0.0,
                     "incremental_shadow_snapshot_s": 0.0,
+                    "strategy_shadow_rows": 0,
+                    "strategy_shadow_mismatches": 0,
+                    "strategy_shadow_first_mismatch": None,
+                    "strategy_shadow_status_mismatches": 0,
+                    "strategy_shadow_registration_impact_mismatches": 0,
                 }
             )
         incremental_shadow_state: Any = None
@@ -404,7 +491,7 @@ def main() -> None:
             symbol_perf["elapsed_update_pending_s"] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            structure, setups, eval_timings = evaluate_setups(symbol, profile, engine)
+            structure, setups, eval_timings, legacy_setup_map = evaluate_setups(symbol, profile, engine)
             symbol_perf["elapsed_eval_s"] += time.perf_counter() - t0
             symbol_perf["setups_evaluated"] += len(setups)
             symbol_perf["candles"] += 1
@@ -439,6 +526,43 @@ def main() -> None:
                                 normalized_incremental,
                             ),
                         }
+
+                shadow_setup_map = {
+                    "LONG": evaluate_pullback_retest_long(
+                        symbol=symbol,
+                        profile=profile,
+                        columns=engine.columns,
+                        structure_state=incremental_structure,
+                    ),
+                    "SHORT": evaluate_pullback_retest_short(
+                        symbol=symbol,
+                        profile=profile,
+                        columns=engine.columns,
+                        structure_state=incremental_structure,
+                    ),
+                }
+                for side in ("LONG", "SHORT"):
+                    symbol_perf["strategy_shadow_rows"] += 1
+                    comparison = _compare_strategy_results(
+                        legacy_setup_map.get(side),
+                        shadow_setup_map.get(side),
+                    )
+                    if comparison["status_mismatch"]:
+                        symbol_perf["strategy_shadow_status_mismatches"] += 1
+                    if comparison["registration_impact_mismatch"]:
+                        symbol_perf["strategy_shadow_registration_impact_mismatches"] += 1
+                    if comparison["is_mismatch"]:
+                        symbol_perf["strategy_shadow_mismatches"] += 1
+                        if symbol_perf["strategy_shadow_first_mismatch"] is None:
+                            symbol_perf["strategy_shadow_first_mismatch"] = {
+                                "symbol": symbol,
+                                "close_ts": close_ts,
+                                "candle_index": i,
+                                "side": side,
+                                "differing_fields": comparison["differing_fields"],
+                                "legacy_result": legacy_setup_map.get(side),
+                                "shadow_result": shadow_setup_map.get(side),
+                            }
 
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
@@ -500,7 +624,9 @@ def main() -> None:
                     + (
                         " "
                         f"incremental_shadow_rows={symbol_perf['incremental_shadow_rows']} "
-                        f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']}"
+                        f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']} "
+                        f"strategy_shadow_rows={symbol_perf['strategy_shadow_rows']} "
+                        f"strategy_shadow_mismatches={symbol_perf['strategy_shadow_mismatches']}"
                         if args.incremental_shadow_structure
                         else ""
                     )
@@ -522,6 +648,14 @@ def main() -> None:
             run_perf["totals"]["incremental_shadow_mismatches"] += int(symbol_perf["incremental_shadow_mismatches"])
             run_perf["totals"]["incremental_shadow_update_s"] += float(symbol_perf["incremental_shadow_update_s"])
             run_perf["totals"]["incremental_shadow_snapshot_s"] += float(symbol_perf["incremental_shadow_snapshot_s"])
+            run_perf["totals"]["strategy_shadow_rows"] += int(symbol_perf["strategy_shadow_rows"])
+            run_perf["totals"]["strategy_shadow_mismatches"] += int(symbol_perf["strategy_shadow_mismatches"])
+            run_perf["totals"]["strategy_shadow_status_mismatches"] += int(
+                symbol_perf["strategy_shadow_status_mismatches"]
+            )
+            run_perf["totals"]["strategy_shadow_registration_impact_mismatches"] += int(
+                symbol_perf["strategy_shadow_registration_impact_mismatches"]
+            )
             if (
                 run_perf["totals"]["incremental_shadow_first_mismatch"] is None
                 and symbol_perf["incremental_shadow_first_mismatch"] is not None
@@ -529,6 +663,11 @@ def main() -> None:
                 run_perf["totals"]["incremental_shadow_first_mismatch"] = symbol_perf[
                     "incremental_shadow_first_mismatch"
                 ]
+            if (
+                run_perf["totals"]["strategy_shadow_first_mismatch"] is None
+                and symbol_perf["strategy_shadow_first_mismatch"] is not None
+            ):
+                run_perf["totals"]["strategy_shadow_first_mismatch"] = symbol_perf["strategy_shadow_first_mismatch"]
 
         perf_snapshot = validation_store.get_perf_snapshot()
         up = perf_snapshot["update_pending"].get(symbol, {})
@@ -558,7 +697,16 @@ def main() -> None:
                 f"{(float(symbol_perf['incremental_shadow_mismatches']) / float(symbol_perf['incremental_shadow_rows'])) if symbol_perf['incremental_shadow_rows'] > 0 else 0.0:.6f} "
                 f"incremental_shadow_update_s={symbol_perf['incremental_shadow_update_s']:.6f} "
                 f"incremental_shadow_snapshot_s={symbol_perf['incremental_shadow_snapshot_s']:.6f} "
-                f"incremental_shadow_first_mismatch={json.dumps(symbol_perf['incremental_shadow_first_mismatch'], sort_keys=True)}"
+                f"incremental_shadow_first_mismatch={json.dumps(symbol_perf['incremental_shadow_first_mismatch'], sort_keys=True)} "
+                f"strategy_shadow_rows={symbol_perf['strategy_shadow_rows']} "
+                "strategy_shadow_mismatch_rate="
+                f"{(float(symbol_perf['strategy_shadow_mismatches']) / float(symbol_perf['strategy_shadow_rows'])) if symbol_perf['strategy_shadow_rows'] > 0 else 0.0:.6f} "
+                f"strategy_shadow_mismatches={symbol_perf['strategy_shadow_mismatches']} "
+                f"strategy_shadow_status_mismatches={symbol_perf['strategy_shadow_status_mismatches']} "
+                "strategy_shadow_registration_impact_mismatch_rate="
+                f"{(float(symbol_perf['strategy_shadow_registration_impact_mismatches']) / float(symbol_perf['strategy_shadow_rows'])) if symbol_perf['strategy_shadow_rows'] > 0 else 0.0:.6f} "
+                f"strategy_shadow_registration_impact_mismatches={symbol_perf['strategy_shadow_registration_impact_mismatches']} "
+                f"strategy_shadow_first_mismatch={json.dumps(symbol_perf['strategy_shadow_first_mismatch'], sort_keys=True)}"
                 if args.incremental_shadow_structure
                 else ""
             )
@@ -626,7 +774,16 @@ def main() -> None:
             f"{(float(run_perf['totals']['incremental_shadow_mismatches']) / float(run_perf['totals']['incremental_shadow_rows'])) if run_perf['totals']['incremental_shadow_rows'] > 0 else 0.0:.6f} "
             f"incremental_shadow_update_s={run_perf['totals']['incremental_shadow_update_s']:.6f} "
             f"incremental_shadow_snapshot_s={run_perf['totals']['incremental_shadow_snapshot_s']:.6f} "
-            f"incremental_shadow_first_mismatch={json.dumps(run_perf['totals']['incremental_shadow_first_mismatch'], sort_keys=True)}"
+            f"incremental_shadow_first_mismatch={json.dumps(run_perf['totals']['incremental_shadow_first_mismatch'], sort_keys=True)} "
+            f"strategy_shadow_rows={run_perf['totals']['strategy_shadow_rows']} "
+            "strategy_shadow_mismatch_rate="
+            f"{(float(run_perf['totals']['strategy_shadow_mismatches']) / float(run_perf['totals']['strategy_shadow_rows'])) if run_perf['totals']['strategy_shadow_rows'] > 0 else 0.0:.6f} "
+            f"strategy_shadow_mismatches={run_perf['totals']['strategy_shadow_mismatches']} "
+            f"strategy_shadow_status_mismatches={run_perf['totals']['strategy_shadow_status_mismatches']} "
+            "strategy_shadow_registration_impact_mismatch_rate="
+            f"{(float(run_perf['totals']['strategy_shadow_registration_impact_mismatches']) / float(run_perf['totals']['strategy_shadow_rows'])) if run_perf['totals']['strategy_shadow_rows'] > 0 else 0.0:.6f} "
+            f"strategy_shadow_registration_impact_mismatches={run_perf['totals']['strategy_shadow_registration_impact_mismatches']} "
+            f"strategy_shadow_first_mismatch={json.dumps(run_perf['totals']['strategy_shadow_first_mismatch'], sort_keys=True)}"
             if args.incremental_shadow_structure
             else ""
         )
