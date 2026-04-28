@@ -14,6 +14,7 @@ import json
 import math
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +182,15 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
 
     mode = str(args.mode)
     implementation_status: dict[str, Any] = {}
+    timing_totals_ns: dict[str, int] = {
+        "legacy_state_build": 0,
+        "incremental_update": 0,
+        "incremental_snapshot": 0,
+        "incremental_update_and_snapshot": 0,
+        "normalize_and_diff": 0,
+        "candle_loop_total": 0,
+    }
+    timing_by_symbol_ns: dict[str, dict[str, int]] = {}
 
     for symbol in symbols:
         profile = _profile_for_symbol(settings_payload, symbol)
@@ -191,11 +201,21 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
         closed_candles = _load_closed_candles_read_only(db_path, symbol, max_candles)
 
         symbol_rows = 0
+        symbol_timing_ns = {
+            "legacy_state_build": 0,
+            "incremental_update": 0,
+            "incremental_snapshot": 0,
+            "incremental_update_and_snapshot": 0,
+            "normalize_and_diff": 0,
+            "candle_loop_total": 0,
+        }
         for idx, candle in enumerate(closed_candles, start=1):
+            candle_started_ns = time.perf_counter_ns()
             close_ts = int(candle["close_time"])
             close_price = float(candle["close"])
             engine.update_from_price(close_ts, close_price)
 
+            legacy_started_ns = time.perf_counter_ns()
             old_state = build_structure_state(
                 symbol=symbol,
                 profile=profile,
@@ -204,20 +224,37 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
                 market_state=engine.market_state(),
                 last_price=getattr(engine, "last_price", None),
             )
+            legacy_elapsed_ns = time.perf_counter_ns() - legacy_started_ns
+            symbol_timing_ns["legacy_state_build"] += legacy_elapsed_ns
+            timing_totals_ns["legacy_state_build"] += legacy_elapsed_ns
 
             if mode == "placeholder":
                 new_state = old_state
             else:
                 assert incremental_state is not None
+                incremental_update_started_ns = time.perf_counter_ns()
                 incremental_state.update_from_engine(
                     engine=engine,
                     latest_signal_name=engine.latest_signal_name(),
                     market_state=engine.market_state(),
                     last_price=getattr(engine, "last_price", None),
                 )
+                incremental_update_elapsed_ns = time.perf_counter_ns() - incremental_update_started_ns
+                symbol_timing_ns["incremental_update"] += incremental_update_elapsed_ns
+                timing_totals_ns["incremental_update"] += incremental_update_elapsed_ns
+
+                incremental_snapshot_started_ns = time.perf_counter_ns()
                 new_state = incremental_state.snapshot(engine=engine)
+                incremental_snapshot_elapsed_ns = time.perf_counter_ns() - incremental_snapshot_started_ns
+                symbol_timing_ns["incremental_snapshot"] += incremental_snapshot_elapsed_ns
+                timing_totals_ns["incremental_snapshot"] += incremental_snapshot_elapsed_ns
+
+                incremental_elapsed_ns = incremental_update_elapsed_ns + incremental_snapshot_elapsed_ns
+                symbol_timing_ns["incremental_update_and_snapshot"] += incremental_elapsed_ns
+                timing_totals_ns["incremental_update_and_snapshot"] += incremental_elapsed_ns
                 implementation_status[symbol] = incremental_state.implementation_status()
 
+            normalize_started_ns = time.perf_counter_ns()
             normalized_old, normalized_new = _normalize_pair(old_state, new_state)
             if normalized_old != normalized_new:
                 assert isinstance(normalized_old, dict)
@@ -231,14 +268,33 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
                         "new": normalized_new,
                     }
                 )
+            normalize_elapsed_ns = time.perf_counter_ns() - normalize_started_ns
+            symbol_timing_ns["normalize_and_diff"] += normalize_elapsed_ns
+            timing_totals_ns["normalize_and_diff"] += normalize_elapsed_ns
+
+            candle_elapsed_ns = time.perf_counter_ns() - candle_started_ns
+            symbol_timing_ns["candle_loop_total"] += candle_elapsed_ns
+            timing_totals_ns["candle_loop_total"] += candle_elapsed_ns
 
             symbol_rows += 1
             total_rows += 1
 
         rows_per_symbol[symbol] = symbol_rows
+        timing_by_symbol_ns[symbol] = symbol_timing_ns
 
     mismatch_count = len(mismatches)
     mismatch_rate = (float(mismatch_count) / float(total_rows)) if total_rows else 0.0
+    total_loop_seconds = float(timing_totals_ns["candle_loop_total"]) / 1_000_000_000.0
+    legacy_build_us_per_row = (
+        float(timing_totals_ns["legacy_state_build"]) / float(total_rows) / 1_000.0 if total_rows else 0.0
+    )
+    incremental_update_us_per_row = (
+        float(timing_totals_ns["incremental_update"]) / float(total_rows) / 1_000.0 if total_rows else 0.0
+    )
+    incremental_snapshot_us_per_row = (
+        float(timing_totals_ns["incremental_snapshot"]) / float(total_rows) / 1_000.0 if total_rows else 0.0
+    )
+    rows_per_second_total = (float(total_rows) / total_loop_seconds) if total_loop_seconds > 0.0 else 0.0
 
     mismatch_log_path: Path | None = None
     if args.mismatch_log:
@@ -261,6 +317,19 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
         "deterministic": True,
         "db_mode": "read_only",
         "mode": mode,
+        "timing_totals_ns": timing_totals_ns,
+        "timing_totals_ms": {key: round(value / 1_000_000.0, 6) for key, value in timing_totals_ns.items()},
+        "incremental_update_s": round(float(timing_totals_ns["incremental_update"]) / 1_000_000_000.0, 6),
+        "incremental_snapshot_s": round(float(timing_totals_ns["incremental_snapshot"]) / 1_000_000_000.0, 6),
+        "legacy_build_us_per_row": round(legacy_build_us_per_row, 6),
+        "incremental_update_us_per_row": round(incremental_update_us_per_row, 6),
+        "incremental_snapshot_us_per_row": round(incremental_snapshot_us_per_row, 6),
+        "rows_per_second_total": round(rows_per_second_total, 6),
+        "timing_by_symbol_ns": timing_by_symbol_ns,
+        "timing_by_symbol_ms": {
+            symbol: {key: round(value / 1_000_000.0, 6) for key, value in symbol_timings.items()}
+            for symbol, symbol_timings in timing_by_symbol_ns.items()
+        },
         "implementation_status": implementation_status if mode == "incremental" else {
             "snapshot_strategy": "placeholder_equals_legacy",
             "delegated_fields": "all",
