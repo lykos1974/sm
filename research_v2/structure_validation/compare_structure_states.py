@@ -181,6 +181,8 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
     total_rows = 0
 
     mode = str(args.mode)
+    ignore_notes = bool(args.ignore_notes)
+    ignored_fields = ["notes"] if ignore_notes else []
     implementation_status: dict[str, Any] = {}
     timing_totals_ns: dict[str, int] = {
         "legacy_state_build": 0,
@@ -196,7 +198,9 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
         profile = _profile_for_symbol(settings_payload, symbol)
         engine = PnFEngine(profile)
         incremental_state = (
-            IncrementalStructureState(symbol=symbol, profile=profile) if mode == "incremental" else None
+            IncrementalStructureState(symbol=symbol, profile=profile)
+            if mode in {"incremental", "incremental-nodelegate"}
+            else None
         )
         closed_candles = _load_closed_candles_read_only(db_path, symbol, max_candles)
 
@@ -244,7 +248,10 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
                 timing_totals_ns["incremental_update"] += incremental_update_elapsed_ns
 
                 incremental_snapshot_started_ns = time.perf_counter_ns()
-                new_state = incremental_state.snapshot(engine=engine)
+                if mode == "incremental-nodelegate":
+                    new_state = incremental_state.snapshot_no_delegate()
+                else:
+                    new_state = incremental_state.snapshot(engine=engine)
                 incremental_snapshot_elapsed_ns = time.perf_counter_ns() - incremental_snapshot_started_ns
                 symbol_timing_ns["incremental_snapshot"] += incremental_snapshot_elapsed_ns
                 timing_totals_ns["incremental_snapshot"] += incremental_snapshot_elapsed_ns
@@ -255,7 +262,13 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
                 implementation_status[symbol] = incremental_state.implementation_status()
 
             normalize_started_ns = time.perf_counter_ns()
-            normalized_old, normalized_new = _normalize_pair(old_state, new_state)
+            compare_old = dict(old_state)
+            compare_new = dict(new_state)
+            if ignore_notes:
+                compare_old.pop("notes", None)
+                compare_new.pop("notes", None)
+
+            normalized_old, normalized_new = _normalize_pair(compare_old, compare_new)
             if normalized_old != normalized_new:
                 assert isinstance(normalized_old, dict)
                 assert isinstance(normalized_new, dict)
@@ -317,6 +330,7 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
         "deterministic": True,
         "db_mode": "read_only",
         "mode": mode,
+        "ignored_fields": ignored_fields,
         "timing_totals_ns": timing_totals_ns,
         "timing_totals_ms": {key: round(value / 1_000_000.0, 6) for key, value in timing_totals_ns.items()},
         "incremental_update_s": round(float(timing_totals_ns["incremental_update"]) / 1_000_000_000.0, 6),
@@ -330,7 +344,7 @@ def compare_structure_states(args: argparse.Namespace) -> dict[str, Any]:
             symbol: {key: round(value / 1_000_000.0, 6) for key, value in symbol_timings.items()}
             for symbol, symbol_timings in timing_by_symbol_ns.items()
         },
-        "implementation_status": implementation_status if mode == "incremental" else {
+        "implementation_status": implementation_status if mode in {"incremental", "incremental-nodelegate"} else {
             "snapshot_strategy": "placeholder_equals_legacy",
             "delegated_fields": "all",
         },
@@ -349,9 +363,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["placeholder", "incremental"],
+        choices=["placeholder", "incremental", "incremental-nodelegate"],
         default="placeholder",
-        help="Comparison mode: placeholder mirrors legacy; incremental uses IncrementalStructureState prototype",
+        help=(
+            "Comparison mode: placeholder mirrors legacy; incremental uses delegated snapshot; "
+            "incremental-nodelegate uses cache-only snapshot without build_structure_state delegation"
+        ),
+    )
+    parser.add_argument(
+        "--ignore-notes",
+        action="store_true",
+        help="Ignore 'notes' field during comparison and report ignored_fields=['notes']",
     )
     return parser
 
