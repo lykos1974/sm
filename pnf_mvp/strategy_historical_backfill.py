@@ -11,9 +11,10 @@ import argparse
 import csv
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 from pnf_engine import PnFProfile, PnFEngine
 from storage import Storage
@@ -23,6 +24,9 @@ from strategy_validation import StrategyValidationStore
 
 # BE module (ready for future integration)
 from trade_management_be import BE_MODE, BE_TRIGGER_R
+
+if TYPE_CHECKING:
+    from research_v2.structure_validation.incremental_structure_state import IncrementalStructureState
 
 VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE", "WATCH"}
 DEFAULT_FUNNEL_CSV_PATH = "exports/strategy_funnel_diagnostics.csv"
@@ -92,6 +96,32 @@ def load_all_closed_candles(storage: Storage, symbol: str) -> List[dict]:
     candles = storage.load_recent_candles(symbol, None)
     return candles[:-1] if len(candles) > 1 else []
 
+
+def _shadow_normalize_structure(value: Any) -> Any:
+    if isinstance(value, dict):
+        normalized: Dict[str, Any] = {}
+        for key, nested_value in value.items():
+            if key == "notes":
+                continue
+            normalized[key] = _shadow_normalize_structure(nested_value)
+        return normalized
+    if isinstance(value, list):
+        return [_shadow_normalize_structure(item) for item in value]
+    return value
+
+
+def _build_shadow_mismatch_details(legacy_structure: dict, incremental_structure: dict) -> Dict[str, Any]:
+    legacy_keys = set(legacy_structure.keys())
+    incremental_keys = set(incremental_structure.keys())
+    return {
+        "missing_in_incremental": sorted(legacy_keys - incremental_keys),
+        "extra_in_incremental": sorted(incremental_keys - legacy_keys),
+        "value_differences": sorted(
+            key
+            for key in (legacy_keys & incremental_keys)
+            if legacy_structure.get(key) != incremental_structure.get(key)
+        ),
+    }
 
 
 def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine) -> Tuple[dict, List[dict], Dict[str, float]]:
@@ -269,6 +299,11 @@ def main() -> None:
         default=1000,
         help="Emit perf progress log every N candles per symbol",
     )
+    parser.add_argument(
+        "--incremental-shadow-structure",
+        action="store_true",
+        help="Run incremental structure shadow comparison without changing strategy behavior",
+    )
     args = parser.parse_args()
 
     settings = load_settings(args.settings)
@@ -300,6 +335,16 @@ def main() -> None:
             "elapsed_eval_short_s": 0.0,
         },
     }
+    if args.incremental_shadow_structure:
+        run_perf["totals"].update(
+            {
+                "incremental_shadow_rows": 0,
+                "incremental_shadow_mismatches": 0,
+                "incremental_shadow_first_mismatch": None,
+                "incremental_shadow_update_s": 0.0,
+                "incremental_shadow_snapshot_s": 0.0,
+            }
+        )
 
     for symbol in symbols:
         profile = profiles[symbol]
@@ -317,6 +362,24 @@ def main() -> None:
             "elapsed_eval_long_s": 0.0,
             "elapsed_eval_short_s": 0.0,
         }
+        if args.incremental_shadow_structure:
+            symbol_perf.update(
+                {
+                    "incremental_shadow_rows": 0,
+                    "incremental_shadow_mismatches": 0,
+                    "incremental_shadow_first_mismatch": None,
+                    "incremental_shadow_update_s": 0.0,
+                    "incremental_shadow_snapshot_s": 0.0,
+                }
+            )
+        incremental_shadow_state: Any = None
+        if args.incremental_shadow_structure:
+            repo_root = Path(__file__).resolve().parents[1]
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            from research_v2.structure_validation.incremental_structure_state import IncrementalStructureState
+
+            incremental_shadow_state = IncrementalStructureState(symbol=symbol, profile=profile)
         progress_every = max(1, int(args.perf_progress_every))
 
         for i, candle in enumerate(candles, start=1):
@@ -348,6 +411,34 @@ def main() -> None:
             symbol_perf["elapsed_build_structure_s"] += float(eval_timings["elapsed_build_structure_s"])
             symbol_perf["elapsed_eval_long_s"] += float(eval_timings["elapsed_eval_long_s"])
             symbol_perf["elapsed_eval_short_s"] += float(eval_timings["elapsed_eval_short_s"])
+            if incremental_shadow_state is not None:
+                t_shadow = time.perf_counter()
+                incremental_shadow_state.update_from_engine(
+                    engine=engine,
+                    latest_signal_name=engine.latest_signal_name(),
+                    market_state=engine.market_state(),
+                    last_price=getattr(engine, "last_price", None),
+                )
+                symbol_perf["incremental_shadow_update_s"] += time.perf_counter() - t_shadow
+
+                t_shadow = time.perf_counter()
+                incremental_structure = incremental_shadow_state.snapshot_no_delegate()
+                symbol_perf["incremental_shadow_snapshot_s"] += time.perf_counter() - t_shadow
+                symbol_perf["incremental_shadow_rows"] += 1
+
+                normalized_legacy = _shadow_normalize_structure(structure)
+                normalized_incremental = _shadow_normalize_structure(incremental_structure)
+                if normalized_legacy != normalized_incremental:
+                    symbol_perf["incremental_shadow_mismatches"] += 1
+                    if symbol_perf["incremental_shadow_first_mismatch"] is None:
+                        symbol_perf["incremental_shadow_first_mismatch"] = {
+                            "symbol": symbol,
+                            "close_ts": close_ts,
+                            "details": _build_shadow_mismatch_details(
+                                normalized_legacy,
+                                normalized_incremental,
+                            ),
+                        }
 
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
@@ -406,6 +497,13 @@ def main() -> None:
                     f"elapsed_build_structure_ms={symbol_perf['elapsed_build_structure_s'] * 1000.0:.3f} "
                     f"elapsed_eval_long_ms={symbol_perf['elapsed_eval_long_s'] * 1000.0:.3f} "
                     f"elapsed_eval_short_ms={symbol_perf['elapsed_eval_short_s'] * 1000.0:.3f}"
+                    + (
+                        " "
+                        f"incremental_shadow_rows={symbol_perf['incremental_shadow_rows']} "
+                        f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']}"
+                        if args.incremental_shadow_structure
+                        else ""
+                    )
                 )
 
         run_perf["symbols"][symbol] = symbol_perf
@@ -419,6 +517,18 @@ def main() -> None:
         run_perf["totals"]["elapsed_build_structure_s"] += float(symbol_perf["elapsed_build_structure_s"])
         run_perf["totals"]["elapsed_eval_long_s"] += float(symbol_perf["elapsed_eval_long_s"])
         run_perf["totals"]["elapsed_eval_short_s"] += float(symbol_perf["elapsed_eval_short_s"])
+        if args.incremental_shadow_structure:
+            run_perf["totals"]["incremental_shadow_rows"] += int(symbol_perf["incremental_shadow_rows"])
+            run_perf["totals"]["incremental_shadow_mismatches"] += int(symbol_perf["incremental_shadow_mismatches"])
+            run_perf["totals"]["incremental_shadow_update_s"] += float(symbol_perf["incremental_shadow_update_s"])
+            run_perf["totals"]["incremental_shadow_snapshot_s"] += float(symbol_perf["incremental_shadow_snapshot_s"])
+            if (
+                run_perf["totals"]["incremental_shadow_first_mismatch"] is None
+                and symbol_perf["incremental_shadow_first_mismatch"] is not None
+            ):
+                run_perf["totals"]["incremental_shadow_first_mismatch"] = symbol_perf[
+                    "incremental_shadow_first_mismatch"
+                ]
 
         perf_snapshot = validation_store.get_perf_snapshot()
         up = perf_snapshot["update_pending"].get(symbol, {})
@@ -440,6 +550,18 @@ def main() -> None:
             f"elapsed_build_structure_s={symbol_perf['elapsed_build_structure_s']:.6f} "
             f"elapsed_eval_long_s={symbol_perf['elapsed_eval_long_s']:.6f} "
             f"elapsed_eval_short_s={symbol_perf['elapsed_eval_short_s']:.6f}"
+            + (
+                " "
+                f"incremental_shadow_rows={symbol_perf['incremental_shadow_rows']} "
+                f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']} "
+                f"incremental_shadow_mismatch_rate="
+                f"{(float(symbol_perf['incremental_shadow_mismatches']) / float(symbol_perf['incremental_shadow_rows'])) if symbol_perf['incremental_shadow_rows'] > 0 else 0.0:.6f} "
+                f"incremental_shadow_update_s={symbol_perf['incremental_shadow_update_s']:.6f} "
+                f"incremental_shadow_snapshot_s={symbol_perf['incremental_shadow_snapshot_s']:.6f} "
+                f"incremental_shadow_first_mismatch={json.dumps(symbol_perf['incremental_shadow_first_mismatch'], sort_keys=True)}"
+                if args.incremental_shadow_structure
+                else ""
+            )
         )
 
     csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
@@ -496,6 +618,18 @@ def main() -> None:
         f"symbols={len(symbols)} total_candles={run_perf['totals']['candles']} "
         f"total_scanned={update_pending_total_scanned} total_sql_updates={update_pending_total_sql_updates} "
         f"hottest_symbol={hottest_symbol} hottest_stage={hottest_stage}"
+        + (
+            " "
+            f"incremental_shadow_rows={run_perf['totals']['incremental_shadow_rows']} "
+            f"incremental_shadow_mismatches={run_perf['totals']['incremental_shadow_mismatches']} "
+            "incremental_shadow_mismatch_rate="
+            f"{(float(run_perf['totals']['incremental_shadow_mismatches']) / float(run_perf['totals']['incremental_shadow_rows'])) if run_perf['totals']['incremental_shadow_rows'] > 0 else 0.0:.6f} "
+            f"incremental_shadow_update_s={run_perf['totals']['incremental_shadow_update_s']:.6f} "
+            f"incremental_shadow_snapshot_s={run_perf['totals']['incremental_shadow_snapshot_s']:.6f} "
+            f"incremental_shadow_first_mismatch={json.dumps(run_perf['totals']['incremental_shadow_first_mismatch'], sort_keys=True)}"
+            if args.incremental_shadow_structure
+            else ""
+        )
     )
 
     perf_output = {
