@@ -490,12 +490,116 @@ class IncrementalStructureState:
         self._cached_fields["breakout_context"] = breakout_context
         return delegated_state
 
+    def snapshot_no_delegate(self) -> dict[str, Any]:
+        """Build structure snapshot purely from cached incremental fields.
+
+        Notes are intentionally returned as an empty list because they are
+        non-decision/debug metadata and remain the only known schema-compatible
+        difference risk versus the delegated legacy snapshot.
+        """
+        cfg = self.config if self.config is not None else StructureConfig()
+        columns_count = int(self._cached_fields.get("columns_count", 0) or 0)
+
+        swing_direction = self._detect_swing_direction_from_cached_values(
+            last_two_meaningful_x_highs=self._cached_fields.get("last_two_meaningful_x_highs"),
+            last_two_meaningful_o_lows=self._cached_fields.get("last_two_meaningful_o_lows"),
+            last_completed_kind=self._cached_fields.get("last_completed_kind"),
+            columns_count=columns_count,
+        )
+
+        trend_regime = self._detect_trend_regime_from_cached_values(
+            columns_count=columns_count,
+            market_state=self.market_state,
+            swing_direction=swing_direction,
+            config=cfg,
+            last_two_meaningful_x_highs=self._cached_fields.get("last_two_meaningful_x_highs"),
+            last_two_meaningful_o_lows=self._cached_fields.get("last_two_meaningful_o_lows"),
+            last_meaningful_x_high=self._cached_fields.get("last_meaningful_x_high"),
+            last_meaningful_o_low=self._cached_fields.get("last_meaningful_o_low"),
+            current_column_top=self._cached_fields.get("current_column_top"),
+            current_column_bottom=self._cached_fields.get("current_column_bottom"),
+            completed_column_kinds=self._cached_fields.get("completed_column_kinds"),
+        )
+
+        trend_state = self._detect_trend_state_from_cached_values(
+            columns_count=columns_count,
+            market_state=self.market_state,
+            swing_direction=swing_direction,
+            trend_regime=trend_regime,
+            config=cfg,
+            last_two_meaningful_x_highs=self._cached_fields.get("last_two_meaningful_x_highs"),
+            last_two_meaningful_o_lows=self._cached_fields.get("last_two_meaningful_o_lows"),
+        )
+
+        immediate_slope = self._detect_immediate_slope_from_cached_values(
+            current_column_kind=self._cached_fields.get("current_column_kind"),
+            trend_regime=trend_regime,
+            trend_state=trend_state,
+        )
+
+        breakout_context = self._detect_breakout_context_from_cached_values(
+            columns_count=columns_count,
+            active_leg_boxes=int(self._cached_fields.get("active_leg_boxes", 0) or 0),
+            extension_boxes_threshold=int(getattr(cfg, "extension_boxes_threshold", StructureConfig().extension_boxes_threshold)),
+            current_column_kind=self._cached_fields.get("current_column_kind"),
+            current_column_top=self._cached_fields.get("current_column_top"),
+            current_column_bottom=self._cached_fields.get("current_column_bottom"),
+            trend_regime=trend_regime,
+            previous_x_top_before_current=self._cached_fields.get("previous_x_top_before_current"),
+            previous_o_bottom_before_current=self._cached_fields.get("previous_o_bottom_before_current"),
+        )
+
+        impulse_boxes = None
+        pullback_boxes = None
+        impulse_to_pullback_ratio = None
+        if (
+            breakout_context == BREAKOUT_POST_BULLISH_PULLBACK
+            and self._cached_fields.get("current_column_kind") == "O"
+            and immediate_slope == SLOPE_BEARISH_PULLBACK
+        ):
+            impulse_boxes = self._cached_fields.get("prev_x_span_boxes")
+            pullback_boxes = self._cached_fields.get("current_column_span_boxes")
+            if (
+                isinstance(impulse_boxes, (int, float))
+                and isinstance(pullback_boxes, (int, float))
+                and pullback_boxes != 0
+            ):
+                impulse_to_pullback_ratio = float(impulse_boxes) / float(pullback_boxes)
+
+        return {
+            "symbol": self.symbol,
+            "trend_state": trend_state,
+            "trend_regime": trend_regime,
+            "immediate_slope": immediate_slope,
+            "swing_direction": swing_direction,
+            "support_level": self._cached_fields.get("last_meaningful_o_low"),
+            "resistance_level": self._cached_fields.get("last_meaningful_x_high"),
+            "breakout_context": breakout_context,
+            "is_extended_move": bool(self._cached_fields.get("is_extended_move", False)),
+            "active_leg_boxes": int(self._cached_fields.get("active_leg_boxes", 0) or 0),
+            "impulse_boxes": impulse_boxes,
+            "pullback_boxes": pullback_boxes,
+            "impulse_to_pullback_ratio": impulse_to_pullback_ratio,
+            "last_meaningful_x_high": self._cached_fields.get("last_meaningful_x_high"),
+            "last_meaningful_o_low": self._cached_fields.get("last_meaningful_o_low"),
+            "current_column_kind": self._cached_fields.get("current_column_kind"),
+            "current_column_top": self._cached_fields.get("current_column_top"),
+            "current_column_bottom": self._cached_fields.get("current_column_bottom"),
+            "latest_signal_name": self.latest_signal_name,
+            "market_state": self.market_state,
+            "last_price": self.last_price,
+            "notes": [],
+        }
+
     def implementation_status(self) -> dict[str, Any]:
         """Expose which parts are cached incrementally vs delegated."""
         cached_fields = set(self._cached_fields.keys())
         return {
             "cached_fields": sorted(cached_fields),
             "delegated_fields": list(self._delegated_snapshot_fields),
-            "snapshot_strategy": "delegated_to_build_structure_state",
+            "snapshot_strategies": [
+                "delegated_to_build_structure_state",
+                "cached_incremental_no_delegate",
+            ],
             "columns_observed": self._last_columns_count,
         }
