@@ -381,7 +381,14 @@ def main() -> None:
         action="store_true",
         help="Run incremental structure shadow comparison without changing strategy behavior",
     )
+    parser.add_argument(
+        "--use-incremental-structure",
+        action="store_true",
+        help="Use incremental structure snapshot as authoritative strategy structure with mandatory legacy guard comparisons",
+    )
     args = parser.parse_args()
+    use_incremental_authoritative = bool(args.use_incremental_structure)
+    use_incremental_shadow = bool(args.incremental_shadow_structure or use_incremental_authoritative)
 
     settings = load_settings(args.settings)
     validation_db_path = settings.get("strategy_validation_db_path", "strategy_validation.db")
@@ -410,9 +417,10 @@ def main() -> None:
             "elapsed_build_structure_s": 0.0,
             "elapsed_eval_long_s": 0.0,
             "elapsed_eval_short_s": 0.0,
+            "structure_source": "incremental" if use_incremental_authoritative else "legacy",
         },
     }
-    if args.incremental_shadow_structure:
+    if use_incremental_shadow:
         run_perf["totals"].update(
             {
                 "incremental_shadow_rows": 0,
@@ -444,7 +452,7 @@ def main() -> None:
             "elapsed_eval_long_s": 0.0,
             "elapsed_eval_short_s": 0.0,
         }
-        if args.incremental_shadow_structure:
+        if use_incremental_shadow:
             symbol_perf.update(
                 {
                     "incremental_shadow_rows": 0,
@@ -459,8 +467,9 @@ def main() -> None:
                     "strategy_shadow_registration_impact_mismatches": 0,
                 }
             )
+        symbol_perf["structure_source"] = "incremental" if use_incremental_authoritative else "legacy"
         incremental_shadow_state: Any = None
-        if args.incremental_shadow_structure:
+        if use_incremental_shadow:
             repo_root = Path(__file__).resolve().parents[1]
             if str(repo_root) not in sys.path:
                 sys.path.insert(0, str(repo_root))
@@ -491,13 +500,16 @@ def main() -> None:
             symbol_perf["elapsed_update_pending_s"] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            structure, setups, eval_timings, legacy_setup_map = evaluate_setups(symbol, profile, engine)
+            legacy_structure, _legacy_setups, eval_timings, legacy_setup_map = evaluate_setups(symbol, profile, engine)
             symbol_perf["elapsed_eval_s"] += time.perf_counter() - t0
-            symbol_perf["setups_evaluated"] += len(setups)
             symbol_perf["candles"] += 1
             symbol_perf["elapsed_build_structure_s"] += float(eval_timings["elapsed_build_structure_s"])
             symbol_perf["elapsed_eval_long_s"] += float(eval_timings["elapsed_eval_long_s"])
             symbol_perf["elapsed_eval_short_s"] += float(eval_timings["elapsed_eval_short_s"])
+            structure = legacy_structure
+            setup_map = legacy_setup_map
+            if use_incremental_authoritative and incremental_shadow_state is None:
+                raise RuntimeError("incremental authoritative mode requires initialized incremental shadow state")
             if incremental_shadow_state is not None:
                 t_shadow = time.perf_counter()
                 incremental_shadow_state.update_from_engine(
@@ -513,7 +525,7 @@ def main() -> None:
                 symbol_perf["incremental_shadow_snapshot_s"] += time.perf_counter() - t_shadow
                 symbol_perf["incremental_shadow_rows"] += 1
 
-                normalized_legacy = _shadow_normalize_structure(structure)
+                normalized_legacy = _shadow_normalize_structure(legacy_structure)
                 normalized_incremental = _shadow_normalize_structure(incremental_structure)
                 if normalized_legacy != normalized_incremental:
                     symbol_perf["incremental_shadow_mismatches"] += 1
@@ -563,6 +575,27 @@ def main() -> None:
                                 "legacy_result": legacy_setup_map.get(side),
                                 "shadow_result": shadow_setup_map.get(side),
                             }
+                    if use_incremental_authoritative and (
+                        comparison["status_mismatch"] or comparison["registration_impact_mismatch"]
+                    ):
+                        print(
+                            "[GUARD_FAIL] "
+                            f"symbol={symbol} close_ts={close_ts} candle_index={i} side={side} "
+                            f"status_mismatch={comparison['status_mismatch']} "
+                            "registration_impact_mismatch="
+                            f"{comparison['registration_impact_mismatch']} "
+                            f"first_structure_mismatch={json.dumps(symbol_perf['incremental_shadow_first_mismatch'], sort_keys=True)} "
+                            f"first_strategy_mismatch={json.dumps(symbol_perf['strategy_shadow_first_mismatch'], sort_keys=True)}"
+                        )
+                        raise RuntimeError(
+                            "Incremental authoritative guard failure: strategy status/registration-impact mismatch detected"
+                        )
+                if use_incremental_authoritative:
+                    structure = incremental_structure
+                    setup_map = shadow_setup_map
+
+            setups = [s for s in (setup_map.get("LONG"), setup_map.get("SHORT")) if s]
+            symbol_perf["setups_evaluated"] += len(setups)
 
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
@@ -627,7 +660,7 @@ def main() -> None:
                         f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']} "
                         f"strategy_shadow_rows={symbol_perf['strategy_shadow_rows']} "
                         f"strategy_shadow_mismatches={symbol_perf['strategy_shadow_mismatches']}"
-                        if args.incremental_shadow_structure
+                        if use_incremental_shadow
                         else ""
                     )
                 )
@@ -643,7 +676,7 @@ def main() -> None:
         run_perf["totals"]["elapsed_build_structure_s"] += float(symbol_perf["elapsed_build_structure_s"])
         run_perf["totals"]["elapsed_eval_long_s"] += float(symbol_perf["elapsed_eval_long_s"])
         run_perf["totals"]["elapsed_eval_short_s"] += float(symbol_perf["elapsed_eval_short_s"])
-        if args.incremental_shadow_structure:
+        if use_incremental_shadow:
             run_perf["totals"]["incremental_shadow_rows"] += int(symbol_perf["incremental_shadow_rows"])
             run_perf["totals"]["incremental_shadow_mismatches"] += int(symbol_perf["incremental_shadow_mismatches"])
             run_perf["totals"]["incremental_shadow_update_s"] += float(symbol_perf["incremental_shadow_update_s"])
@@ -688,7 +721,8 @@ def main() -> None:
             f"elapsed_register_s={symbol_perf['elapsed_register_s']:.6f} "
             f"elapsed_build_structure_s={symbol_perf['elapsed_build_structure_s']:.6f} "
             f"elapsed_eval_long_s={symbol_perf['elapsed_eval_long_s']:.6f} "
-            f"elapsed_eval_short_s={symbol_perf['elapsed_eval_short_s']:.6f}"
+            f"elapsed_eval_short_s={symbol_perf['elapsed_eval_short_s']:.6f} "
+            f"structure_source={symbol_perf['structure_source']}"
             + (
                 " "
                 f"incremental_shadow_rows={symbol_perf['incremental_shadow_rows']} "
@@ -707,7 +741,7 @@ def main() -> None:
                 f"{(float(symbol_perf['strategy_shadow_registration_impact_mismatches']) / float(symbol_perf['strategy_shadow_rows'])) if symbol_perf['strategy_shadow_rows'] > 0 else 0.0:.6f} "
                 f"strategy_shadow_registration_impact_mismatches={symbol_perf['strategy_shadow_registration_impact_mismatches']} "
                 f"strategy_shadow_first_mismatch={json.dumps(symbol_perf['strategy_shadow_first_mismatch'], sort_keys=True)}"
-                if args.incremental_shadow_structure
+                if use_incremental_shadow
                 else ""
             )
         )
@@ -765,7 +799,8 @@ def main() -> None:
         "[PERF_RUN] "
         f"symbols={len(symbols)} total_candles={run_perf['totals']['candles']} "
         f"total_scanned={update_pending_total_scanned} total_sql_updates={update_pending_total_sql_updates} "
-        f"hottest_symbol={hottest_symbol} hottest_stage={hottest_stage}"
+        f"hottest_symbol={hottest_symbol} hottest_stage={hottest_stage} "
+        f"structure_source={run_perf['totals']['structure_source']}"
         + (
             " "
             f"incremental_shadow_rows={run_perf['totals']['incremental_shadow_rows']} "
@@ -784,7 +819,7 @@ def main() -> None:
             f"{(float(run_perf['totals']['strategy_shadow_registration_impact_mismatches']) / float(run_perf['totals']['strategy_shadow_rows'])) if run_perf['totals']['strategy_shadow_rows'] > 0 else 0.0:.6f} "
             f"strategy_shadow_registration_impact_mismatches={run_perf['totals']['strategy_shadow_registration_impact_mismatches']} "
             f"strategy_shadow_first_mismatch={json.dumps(run_perf['totals']['strategy_shadow_first_mismatch'], sort_keys=True)}"
-            if args.incremental_shadow_structure
+            if use_incremental_shadow
             else ""
         )
     )
