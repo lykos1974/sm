@@ -417,6 +417,12 @@ def main() -> None:
             "elapsed_build_structure_s": 0.0,
             "elapsed_eval_long_s": 0.0,
             "elapsed_eval_short_s": 0.0,
+            "structure_compare_s": 0.0,
+            "shadow_strategy_eval_s": 0.0,
+            "shadow_compare_s": 0.0,
+            "funnel_row_build_s": 0.0,
+            "funnel_csv_write_s": 0.0,
+            "perf_json_write_s": 0.0,
             "structure_source": "incremental" if use_incremental_authoritative else "legacy",
         },
     }
@@ -451,6 +457,10 @@ def main() -> None:
             "elapsed_build_structure_s": 0.0,
             "elapsed_eval_long_s": 0.0,
             "elapsed_eval_short_s": 0.0,
+            "structure_compare_s": 0.0,
+            "shadow_strategy_eval_s": 0.0,
+            "shadow_compare_s": 0.0,
+            "funnel_row_build_s": 0.0,
         }
         if use_incremental_shadow:
             symbol_perf.update(
@@ -525,6 +535,7 @@ def main() -> None:
                 symbol_perf["incremental_shadow_snapshot_s"] += time.perf_counter() - t_shadow
                 symbol_perf["incremental_shadow_rows"] += 1
 
+                t_structure_compare = time.perf_counter()
                 normalized_legacy = _shadow_normalize_structure(legacy_structure)
                 normalized_incremental = _shadow_normalize_structure(incremental_structure)
                 if normalized_legacy != normalized_incremental:
@@ -538,7 +549,9 @@ def main() -> None:
                                 normalized_incremental,
                             ),
                         }
+                symbol_perf["structure_compare_s"] += time.perf_counter() - t_structure_compare
 
+                t_shadow_eval = time.perf_counter()
                 shadow_setup_map = {
                     "LONG": evaluate_pullback_retest_long(
                         symbol=symbol,
@@ -553,6 +566,9 @@ def main() -> None:
                         structure_state=incremental_structure,
                     ),
                 }
+                symbol_perf["shadow_strategy_eval_s"] += time.perf_counter() - t_shadow_eval
+
+                t_shadow_compare = time.perf_counter()
                 for side in ("LONG", "SHORT"):
                     symbol_perf["strategy_shadow_rows"] += 1
                     comparison = _compare_strategy_results(
@@ -590,6 +606,7 @@ def main() -> None:
                         raise RuntimeError(
                             "Incremental authoritative guard failure: strategy status/registration-impact mismatch detected"
                         )
+                symbol_perf["shadow_compare_s"] += time.perf_counter() - t_shadow_compare
                 if use_incremental_authoritative:
                     structure = incremental_structure
                     setup_map = shadow_setup_map
@@ -624,6 +641,7 @@ def main() -> None:
                         if setup_id is None and not validation_store.allow_multiple_trades_per_symbol:
                             blocked_by_open_trade = True
 
+                t_funnel_row = time.perf_counter()
                 funnel_rows.append(
                     build_funnel_row(
                         symbol=symbol,
@@ -634,6 +652,7 @@ def main() -> None:
                         registered_to_validation=registered_to_validation,
                     )
                 )
+                symbol_perf["funnel_row_build_s"] += time.perf_counter() - t_funnel_row
 
             if i % progress_every == 0:
                 perf_snapshot = validation_store.get_perf_snapshot()
@@ -653,11 +672,15 @@ def main() -> None:
                     f"elapsed_register_ms={elapsed_register_ms:.3f} "
                     f"elapsed_build_structure_ms={symbol_perf['elapsed_build_structure_s'] * 1000.0:.3f} "
                     f"elapsed_eval_long_ms={symbol_perf['elapsed_eval_long_s'] * 1000.0:.3f} "
-                    f"elapsed_eval_short_ms={symbol_perf['elapsed_eval_short_s'] * 1000.0:.3f}"
+                    f"elapsed_eval_short_ms={symbol_perf['elapsed_eval_short_s'] * 1000.0:.3f} "
+                    f"funnel_row_build_ms={symbol_perf['funnel_row_build_s'] * 1000.0:.3f}"
                     + (
                         " "
                         f"incremental_shadow_rows={symbol_perf['incremental_shadow_rows']} "
                         f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']} "
+                        f"structure_compare_ms={symbol_perf['structure_compare_s'] * 1000.0:.3f} "
+                        f"shadow_strategy_eval_ms={symbol_perf['shadow_strategy_eval_s'] * 1000.0:.3f} "
+                        f"shadow_compare_ms={symbol_perf['shadow_compare_s'] * 1000.0:.3f} "
                         f"strategy_shadow_rows={symbol_perf['strategy_shadow_rows']} "
                         f"strategy_shadow_mismatches={symbol_perf['strategy_shadow_mismatches']}"
                         if use_incremental_shadow
@@ -676,6 +699,10 @@ def main() -> None:
         run_perf["totals"]["elapsed_build_structure_s"] += float(symbol_perf["elapsed_build_structure_s"])
         run_perf["totals"]["elapsed_eval_long_s"] += float(symbol_perf["elapsed_eval_long_s"])
         run_perf["totals"]["elapsed_eval_short_s"] += float(symbol_perf["elapsed_eval_short_s"])
+        run_perf["totals"]["structure_compare_s"] += float(symbol_perf["structure_compare_s"])
+        run_perf["totals"]["shadow_strategy_eval_s"] += float(symbol_perf["shadow_strategy_eval_s"])
+        run_perf["totals"]["shadow_compare_s"] += float(symbol_perf["shadow_compare_s"])
+        run_perf["totals"]["funnel_row_build_s"] += float(symbol_perf["funnel_row_build_s"])
         if use_incremental_shadow:
             run_perf["totals"]["incremental_shadow_rows"] += int(symbol_perf["incremental_shadow_rows"])
             run_perf["totals"]["incremental_shadow_mismatches"] += int(symbol_perf["incremental_shadow_mismatches"])
@@ -722,15 +749,22 @@ def main() -> None:
             f"elapsed_build_structure_s={symbol_perf['elapsed_build_structure_s']:.6f} "
             f"elapsed_eval_long_s={symbol_perf['elapsed_eval_long_s']:.6f} "
             f"elapsed_eval_short_s={symbol_perf['elapsed_eval_short_s']:.6f} "
+            f"funnel_row_build_s={symbol_perf['funnel_row_build_s']:.6f} "
             f"structure_source={symbol_perf['structure_source']}"
             + (
                 " "
                 f"incremental_shadow_rows={symbol_perf['incremental_shadow_rows']} "
                 f"incremental_shadow_mismatches={symbol_perf['incremental_shadow_mismatches']} "
+                        f"structure_compare_ms={symbol_perf['structure_compare_s'] * 1000.0:.3f} "
+                        f"shadow_strategy_eval_ms={symbol_perf['shadow_strategy_eval_s'] * 1000.0:.3f} "
+                        f"shadow_compare_ms={symbol_perf['shadow_compare_s'] * 1000.0:.3f} "
                 f"incremental_shadow_mismatch_rate="
                 f"{(float(symbol_perf['incremental_shadow_mismatches']) / float(symbol_perf['incremental_shadow_rows'])) if symbol_perf['incremental_shadow_rows'] > 0 else 0.0:.6f} "
                 f"incremental_shadow_update_s={symbol_perf['incremental_shadow_update_s']:.6f} "
                 f"incremental_shadow_snapshot_s={symbol_perf['incremental_shadow_snapshot_s']:.6f} "
+                f"structure_compare_s={symbol_perf['structure_compare_s']:.6f} "
+                f"shadow_strategy_eval_s={symbol_perf['shadow_strategy_eval_s']:.6f} "
+                f"shadow_compare_s={symbol_perf['shadow_compare_s']:.6f} "
                 f"incremental_shadow_first_mismatch={json.dumps(symbol_perf['incremental_shadow_first_mismatch'], sort_keys=True)} "
                 f"strategy_shadow_rows={symbol_perf['strategy_shadow_rows']} "
                 "strategy_shadow_mismatch_rate="
@@ -746,7 +780,9 @@ def main() -> None:
             )
         )
 
+    t_funnel_csv_write = time.perf_counter()
     csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
+    run_perf["totals"]["funnel_csv_write_s"] = time.perf_counter() - t_funnel_csv_write
     counts = status_counts(funnel_rows)
 
     print(f"validation_rows={table_row_count(validation_db_path)}")
@@ -786,6 +822,12 @@ def main() -> None:
         "build_structure_state": run_perf["totals"]["elapsed_build_structure_s"],
         "evaluate_pullback_retest_long": run_perf["totals"]["elapsed_eval_long_s"],
         "evaluate_pullback_retest_short": run_perf["totals"]["elapsed_eval_short_s"],
+        "structure_compare": run_perf["totals"]["structure_compare_s"],
+        "shadow_strategy_eval": run_perf["totals"]["shadow_strategy_eval_s"],
+        "shadow_compare": run_perf["totals"]["shadow_compare_s"],
+        "funnel_row_build": run_perf["totals"]["funnel_row_build_s"],
+        "funnel_csv_write": run_perf["totals"]["funnel_csv_write_s"],
+        "perf_json_write": run_perf["totals"]["perf_json_write_s"],
     }
     hottest_stage = max(stage_totals.items(), key=lambda kv: kv[1])[0] if stage_totals else "n/a"
     update_pending_total_scanned = sum(
@@ -809,6 +851,9 @@ def main() -> None:
             f"{(float(run_perf['totals']['incremental_shadow_mismatches']) / float(run_perf['totals']['incremental_shadow_rows'])) if run_perf['totals']['incremental_shadow_rows'] > 0 else 0.0:.6f} "
             f"incremental_shadow_update_s={run_perf['totals']['incremental_shadow_update_s']:.6f} "
             f"incremental_shadow_snapshot_s={run_perf['totals']['incremental_shadow_snapshot_s']:.6f} "
+            f"structure_compare_s={run_perf['totals']['structure_compare_s']:.6f} "
+            f"shadow_strategy_eval_s={run_perf['totals']['shadow_strategy_eval_s']:.6f} "
+            f"shadow_compare_s={run_perf['totals']['shadow_compare_s']:.6f} "
             f"incremental_shadow_first_mismatch={json.dumps(run_perf['totals']['incremental_shadow_first_mismatch'], sort_keys=True)} "
             f"strategy_shadow_rows={run_perf['totals']['strategy_shadow_rows']} "
             "strategy_shadow_mismatch_rate="
@@ -835,7 +880,9 @@ def main() -> None:
     }
     perf_json_path = Path(args.perf_json)
     perf_json_path.parent.mkdir(parents=True, exist_ok=True)
+    t_perf_json_write = time.perf_counter()
     perf_json_path.write_text(json.dumps(perf_output, indent=2, sort_keys=True), encoding="utf-8")
+    run_perf["totals"]["perf_json_write_s"] = time.perf_counter() - t_perf_json_write
     print(f"perf_json={str(perf_json_path.resolve())}")
     print("DONE")
 
