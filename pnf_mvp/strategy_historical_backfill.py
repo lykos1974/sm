@@ -724,6 +724,9 @@ def main() -> None:
                     f"scanned={up.get('trades_scanned', 0)} updated={up.get('trades_updated', 0)} "
                     f"activated={up.get('trades_activated', 0)} resolved={up.get('trades_resolved', 0)} "
                     f"sql_updates={up.get('sql_update_count', 0)} sql_inserts={up.get('sql_insert_count', 0)} "
+                    f"diag_sql_updates={up.get('update_pending_sql_updates_total', 0)} "
+                    f"diag_event_updates={up.get('update_pending_event_updates', 0)} "
+                    f"diag_progress_updates={up.get('update_pending_progress_updates', 0)} "
                     f"sql_selects={up.get('sql_select_count', 0)} "
                     f"elapsed_update_pending_ms={elapsed_update_pending_ms:.3f} "
                     f"elapsed_eval_ms={elapsed_eval_ms:.3f} "
@@ -800,6 +803,20 @@ def main() -> None:
             f"avg_pending={avg_pending:.4f} total_scanned={up.get('trades_scanned', 0)} "
             f"total_updated={up.get('trades_updated', 0)} total_resolved={up.get('trades_resolved', 0)} "
             f"total_sql_updates={up.get('sql_update_count', 0)} total_sql_inserts={up.get('sql_insert_count', 0)} "
+            f"diag_sql_updates={up.get('update_pending_sql_updates_total', 0)} "
+            f"diag_event_updates={up.get('update_pending_event_updates', 0)} "
+            f"diag_event_activation={up.get('update_pending_event_activation', 0)} "
+            f"diag_event_tp1_hit={up.get('update_pending_event_tp1_hit', 0)} "
+            f"diag_event_final_resolution={up.get('update_pending_event_final_resolution', 0)} "
+            f"diag_event_stop_loss={up.get('update_pending_event_stop_loss', 0)} "
+            f"diag_event_break_even={up.get('update_pending_event_break_even', 0)} "
+            f"diag_event_timeout_expiry={up.get('update_pending_event_timeout_expiry', 0)} "
+            f"diag_progress_updates={up.get('update_pending_progress_updates', 0)} "
+            f"diag_progress_unresolved_active={up.get('update_pending_progress_unresolved_active', 0)} "
+            f"diag_progress_pending_not_activated={up.get('update_pending_progress_pending_not_activated', 0)} "
+            f"diag_only_timestamp_updates={up.get('update_pending_only_timestamp_updates', 0)} "
+            f"diag_excursion_updates={up.get('update_pending_excursion_updates', 0)} "
+            f"diag_noop_candidate_updates={up.get('update_pending_noop_candidate_updates', 0)} "
             f"total_sql_selects={up.get('sql_select_count', 0)} "
             f"elapsed_update_pending_s={symbol_perf['elapsed_update_pending_s']:.6f} "
             f"elapsed_eval_s={symbol_perf['elapsed_eval_s']:.6f} "
@@ -894,11 +911,27 @@ def main() -> None:
     update_pending_total_sql_updates = sum(
         int(v.get("sql_update_count", 0)) for v in perf_snapshot["update_pending"].values()
     )
+    update_pending_diag_sql_updates_total = sum(
+        int(v.get("update_pending_sql_updates_total", 0)) for v in perf_snapshot["update_pending"].values()
+    )
+    update_pending_diag_event_updates_total = sum(
+        int(v.get("update_pending_event_updates", 0)) for v in perf_snapshot["update_pending"].values()
+    )
+    update_pending_diag_progress_updates_total = sum(
+        int(v.get("update_pending_progress_updates", 0)) for v in perf_snapshot["update_pending"].values()
+    )
+    update_pending_diag_noop_candidate_updates_total = sum(
+        int(v.get("update_pending_noop_candidate_updates", 0)) for v in perf_snapshot["update_pending"].values()
+    )
 
     print(
         "[PERF_RUN] "
         f"symbols={len(symbols)} total_candles={run_perf['totals']['candles']} "
         f"total_scanned={update_pending_total_scanned} total_sql_updates={update_pending_total_sql_updates} "
+        f"diag_sql_updates={update_pending_diag_sql_updates_total} "
+        f"diag_event_updates={update_pending_diag_event_updates_total} "
+        f"diag_progress_updates={update_pending_diag_progress_updates_total} "
+        f"diag_noop_candidate_updates={update_pending_diag_noop_candidate_updates_total} "
         f"hottest_symbol={hottest_symbol} hottest_stage={hottest_stage} "
         f"structure_source={run_perf['totals']['structure_source']}"
         + (
@@ -935,6 +968,10 @@ def main() -> None:
         "hottest_stage": hottest_stage,
         "update_pending_total_scanned": update_pending_total_scanned,
         "update_pending_total_sql_updates": update_pending_total_sql_updates,
+        "update_pending_diag_sql_updates_total": update_pending_diag_sql_updates_total,
+        "update_pending_diag_event_updates_total": update_pending_diag_event_updates_total,
+        "update_pending_diag_progress_updates_total": update_pending_diag_progress_updates_total,
+        "update_pending_diag_noop_candidate_updates_total": update_pending_diag_noop_candidate_updates_total,
     }
     perf_json_path = Path(args.perf_json)
     perf_json_path.parent.mkdir(parents=True, exist_ok=True)

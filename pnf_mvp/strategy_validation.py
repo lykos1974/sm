@@ -113,6 +113,20 @@ class StrategyValidationStore:
                     "current_pending_count": 0,
                     "pending_count_total": 0,
                     "max_pending_count": 0,
+                    "update_pending_sql_updates_total": 0,
+                    "update_pending_event_updates": 0,
+                    "update_pending_event_activation": 0,
+                    "update_pending_event_tp1_hit": 0,
+                    "update_pending_event_final_resolution": 0,
+                    "update_pending_event_stop_loss": 0,
+                    "update_pending_event_break_even": 0,
+                    "update_pending_event_timeout_expiry": 0,
+                    "update_pending_progress_updates": 0,
+                    "update_pending_progress_unresolved_active": 0,
+                    "update_pending_progress_pending_not_activated": 0,
+                    "update_pending_only_timestamp_updates": 0,
+                    "update_pending_excursion_updates": 0,
+                    "update_pending_noop_candidate_updates": 0,
                 }
             ),
             "register_setup": {
@@ -592,6 +606,28 @@ class StrategyValidationStore:
 
             still_pending: list[dict[str, Any]] = []
 
+            def _record_update_diagnostic(
+                *,
+                event_key: Optional[str] = None,
+                progress_key: Optional[str] = None,
+                only_timestamp: bool = False,
+                excursion: bool = False,
+                noop_candidate: bool = False,
+            ) -> None:
+                self._perf_inc("update_pending", "update_pending_sql_updates_total", 1, symbol=symbol)
+                if event_key is not None:
+                    self._perf_inc("update_pending", "update_pending_event_updates", 1, symbol=symbol)
+                    self._perf_inc("update_pending", event_key, 1, symbol=symbol)
+                if progress_key is not None:
+                    self._perf_inc("update_pending", "update_pending_progress_updates", 1, symbol=symbol)
+                    self._perf_inc("update_pending", progress_key, 1, symbol=symbol)
+                if only_timestamp:
+                    self._perf_inc("update_pending", "update_pending_only_timestamp_updates", 1, symbol=symbol)
+                if excursion:
+                    self._perf_inc("update_pending", "update_pending_excursion_updates", 1, symbol=symbol)
+                if noop_candidate:
+                    self._perf_inc("update_pending", "update_pending_noop_candidate_updates", 1, symbol=symbol)
+
             for row in pending:
                 self._perf_inc("update_pending", "trades_scanned", 1, symbol=symbol)
                 if int(row.get("reference_ts") or 0) >= close_ts:
@@ -651,6 +687,7 @@ class StrategyValidationStore:
                         self._mark_dirty()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
+                        _record_update_diagnostic(event_key="update_pending_event_activation")
                         continue
 
                     self._execute_counted(
@@ -673,6 +710,10 @@ class StrategyValidationStore:
                     still_pending.append(row)
                     self._mark_dirty()
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                    _record_update_diagnostic(
+                        progress_key="update_pending_progress_pending_not_activated",
+                        noop_candidate=True,
+                    )
                     continue
 
                 if activation_status != ACTIVATION_ACTIVE:
@@ -757,6 +798,10 @@ class StrategyValidationStore:
                         self._mark_dirty()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
+                        _record_update_diagnostic(
+                            event_key="update_pending_event_tp1_hit",
+                            excursion=True,
+                        )
                         continue
 
                     if mark_tp1_hit and resolution_status is not None:
@@ -819,6 +864,14 @@ class StrategyValidationStore:
                             self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
                         elif resolution_status == RESOLUTION_AMBIGUOUS:
                             self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
+                        _record_update_diagnostic(
+                            event_key="update_pending_event_final_resolution",
+                            excursion=True,
+                        )
+                        if resolution_status == RESOLUTION_STOPPED:
+                            self._perf_inc("update_pending", "update_pending_event_stop_loss", 1, symbol=symbol)
+                        elif resolution_status == RESOLUTION_TP1_PARTIAL_THEN_BE:
+                            self._perf_inc("update_pending", "update_pending_event_break_even", 1, symbol=symbol)
                         continue
                 else:
                     if entry_price is None:
@@ -860,6 +913,11 @@ class StrategyValidationStore:
                     still_pending.append(row)
                     self._mark_dirty()
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                    _record_update_diagnostic(
+                        progress_key="update_pending_progress_unresolved_active",
+                        excursion=True,
+                        noop_candidate=True,
+                    )
                 else:
                     self._execute_counted(
                         "update_pending",
@@ -911,6 +969,14 @@ class StrategyValidationStore:
                         self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
                     elif resolution_status == RESOLUTION_AMBIGUOUS:
                         self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
+                    _record_update_diagnostic(
+                        event_key="update_pending_event_final_resolution",
+                        excursion=True,
+                    )
+                    if resolution_status == RESOLUTION_STOPPED:
+                        self._perf_inc("update_pending", "update_pending_event_stop_loss", 1, symbol=symbol)
+                    elif resolution_status == RESOLUTION_TP1_PARTIAL_THEN_BE:
+                        self._perf_inc("update_pending", "update_pending_event_break_even", 1, symbol=symbol)
 
             self._pending_by_symbol[symbol] = [r for r in still_pending if str(r.get("resolution_status") or "").upper() == RESOLUTION_PENDING]
             self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
