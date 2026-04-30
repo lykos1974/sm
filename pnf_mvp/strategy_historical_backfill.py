@@ -90,6 +90,14 @@ FUNNEL_FIELD_ORDER = [
     "breakout_context_rank",
     "extension_risk_score",
     "is_baseline_profile_match",
+    "shadow_v4_version",
+    "shadow_v4_status",
+    "shadow_v4_reason",
+    "shadow_v4_flags",
+    "shadow_v4_rule_hit",
+    "shadow_v4_status_delta",
+    "shadow_v4_registration_eligible",
+    "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
     "registered_to_validation",
 ]
@@ -308,6 +316,17 @@ def build_funnel_row(
     blocked_by_existing_open_trade: bool,
     registered_to_validation: bool,
 ) -> Dict[str, Any]:
+    shadow_v4_status = setup.get("shadow_v4_status", setup.get("status"))
+    shadow_v4_watch_flags = str(setup.get("watch_flags") or "").strip()
+    shadow_v4_reject_flags = str(setup.get("reject_flags") or "").strip()
+    shadow_v4_flags = setup.get("shadow_v4_flags")
+    if shadow_v4_flags is None:
+        shadow_v4_flags = "|".join([x for x in (shadow_v4_watch_flags, shadow_v4_reject_flags) if x])
+    shadow_v4_registration_eligible = setup.get("shadow_v4_registration_eligible")
+    if shadow_v4_registration_eligible is None:
+        shadow_v4_registration_eligible = (
+            1 if str(shadow_v4_status or "").upper() in VALIDATION_ELIGIBLE_STATUSES else 0
+        )
     row = {
         "symbol": symbol,
         "reference_ts": int(reference_ts),
@@ -347,6 +366,14 @@ def build_funnel_row(
         "breakout_context_rank": setup.get("breakout_context_rank"),
         "extension_risk_score": setup.get("extension_risk_score"),
         "is_baseline_profile_match": setup.get("is_baseline_profile_match"),
+        "shadow_v4_version": setup.get("shadow_v4_version", setup.get("decision_version")),
+        "shadow_v4_status": shadow_v4_status,
+        "shadow_v4_reason": setup.get("shadow_v4_reason", setup.get("reason")),
+        "shadow_v4_flags": shadow_v4_flags,
+        "shadow_v4_rule_hit": setup.get("shadow_v4_rule_hit", setup.get("decision_path")),
+        "shadow_v4_status_delta": setup.get("shadow_v4_status_delta"),
+        "shadow_v4_registration_eligible": shadow_v4_registration_eligible,
+        "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 1 if blocked_by_existing_open_trade else 0,
         "registered_to_validation": 1 if registered_to_validation else 0,
     }
