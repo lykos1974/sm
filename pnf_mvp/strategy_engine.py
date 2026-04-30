@@ -381,6 +381,61 @@ def _breakout_context_rank(context: Optional[str], side: str) -> int:
     return int(mapping.get(context, 0))
 
 
+def _compute_early_trend_diagnostics(
+    *,
+    trend_regime: Optional[str],
+    breakout_context: Optional[str],
+    active_leg_boxes: int,
+    pullback_position: Optional[float],
+    is_extended: bool,
+) -> Dict[str, Any]:
+    leg_stage = "EARLY" if active_leg_boxes <= 1 else ("MATURE" if active_leg_boxes == 2 else "LATE")
+    pullback_stage = "UNKNOWN"
+    if pullback_position is not None:
+        if pullback_position < 0.20:
+            pullback_stage = "SHALLOW_EARLY"
+        elif pullback_position <= 0.75:
+            pullback_stage = "HEALTHY_BALANCED"
+        else:
+            pullback_stage = "DEEP_LATE"
+    context_bias = "UNCLASSIFIED"
+    if breakout_context in (BREAKOUT_FRESH_BULLISH, BREAKOUT_FRESH_BEARISH):
+        context_bias = "FRESH_BREAKOUT"
+    elif breakout_context in (BREAKOUT_POST_BULLISH_PULLBACK, BREAKOUT_POST_BEARISH_REBOUND):
+        context_bias = "POST_BREAKOUT_CONTINUATION"
+    elif breakout_context == BREAKOUT_LATE_EXTENSION:
+        context_bias = "LATE_EXTENSION"
+    elif breakout_context == BREAKOUT_NONE:
+        context_bias = "NO_BREAKOUT"
+    regime_bias = trend_regime or "NO_REGIME"
+    score = 0
+    if leg_stage == "EARLY":
+        score += 20
+    elif leg_stage == "MATURE":
+        score += 10
+    else:
+        score -= 10
+    if pullback_stage == "HEALTHY_BALANCED":
+        score += 20
+    elif pullback_stage == "DEEP_LATE":
+        score -= 10
+    if context_bias == "POST_BREAKOUT_CONTINUATION":
+        score += 15
+    elif context_bias == "FRESH_BREAKOUT":
+        score += 8
+    elif context_bias == "LATE_EXTENSION":
+        score -= 20
+    if is_extended:
+        score -= 15
+    return {
+        "early_trend_diag_leg_stage": leg_stage,
+        "early_trend_diag_pullback_stage": pullback_stage,
+        "early_trend_diag_context_bias": context_bias,
+        "early_trend_diag_regime_bias": regime_bias,
+        "early_trend_diag_score": float(max(0, min(100, 50 + score))),
+    }
+
+
 def _base_result(
     *,
     symbol: str,
@@ -418,6 +473,11 @@ def _base_result(
     breakout_context_rank: Optional[int] = None,
     extension_risk_score: Optional[float] = None,
     is_baseline_profile_match: Optional[int] = None,
+    early_trend_diag_leg_stage: Optional[str] = None,
+    early_trend_diag_pullback_stage: Optional[str] = None,
+    early_trend_diag_context_bias: Optional[str] = None,
+    early_trend_diag_regime_bias: Optional[str] = None,
+    early_trend_diag_score: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -453,6 +513,11 @@ def _base_result(
         "breakout_context_rank": breakout_context_rank,
         "extension_risk_score": extension_risk_score,
         "is_baseline_profile_match": is_baseline_profile_match,
+        "early_trend_diag_leg_stage": early_trend_diag_leg_stage,
+        "early_trend_diag_pullback_stage": early_trend_diag_pullback_stage,
+        "early_trend_diag_context_bias": early_trend_diag_context_bias,
+        "early_trend_diag_regime_bias": early_trend_diag_regime_bias,
+        "early_trend_diag_score": early_trend_diag_score,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -567,6 +632,13 @@ def evaluate_pullback_retest_long(
         is_extended=is_extended,
     )
     pullback_position_bucket = _pullback_position_bucket(pullback_position)
+    early_trend_diag = _compute_early_trend_diagnostics(
+        trend_regime=trend_regime,
+        breakout_context=breakout_context,
+        active_leg_boxes=active_leg_boxes,
+        pullback_position=pullback_position,
+        is_extended=is_extended,
+    )
     breakout_rank = _breakout_context_rank(breakout_context, "LONG")
     entry_to_support_boxes = (ideal_entry - support) / box if box > 0 else None
     extension_risk_score = float(100 if (breakout_context == BREAKOUT_LATE_EXTENSION or is_extended) else 0)
@@ -661,6 +733,11 @@ def evaluate_pullback_retest_long(
         breakout_context_rank=breakout_rank,
         extension_risk_score=extension_risk_score,
         is_baseline_profile_match=is_baseline_profile_match,
+        early_trend_diag_leg_stage=early_trend_diag["early_trend_diag_leg_stage"],
+        early_trend_diag_pullback_stage=early_trend_diag["early_trend_diag_pullback_stage"],
+        early_trend_diag_context_bias=early_trend_diag["early_trend_diag_context_bias"],
+        early_trend_diag_regime_bias=early_trend_diag["early_trend_diag_regime_bias"],
+        early_trend_diag_score=early_trend_diag["early_trend_diag_score"],
     )
 
 
@@ -785,6 +862,13 @@ def evaluate_pullback_retest_short(
         is_extended=is_extended,
     )
     pullback_position_bucket = _pullback_position_bucket(rebound_position)
+    early_trend_diag = _compute_early_trend_diagnostics(
+        trend_regime=trend_regime,
+        breakout_context=breakout_context,
+        active_leg_boxes=active_leg_boxes,
+        pullback_position=rebound_position,
+        is_extended=is_extended,
+    )
     breakout_rank = _breakout_context_rank(breakout_context, "SHORT")
     entry_to_support_boxes = (ideal_entry - support) / box if box > 0 else None
     extension_risk_score = float(100 if is_extended else 0)
@@ -860,4 +944,9 @@ def evaluate_pullback_retest_short(
         breakout_context_rank=breakout_rank,
         extension_risk_score=extension_risk_score,
         is_baseline_profile_match=is_baseline_profile_match,
+        early_trend_diag_leg_stage=early_trend_diag["early_trend_diag_leg_stage"],
+        early_trend_diag_pullback_stage=early_trend_diag["early_trend_diag_pullback_stage"],
+        early_trend_diag_context_bias=early_trend_diag["early_trend_diag_context_bias"],
+        early_trend_diag_regime_bias=early_trend_diag["early_trend_diag_regime_bias"],
+        early_trend_diag_score=early_trend_diag["early_trend_diag_score"],
     )
