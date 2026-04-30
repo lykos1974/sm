@@ -55,6 +55,7 @@ BREAKOUT_FRESH_BEARISH = "FRESH_BEARISH_BREAKDOWN"
 BREAKOUT_POST_BULLISH_PULLBACK = "POST_BREAKOUT_PULLBACK"
 BREAKOUT_POST_BEARISH_REBOUND = "POST_BREAKDOWN_REBOUND"
 BREAKOUT_LATE_EXTENSION = "LATE_EXTENSION"
+DECISION_VERSION = "v4_diag"
 
 
 def _box_size(profile: Any) -> float:
@@ -338,6 +339,48 @@ def _derive_cs_profile_tag(
     return tag
 
 
+def _pullback_position_bucket(position: Optional[float]) -> Optional[str]:
+    if position is None:
+        return None
+    if position < 0.0:
+        return "BELOW_RANGE"
+    if position < 0.10:
+        return "0_10"
+    if position < 0.20:
+        return "10_20"
+    if position <= 0.60:
+        return "20_60"
+    if position <= 0.75:
+        return "60_75"
+    if position <= 0.85:
+        return "75_85"
+    if position <= 1.0:
+        return "85_100"
+    return "ABOVE_RANGE"
+
+
+def _breakout_context_rank(context: Optional[str], side: str) -> int:
+    if side == "LONG":
+        mapping = {
+            BREAKOUT_POST_BULLISH_PULLBACK: 5,
+            BREAKOUT_FRESH_BULLISH: 4,
+            BREAKOUT_NONE: 2,
+            BREAKOUT_LATE_EXTENSION: 1,
+            BREAKOUT_FRESH_BEARISH: 0,
+            BREAKOUT_POST_BEARISH_REBOUND: 0,
+        }
+    else:
+        mapping = {
+            BREAKOUT_POST_BEARISH_REBOUND: 5,
+            BREAKOUT_FRESH_BEARISH: 4,
+            BREAKOUT_NONE: 2,
+            BREAKOUT_LATE_EXTENSION: 3,
+            BREAKOUT_FRESH_BULLISH: 1,
+            BREAKOUT_POST_BULLISH_PULLBACK: 1,
+        }
+    return int(mapping.get(context, 0))
+
+
 def _base_result(
     *,
     symbol: str,
@@ -363,6 +406,18 @@ def _base_result(
     continuation_strength_v1: Optional[float] = None,
     cs_geometry_component: Optional[str] = None,
     cs_profile_tag: Optional[str] = None,
+    decision_version: Optional[str] = None,
+    decision_path: Optional[str] = None,
+    watch_flags: Optional[str] = None,
+    reject_flags: Optional[str] = None,
+    promotion_checklist_pass_count: Optional[int] = None,
+    promotion_checklist_failed_items: Optional[str] = None,
+    entry_to_support_boxes: Optional[float] = None,
+    invalidation_distance_boxes: Optional[float] = None,
+    pullback_position_bucket: Optional[str] = None,
+    breakout_context_rank: Optional[int] = None,
+    extension_risk_score: Optional[float] = None,
+    is_baseline_profile_match: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -386,6 +441,18 @@ def _base_result(
         "continuation_strength_v1": continuation_strength_v1,
         "cs_geometry_component": cs_geometry_component,
         "cs_profile_tag": cs_profile_tag,
+        "decision_version": decision_version,
+        "decision_path": decision_path,
+        "watch_flags": watch_flags,
+        "reject_flags": reject_flags,
+        "promotion_checklist_pass_count": promotion_checklist_pass_count,
+        "promotion_checklist_failed_items": promotion_checklist_failed_items,
+        "entry_to_support_boxes": entry_to_support_boxes,
+        "invalidation_distance_boxes": invalidation_distance_boxes,
+        "pullback_position_bucket": pullback_position_bucket,
+        "breakout_context_rank": breakout_context_rank,
+        "extension_risk_score": extension_risk_score,
+        "is_baseline_profile_match": is_baseline_profile_match,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -465,6 +532,7 @@ def evaluate_pullback_retest_long(
     pullback_quality = _classify_long_pullback_quality(support, resistance, current_bottom)
     risk_quality = _classify_risk_quality(risk, profile)
     reward_quality = _classify_reward_quality(rr1, rr2)
+    invalidation_distance_boxes = risk / box if box > 0 else None
 
     strength = _compute_strength_score(
         pullback_quality=pullback_quality,
@@ -498,39 +566,79 @@ def evaluate_pullback_retest_long(
         trend_regime=trend_regime,
         is_extended=is_extended,
     )
+    pullback_position_bucket = _pullback_position_bucket(pullback_position)
+    breakout_rank = _breakout_context_rank(breakout_context, "LONG")
+    entry_to_support_boxes = (ideal_entry - support) / box if box > 0 else None
+    extension_risk_score = float(100 if (breakout_context == BREAKOUT_LATE_EXTENSION or is_extended) else 0)
+    is_baseline_profile_match = int(
+        pullback_quality == PULLBACK_HEALTHY
+        and active_leg_boxes == 2
+        and breakout_context == BREAKOUT_POST_BULLISH_PULLBACK
+        and (not is_extended)
+    )
+    watch_flags: List[str] = []
+    reject_flags: List[str] = []
+    decision_path = "long_eval"
 
     if pullback_quality == PULLBACK_BROKEN:
         status = STATUS_REJECT
         reason = "Pullback broke support"
         reject_reason = "broken_pullback"
+        reject_flags.append("broken_pullback")
+        decision_path += "->reject_broken_pullback"
     elif reward_quality == REWARD_POOR:
         status = STATUS_REJECT
         reason = "Reward-to-risk below minimum threshold"
         reject_reason = "rr_too_low"
+        reject_flags.append("rr_too_low")
+        decision_path += "->reject_rr_too_low"
     elif breakout_context == BREAKOUT_LATE_EXTENSION or is_extended:
         status = STATUS_WATCH
         reason = "Bullish setup exists but extended structure is restricted to WATCH by promotion policy"
         reject_reason = None
+        watch_flags.append("extended_policy_restriction")
+        decision_path += "->watch_extended_policy"
     elif active_leg_boxes >= 3:
         status = STATUS_WATCH
         reason = "Bullish setup exists but late leg count is restricted to WATCH by promotion policy"
         reject_reason = None
+        watch_flags.append("late_leg_policy_restriction")
+        decision_path += "->watch_late_leg_policy"
     elif pullback_quality == PULLBACK_DEEP:
         status = STATUS_WATCH
         reason = "Bullish setup exists but deep pullback is restricted to WATCH by promotion policy"
         reject_reason = None
+        watch_flags.append("deep_pullback_policy_restriction")
+        decision_path += "->watch_deep_pullback_policy"
     elif strength >= 65 and pullback_quality == PULLBACK_HEALTHY and active_leg_boxes == 2 and breakout_context == BREAKOUT_POST_BULLISH_PULLBACK:
         status = STATUS_CANDIDATE
         reason = "Bullish pullback near support with acceptable close-confirmed risk profile"
         reject_reason = None
+        decision_path += "->candidate_baseline_promoted"
     elif strength >= 35:
         status = STATUS_WATCH
         reason = "Bullish setup exists but quality is not yet strong enough"
         reject_reason = None
+        watch_flags.append("quality_not_strong_enough")
+        decision_path += "->watch_quality_not_strong_enough"
     else:
         status = STATUS_REJECT
         reason = "Bullish setup quality is insufficient"
         reject_reason = "quality_too_low"
+        reject_flags.append("quality_too_low")
+        decision_path += "->reject_quality_too_low"
+
+    checklist_failed_items = [
+        item
+        for item, passed in (
+            ("pullback_healthy", pullback_quality == PULLBACK_HEALTHY),
+            ("active_leg_boxes_eq_2", active_leg_boxes == 2),
+            ("post_breakout_pullback_context", breakout_context == BREAKOUT_POST_BULLISH_PULLBACK),
+            ("non_extended", not is_extended),
+        )
+        if not passed
+    ]
+    promotion_checklist_pass_count = 4 - len(checklist_failed_items)
 
     return _base_result(
         symbol=symbol, side="LONG", status=status, reason=reason, reject_reason=reject_reason,
@@ -541,6 +649,18 @@ def evaluate_pullback_retest_long(
         continuation_strength_v1=continuation_strength_v1,
         cs_geometry_component=cs_geometry_component,
         cs_profile_tag=cs_profile_tag,
+        decision_version=DECISION_VERSION,
+        decision_path=decision_path,
+        watch_flags="|".join(watch_flags),
+        reject_flags="|".join(reject_flags),
+        promotion_checklist_pass_count=promotion_checklist_pass_count,
+        promotion_checklist_failed_items="|".join(checklist_failed_items),
+        entry_to_support_boxes=entry_to_support_boxes,
+        invalidation_distance_boxes=invalidation_distance_boxes,
+        pullback_position_bucket=pullback_position_bucket,
+        breakout_context_rank=breakout_rank,
+        extension_risk_score=extension_risk_score,
+        is_baseline_profile_match=is_baseline_profile_match,
     )
 
 
@@ -631,6 +751,7 @@ def evaluate_pullback_retest_short(
     rebound_quality = _classify_short_rebound_quality(support, resistance, current_top)
     risk_quality = _classify_risk_quality(risk, profile)
     reward_quality = _classify_reward_quality(rr1, rr2)
+    invalidation_distance_boxes = risk / box if box > 0 else None
 
     strength = _compute_strength_score(
         pullback_quality=rebound_quality,
@@ -663,39 +784,62 @@ def evaluate_pullback_retest_short(
         trend_regime=trend_regime,
         is_extended=is_extended,
     )
+    pullback_position_bucket = _pullback_position_bucket(rebound_position)
+    breakout_rank = _breakout_context_rank(breakout_context, "SHORT")
+    entry_to_support_boxes = (ideal_entry - support) / box if box > 0 else None
+    extension_risk_score = float(100 if is_extended else 0)
+    is_baseline_profile_match = 0
+    watch_flags: List[str] = []
+    reject_flags: List[str] = []
+    decision_path = "short_eval"
 
     if rebound_quality == PULLBACK_BROKEN:
         status = STATUS_REJECT
         reason = "Failure structure is invalid; reversal short broke too far"
         reject_reason = "broken_reversal_context"
+        reject_flags.append("broken_reversal_context")
+        decision_path += "->reject_broken_reversal_context"
     elif reward_quality == REWARD_POOR:
         status = STATUS_REJECT
         reason = "Reward-to-risk below minimum threshold"
         reject_reason = "rr_too_low"
+        reject_flags.append("rr_too_low")
+        decision_path += "->reject_rr_too_low"
     elif active_leg_boxes < 2:
         status = STATUS_WATCH
         reason = "Short reversal exists but needs more mature failure structure"
         reject_reason = None
+        watch_flags.append("immature_failure_structure")
+        decision_path += "->watch_immature_failure_structure"
     elif rebound_quality == PULLBACK_SHALLOW:
         status = STATUS_WATCH
         reason = "Short reversal exists but failure pullback is still shallow"
         reject_reason = None
+        watch_flags.append("shallow_failure_pullback")
+        decision_path += "->watch_shallow_failure_pullback"
     elif risk_quality == RISK_WIDE:
         status = STATUS_WATCH
         reason = "Short reversal exists but risk is still wide"
         reject_reason = None
+        watch_flags.append("risk_wide")
+        decision_path += "->watch_risk_wide"
     elif strength >= 70 and active_leg_boxes in (2, 3):
         status = STATUS_CANDIDATE
         reason = "Failed bullish move / reversal short near resistance with acceptable risk profile"
         reject_reason = None
+        decision_path += "->candidate_reversal_promoted"
     elif strength >= 45:
         status = STATUS_WATCH
         reason = "Short reversal exists but quality is not yet strong enough"
         reject_reason = None
+        watch_flags.append("quality_not_strong_enough")
+        decision_path += "->watch_quality_not_strong_enough"
     else:
         status = STATUS_REJECT
         reason = "Short reversal quality is insufficient"
         reject_reason = "quality_too_low"
+        reject_flags.append("quality_too_low")
+        decision_path += "->reject_quality_too_low"
 
     return _base_result(
         symbol=symbol, side="SHORT", status=status, reason=reason, reject_reason=reject_reason,
@@ -704,4 +848,16 @@ def evaluate_pullback_retest_short(
         rr1=rr1, rr2=rr2, pullback_quality=rebound_quality, risk_quality=risk_quality,
         reward_quality=reward_quality, quality_score=float(strength), quality_grade=grade,
         continuation_strength_v1=None, cs_geometry_component=cs_geometry_component, cs_profile_tag=cs_profile_tag,
+        decision_version=DECISION_VERSION,
+        decision_path=decision_path,
+        watch_flags="|".join(watch_flags),
+        reject_flags="|".join(reject_flags),
+        promotion_checklist_pass_count=None,
+        promotion_checklist_failed_items="",
+        entry_to_support_boxes=entry_to_support_boxes,
+        invalidation_distance_boxes=invalidation_distance_boxes,
+        pullback_position_bucket=pullback_position_bucket,
+        breakout_context_rank=breakout_rank,
+        extension_risk_score=extension_risk_score,
+        is_baseline_profile_match=is_baseline_profile_match,
     )
