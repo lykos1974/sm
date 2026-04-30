@@ -386,9 +386,21 @@ def main() -> None:
         action="store_true",
         help="Use incremental structure snapshot as authoritative strategy structure with mandatory legacy guard comparisons",
     )
+    parser.add_argument(
+        "--use-incremental-structure-fast",
+        action="store_true",
+        help="Use incremental structure snapshot as authoritative strategy structure without per-candle legacy guard comparisons",
+    )
     args = parser.parse_args()
+    if args.use_incremental_structure and args.use_incremental_structure_fast:
+        parser.error(
+            "--use-incremental-structure and --use-incremental-structure-fast are mutually exclusive; choose one mode"
+        )
+    use_incremental_fast = bool(args.use_incremental_structure_fast)
     use_incremental_authoritative = bool(args.use_incremental_structure)
     use_incremental_shadow = bool(args.incremental_shadow_structure or use_incremental_authoritative)
+    if use_incremental_fast:
+        use_incremental_shadow = False
 
     settings = load_settings(args.settings)
     validation_db_path = settings.get("strategy_validation_db_path", "strategy_validation.db")
@@ -423,7 +435,9 @@ def main() -> None:
             "funnel_row_build_s": 0.0,
             "funnel_csv_write_s": 0.0,
             "perf_json_write_s": 0.0,
-            "structure_source": "incremental" if use_incremental_authoritative else "legacy",
+            "structure_source": (
+                "incremental_fast" if use_incremental_fast else ("incremental" if use_incremental_authoritative else "legacy")
+            ),
         },
     }
     if use_incremental_shadow:
@@ -477,9 +491,11 @@ def main() -> None:
                     "strategy_shadow_registration_impact_mismatches": 0,
                 }
             )
-        symbol_perf["structure_source"] = "incremental" if use_incremental_authoritative else "legacy"
+        symbol_perf["structure_source"] = (
+            "incremental_fast" if use_incremental_fast else ("incremental" if use_incremental_authoritative else "legacy")
+        )
         incremental_shadow_state: Any = None
-        if use_incremental_shadow:
+        if use_incremental_shadow or use_incremental_fast:
             repo_root = Path(__file__).resolve().parents[1]
             if str(repo_root) not in sys.path:
                 sys.path.insert(0, str(repo_root))
@@ -509,18 +525,60 @@ def main() -> None:
             )
             symbol_perf["elapsed_update_pending_s"] += time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            legacy_structure, _legacy_setups, eval_timings, legacy_setup_map = evaluate_setups(symbol, profile, engine)
-            symbol_perf["elapsed_eval_s"] += time.perf_counter() - t0
+            legacy_structure = None
+            legacy_setup_map: Dict[str, Any] = {}
+            structure: Dict[str, Any] = {}
+            setup_map: Dict[str, Any] = {}
+            if use_incremental_fast:
+                if incremental_shadow_state is None:
+                    raise RuntimeError("incremental fast mode requires initialized incremental state")
+                t_fast = time.perf_counter()
+                incremental_shadow_state.update_from_engine(
+                    engine=engine,
+                    latest_signal_name=engine.latest_signal_name(),
+                    market_state=engine.market_state(),
+                    last_price=getattr(engine, "last_price", None),
+                )
+                symbol_perf["incremental_shadow_update_s"] = symbol_perf.get("incremental_shadow_update_s", 0.0) + (
+                    time.perf_counter() - t_fast
+                )
+                t_fast = time.perf_counter()
+                structure = incremental_shadow_state.snapshot_no_delegate()
+                symbol_perf["incremental_shadow_snapshot_s"] = symbol_perf.get("incremental_shadow_snapshot_s", 0.0) + (
+                    time.perf_counter() - t_fast
+                )
+                t_fast_eval = time.perf_counter()
+                setup_map = {
+                    "LONG": evaluate_pullback_retest_long(
+                        symbol=symbol,
+                        profile=profile,
+                        columns=engine.columns,
+                        structure_state=structure,
+                    ),
+                    "SHORT": evaluate_pullback_retest_short(
+                        symbol=symbol,
+                        profile=profile,
+                        columns=engine.columns,
+                        structure_state=structure,
+                    ),
+                }
+                elapsed_fast_eval_s = time.perf_counter() - t_fast_eval
+                symbol_perf["elapsed_eval_s"] += elapsed_fast_eval_s
+                symbol_perf["elapsed_eval_long_s"] += elapsed_fast_eval_s / 2.0
+                symbol_perf["elapsed_eval_short_s"] += elapsed_fast_eval_s / 2.0
+            else:
+                t0 = time.perf_counter()
+                legacy_structure, _legacy_setups, eval_timings, legacy_setup_map = evaluate_setups(symbol, profile, engine)
+                symbol_perf["elapsed_eval_s"] += time.perf_counter() - t0
+                symbol_perf["elapsed_build_structure_s"] += float(eval_timings["elapsed_build_structure_s"])
+                symbol_perf["elapsed_eval_long_s"] += float(eval_timings["elapsed_eval_long_s"])
+                symbol_perf["elapsed_eval_short_s"] += float(eval_timings["elapsed_eval_short_s"])
+                structure = legacy_structure
+                setup_map = legacy_setup_map
             symbol_perf["candles"] += 1
-            symbol_perf["elapsed_build_structure_s"] += float(eval_timings["elapsed_build_structure_s"])
-            symbol_perf["elapsed_eval_long_s"] += float(eval_timings["elapsed_eval_long_s"])
-            symbol_perf["elapsed_eval_short_s"] += float(eval_timings["elapsed_eval_short_s"])
-            structure = legacy_structure
-            setup_map = legacy_setup_map
             if use_incremental_authoritative and incremental_shadow_state is None:
                 raise RuntimeError("incremental authoritative mode requires initialized incremental shadow state")
-            if incremental_shadow_state is not None:
+            if incremental_shadow_state is not None and not use_incremental_fast:
                 t_shadow = time.perf_counter()
                 incremental_shadow_state.update_from_engine(
                     engine=engine,
