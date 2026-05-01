@@ -472,7 +472,11 @@ def main() -> None:
         reset_validation_db(validation_db_path)
 
     storage = Storage(settings["database_path"])
-    validation_store = StrategyValidationStore(validation_db_path)
+    allow_multiple_trades_per_symbol = bool(settings.get("allow_multiple_trades_per_symbol", False))
+    validation_store = StrategyValidationStore(
+        validation_db_path,
+        allow_multiple_trades_per_symbol=allow_multiple_trades_per_symbol,
+    )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)
 
@@ -501,6 +505,7 @@ def main() -> None:
             "structure_source": (
                 "incremental_fast" if use_incremental_fast else ("incremental" if use_incremental_authoritative else "legacy")
             ),
+            "allow_multiple_trades_per_symbol": allow_multiple_trades_per_symbol,
         },
     }
     if use_incremental_shadow:
