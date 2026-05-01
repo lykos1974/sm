@@ -302,6 +302,26 @@ def table_row_count(db_path: str, table_name: str = "strategy_setups") -> int:
 
 
 
+
+
+def has_pending_candidate_for_symbol(db_path: str, symbol: str) -> bool:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM strategy_setups
+            WHERE symbol = ?
+              AND resolution_status = 'PENDING'
+              AND UPPER(COALESCE(status, '')) = 'CANDIDATE'
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
 def _coerce_bool_int(value: Any) -> int:
     return 1 if bool(value) else 0
 
@@ -472,7 +492,11 @@ def main() -> None:
         reset_validation_db(validation_db_path)
 
     storage = Storage(settings["database_path"])
-    validation_store = StrategyValidationStore(validation_db_path)
+    allow_multiple_trades_per_symbol = bool(settings.get("allow_multiple_trades_per_symbol", False))
+    validation_store = StrategyValidationStore(
+        validation_db_path,
+        allow_multiple_trades_per_symbol=allow_multiple_trades_per_symbol,
+    )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)
 
@@ -501,6 +525,7 @@ def main() -> None:
             "structure_source": (
                 "incremental_fast" if use_incremental_fast else ("incremental" if use_incremental_authoritative else "legacy")
             ),
+            "allow_multiple_trades_per_symbol": allow_multiple_trades_per_symbol,
         },
     }
     if use_incremental_shadow:
@@ -743,9 +768,11 @@ def main() -> None:
                 registered_to_validation = False
 
                 if eligible_for_validation:
+                    is_candidate = status == "CANDIDATE"
                     if (
-                        not validation_store.allow_multiple_trades_per_symbol
-                        and validation_store.has_open_trade_for_symbol(symbol)
+                        is_candidate
+                        and not validation_store.allow_multiple_trades_per_symbol
+                        and has_pending_candidate_for_symbol(validation_db_path, symbol)
                     ):
                         blocked_by_open_trade = True
                     else:
@@ -759,7 +786,11 @@ def main() -> None:
                         symbol_perf["elapsed_register_s"] += time.perf_counter() - t0
                         symbol_perf["register_calls"] += 1
                         registered_to_validation = setup_id is not None
-                        if setup_id is None and not validation_store.allow_multiple_trades_per_symbol:
+                        if (
+                            is_candidate
+                            and setup_id is None
+                            and not validation_store.allow_multiple_trades_per_symbol
+                        ):
                             blocked_by_open_trade = True
 
                 t_funnel_row = time.perf_counter()
