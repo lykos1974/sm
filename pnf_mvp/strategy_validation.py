@@ -392,7 +392,12 @@ class StrategyValidationStore:
             self._perf_inc("register_setup", "call_count", 1)
             self._ensure_pending_loaded(symbol, perf_category="register_setup")
 
-            if not self.allow_multiple_trades_per_symbol and self._pending_by_symbol.get(symbol):
+            setup_status = str(setup.get("status") or "")
+            if (
+                not self.allow_multiple_trades_per_symbol
+                and setup_status == "CANDIDATE"
+                and self._pending_by_symbol.get(symbol)
+            ):
                 elapsed = time.perf_counter() - started
                 self._perf_inc("register_setup", "elapsed_s", elapsed)
                 return None
