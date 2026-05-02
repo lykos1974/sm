@@ -97,6 +97,11 @@ FUNNEL_FIELD_ORDER = [
     "shadow_v4_rule_hit",
     "shadow_v4_status_delta",
     "shadow_v4_registration_eligible",
+    "shadow_continuation_candidate",
+    "shadow_continuation_trigger",
+    "shadow_entry_price",
+    "shadow_stop_price",
+    "shadow_continuation_candidate_id",
     "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
     "blocked_by_watch_cap",
@@ -333,6 +338,61 @@ def _coerce_bool_int(value: Any) -> int:
     return 1 if bool(value) else 0
 
 
+def _compute_shadow_continuation_fields(
+    *, setup: Dict[str, Any], structure: Dict[str, Any], columns: List[Any], profile: PnFProfile
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "shadow_continuation_candidate": 0,
+        "shadow_continuation_trigger": 0,
+        "shadow_entry_price": None,
+        "shadow_stop_price": None,
+        "shadow_continuation_candidate_id": None,
+    }
+    if str(setup.get("side") or "").upper() != "LONG":
+        return out
+    if str(structure.get("breakout_context") or "").upper() != "LATE_EXTENSION":
+        return out
+    if str(structure.get("trend_regime") or "").upper() != "BULLISH_REGIME":
+        return out
+    active_leg_boxes = structure.get("active_leg_boxes")
+    if active_leg_boxes is None or int(active_leg_boxes) < 4:
+        return out
+    if not columns:
+        return out
+    box_size = float(profile.box_size)
+    current_col = columns[-1]
+    if str(getattr(current_col, "kind", "")).upper() == "O":
+        pullback_depth_boxes = int(
+            round(abs(float(getattr(current_col, "top", 0.0)) - float(getattr(current_col, "bottom", 0.0))) / box_size)
+        )
+        if pullback_depth_boxes <= 4:
+            out["shadow_continuation_candidate"] = 1
+    if len(columns) < 3:
+        return out
+    new_x = columns[-1]
+    prev_o = columns[-2]
+    if str(getattr(new_x, "kind", "")).upper() != "X" or str(getattr(prev_o, "kind", "")).upper() != "O":
+        return out
+    prev_x = None
+    for col in reversed(columns[:-2]):
+        if str(getattr(col, "kind", "")).upper() == "X":
+            prev_x = col
+            break
+    if prev_x is None:
+        return out
+    prev_o_depth_boxes = int(
+        round(abs(float(getattr(prev_o, "top", 0.0)) - float(getattr(prev_o, "bottom", 0.0))) / box_size)
+    )
+    if prev_o_depth_boxes > 4:
+        return out
+    if float(getattr(new_x, "top", 0.0)) <= float(getattr(prev_x, "top", 0.0)):
+        return out
+    out["shadow_continuation_trigger"] = 1
+    out["shadow_entry_price"] = float(getattr(prev_x, "top", 0.0))
+    out["shadow_stop_price"] = float(getattr(prev_o, "bottom", 0.0))
+    return out
+
+
 
 def build_funnel_row(
     *,
@@ -343,6 +403,8 @@ def build_funnel_row(
     blocked_by_existing_open_trade: bool,
     blocked_by_watch_cap: bool,
     registered_to_validation: bool,
+    columns: List[Any],
+    profile: PnFProfile,
 ) -> Dict[str, Any]:
     shadow_v4_status = setup.get("shadow_v4_status", setup.get("status"))
     shadow_v4_watch_flags = str(setup.get("watch_flags") or "").strip()
@@ -401,11 +463,17 @@ def build_funnel_row(
         "shadow_v4_rule_hit": setup.get("shadow_v4_rule_hit", setup.get("decision_path")),
         "shadow_v4_status_delta": setup.get("shadow_v4_status_delta"),
         "shadow_v4_registration_eligible": shadow_v4_registration_eligible,
+        "shadow_continuation_candidate": 0,
+        "shadow_continuation_trigger": 0,
+        "shadow_entry_price": None,
+        "shadow_stop_price": None,
+        "shadow_continuation_candidate_id": None,
         "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 1 if blocked_by_existing_open_trade else 0,
         "blocked_by_watch_cap": 1 if blocked_by_watch_cap else 0,
         "registered_to_validation": 1 if registered_to_validation else 0,
     }
+    row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     return row
 
 
@@ -601,6 +669,7 @@ def main() -> None:
 
             incremental_shadow_state = IncrementalStructureState(symbol=symbol, profile=profile)
         progress_every = max(1, int(args.perf_progress_every))
+        shadow_continuation_pending_candidate_id: str | None = None
 
         for i, candle in enumerate(candles, start=1):
             close_ts = int(candle["close_time"])
@@ -821,8 +890,7 @@ def main() -> None:
                             blocked_by_open_trade = True
 
                 t_funnel_row = time.perf_counter()
-                funnel_rows.append(
-                    build_funnel_row(
+                funnel_row = build_funnel_row(
                         symbol=symbol,
                         reference_ts=close_ts,
                         setup=setup,
@@ -830,8 +898,28 @@ def main() -> None:
                         blocked_by_existing_open_trade=blocked_by_open_trade,
                         blocked_by_watch_cap=blocked_by_watch_cap,
                         registered_to_validation=registered_to_validation,
+                        columns=engine.columns,
+                        profile=profile,
                     )
-                )
+                if str(setup.get("side") or "").upper() == "LONG" and str(structure.get("breakout_context") or "").upper() == "LATE_EXTENSION":
+                    current_col = engine.columns[-1] if engine.columns else None
+                    current_col_kind = str(getattr(current_col, "kind", "")).upper() if current_col is not None else ""
+                    current_col_idx = getattr(current_col, "idx", None) if current_col is not None else None
+                    if int(funnel_row.get("shadow_continuation_candidate") or 0) == 1 and current_col_kind == "O" and current_col_idx is not None:
+                        shadow_continuation_pending_candidate_id = f"{symbol}:{int(current_col_idx)}"
+                        funnel_row["shadow_continuation_candidate_id"] = shadow_continuation_pending_candidate_id
+                    if int(funnel_row.get("shadow_continuation_trigger") or 0) == 1:
+                        prev_o = engine.columns[-2] if len(engine.columns) >= 2 else None
+                        prev_o_idx = getattr(prev_o, "idx", None) if prev_o is not None else None
+                        expected_candidate_id = f"{symbol}:{int(prev_o_idx)}" if prev_o_idx is not None else None
+                        if shadow_continuation_pending_candidate_id is None or expected_candidate_id != shadow_continuation_pending_candidate_id:
+                            funnel_row["shadow_continuation_trigger"] = 0
+                            funnel_row["shadow_entry_price"] = None
+                            funnel_row["shadow_stop_price"] = None
+                        else:
+                            funnel_row["shadow_continuation_candidate_id"] = shadow_continuation_pending_candidate_id
+                            shadow_continuation_pending_candidate_id = None
+                funnel_rows.append(funnel_row)
                 symbol_perf["funnel_row_build_s"] += time.perf_counter() - t_funnel_row
 
             if i % progress_every == 0:
