@@ -166,6 +166,7 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "continuation_strength_v1",
         "cs_geometry_component",
         "cs_profile_tag",
+        "pullback_position_bucket",
         "ideal_entry",
         "activated_ts",
         "activated_price",
@@ -330,6 +331,20 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
     out["cs_geometry_component"] = out.apply(extract_cs_geometry_component, axis=1)
     out["cs_profile_tag"] = out.apply(extract_cs_profile_tag, axis=1)
+
+    def extract_pullback_position_bucket(row: pd.Series):
+        raw = row.get("raw_setup_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                value = parsed.get("pullback_position_bucket")
+                if isinstance(value, str) and value.strip():
+                    return value.strip().upper()
+            except Exception:
+                pass
+        return "UNKNOWN"
+
+    out["pullback_position_bucket"] = out.apply(extract_pullback_position_bucket, axis=1)
 
     return out[[c for c in cols if c in out.columns]]
 
@@ -671,6 +686,44 @@ def build_pullback_quality_breakdown(active: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def build_structure_cluster_breakdown(active: pd.DataFrame) -> pd.DataFrame:
+    if active.empty:
+        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
+
+    bucketed = active.copy()
+    bucketed["pullback_position_bucket"] = bucketed["pullback_position_bucket"].fillna("UNKNOWN").astype(str).str.upper()
+    bucketed["trend_regime"] = bucketed["trend_regime"].fillna("UNKNOWN").astype(str).str.upper()
+    bucketed["active_leg_boxes"] = pd.to_numeric(bucketed["active_leg_boxes"], errors="coerce").fillna(-1).astype(int)
+    bucketed["is_extended_move"] = pd.to_numeric(bucketed["is_extended_move"], errors="coerce").fillna(0).astype(int)
+
+    bucketed["group"] = bucketed.apply(
+        lambda r: (
+            f"pb={r['pullback_position_bucket']}"
+            f"|leg={r['active_leg_boxes']}"
+            f"|regime={r['trend_regime']}"
+            f"|extended={int(r['is_extended_move'])}"
+        ),
+        axis=1,
+    )
+
+    out = (
+        bucketed.groupby("group")
+        .agg(
+            trades=("setup_id", "count"),
+            tp1_touched=("tp1_hit", "sum"),
+            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
+            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
+            avg_r=("realized_r_multiple", "mean"),
+        )
+        .reset_index()
+        .sort_values("trades", ascending=False)
+    )
+    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
+    out["tp2_rate"] = out["tp2"] / out["trades"]
+    out.insert(0, "section", "structure_cluster")
+    return out
+
+
 def filter_long_candidates(active: pd.DataFrame) -> pd.DataFrame:
     if active.empty:
         return active
@@ -834,6 +887,7 @@ def print_breakdowns(df: pd.DataFrame) -> None:
     print_df("CS PROFILE TAG BREAKDOWN", build_cs_profile_tag_breakdown(active))
     print_df("PULLBACK + SIDE BREAKDOWN", build_pullback_side_breakdown(active))
     print_df("ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(active))
+    print_df("STRUCTURE CLUSTER BREAKDOWN", build_structure_cluster_breakdown(active))
     print_df("TP1 -> TP2 CONVERSION", build_tp1_to_tp2_conversion(active))
 
     long_candidate = filter_long_candidates(active)
@@ -858,6 +912,7 @@ def build_diagnostics_export(active: pd.DataFrame) -> pd.DataFrame:
         build_pullback_quality_breakdown(active),
         build_pullback_side_breakdown(active),
         build_active_leg_boxes_breakdown(active),
+        build_structure_cluster_breakdown(active),
     ]
     long_candidate = filter_long_candidates(active)
     tables.extend(
