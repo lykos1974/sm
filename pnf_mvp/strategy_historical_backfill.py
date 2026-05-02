@@ -99,6 +99,7 @@ FUNNEL_FIELD_ORDER = [
     "shadow_v4_registration_eligible",
     "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
+    "blocked_by_watch_cap",
     "registered_to_validation",
 ]
 
@@ -322,6 +323,12 @@ def has_pending_candidate_for_symbol(db_path: str, symbol: str) -> bool:
     finally:
         conn.close()
 
+def count_open_watch_for_symbol(validation_store: StrategyValidationStore, symbol: str) -> int:
+    with validation_store._lock:
+        validation_store._ensure_pending_loaded(symbol, perf_category="register_setup")
+        pending_rows = validation_store._pending_by_symbol.get(symbol, [])
+        return sum(1 for row in pending_rows if str(row.get("status") or "").upper() == "WATCH")
+
 def _coerce_bool_int(value: Any) -> int:
     return 1 if bool(value) else 0
 
@@ -334,6 +341,7 @@ def build_funnel_row(
     setup: Dict[str, Any],
     structure: Dict[str, Any],
     blocked_by_existing_open_trade: bool,
+    blocked_by_watch_cap: bool,
     registered_to_validation: bool,
 ) -> Dict[str, Any]:
     shadow_v4_status = setup.get("shadow_v4_status", setup.get("status"))
@@ -395,6 +403,7 @@ def build_funnel_row(
         "shadow_v4_registration_eligible": shadow_v4_registration_eligible,
         "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 1 if blocked_by_existing_open_trade else 0,
+        "blocked_by_watch_cap": 1 if blocked_by_watch_cap else 0,
         "registered_to_validation": 1 if registered_to_validation else 0,
     }
     return row
@@ -487,6 +496,7 @@ def main() -> None:
 
     settings = load_settings(args.settings)
     validation_db_path = settings.get("strategy_validation_db_path", "strategy_validation.db")
+    max_open_watch_per_symbol = int(settings.get("max_open_watch_per_symbol", 20))
 
     if args.reset_validation_db:
         reset_validation_db(validation_db_path)
@@ -765,11 +775,28 @@ def main() -> None:
                 eligible_for_validation = status in VALIDATION_ELIGIBLE_STATUSES
 
                 blocked_by_open_trade = False
+                blocked_by_watch_cap = False
                 registered_to_validation = False
 
                 if eligible_for_validation:
                     is_candidate = status == "CANDIDATE"
-                    if (
+                    is_watch = status == "WATCH"
+                    if is_watch:
+                        open_watch_count = count_open_watch_for_symbol(validation_store, symbol)
+                        if open_watch_count >= max_open_watch_per_symbol:
+                            blocked_by_watch_cap = True
+                        else:
+                            t0 = time.perf_counter()
+                            setup_id = validation_store.register_setup(
+                                symbol=symbol,
+                                setup=setup,
+                                structure_state=structure,
+                                reference_ts=close_ts,
+                            )
+                            symbol_perf["elapsed_register_s"] += time.perf_counter() - t0
+                            symbol_perf["register_calls"] += 1
+                            registered_to_validation = setup_id is not None
+                    elif (
                         is_candidate
                         and not validation_store.allow_multiple_trades_per_symbol
                         and has_pending_candidate_for_symbol(validation_db_path, symbol)
@@ -801,6 +828,7 @@ def main() -> None:
                         setup=setup,
                         structure=structure,
                         blocked_by_existing_open_trade=blocked_by_open_trade,
+                        blocked_by_watch_cap=blocked_by_watch_cap,
                         registered_to_validation=registered_to_validation,
                     )
                 )
