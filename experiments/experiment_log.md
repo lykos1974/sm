@@ -60,3 +60,37 @@ Status: **Stable / profitable rollback point**.
 - BE at 1.5R: **DISCARD**.
 - Short continuation mirror: **DISCARD**.
 - Mixed long + short reversal: **KEEP AS RESEARCH**.
+
+## Experiment ID: LATE_EXTENSION_SHADOW_V1
+- ID: LATE_EXTENSION_SHADOW_V1
+- Date: 2026-05-02
+- Branch: current
+- Owner: research
+
+### Hypothesis (One Idea Only)
+- Summary: Micro-pullback continuation entries during LONG `LATE_EXTENSION` context can produce tradeable edge.
+- Intended impact: Identify whether a continuation trigger can complement the stable rollback baseline without changing live execution.
+
+### Change Scope
+- Files touched: None (shadow labeling analysis only)
+- Strategy behavior change: No
+- Schema change: No
+
+### Scorecard
+- `candidate_rows_registered`: 240 (`total_triggers`)
+- `resolved_rows`: 240 (`valid_triggers`)
+- `win_rate_non_ambiguous`: 0.0167 (`TP2_FIRST / resolved_rows`)
+- `avg_realized_r_multiple`: 0.0042 (assuming `STOP_FIRST=-1R`, `TP1_FIRST=+2R`, `TP2_FIRST=+3R`)
+- `total_realized_r_multiple`: 1.0 (same assumption set)
+- `TP1 -> TP2 conversion`: 0.0336 (`TP2_FIRST / TP1_FIRST`)
+
+### Decision
+- Outcome: **DISCARD**
+- Rationale: STOP and TP1 are nearly symmetric (`48.75%` vs `49.58%`) and TP2 incidence is too rare (`1.67%`) to support edge after costs/slippage.
+- Follow-up: Optional future variants include earlier pullback entry, volatility-adjusted stop model, and momentum pre-filtering.
+
+### Notes
+- Setup definition (v1): LONG `LATE_EXTENSION`, micro pullback `O<=4`, trigger on new X breaking previous X high, entry at previous X high, stop at previous O low, fixed risk (~500), targets TP1=2R and TP2=3R.
+- Method: Shadow labeling only, forward 1m candle scan, conservative ambiguity policy (same-candle stop/TP marked ambiguous).
+- Outcome distribution: STOP_FIRST=117, TP1_FIRST=119, TP2_FIRST=4, AMBIGUOUS=0, NO_HIT=0.
+- Additional: median candles to event ~110.
