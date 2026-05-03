@@ -700,6 +700,17 @@ def evaluate_pullback_retest_long(
         reject_flags.append("quality_too_low")
         decision_path += "->reject_quality_too_low"
 
+    if status in (STATUS_WATCH, STATUS_CANDIDATE):
+        if (
+            trend_regime == "BULLISH_REGIME"
+            and (not is_extended)
+            and active_leg_boxes == 3
+            and pullback_position_bucket in ("20_60", "75_85")
+        ):
+            status = STATUS_CANDIDATE
+            reason = "promoted_by_structure_edge_filter"
+            decision_path += "->override_candidate_structure_edge_filter"
+
     checklist_failed_items = [
         item
         for item, passed in (
