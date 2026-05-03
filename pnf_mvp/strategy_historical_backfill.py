@@ -102,6 +102,11 @@ FUNNEL_FIELD_ORDER = [
     "shadow_entry_price",
     "shadow_stop_price",
     "shadow_continuation_candidate_id",
+    "shadow_krausz_short_candidate",
+    "shadow_krausz_short_entry",
+    "shadow_krausz_short_stop",
+    "shadow_krausz_short_tp1",
+    "shadow_krausz_short_tp2",
     "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
     "blocked_by_watch_cap",
@@ -393,6 +398,50 @@ def _compute_shadow_continuation_fields(
     return out
 
 
+def _compute_shadow_krausz_short_fields(*, structure: Dict[str, Any], columns: List[Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "shadow_krausz_short_candidate": 0,
+        "shadow_krausz_short_entry": None,
+        "shadow_krausz_short_stop": None,
+        "shadow_krausz_short_tp1": None,
+        "shadow_krausz_short_tp2": None,
+    }
+    if str(structure.get("latest_signal_name") or "").upper() != "SELL":
+        return out
+    if str(structure.get("breakout_context") or "").upper() != "FRESH_BEARISH_BREAKDOWN":
+        return out
+    if not columns:
+        return out
+
+    current_col = columns[-1]
+    if str(getattr(current_col, "kind", "")).upper() != "O":
+        return out
+
+    entry = float(getattr(current_col, "bottom", 0.0))
+    stop = None
+    for col in reversed(columns[:-1]):
+        if str(getattr(col, "kind", "")).upper() == "X":
+            stop = float(getattr(col, "top", 0.0))
+            break
+    if stop is None:
+        resistance_level = structure.get("resistance_level")
+        if isinstance(resistance_level, (int, float)):
+            stop = float(resistance_level)
+    if stop is None:
+        return out
+
+    risk = stop - entry
+    if risk <= 0:
+        return out
+
+    out["shadow_krausz_short_candidate"] = 1
+    out["shadow_krausz_short_entry"] = entry
+    out["shadow_krausz_short_stop"] = stop
+    out["shadow_krausz_short_tp1"] = entry - (2.0 * risk)
+    out["shadow_krausz_short_tp2"] = entry - (3.0 * risk)
+    return out
+
+
 
 def build_funnel_row(
     *,
@@ -468,12 +517,18 @@ def build_funnel_row(
         "shadow_entry_price": None,
         "shadow_stop_price": None,
         "shadow_continuation_candidate_id": None,
+        "shadow_krausz_short_candidate": 0,
+        "shadow_krausz_short_entry": None,
+        "shadow_krausz_short_stop": None,
+        "shadow_krausz_short_tp1": None,
+        "shadow_krausz_short_tp2": None,
         "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 1 if blocked_by_existing_open_trade else 0,
         "blocked_by_watch_cap": 1 if blocked_by_watch_cap else 0,
         "registered_to_validation": 1 if registered_to_validation else 0,
     }
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
+    row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
     return row
 
 
