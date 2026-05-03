@@ -94,3 +94,27 @@ Status: **Stable / profitable rollback point**.
 - Method: Shadow labeling only, forward 1m candle scan, conservative ambiguity policy (same-candle stop/TP marked ambiguous).
 - Outcome distribution: STOP_FIRST=117, TP1_FIRST=119, TP2_FIRST=4, AMBIGUOUS=0, NO_HIT=0.
 - Additional: median candles to event ~110.
+
+## SHORT_EXTREME_BEARISH_EXTENSION — Multi-symbol validation
+
+Context:
+Initial BTC-only test suggested strong short edge:
+- filter: SHORT, BEARISH_REGIME, is_extended_move=1, active_leg_boxes>=6, LATE_EXTENSION, DEEP_GEOMETRY
+- BTC-only: 16 trades, avg R +1.31, TP2 50%, stop 18.7%
+
+Multi-symbol validation:
+- symbols: BTC, ETH, SOL
+- trades: 215
+- avg R: -0.3757
+- total R: -80.78
+- TP2 rate: 12.09%
+- stop rate: 73.95%
+- distribution: ETH 165, SOL 34, BTC 16
+
+Conclusion:
+Rejected as general short edge.
+BTC result was symbol-specific / small-sample artifact.
+Do not promote to strategy module.
+
+Important rule:
+Future edge candidates must pass multi-symbol validation before implementation.
