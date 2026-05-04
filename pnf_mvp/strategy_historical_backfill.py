@@ -107,6 +107,16 @@ FUNNEL_FIELD_ORDER = [
     "shadow_krausz_short_stop",
     "shadow_krausz_short_tp1",
     "shadow_krausz_short_tp2",
+    "shadow_krausz_bounce_short_candidate",
+    "shadow_krausz_bounce_short_entry",
+    "shadow_krausz_bounce_short_stop",
+    "shadow_krausz_bounce_short_tp1",
+    "shadow_krausz_bounce_short_tp2",
+    "shadow_reversal_long_candidate",
+    "shadow_reversal_long_entry",
+    "shadow_reversal_long_stop",
+    "shadow_reversal_long_tp1",
+    "shadow_reversal_long_tp2",
     "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
     "blocked_by_watch_cap",
@@ -443,6 +453,135 @@ def _compute_shadow_krausz_short_fields(*, structure: Dict[str, Any], columns: L
 
 
 
+def _compute_shadow_krausz_bounce_short_fields(*, structure: Dict[str, Any], columns: List[Any], max_bounce_boxes: int = 2) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "shadow_krausz_bounce_short_candidate": 0,
+        "shadow_krausz_bounce_short_entry": None,
+        "shadow_krausz_bounce_short_stop": None,
+        "shadow_krausz_bounce_short_tp1": None,
+        "shadow_krausz_bounce_short_tp2": None,
+    }
+    if str(structure.get("latest_signal_name") or "").upper() != "SELL":
+        return out
+    if "BREAKDOWN" not in str(structure.get("breakout_context") or "").upper():
+        return out
+    if len(columns) < 4:
+        return out
+
+    resumed_o = columns[-1]
+    bounce_x = columns[-2]
+    breakdown_o = columns[-3]
+    prior_x = columns[-4]
+    if str(getattr(resumed_o, "kind", "")).upper() != "O":
+        return out
+    if str(getattr(bounce_x, "kind", "")).upper() != "X":
+        return out
+    if str(getattr(breakdown_o, "kind", "")).upper() != "O":
+        return out
+    if str(getattr(prior_x, "kind", "")).upper() != "X":
+        return out
+
+    bounce_size_boxes = int(round(abs(float(getattr(bounce_x, "top", 0.0)) - float(getattr(bounce_x, "bottom", 0.0)))))
+    if bounce_size_boxes > max_bounce_boxes:
+        return out
+
+    breakdown_level = float(getattr(breakdown_o, "bottom", 0.0))
+    failure_reclaim_level = float(getattr(prior_x, "top", 0.0))
+    bounce_high = float(getattr(bounce_x, "top", 0.0))
+    resumed_low = float(getattr(resumed_o, "bottom", 0.0))
+
+    if bounce_high >= failure_reclaim_level:
+        return out
+    if resumed_low >= breakdown_level:
+        return out
+
+    entry = breakdown_level
+    stop = bounce_high
+    risk = stop - entry
+    if risk <= 0:
+        return out
+
+    out["shadow_krausz_bounce_short_candidate"] = 1
+    out["shadow_krausz_bounce_short_entry"] = entry
+    out["shadow_krausz_bounce_short_stop"] = stop
+    out["shadow_krausz_bounce_short_tp1"] = entry - (2.0 * risk)
+    out["shadow_krausz_bounce_short_tp2"] = entry - (3.0 * risk)
+    return out
+
+
+
+
+def _compute_shadow_reversal_long_fields(*, structure: Dict[str, Any], columns: List[Any], lookahead_columns: int = 4) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "shadow_reversal_long_candidate": 0,
+        "shadow_reversal_long_entry": None,
+        "shadow_reversal_long_stop": None,
+        "shadow_reversal_long_tp1": None,
+        "shadow_reversal_long_tp2": None,
+    }
+    if str(structure.get("latest_signal_name") or "").upper() != "SELL":
+        return out
+
+    active_leg_boxes = structure.get("active_leg_boxes")
+    active_leg_boxes_value = int(active_leg_boxes) if isinstance(active_leg_boxes, (int, float)) else None
+    breakout_context = str(structure.get("breakout_context") or "").upper()
+    if not (breakout_context == "LATE_EXTENSION" and active_leg_boxes_value is not None and active_leg_boxes_value >= 5):
+        return out
+
+    if not columns:
+        return out
+
+    breakdown_idx = None
+    breakdown_level = None
+    for idx in range(len(columns) - 1, -1, -1):
+        col = columns[idx]
+        if str(getattr(col, "kind", "")).upper() != "O":
+            continue
+        low = float(getattr(col, "bottom", 0.0))
+        prev_o_lows = [
+            float(getattr(prev, "bottom", 0.0))
+            for prev in columns[:idx]
+            if str(getattr(prev, "kind", "")).upper() == "O"
+        ]
+        if not prev_o_lows or low <= min(prev_o_lows):
+            breakdown_idx = idx
+            breakdown_level = low
+            break
+    if breakdown_idx is None or breakdown_level is None:
+        return out
+
+    end_idx = min(len(columns), breakdown_idx + lookahead_columns + 1)
+    crossed_back_above = False
+    for col in columns[breakdown_idx + 1 : end_idx]:
+        if float(getattr(col, "top", 0.0)) > breakdown_level:
+            crossed_back_above = True
+            break
+    if not crossed_back_above:
+        return out
+
+    lows_after_breakdown = [
+        float(getattr(col, "bottom", 0.0))
+        for col in columns[breakdown_idx:end_idx]
+        if str(getattr(col, "kind", "")).upper() == "O"
+    ]
+    if not lows_after_breakdown:
+        return out
+    stop = min(lows_after_breakdown)
+    entry = breakdown_level
+    risk = entry - stop
+    if risk <= 0:
+        return out
+
+    out["shadow_reversal_long_candidate"] = 1
+    out["shadow_reversal_long_entry"] = entry
+    out["shadow_reversal_long_stop"] = stop
+    out["shadow_reversal_long_tp1"] = entry + (2.0 * risk)
+    out["shadow_reversal_long_tp2"] = entry + (3.0 * risk)
+    return out
+
+
+
+
 def build_funnel_row(
     *,
     symbol: str,
@@ -522,6 +661,16 @@ def build_funnel_row(
         "shadow_krausz_short_stop": None,
         "shadow_krausz_short_tp1": None,
         "shadow_krausz_short_tp2": None,
+        "shadow_krausz_bounce_short_candidate": 0,
+        "shadow_krausz_bounce_short_entry": None,
+        "shadow_krausz_bounce_short_stop": None,
+        "shadow_krausz_bounce_short_tp1": None,
+        "shadow_krausz_bounce_short_tp2": None,
+        "shadow_reversal_long_candidate": 0,
+        "shadow_reversal_long_entry": None,
+        "shadow_reversal_long_stop": None,
+        "shadow_reversal_long_tp1": None,
+        "shadow_reversal_long_tp2": None,
         "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 1 if blocked_by_existing_open_trade else 0,
         "blocked_by_watch_cap": 1 if blocked_by_watch_cap else 0,
@@ -529,6 +678,8 @@ def build_funnel_row(
     }
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
+    row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns))
+    row.update(_compute_shadow_reversal_long_fields(structure=structure, columns=columns))
     return row
 
 
