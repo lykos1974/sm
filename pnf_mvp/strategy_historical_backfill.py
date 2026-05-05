@@ -695,6 +695,33 @@ def write_funnel_csv(rows: List[Dict[str, Any]], csv_path: str) -> str:
     return str(out_path.resolve())
 
 
+def write_funnel_parquet(rows: List[Dict[str, Any]], parquet_path: str) -> str:
+    out_path = Path(parquet_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import pandas as pd  # type: ignore
+
+        pd.DataFrame(rows).to_parquet(out_path, index=False)
+        return str(out_path.resolve())
+    except ImportError:
+        try:
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+
+            table = pa.Table.from_pylist(rows)
+            pq.write_table(table, out_path)
+            return str(out_path.resolve())
+        except ImportError as exc:
+            raise RuntimeError("Unable to export funnel parquet: install pandas or pyarrow.") from exc
+
+
+def _has_shadow_candidate_flag(row: Dict[str, Any]) -> bool:
+    for key, value in row.items():
+        if key.startswith("shadow_") and key.endswith("_candidate") and int(value or 0) == 1:
+            return True
+    return False
+
+
 
 def status_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     counts = {
@@ -741,6 +768,16 @@ def main() -> None:
         type=int,
         default=1000,
         help="Emit perf progress log every N candles per symbol",
+    )
+    parser.add_argument(
+        "--shadow-candidates-only-funnel",
+        action="store_true",
+        help="When set, write funnel rows only when any shadow_*_candidate flag equals 1",
+    )
+    parser.add_argument(
+        "--funnel-parquet",
+        default=None,
+        help="Optional parquet output path for funnel diagnostics (requires pandas or pyarrow)",
     )
     parser.add_argument(
         "--incremental-shadow-structure",
@@ -1125,7 +1162,8 @@ def main() -> None:
                         else:
                             funnel_row["shadow_continuation_candidate_id"] = shadow_continuation_pending_candidate_id
                             shadow_continuation_pending_candidate_id = None
-                funnel_rows.append(funnel_row)
+                if (not args.shadow_candidates_only_funnel) or _has_shadow_candidate_flag(funnel_row):
+                    funnel_rows.append(funnel_row)
                 symbol_perf["funnel_row_build_s"] += time.perf_counter() - t_funnel_row
 
             if i % progress_every == 0:
@@ -1274,10 +1312,15 @@ def main() -> None:
     t_funnel_csv_write = time.perf_counter()
     csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
     run_perf["totals"]["funnel_csv_write_s"] = time.perf_counter() - t_funnel_csv_write
+    parquet_file: str | None = None
+    if args.funnel_parquet:
+        parquet_file = write_funnel_parquet(funnel_rows, args.funnel_parquet)
     counts = status_counts(funnel_rows)
 
     print(f"validation_rows={table_row_count(validation_db_path)}")
     print(f"funnel_csv={csv_file}")
+    if parquet_file is not None:
+        print(f"funnel_parquet={parquet_file}")
     print(
         " | ".join(
             [
