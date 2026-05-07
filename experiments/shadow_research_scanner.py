@@ -95,6 +95,15 @@ FUNNEL_FIELD_ORDER = [
     "shadow_reversal_long_stop",
     "shadow_reversal_long_tp1",
     "shadow_reversal_long_tp2",
+    "shadow_triple_top_breakout",
+    "shadow_triple_bottom_breakdown",
+    "triple_top_resistance_level",
+    "triple_bottom_support_level",
+    "triple_pattern_width_columns",
+    "breakout_distance_boxes",
+    "breakdown_distance_boxes",
+    "prior_test_count",
+    "pattern_compaction_hint",
     "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
     "blocked_by_watch_cap",
@@ -485,6 +494,103 @@ def _event_state_from_engine(engine: PnFEngine, structure: Dict[str, Any] | None
 def _basic_event_state_from_engine(engine: PnFEngine) -> tuple[int, str | None, float | None, float | None, str | None]:
     column_count, current_column_kind, current_column_top, current_column_bottom = _current_column_parts(engine)
     return (column_count, current_column_kind, current_column_top, current_column_bottom, engine.latest_signal_name())
+
+
+
+def _empty_shadow_triple_pattern_fields() -> Dict[str, Any]:
+    return {
+        "shadow_triple_top_breakout": 0,
+        "shadow_triple_bottom_breakdown": 0,
+        "triple_top_resistance_level": None,
+        "triple_bottom_support_level": None,
+        "triple_pattern_width_columns": None,
+        "breakout_distance_boxes": None,
+        "breakdown_distance_boxes": None,
+        "prior_test_count": None,
+        "pattern_compaction_hint": None,
+    }
+
+
+def _pattern_compaction_hint(width_columns: int | None) -> str | None:
+    if width_columns is None:
+        return None
+    if width_columns <= 5:
+        return "COMPACT"
+    if width_columns <= 9:
+        return "BALANCED"
+    return "BROAD"
+
+
+def _cluster_prior_tests(prior_columns: List[Any], level_attr: str, candidate_level: float, box_size: float) -> List[Any]:
+    tolerance = max(float(box_size) * 0.5, 1e-9)
+    return [col for col in prior_columns if abs(float(getattr(col, level_attr, 0.0)) - candidate_level) <= tolerance]
+
+
+def _compute_shadow_triple_pattern_fields(
+    *, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile, recent_window_columns: int = 21
+) -> Dict[str, Any]:
+    """Classify local triple-top/bottom PnF structural events.
+
+    This helper is intentionally diagnostic-only. It uses the scanner's
+    close-updated PnF columns and the existing BUY/SELL signal semantics as
+    the breakout/breakdown confirmation, then inspects only a bounded local
+    column window so event processing remains O(1) per structural change.
+    """
+    out = _empty_shadow_triple_pattern_fields()
+    if len(columns) < 5:
+        return out
+
+    box_size = float(profile.box_size)
+    if box_size <= 0:
+        return out
+
+    current = columns[-1]
+    current_kind = str(getattr(current, "kind", "")).upper()
+    latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
+    local_columns = columns[-recent_window_columns:]
+    current_idx = int(getattr(current, "idx", len(columns) - 1))
+
+    if current_kind == "X" and latest_signal_name == "BUY":
+        prior_x = [col for col in local_columns[:-1] if str(getattr(col, "kind", "")).upper() == "X"]
+        current_top = float(getattr(current, "top", 0.0))
+        candidate_levels = sorted({float(getattr(col, "top", 0.0)) for col in prior_x if float(getattr(col, "top", 0.0)) < current_top}, reverse=True)
+        for resistance_level in candidate_levels:
+            tests = _cluster_prior_tests(prior_x, "top", resistance_level, box_size)
+            if len(tests) < 2:
+                continue
+            earliest_idx = min(int(getattr(col, "idx", 0)) for col in tests)
+            width_columns = current_idx - earliest_idx + 1
+            if width_columns < 5:
+                continue
+            out["shadow_triple_top_breakout"] = 1
+            out["triple_top_resistance_level"] = resistance_level
+            out["triple_pattern_width_columns"] = width_columns
+            out["breakout_distance_boxes"] = round((current_top - resistance_level) / box_size, 4)
+            out["prior_test_count"] = len(tests)
+            out["pattern_compaction_hint"] = _pattern_compaction_hint(width_columns)
+            return out
+
+    if current_kind == "O" and latest_signal_name == "SELL":
+        prior_o = [col for col in local_columns[:-1] if str(getattr(col, "kind", "")).upper() == "O"]
+        current_bottom = float(getattr(current, "bottom", 0.0))
+        candidate_levels = sorted({float(getattr(col, "bottom", 0.0)) for col in prior_o if float(getattr(col, "bottom", 0.0)) > current_bottom})
+        for support_level in candidate_levels:
+            tests = _cluster_prior_tests(prior_o, "bottom", support_level, box_size)
+            if len(tests) < 2:
+                continue
+            earliest_idx = min(int(getattr(col, "idx", 0)) for col in tests)
+            width_columns = current_idx - earliest_idx + 1
+            if width_columns < 5:
+                continue
+            out["shadow_triple_bottom_breakdown"] = 1
+            out["triple_bottom_support_level"] = support_level
+            out["triple_pattern_width_columns"] = width_columns
+            out["breakdown_distance_boxes"] = round((support_level - current_bottom) / box_size, 4)
+            out["prior_test_count"] = len(tests)
+            out["pattern_compaction_hint"] = _pattern_compaction_hint(width_columns)
+            return out
+
+    return out
 
 
 def _compute_shadow_continuation_fields(
@@ -889,6 +995,15 @@ def build_funnel_row(
         "shadow_reversal_long_stop": None,
         "shadow_reversal_long_tp1": None,
         "shadow_reversal_long_tp2": None,
+        "shadow_triple_top_breakout": 0,
+        "shadow_triple_bottom_breakdown": 0,
+        "triple_top_resistance_level": None,
+        "triple_bottom_support_level": None,
+        "triple_pattern_width_columns": None,
+        "breakout_distance_boxes": None,
+        "breakdown_distance_boxes": None,
+        "prior_test_count": None,
+        "pattern_compaction_hint": None,
         "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 0,
         "blocked_by_watch_cap": 0,
@@ -897,8 +1012,58 @@ def build_funnel_row(
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
     row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns, profile=profile))
+    row.update(_compute_shadow_triple_pattern_fields(structure=structure, columns=columns, profile=profile))
     if shadow_reversal_long_fields is not None:
         row.update(shadow_reversal_long_fields)
+    return row
+
+
+
+def _has_shadow_triple_pattern_flag(row: Dict[str, Any]) -> bool:
+    return int(row.get("shadow_triple_top_breakout") or 0) == 1 or int(row.get("shadow_triple_bottom_breakdown") or 0) == 1
+
+
+def _shadow_triple_pattern_event_key(symbol: str, columns: List[Any], fields: Dict[str, Any]) -> tuple[str, int, str] | None:
+    if not _has_shadow_triple_pattern_flag(fields) or not columns:
+        return None
+    current = columns[-1]
+    pattern_name = "TRIPLE_TOP" if int(fields.get("shadow_triple_top_breakout") or 0) == 1 else "TRIPLE_BOTTOM"
+    return (symbol, int(getattr(current, "idx", len(columns) - 1)), pattern_name)
+
+
+def build_structural_event_row(
+    *, symbol: str, reference_ts: int, structure: Dict[str, Any], fields: Dict[str, Any]
+) -> Dict[str, Any]:
+    row = {field: None for field in FUNNEL_FIELD_ORDER}
+    side = "LONG" if int(fields.get("shadow_triple_top_breakout") or 0) == 1 else "SHORT"
+    reason = "shadow_triple_top_breakout" if side == "LONG" else "shadow_triple_bottom_breakdown"
+    row.update(
+        {
+            "symbol": symbol,
+            "reference_ts": int(reference_ts),
+            "side": side,
+            "status": "STRUCTURAL_EVENT",
+            "strategy": "PNF_STRUCTURE",
+            "reason": reason,
+            "trend_state": structure.get("trend_state"),
+            "trend_regime": structure.get("trend_regime"),
+            "immediate_slope": structure.get("immediate_slope"),
+            "breakout_context": structure.get("breakout_context"),
+            "market_state": structure.get("market_state"),
+            "latest_signal_name": structure.get("latest_signal_name"),
+            "is_extended_move": _coerce_bool_int(structure.get("is_extended_move", False)),
+            "active_leg_boxes": structure.get("active_leg_boxes"),
+            "shadow_continuation_candidate": 0,
+            "shadow_continuation_trigger": 0,
+            "shadow_krausz_short_candidate": 0,
+            "shadow_krausz_bounce_short_candidate": 0,
+            "shadow_reversal_long_candidate": 0,
+            "blocked_by_existing_open_trade": 0,
+            "blocked_by_watch_cap": 0,
+            "registered_to_validation": 0,
+        }
+    )
+    row.update(fields)
     return row
 
 
@@ -928,12 +1093,14 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
     previous_event_state: ShadowEventState | None = None
     shadow_continuation_pending_candidate_id: str | None = None
     shadow_reversal_long_state: ShadowReversalLongState | None = None
+    emitted_triple_pattern_events: set[tuple[str, int, str]] = set()
     t_symbol = time.perf_counter()
     counters: Dict[str, Any] = {
         "candles_processed": 0,
         "events_processed": 0,
         "events_skipped": 0,
         "candidates_generated": 0,
+        "structural_events_generated": 0,
         "pnf_update_s": 0.0,
         "event_detection_s": 0.0,
         "structure_build_s": 0.0,
@@ -988,6 +1155,19 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
             close_price=close_price,
             structure=structure,
         )
+        triple_pattern_fields = _compute_shadow_triple_pattern_fields(structure=structure, columns=engine.columns, profile=profile)
+        triple_event_key = _shadow_triple_pattern_event_key(symbol, engine.columns, triple_pattern_fields)
+        if triple_event_key is not None and triple_event_key not in emitted_triple_pattern_events:
+            rows.append(
+                build_structural_event_row(
+                    symbol=symbol,
+                    reference_ts=close_ts,
+                    structure=structure,
+                    fields=triple_pattern_fields,
+                )
+            )
+            emitted_triple_pattern_events.add(triple_event_key)
+            counters["structural_events_generated"] += 1
         setups = evaluate_setups(symbol, profile, engine, structure)
         for setup in setups:
             funnel_row = build_funnel_row(
@@ -1047,6 +1227,7 @@ def main() -> None:
         "events_processed": 0,
         "events_skipped": 0,
         "candidates_generated": 0,
+        "structural_events_generated": 0,
         "elapsed_s": 0.0,
         "candle_load_s": 0.0,
         "pnf_update_s": 0.0,
@@ -1077,6 +1258,7 @@ def main() -> None:
             f"events_processed={counters['events_processed']} "
             f"events_skipped={counters['events_skipped']} "
             f"candidates_generated={counters['candidates_generated']} "
+            f"structural_events_generated={counters['structural_events_generated']} "
             f"event_ratio={counters['event_ratio']:.6f}"
         )
 
@@ -1097,9 +1279,10 @@ def main() -> None:
         f"events_processed={totals['events_processed']} "
         f"events_skipped={totals['events_skipped']} "
         f"candidates_generated={totals['candidates_generated']} "
+        f"structural_events_generated={totals['structural_events_generated']} "
         f"event_ratio={event_ratio:.6f}"
     )
-    print(f"Wrote {len(all_rows)} candidate rows to {output_path}")
+    print(f"Wrote {len(all_rows)} shadow research rows to {output_path}")
 
 
 if __name__ == "__main__":
