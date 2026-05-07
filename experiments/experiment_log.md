@@ -118,3 +118,124 @@ Do not promote to strategy module.
 
 Important rule:
 Future edge candidates must pass multi-symbol validation before implementation.
+
+---
+
+## SHADOW_RESEARCH_SCANNER — Event-driven structural research breakthrough
+
+Context:
+We moved shadow strategy research away from full strategy_historical_backfill runs and into a dedicated event-driven scanner.
+
+Key performance result:
+- symbols: ETH + SOL
+- candles_processed: 1,902,347
+- events_processed: 146,438
+- event_ratio: 0.076978
+- candidates_generated: 9,346
+- total runtime: ~18.4 seconds
+
+Conclusion:
+The research loop moved from slow full backfill-style runs to fast event-driven structural scanning.
+This is now the preferred workflow for shadow candidate discovery.
+
+---
+
+## BOUNCE_SHORT_REJECTION — Initial edge discovery
+
+Candidate:
+shadow_krausz_bounce_short_candidate
+
+Observed counts:
+- BTC: 0 candidates
+- ETH: 0 candidates
+- SOL: 2,022 candidates
+
+Outcome on SOL:
+- trades: 2,022
+- avg_R: +0.5381
+- stop_rate: 49.46%
+- TP1_rate: 48.37%
+- TP2_rate: 2.18%
+- median_bars_to_event: 26
+
+Interpretation:
+This is not a generic crypto short setup.
+It appears SOL-specific so far and likely represents high-beta altcoin rejection-continuation behavior after fresh bearish breakdown.
+
+Best observed subtypes:
+- bars_since_breakdown 51–100, failed_below_breakdown=0:
+  - trades: 744
+  - avg_R: +0.6237
+  - win_rate: 53.76%
+  - stop_rate: 46.24%
+
+- bars_since_breakdown 0–25, failed_below_breakdown=0:
+  - trades: 796
+  - avg_R: +0.6181
+  - win_rate: 52.76%
+  - stop_rate: 47.24%
+
+Important structural insight:
+failed_below_breakdown=0 performed better than expected.
+This suggests the edge may be a bull-trap reclaim/rejection pattern, not merely weak bounce failure below breakdown.
+
+Decision:
+Do not promote to strategy yet.
+Keep as promising shadow research candidate.
+Next step should be deeper bounce taxonomy / archetype classification.
+
+---
+
+## REVERSAL_LONG_AFTER_BREAKDOWN — Rejected current form
+
+Candidate:
+shadow_reversal_long_candidate
+
+Counts:
+- BTC: 8
+- ETH: 12
+- SOL: 10 in scanner comparison, 22 tested on ETH+SOL set
+
+Outcome on tested 22 ETH+SOL reversal candidates:
+- stop_count: 22
+- TP1: 0
+- TP2: 0
+- avg_R: -1.0
+- median_bars_to_stop: 1
+
+Conclusion:
+Current structural reclaim reversal logic is not tradable.
+It behaves like falling-knife catching after breakdown and stops immediately.
+Do not promote.
+
+---
+
+## Asset personality finding
+
+Cross-asset comparison:
+
+BTC:
+- rows: 4,166
+- fresh_breakdowns: 2,178
+- bounce_candidates: 0
+- reversal_candidates: 8
+
+ETH:
+- rows: 4,408
+- fresh_breakdowns: 2,242
+- bounce_candidates: 0
+- reversal_candidates: 12
+
+SOL:
+- rows: 4,938
+- fresh_breakdowns: 2,528
+- bounce_candidates: 2,022
+- reversal_candidates: 10
+
+Interpretation:
+Fresh bearish breakdowns exist across all three assets, but bounce-rejection behavior appears only in SOL so far.
+This suggests symbol personality / high-beta altcoin behavior must be part of future strategy research.
+
+Important future rule:
+Do not assume one crypto strategy applies uniformly across BTC, ETH, and SOL.
+Future research should classify structural archetypes by asset behavior.
