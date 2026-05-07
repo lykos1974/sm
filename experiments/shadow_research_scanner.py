@@ -107,6 +107,267 @@ class ShadowEventState:
     active_leg_boxes: int | None
 
 
+@dataclass(frozen=True)
+class CachedStructureSnapshot:
+    structure: Dict[str, Any]
+    latest_signal_name: str | None
+    market_state: str
+    latest_all_time_o_breakdown_idx: int | None
+    latest_all_time_o_breakdown_level: float | None
+
+
+class ScannerStructureCache:
+    """Incremental structure-state builder for this scanner.
+
+    The public structure engine computes several values by repeatedly scanning
+    the full PnF column history. That is fine for interactive snapshots but too
+    expensive for an event scanner over ~1M candles. This cache mirrors
+    ``build_structure_state`` semantics using only the current/previous columns
+    plus small rolling summaries of completed columns.
+    """
+
+    EARLY_MIN_COLUMNS = 4
+    EXTENSION_BOXES_THRESHOLD = 4
+    RECENT_COLUMNS_FOR_BIAS = 5
+    REGIME_BIAS_THRESHOLD = 1
+
+    def __init__(self, symbol: str, profile: PnFProfile) -> None:
+        self.symbol = symbol
+        self.profile = profile
+        self.box_size = float(profile.box_size)
+        self._last_column_count = 0
+        self._completed_x_highs: List[float] = []
+        self._completed_o_lows: List[float] = []
+        self._completed_kinds: List[str] = []
+        self._latest_all_time_o_breakdown_idx: int | None = None
+        self._latest_all_time_o_breakdown_level: float | None = None
+        self._min_o_low_seen: float | None = None
+
+    @staticmethod
+    def _kind(col: Any) -> str:
+        return str(getattr(col, "kind", ""))
+
+    @staticmethod
+    def _top(col: Any) -> float:
+        return float(getattr(col, "top", 0.0))
+
+    @staticmethod
+    def _bottom(col: Any) -> float:
+        return float(getattr(col, "bottom", 0.0))
+
+    def _ingest_newly_completed_columns(self, columns: List[Any]) -> None:
+        # A column becomes "meaningful" for structure_engine when it is no
+        # longer the current column (i.e. columns[:-1]). Ingest each such
+        # column exactly once when a reversal appends a new current column.
+        completed_count = max(0, len(columns) - 1)
+        while self._last_column_count < completed_count:
+            col = columns[self._last_column_count]
+            kind = self._kind(col)
+            self._completed_kinds.append(kind)
+            if kind == "X":
+                self._completed_x_highs.append(self._top(col))
+            elif kind == "O":
+                low = self._bottom(col)
+                if self._min_o_low_seen is None or low <= self._min_o_low_seen:
+                    self._latest_all_time_o_breakdown_idx = int(getattr(col, "idx"))
+                    self._latest_all_time_o_breakdown_level = low
+                    self._min_o_low_seen = low
+                self._completed_o_lows.append(low)
+            self._last_column_count += 1
+
+    def _refresh_current_o_breakdown(self, current: Any) -> tuple[int | None, float | None]:
+        idx = int(getattr(current, "idx"))
+        low = self._bottom(current)
+        if self._kind(current) == "O" and (self._min_o_low_seen is None or low <= self._min_o_low_seen):
+            return idx, low
+        return self._latest_all_time_o_breakdown_idx, self._latest_all_time_o_breakdown_level
+
+    def _latest_signal_name(self, current: Any | None) -> str | None:
+        if current is None:
+            return None
+        kind = self._kind(current)
+        if kind == "X" and self._completed_x_highs and self._top(current) > self._completed_x_highs[-1]:
+            return "BUY"
+        if kind == "O" and self._completed_o_lows and self._bottom(current) < self._completed_o_lows[-1]:
+            return "SELL"
+        return None
+
+    def _market_state(self, columns: List[Any], current: Any, latest_signal_name: str | None) -> str:
+        if len(columns) < 2:
+            return "EARLY"
+        if latest_signal_name == "BUY":
+            return "BULLISH_BREAKOUT"
+        if latest_signal_name == "SELL":
+            return "BEARISH_BREAKDOWN"
+        kind = self._kind(current)
+        bullish_trend = kind == "X" and bool(self._completed_x_highs) and self._top(current) > self._completed_x_highs[-1]
+        bearish_trend = kind == "O" and bool(self._completed_o_lows) and self._bottom(current) < self._completed_o_lows[-1]
+        if bullish_trend:
+            return "BULLISH_TREND"
+        if bearish_trend:
+            return "BEARISH_TREND"
+        return "RANGE" if len(columns) >= 4 else "NEUTRAL"
+
+    def _swing_direction(self, columns: List[Any]) -> str:
+        x_highs = self._completed_x_highs[-2:]
+        o_lows = self._completed_o_lows[-2:]
+        up = len(x_highs) >= 2 and x_highs[-1] > x_highs[-2]
+        down = len(o_lows) >= 2 and o_lows[-1] < o_lows[-2]
+        if up and not down:
+            return "UP"
+        if down and not up:
+            return "DOWN"
+        if len(columns) >= 2:
+            last_completed_kind = self._kind(columns[-2])
+            if last_completed_kind == "X":
+                return "UP"
+            if last_completed_kind == "O":
+                return "DOWN"
+        return "NEUTRAL"
+
+    def _trend_regime(self, columns: List[Any], market_state: str, swing_direction: str, current: Any) -> str:
+        if len(columns) < self.EARLY_MIN_COLUMNS:
+            return "EARLY_REGIME"
+        x_highs = self._completed_x_highs[-2:]
+        o_lows = self._completed_o_lows[-2:]
+        bullish_structure = len(x_highs) >= 2 and x_highs[-1] > x_highs[-2]
+        bearish_structure = len(o_lows) >= 2 and o_lows[-1] < o_lows[-2]
+        ms = market_state.upper()
+        bias = sum(1 if k == "X" else -1 if k == "O" else 0 for k in self._completed_kinds[-self.RECENT_COLUMNS_FOR_BIAS :])
+        if "BULLISH" in ms:
+            return "BULLISH_REGIME"
+        if "BEARISH" in ms:
+            return "BEARISH_REGIME"
+        if bullish_structure and swing_direction == "UP":
+            return "BULLISH_REGIME"
+        if bearish_structure and swing_direction == "DOWN":
+            return "BEARISH_REGIME"
+        if bias >= self.REGIME_BIAS_THRESHOLD and swing_direction == "UP":
+            return "BULLISH_REGIME"
+        if bias <= -self.REGIME_BIAS_THRESHOLD and swing_direction == "DOWN":
+            return "BEARISH_REGIME"
+        last_x = self._completed_x_highs[-1] if self._completed_x_highs else None
+        last_o = self._completed_o_lows[-1] if self._completed_o_lows else None
+        if last_x is not None and last_o is not None:
+            if self._top(current) >= last_x and self._bottom(current) > last_o:
+                return "BULLISH_REGIME"
+            if self._bottom(current) <= last_o and self._top(current) < last_x:
+                return "BEARISH_REGIME"
+        return "RANGE_REGIME"
+
+    def snapshot(self, columns: List[Any], last_price: float | None) -> CachedStructureSnapshot:
+        self._ingest_newly_completed_columns(columns)
+        if not columns:
+            structure = build_structure_state(self.symbol, self.profile, columns, None, "EARLY", last_price)
+            return CachedStructureSnapshot(structure, None, "EARLY", None, None)
+
+        current = columns[-1]
+        latest_signal_name = self._latest_signal_name(current)
+        market_state = self._market_state(columns, current, latest_signal_name)
+        swing_direction = self._swing_direction(columns)
+        trend_regime = self._trend_regime(columns, market_state, swing_direction, current)
+
+        if len(columns) < self.EARLY_MIN_COLUMNS:
+            trend_state = "EARLY"
+        else:
+            x_highs = self._completed_x_highs[-2:]
+            o_lows = self._completed_o_lows[-2:]
+            bullish_structure = len(x_highs) >= 2 and len(o_lows) >= 2 and x_highs[-1] > x_highs[-2] and o_lows[-1] > o_lows[-2]
+            bearish_structure = len(x_highs) >= 2 and len(o_lows) >= 2 and x_highs[-1] < x_highs[-2] and o_lows[-1] < o_lows[-2]
+            if bullish_structure:
+                trend_state = "BULLISH"
+            elif bearish_structure:
+                trend_state = "BEARISH"
+            elif trend_regime == "BULLISH_REGIME" and swing_direction == "UP":
+                trend_state = "BULLISH"
+            elif trend_regime == "BEARISH_REGIME" and swing_direction == "DOWN":
+                trend_state = "BEARISH"
+            elif "BULLISH" in market_state.upper():
+                trend_state = "BULLISH"
+            elif "BEARISH" in market_state.upper():
+                trend_state = "BEARISH"
+            else:
+                trend_state = "RANGE"
+
+        current_kind = self._kind(current)
+        if current_kind == "X":
+            immediate_slope = "BULLISH_PUSH" if trend_state == "BULLISH" or trend_regime == "BULLISH_REGIME" else "BULLISH_REBOUND"
+        elif current_kind == "O":
+            if trend_state == "BULLISH" or trend_regime == "BULLISH_REGIME":
+                immediate_slope = "BEARISH_PULLBACK"
+            elif trend_state == "BEARISH" or trend_regime == "BEARISH_REGIME":
+                immediate_slope = "BEARISH_PUSH"
+            else:
+                immediate_slope = "BEARISH_PULLBACK"
+        else:
+            immediate_slope = "FLAT"
+
+        active_leg_boxes = int(round(abs(self._top(current) - self._bottom(current)) / self.box_size)) if self.box_size > 0 else 0
+        is_extended_move = active_leg_boxes >= self.EXTENSION_BOXES_THRESHOLD
+        prev_x_high = self._completed_x_highs[-1] if self._completed_x_highs else None
+        prev_o_low = self._completed_o_lows[-1] if self._completed_o_lows else None
+        if len(columns) < 3:
+            breakout_context = "NONE"
+        elif is_extended_move:
+            breakout_context = "LATE_EXTENSION"
+        elif trend_regime == "BULLISH_REGIME" and current_kind == "X" and prev_x_high is not None and self._top(current) > prev_x_high:
+            breakout_context = "FRESH_BULLISH_BREAKOUT"
+        elif trend_regime == "BULLISH_REGIME" and current_kind == "O":
+            breakout_context = "POST_BREAKOUT_PULLBACK"
+        elif trend_regime == "BEARISH_REGIME" and current_kind == "O" and prev_o_low is not None and self._bottom(current) < prev_o_low:
+            breakout_context = "FRESH_BEARISH_BREAKDOWN"
+        elif trend_regime == "BEARISH_REGIME" and current_kind == "X":
+            breakout_context = "POST_BREAKDOWN_REBOUND"
+        else:
+            breakout_context = "NONE"
+
+        impulse_boxes = None
+        pullback_boxes = None
+        impulse_to_pullback_ratio = None
+        if breakout_context == "POST_BREAKOUT_PULLBACK" and current_kind == "O" and immediate_slope == "BEARISH_PULLBACK":
+            impulse_boxes = abs(prev_x_high - self._bottom(columns[-2])) / self.box_size if prev_x_high is not None and len(columns) >= 2 and self.box_size > 0 else None
+            pullback_boxes = active_leg_boxes if self.box_size > 0 else None
+            impulse_to_pullback_ratio = float(impulse_boxes) / float(pullback_boxes) if impulse_boxes is not None and pullback_boxes and pullback_boxes > 0 else None
+
+        support_level = self._completed_o_lows[-1] if self._completed_o_lows else None
+        resistance_level = self._completed_x_highs[-1] if self._completed_x_highs else None
+        structure = {
+            "symbol": self.symbol,
+            "trend_state": trend_state,
+            "trend_regime": trend_regime,
+            "immediate_slope": immediate_slope,
+            "swing_direction": swing_direction,
+            "support_level": support_level,
+            "resistance_level": resistance_level,
+            "breakout_context": breakout_context,
+            "is_extended_move": is_extended_move,
+            "active_leg_boxes": active_leg_boxes,
+            "impulse_boxes": impulse_boxes,
+            "pullback_boxes": pullback_boxes,
+            "impulse_to_pullback_ratio": impulse_to_pullback_ratio,
+            "last_meaningful_x_high": resistance_level,
+            "last_meaningful_o_low": support_level,
+            "current_column_kind": current_kind,
+            "current_column_top": self._top(current),
+            "current_column_bottom": self._bottom(current),
+            "latest_signal_name": latest_signal_name,
+            "market_state": market_state,
+            "last_price": last_price,
+            "notes": [],
+        }
+        structure["notes"] = [
+            f"Trend: {trend_state}",
+            f"Trend regime: {trend_regime}",
+            f"Immediate slope: {immediate_slope}",
+            *( [f"Support identified at {support_level}"] if support_level is not None else [] ),
+            *( [f"Resistance identified at {resistance_level}"] if resistance_level is not None else [] ),
+            *( [f"Breakout context: {breakout_context}"] if breakout_context != "NONE" else [] ),
+            *( ["Move classified as extended"] if is_extended_move else [] ),
+        ]
+        breakdown_idx, breakdown_level = self._refresh_current_o_breakdown(current)
+        return CachedStructureSnapshot(structure, latest_signal_name, market_state, breakdown_idx, breakdown_level)
+
+
 def load_settings(settings_path: str) -> dict:
     with open(settings_path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -355,7 +616,14 @@ def _compute_shadow_krausz_bounce_short_fields(*, structure: Dict[str, Any], col
     return out
 
 
-def _compute_shadow_reversal_long_fields(*, structure: Dict[str, Any], columns: List[Any], lookahead_columns: int = 4) -> Dict[str, Any]:
+def _compute_shadow_reversal_long_fields(
+    *,
+    structure: Dict[str, Any],
+    columns: List[Any],
+    latest_breakdown_idx: int | None = None,
+    latest_breakdown_level: float | None = None,
+    lookahead_columns: int = 4,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "shadow_reversal_long_candidate": 0,
         "shadow_reversal_long_entry": None,
@@ -372,41 +640,42 @@ def _compute_shadow_reversal_long_fields(*, structure: Dict[str, Any], columns: 
         return out
     if not columns:
         return out
-    breakdown_idx = None
-    breakdown_level = None
-    for idx in range(len(columns) - 1, -1, -1):
-        col = columns[idx]
-        if str(getattr(col, "kind", "")).upper() != "O":
-            continue
-        low = float(getattr(col, "bottom", 0.0))
-        prev_o_lows = [
-            float(getattr(prev, "bottom", 0.0))
-            for prev in columns[:idx]
-            if str(getattr(prev, "kind", "")).upper() == "O"
-        ]
-        if not prev_o_lows or low <= min(prev_o_lows):
-            breakdown_idx = idx
-            breakdown_level = low
-            break
+
+    # The original logic finds the most recent O column whose low is an
+    # all-time low relative to prior O columns. The scanner cache maintains
+    # that answer incrementally so candidate rows do not rescan full history.
+    breakdown_idx = latest_breakdown_idx
+    breakdown_level = latest_breakdown_level
+    if breakdown_idx is None or breakdown_level is None:
+        min_prior_o_low = None
+        for idx, col in enumerate(columns):
+            if str(getattr(col, "kind", "")).upper() != "O":
+                continue
+            low = float(getattr(col, "bottom", 0.0))
+            if min_prior_o_low is None or low <= min_prior_o_low:
+                breakdown_idx = idx
+                breakdown_level = low
+                min_prior_o_low = low
+
     if breakdown_idx is None or breakdown_level is None:
         return out
-    end_idx = min(len(columns), breakdown_idx + lookahead_columns + 1)
+    end_idx = min(len(columns), int(breakdown_idx) + lookahead_columns + 1)
     crossed_back_above = False
-    for col in columns[breakdown_idx + 1 : end_idx]:
-        if float(getattr(col, "top", 0.0)) > breakdown_level:
+    for col in columns[int(breakdown_idx) + 1 : end_idx]:
+        if float(getattr(col, "top", 0.0)) > float(breakdown_level):
             crossed_back_above = True
             break
     if not crossed_back_above:
         return out
     lows_after_breakdown = [
         float(getattr(col, "bottom", 0.0))
-        for col in columns[breakdown_idx:end_idx]
+        for col in columns[int(breakdown_idx):end_idx]
         if str(getattr(col, "kind", "")).upper() == "O"
     ]
     if not lows_after_breakdown:
         return out
     stop = min(lows_after_breakdown)
-    entry = breakdown_level
+    entry = float(breakdown_level)
     risk = entry - stop
     if risk <= 0:
         return out
@@ -442,6 +711,8 @@ def build_funnel_row(
     structure: Dict[str, Any],
     columns: List[Any],
     profile: PnFProfile,
+    latest_breakdown_idx: int | None = None,
+    latest_breakdown_level: float | None = None,
 ) -> Dict[str, Any]:
     shadow_v4_status = setup.get("shadow_v4_status", setup.get("status"))
     shadow_v4_watch_flags = str(setup.get("watch_flags") or "").strip()
@@ -526,7 +797,14 @@ def build_funnel_row(
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
     row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns))
-    row.update(_compute_shadow_reversal_long_fields(structure=structure, columns=columns))
+    row.update(
+        _compute_shadow_reversal_long_fields(
+            structure=structure,
+            columns=columns,
+            latest_breakdown_idx=latest_breakdown_idx,
+            latest_breakdown_level=latest_breakdown_level,
+        )
+    )
     return row
 
 
@@ -550,6 +828,7 @@ def write_funnel_csv(rows: List[Dict[str, Any]], csv_path: str) -> str:
 
 def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     engine = PnFEngine(profile)
+    structure_cache = ScannerStructureCache(symbol, profile)
     rows: List[Dict[str, Any]] = []
     previous_basic_state: tuple[int, str | None, float | None, float | None, str | None] | None = None
     previous_event_state: ShadowEventState | None = None
@@ -560,35 +839,49 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
         "events_processed": 0,
         "events_skipped": 0,
         "candidates_generated": 0,
+        "pnf_update_s": 0.0,
+        "event_detection_s": 0.0,
+        "structure_build_s": 0.0,
+        "shadow_eval_s": 0.0,
     }
 
     for candle in candles:
         close_ts = int(candle["close_time"])
         close_price = float(candle["close"])
+        t0 = time.perf_counter()
         engine.update_from_price(close_ts, close_price)
+        counters["pnf_update_s"] += time.perf_counter() - t0
         counters["candles_processed"] += 1
 
+        t0 = time.perf_counter()
         basic_state = _basic_event_state_from_engine(engine)
+        counters["event_detection_s"] += time.perf_counter() - t0
         if basic_state == previous_basic_state:
             counters["events_skipped"] += 1
             continue
         previous_basic_state = basic_state
 
-        structure = build_structure_state(
-            symbol=symbol,
-            profile=profile,
-            columns=engine.columns,
-            latest_signal_name=engine.latest_signal_name(),
-            market_state=engine.market_state(),
-            last_price=getattr(engine, "last_price", None),
+        t0 = time.perf_counter()
+        snapshot = structure_cache.snapshot(engine.columns, getattr(engine, "last_price", None))
+        structure = snapshot.structure
+        active_leg_boxes = structure.get("active_leg_boxes")
+        event_state = ShadowEventState(
+            column_count=len(engine.columns),
+            current_column_kind=str(structure.get("current_column_kind")) if structure.get("current_column_kind") is not None else None,
+            current_column_top=float(structure["current_column_top"]) if structure.get("current_column_top") is not None else None,
+            current_column_bottom=float(structure["current_column_bottom"]) if structure.get("current_column_bottom") is not None else None,
+            latest_signal_name=snapshot.latest_signal_name,
+            breakout_context=str(structure.get("breakout_context")) if structure.get("breakout_context") is not None else None,
+            active_leg_boxes=int(active_leg_boxes) if active_leg_boxes is not None else None,
         )
-        event_state = _event_state_from_engine(engine, structure)
+        counters["structure_build_s"] += time.perf_counter() - t0
         if event_state == previous_event_state:
             counters["events_skipped"] += 1
             continue
         previous_event_state = event_state
         counters["events_processed"] += 1
 
+        t0 = time.perf_counter()
         setups = evaluate_setups(symbol, profile, engine, structure)
         for setup in setups:
             funnel_row = build_funnel_row(
@@ -598,6 +891,8 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
                 structure=structure,
                 columns=engine.columns,
                 profile=profile,
+                latest_breakdown_idx=snapshot.latest_all_time_o_breakdown_idx,
+                latest_breakdown_level=snapshot.latest_all_time_o_breakdown_level,
             )
             if str(setup.get("side") or "").upper() == "LONG" and str(structure.get("breakout_context") or "").upper() == "LATE_EXTENSION":
                 current_col = engine.columns[-1] if engine.columns else None
@@ -620,6 +915,7 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
             if _has_shadow_candidate_flag(funnel_row):
                 rows.append(funnel_row)
                 counters["candidates_generated"] += 1
+        counters["shadow_eval_s"] += time.perf_counter() - t0
 
     counters["elapsed_s"] = time.perf_counter() - t_symbol
     candles_processed = int(counters["candles_processed"])
@@ -647,15 +943,31 @@ def main() -> None:
         "events_skipped": 0,
         "candidates_generated": 0,
         "elapsed_s": 0.0,
+        "candle_load_s": 0.0,
+        "pnf_update_s": 0.0,
+        "event_detection_s": 0.0,
+        "structure_build_s": 0.0,
+        "shadow_eval_s": 0.0,
+        "output_write_s": 0.0,
     }
     for symbol in symbols:
+        t_load = time.perf_counter()
         candles = load_all_closed_candles(database_path, symbol, args.sample_limit)
+        candle_load_s = time.perf_counter() - t_load
         rows, counters = process_symbol(symbol, profiles[symbol], candles)
+        counters["candle_load_s"] = candle_load_s
+        counters["output_write_s"] = 0.0
         all_rows.extend(rows)
         for key in totals:
             totals[key] += counters[key]
         print(
             f"[EVENT] symbol={symbol} elapsed_s={counters['elapsed_s']:.3f} "
+            f"candle_load_s={counters['candle_load_s']:.3f} "
+            f"pnf_update_s={counters['pnf_update_s']:.3f} "
+            f"event_detection_s={counters['event_detection_s']:.3f} "
+            f"structure_build_s={counters['structure_build_s']:.3f} "
+            f"shadow_eval_s={counters['shadow_eval_s']:.3f} "
+            f"output_write_s={counters['output_write_s']:.3f} "
             f"candles_processed={counters['candles_processed']} "
             f"events_processed={counters['events_processed']} "
             f"events_skipped={counters['events_skipped']} "
@@ -663,11 +975,19 @@ def main() -> None:
             f"event_ratio={counters['event_ratio']:.6f}"
         )
 
+    t_write = time.perf_counter()
     output_path = write_funnel_csv(all_rows, args.funnel_csv)
+    totals["output_write_s"] = time.perf_counter() - t_write
     total_candles = int(totals["candles_processed"])
     event_ratio = (float(totals["events_processed"]) / float(total_candles)) if total_candles else 0.0
     print(
         f"[EVENT_TOTAL] elapsed_s={totals['elapsed_s']:.3f} "
+        f"candle_load_s={totals['candle_load_s']:.3f} "
+        f"pnf_update_s={totals['pnf_update_s']:.3f} "
+        f"event_detection_s={totals['event_detection_s']:.3f} "
+        f"structure_build_s={totals['structure_build_s']:.3f} "
+        f"shadow_eval_s={totals['shadow_eval_s']:.3f} "
+        f"output_write_s={totals['output_write_s']:.3f} "
         f"candles_processed={totals['candles_processed']} "
         f"events_processed={totals['events_processed']} "
         f"events_skipped={totals['events_skipped']} "
