@@ -84,6 +84,12 @@ FUNNEL_FIELD_ORDER = [
     "shadow_krausz_bounce_short_stop",
     "shadow_krausz_bounce_short_tp1",
     "shadow_krausz_bounce_short_tp2",
+    "bars_since_breakdown",
+    "bounce_depth_boxes",
+    "reclaim_fraction",
+    "rejection_speed_bars",
+    "bounce_column_height",
+    "failed_below_breakdown",
     "shadow_reversal_long_candidate",
     "shadow_reversal_long_entry",
     "shadow_reversal_long_stop",
@@ -105,6 +111,16 @@ class ShadowEventState:
     latest_signal_name: str | None
     breakout_context: str | None
     active_leg_boxes: int | None
+
+
+@dataclass
+class ShadowReversalLongState:
+    breakdown_ts: int
+    breakdown_level: float
+    lowest_low_after_breakdown: float
+    has_extended: bool
+    has_reclaimed: bool
+    initial_active_leg_boxes: int | None
 
 
 @dataclass(frozen=True)
@@ -566,13 +582,38 @@ def _compute_shadow_krausz_short_fields(*, structure: Dict[str, Any], columns: L
     return out
 
 
-def _compute_shadow_krausz_bounce_short_fields(*, structure: Dict[str, Any], columns: List[Any], max_bounce_boxes: int = 2) -> Dict[str, Any]:
+def _bars_between(start_ts: int | None, end_ts: int | None) -> int | None:
+    if start_ts is None or end_ts is None:
+        return None
+    return max(0, int(round((int(end_ts) - int(start_ts)) / 60000.0)))
+
+
+def _previous_o_bottom_before(columns: List[Any], column_idx: int) -> float | None:
+    for col in reversed(columns[:column_idx]):
+        if str(getattr(col, "kind", "")).upper() == "O":
+            return float(getattr(col, "bottom", 0.0))
+    return None
+
+
+def _compute_shadow_krausz_bounce_short_fields(
+    *,
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    max_bounce_boxes: int = 2,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "shadow_krausz_bounce_short_candidate": 0,
         "shadow_krausz_bounce_short_entry": None,
         "shadow_krausz_bounce_short_stop": None,
         "shadow_krausz_bounce_short_tp1": None,
         "shadow_krausz_bounce_short_tp2": None,
+        "bars_since_breakdown": None,
+        "bounce_depth_boxes": None,
+        "reclaim_fraction": None,
+        "rejection_speed_bars": None,
+        "bounce_column_height": None,
+        "failed_below_breakdown": None,
     }
     if str(structure.get("latest_signal_name") or "").upper() != "SELL":
         return out
@@ -613,69 +654,49 @@ def _compute_shadow_krausz_bounce_short_fields(*, structure: Dict[str, Any], col
     out["shadow_krausz_bounce_short_stop"] = stop
     out["shadow_krausz_bounce_short_tp1"] = entry - (2.0 * risk)
     out["shadow_krausz_bounce_short_tp2"] = entry - (3.0 * risk)
+
+    box_size = float(profile.box_size)
+    initial_breakdown_level = _previous_o_bottom_before(columns, int(getattr(breakdown_o, "idx", 0)))
+    if initial_breakdown_level is None:
+        initial_breakdown_level = breakdown_level
+    if box_size > 0:
+        out["bounce_column_height"] = int(
+            round(abs(bounce_high - float(getattr(bounce_x, "bottom", 0.0))) / box_size)
+        )
+        out["bounce_depth_boxes"] = max(0.0, (bounce_high - breakdown_level) / box_size)
+    breakdown_range = initial_breakdown_level - breakdown_level
+    if breakdown_range > 0:
+        out["reclaim_fraction"] = (bounce_high - breakdown_level) / breakdown_range
+    else:
+        out["reclaim_fraction"] = None
+    out["bars_since_breakdown"] = _bars_between(
+        int(getattr(breakdown_o, "start_ts", 0)),
+        int(getattr(resumed_o, "start_ts", 0)),
+    )
+    out["rejection_speed_bars"] = _bars_between(
+        int(getattr(bounce_x, "end_ts", 0)),
+        int(getattr(resumed_o, "start_ts", 0)),
+    )
+    out["failed_below_breakdown"] = 1 if bounce_high <= initial_breakdown_level else 0
     return out
 
 
-def _compute_shadow_reversal_long_fields(
-    *,
-    structure: Dict[str, Any],
-    columns: List[Any],
-    latest_breakdown_idx: int | None = None,
-    latest_breakdown_level: float | None = None,
-    lookahead_columns: int = 4,
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
+def _empty_shadow_reversal_long_fields() -> Dict[str, Any]:
+    return {
         "shadow_reversal_long_candidate": 0,
         "shadow_reversal_long_entry": None,
         "shadow_reversal_long_stop": None,
         "shadow_reversal_long_tp1": None,
         "shadow_reversal_long_tp2": None,
     }
-    if str(structure.get("latest_signal_name") or "").upper() != "SELL":
-        return out
-    active_leg_boxes = structure.get("active_leg_boxes")
-    active_leg_boxes_value = int(active_leg_boxes) if isinstance(active_leg_boxes, (int, float)) else None
-    breakout_context = str(structure.get("breakout_context") or "").upper()
-    if not (breakout_context == "LATE_EXTENSION" and active_leg_boxes_value is not None and active_leg_boxes_value >= 5):
-        return out
-    if not columns:
-        return out
 
-    # The original logic finds the most recent O column whose low is an
-    # all-time low relative to prior O columns. The scanner cache maintains
-    # that answer incrementally so candidate rows do not rescan full history.
-    breakdown_idx = latest_breakdown_idx
-    breakdown_level = latest_breakdown_level
-    if breakdown_idx is None or breakdown_level is None:
-        min_prior_o_low = None
-        for idx, col in enumerate(columns):
-            if str(getattr(col, "kind", "")).upper() != "O":
-                continue
-            low = float(getattr(col, "bottom", 0.0))
-            if min_prior_o_low is None or low <= min_prior_o_low:
-                breakdown_idx = idx
-                breakdown_level = low
-                min_prior_o_low = low
 
-    if breakdown_idx is None or breakdown_level is None:
+def _shadow_reversal_long_fields_from_state(state: ShadowReversalLongState | None) -> Dict[str, Any]:
+    out = _empty_shadow_reversal_long_fields()
+    if state is None or not state.has_reclaimed:
         return out
-    end_idx = min(len(columns), int(breakdown_idx) + lookahead_columns + 1)
-    crossed_back_above = False
-    for col in columns[int(breakdown_idx) + 1 : end_idx]:
-        if float(getattr(col, "top", 0.0)) > float(breakdown_level):
-            crossed_back_above = True
-            break
-    if not crossed_back_above:
-        return out
-    lows_after_breakdown = [
-        float(getattr(col, "bottom", 0.0))
-        for col in columns[int(breakdown_idx):end_idx]
-        if str(getattr(col, "kind", "")).upper() == "O"
-    ]
-    if not lows_after_breakdown:
-        return out
-    stop = min(lows_after_breakdown)
-    entry = float(breakdown_level)
+    entry = float(state.breakdown_level)
+    stop = float(state.lowest_low_after_breakdown)
     risk = entry - stop
     if risk <= 0:
         return out
@@ -685,6 +706,80 @@ def _compute_shadow_reversal_long_fields(
     out["shadow_reversal_long_tp1"] = entry + (2.0 * risk)
     out["shadow_reversal_long_tp2"] = entry + (3.0 * risk)
     return out
+
+
+def _current_structure_low(structure: Dict[str, Any], fallback_price: float) -> float:
+    current_bottom = structure.get("current_column_bottom")
+    if isinstance(current_bottom, (int, float)):
+        return min(float(current_bottom), float(fallback_price))
+    return float(fallback_price)
+
+
+def _structure_has_reclaimed_breakdown(structure: Dict[str, Any], breakdown_level: float) -> bool:
+    current_kind = str(structure.get("current_column_kind") or "").upper()
+    current_top = structure.get("current_column_top")
+    if (
+        current_kind == "X"
+        and isinstance(current_top, (int, float))
+        and float(current_top) > float(breakdown_level)
+    ):
+        return True
+    return False
+
+
+def update_shadow_reversal_long_state(
+    *,
+    state: ShadowReversalLongState | None,
+    reference_ts: int,
+    close_price: float,
+    structure: Dict[str, Any],
+) -> tuple[ShadowReversalLongState | None, Dict[str, Any]]:
+    candidate_fields = _empty_shadow_reversal_long_fields()
+    latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
+    current_kind = str(structure.get("current_column_kind") or "").upper()
+    active_leg_boxes = structure.get("active_leg_boxes")
+    active_leg_boxes_value = int(active_leg_boxes) if isinstance(active_leg_boxes, (int, float)) else None
+
+    if state is None and latest_signal_name == "SELL" and current_kind == "O":
+        current_bottom = structure.get("current_column_bottom")
+        if isinstance(current_bottom, (int, float)):
+            breakdown_level = float(current_bottom)
+            return (
+                ShadowReversalLongState(
+                    breakdown_ts=int(reference_ts),
+                    breakdown_level=breakdown_level,
+                    lowest_low_after_breakdown=breakdown_level,
+                    has_extended=False,
+                    has_reclaimed=False,
+                    initial_active_leg_boxes=active_leg_boxes_value,
+                ),
+                candidate_fields,
+            )
+        return state, candidate_fields
+
+    if state is None or state.has_reclaimed:
+        return state, candidate_fields
+
+    state.lowest_low_after_breakdown = min(
+        float(state.lowest_low_after_breakdown),
+        _current_structure_low(structure, close_price),
+    )
+
+    initial_active_leg_boxes = state.initial_active_leg_boxes
+    if active_leg_boxes_value is not None:
+        extension_threshold = 4
+        if initial_active_leg_boxes is not None:
+            extension_threshold = max(extension_threshold, initial_active_leg_boxes + 1)
+        if active_leg_boxes_value >= extension_threshold:
+            state.has_extended = True
+
+    if state.has_extended and _structure_has_reclaimed_breakdown(structure, state.breakdown_level):
+        state.has_reclaimed = True
+        candidate_fields = _shadow_reversal_long_fields_from_state(state)
+        if int(candidate_fields.get("shadow_reversal_long_candidate") or 0) == 1:
+            return None, candidate_fields
+
+    return state, candidate_fields
 
 
 def evaluate_setups(symbol: str, profile: PnFProfile, engine: PnFEngine, structure: Dict[str, Any]) -> List[dict]:
@@ -711,8 +806,7 @@ def build_funnel_row(
     structure: Dict[str, Any],
     columns: List[Any],
     profile: PnFProfile,
-    latest_breakdown_idx: int | None = None,
-    latest_breakdown_level: float | None = None,
+    shadow_reversal_long_fields: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     shadow_v4_status = setup.get("shadow_v4_status", setup.get("status"))
     shadow_v4_watch_flags = str(setup.get("watch_flags") or "").strip()
@@ -784,6 +878,12 @@ def build_funnel_row(
         "shadow_krausz_bounce_short_stop": None,
         "shadow_krausz_bounce_short_tp1": None,
         "shadow_krausz_bounce_short_tp2": None,
+        "bars_since_breakdown": None,
+        "bounce_depth_boxes": None,
+        "reclaim_fraction": None,
+        "rejection_speed_bars": None,
+        "bounce_column_height": None,
+        "failed_below_breakdown": None,
         "shadow_reversal_long_candidate": 0,
         "shadow_reversal_long_entry": None,
         "shadow_reversal_long_stop": None,
@@ -796,15 +896,9 @@ def build_funnel_row(
     }
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
-    row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns))
-    row.update(
-        _compute_shadow_reversal_long_fields(
-            structure=structure,
-            columns=columns,
-            latest_breakdown_idx=latest_breakdown_idx,
-            latest_breakdown_level=latest_breakdown_level,
-        )
-    )
+    row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns, profile=profile))
+    if shadow_reversal_long_fields is not None:
+        row.update(shadow_reversal_long_fields)
     return row
 
 
@@ -833,6 +927,7 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
     previous_basic_state: tuple[int, str | None, float | None, float | None, str | None] | None = None
     previous_event_state: ShadowEventState | None = None
     shadow_continuation_pending_candidate_id: str | None = None
+    shadow_reversal_long_state: ShadowReversalLongState | None = None
     t_symbol = time.perf_counter()
     counters: Dict[str, Any] = {
         "candles_processed": 0,
@@ -857,6 +952,11 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
         basic_state = _basic_event_state_from_engine(engine)
         counters["event_detection_s"] += time.perf_counter() - t0
         if basic_state == previous_basic_state:
+            if shadow_reversal_long_state is not None:
+                shadow_reversal_long_state.lowest_low_after_breakdown = min(
+                    float(shadow_reversal_long_state.lowest_low_after_breakdown),
+                    close_price,
+                )
             counters["events_skipped"] += 1
             continue
         previous_basic_state = basic_state
@@ -882,6 +982,12 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
         counters["events_processed"] += 1
 
         t0 = time.perf_counter()
+        shadow_reversal_long_state, shadow_reversal_long_fields = update_shadow_reversal_long_state(
+            state=shadow_reversal_long_state,
+            reference_ts=close_ts,
+            close_price=close_price,
+            structure=structure,
+        )
         setups = evaluate_setups(symbol, profile, engine, structure)
         for setup in setups:
             funnel_row = build_funnel_row(
@@ -891,8 +997,7 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
                 structure=structure,
                 columns=engine.columns,
                 profile=profile,
-                latest_breakdown_idx=snapshot.latest_all_time_o_breakdown_idx,
-                latest_breakdown_level=snapshot.latest_all_time_o_breakdown_level,
+                shadow_reversal_long_fields=shadow_reversal_long_fields,
             )
             if str(setup.get("side") or "").upper() == "LONG" and str(structure.get("breakout_context") or "").upper() == "LATE_EXTENSION":
                 current_col = engine.columns[-1] if engine.columns else None
