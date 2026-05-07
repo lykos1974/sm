@@ -84,6 +84,12 @@ FUNNEL_FIELD_ORDER = [
     "shadow_krausz_bounce_short_stop",
     "shadow_krausz_bounce_short_tp1",
     "shadow_krausz_bounce_short_tp2",
+    "bars_since_breakdown",
+    "bounce_depth_boxes",
+    "reclaim_fraction",
+    "rejection_speed_bars",
+    "bounce_column_height",
+    "failed_below_breakdown",
     "shadow_reversal_long_candidate",
     "shadow_reversal_long_entry",
     "shadow_reversal_long_stop",
@@ -576,13 +582,38 @@ def _compute_shadow_krausz_short_fields(*, structure: Dict[str, Any], columns: L
     return out
 
 
-def _compute_shadow_krausz_bounce_short_fields(*, structure: Dict[str, Any], columns: List[Any], max_bounce_boxes: int = 2) -> Dict[str, Any]:
+def _bars_between(start_ts: int | None, end_ts: int | None) -> int | None:
+    if start_ts is None or end_ts is None:
+        return None
+    return max(0, int(round((int(end_ts) - int(start_ts)) / 60000.0)))
+
+
+def _previous_o_bottom_before(columns: List[Any], column_idx: int) -> float | None:
+    for col in reversed(columns[:column_idx]):
+        if str(getattr(col, "kind", "")).upper() == "O":
+            return float(getattr(col, "bottom", 0.0))
+    return None
+
+
+def _compute_shadow_krausz_bounce_short_fields(
+    *,
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    max_bounce_boxes: int = 2,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "shadow_krausz_bounce_short_candidate": 0,
         "shadow_krausz_bounce_short_entry": None,
         "shadow_krausz_bounce_short_stop": None,
         "shadow_krausz_bounce_short_tp1": None,
         "shadow_krausz_bounce_short_tp2": None,
+        "bars_since_breakdown": None,
+        "bounce_depth_boxes": None,
+        "reclaim_fraction": None,
+        "rejection_speed_bars": None,
+        "bounce_column_height": None,
+        "failed_below_breakdown": None,
     }
     if str(structure.get("latest_signal_name") or "").upper() != "SELL":
         return out
@@ -623,6 +654,30 @@ def _compute_shadow_krausz_bounce_short_fields(*, structure: Dict[str, Any], col
     out["shadow_krausz_bounce_short_stop"] = stop
     out["shadow_krausz_bounce_short_tp1"] = entry - (2.0 * risk)
     out["shadow_krausz_bounce_short_tp2"] = entry - (3.0 * risk)
+
+    box_size = float(profile.box_size)
+    initial_breakdown_level = _previous_o_bottom_before(columns, int(getattr(breakdown_o, "idx", 0)))
+    if initial_breakdown_level is None:
+        initial_breakdown_level = breakdown_level
+    if box_size > 0:
+        out["bounce_column_height"] = int(
+            round(abs(bounce_high - float(getattr(bounce_x, "bottom", 0.0))) / box_size)
+        )
+        out["bounce_depth_boxes"] = max(0.0, (bounce_high - breakdown_level) / box_size)
+    breakdown_range = initial_breakdown_level - breakdown_level
+    if breakdown_range > 0:
+        out["reclaim_fraction"] = (bounce_high - breakdown_level) / breakdown_range
+    else:
+        out["reclaim_fraction"] = None
+    out["bars_since_breakdown"] = _bars_between(
+        int(getattr(breakdown_o, "start_ts", 0)),
+        int(getattr(resumed_o, "start_ts", 0)),
+    )
+    out["rejection_speed_bars"] = _bars_between(
+        int(getattr(bounce_x, "end_ts", 0)),
+        int(getattr(resumed_o, "start_ts", 0)),
+    )
+    out["failed_below_breakdown"] = 1 if bounce_high <= initial_breakdown_level else 0
     return out
 
 
@@ -823,6 +878,12 @@ def build_funnel_row(
         "shadow_krausz_bounce_short_stop": None,
         "shadow_krausz_bounce_short_tp1": None,
         "shadow_krausz_bounce_short_tp2": None,
+        "bars_since_breakdown": None,
+        "bounce_depth_boxes": None,
+        "reclaim_fraction": None,
+        "rejection_speed_bars": None,
+        "bounce_column_height": None,
+        "failed_below_breakdown": None,
         "shadow_reversal_long_candidate": 0,
         "shadow_reversal_long_entry": None,
         "shadow_reversal_long_stop": None,
@@ -835,7 +896,7 @@ def build_funnel_row(
     }
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
-    row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns))
+    row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns, profile=profile))
     if shadow_reversal_long_fields is not None:
         row.update(shadow_reversal_long_fields)
     return row
