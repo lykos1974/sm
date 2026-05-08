@@ -97,6 +97,14 @@ FUNNEL_FIELD_ORDER = [
     "shadow_reversal_long_tp2",
     "shadow_triple_top_breakout",
     "shadow_triple_bottom_breakdown",
+    "shadow_bearish_catapult",
+    "catapult_support_level",
+    "catapult_origin_width",
+    "catapult_rebound_columns",
+    "catapult_total_columns",
+    "catapult_break_distance_boxes",
+    "catapult_rebound_failed",
+    "catapult_pattern_quality",
     "triple_top_resistance_level",
     "triple_bottom_support_level",
     "triple_pattern_width_columns",
@@ -133,6 +141,17 @@ class ShadowReversalLongState:
     has_extended: bool
     has_reclaimed: bool
     initial_active_leg_boxes: int | None
+
+
+@dataclass
+class ShadowBearishCatapultState:
+    support_level: float
+    origin_breakdown_idx: int
+    origin_start_idx: int
+    origin_width: int
+    origin_test_count: int
+    origin_resistance_level: float
+    rebound_column_indices: set[int]
 
 
 @dataclass(frozen=True)
@@ -517,6 +536,19 @@ def _empty_shadow_triple_pattern_fields() -> Dict[str, Any]:
     }
 
 
+def _empty_shadow_bearish_catapult_fields() -> Dict[str, Any]:
+    return {
+        "shadow_bearish_catapult": 0,
+        "catapult_support_level": None,
+        "catapult_origin_width": None,
+        "catapult_rebound_columns": None,
+        "catapult_total_columns": None,
+        "catapult_break_distance_boxes": None,
+        "catapult_rebound_failed": None,
+        "catapult_pattern_quality": None,
+    }
+
+
 def _pattern_compaction_hint(width_columns: int | None) -> str | None:
     if width_columns is None:
         return None
@@ -636,6 +668,134 @@ def _compute_shadow_triple_pattern_fields(
             return out
 
     return out
+
+
+def _catapult_pattern_quality(total_columns: int | None) -> str | None:
+    return _pattern_compaction_hint(total_columns)
+
+
+def _origin_resistance_level(columns: List[Any], origin_start_idx: int, origin_breakdown_idx: int) -> float | None:
+    local_origin_columns = [
+        col
+        for col in columns[-21:]
+        if origin_start_idx <= int(getattr(col, "idx", -1)) <= origin_breakdown_idx
+        and str(getattr(col, "kind", "")).upper() == "X"
+    ]
+    if not local_origin_columns:
+        return None
+    return max(float(getattr(col, "top", 0.0)) for col in local_origin_columns)
+
+
+def _state_from_triple_bottom_origin(
+    *, columns: List[Any], triple_pattern_fields: Dict[str, Any]
+) -> ShadowBearishCatapultState | None:
+    if int(triple_pattern_fields.get("shadow_triple_bottom_breakdown") or 0) != 1 or not columns:
+        return None
+    support_level = triple_pattern_fields.get("triple_bottom_support_level")
+    origin_width = triple_pattern_fields.get("triple_pattern_width_columns")
+    origin_test_count = triple_pattern_fields.get("prior_test_count")
+    if support_level is None or origin_width is None or origin_test_count is None:
+        return None
+    current = columns[-1]
+    origin_breakdown_idx = int(getattr(current, "idx", len(columns) - 1))
+    origin_width_value = int(origin_width)
+    origin_start_idx = origin_breakdown_idx - origin_width_value + 1
+    resistance_level = _origin_resistance_level(columns, origin_start_idx, origin_breakdown_idx)
+    if resistance_level is None:
+        return None
+    return ShadowBearishCatapultState(
+        support_level=float(support_level),
+        origin_breakdown_idx=origin_breakdown_idx,
+        origin_start_idx=origin_start_idx,
+        origin_width=origin_width_value,
+        origin_test_count=int(origin_test_count),
+        origin_resistance_level=float(resistance_level),
+        rebound_column_indices=set(),
+    )
+
+
+def _current_column_crosses_catapult_support(current: Any, support_level: float, box_size: float) -> bool:
+    if box_size <= 0:
+        return False
+    current_top = float(getattr(current, "top", 0.0))
+    current_bottom = float(getattr(current, "bottom", 0.0))
+    # The second O column must attack the original support area, not merely
+    # continue a lower sell leg. Requiring the column to span the support keeps
+    # the breakdown level anchored to the originating triple bottom.
+    return current_top >= support_level - (0.25 * box_size) and current_bottom < support_level
+
+
+def update_shadow_bearish_catapult_states(
+    *,
+    active_states: Dict[float, ShadowBearishCatapultState],
+    emitted_levels: set[float],
+    triple_pattern_fields: Dict[str, Any],
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    max_total_columns: int = 21,
+) -> Dict[str, Any]:
+    fields = _empty_shadow_bearish_catapult_fields()
+    origin_state = _state_from_triple_bottom_origin(columns=columns, triple_pattern_fields=triple_pattern_fields)
+    if origin_state is not None and origin_state.support_level not in emitted_levels:
+        active_states[origin_state.support_level] = origin_state
+
+    if not columns:
+        return fields
+    box_size = float(profile.box_size)
+    if box_size <= 0:
+        return fields
+
+    current = columns[-1]
+    current_idx = int(getattr(current, "idx", len(columns) - 1))
+    current_kind = str(getattr(current, "kind", "")).upper()
+    latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
+
+    stale_levels: List[float] = []
+    for support_level, state in list(active_states.items()):
+        if support_level in emitted_levels or current_idx <= state.origin_breakdown_idx:
+            continue
+
+        total_columns = current_idx - state.origin_start_idx + 1
+        if total_columns > max_total_columns:
+            stale_levels.append(support_level)
+            continue
+
+        if current_kind == "X":
+            current_top = float(getattr(current, "top", 0.0))
+            if latest_signal_name == "BUY" or current_top >= state.origin_resistance_level:
+                stale_levels.append(support_level)
+                continue
+            state.rebound_column_indices.add(current_idx)
+            continue
+
+        if current_kind != "O" or latest_signal_name != "SELL" or not state.rebound_column_indices:
+            continue
+        if total_columns < 7:
+            continue
+        if not _current_column_crosses_catapult_support(current, state.support_level, box_size):
+            continue
+
+        current_bottom = float(getattr(current, "bottom", 0.0))
+        fields.update(
+            {
+                "shadow_bearish_catapult": 1,
+                "catapult_support_level": state.support_level,
+                "catapult_origin_width": state.origin_width,
+                "catapult_rebound_columns": len(state.rebound_column_indices),
+                "catapult_total_columns": total_columns,
+                "catapult_break_distance_boxes": round((state.support_level - current_bottom) / box_size, 4),
+                "catapult_rebound_failed": 1,
+                "catapult_pattern_quality": _catapult_pattern_quality(total_columns),
+            }
+        )
+        emitted_levels.add(support_level)
+        stale_levels.append(support_level)
+        break
+
+    for support_level in stale_levels:
+        active_states.pop(support_level, None)
+    return fields
 
 
 def _compute_shadow_continuation_fields(
@@ -1044,6 +1204,14 @@ def build_funnel_row(
         "shadow_reversal_long_tp2": None,
         "shadow_triple_top_breakout": 0,
         "shadow_triple_bottom_breakdown": 0,
+        "shadow_bearish_catapult": 0,
+        "catapult_support_level": None,
+        "catapult_origin_width": None,
+        "catapult_rebound_columns": None,
+        "catapult_total_columns": None,
+        "catapult_break_distance_boxes": None,
+        "catapult_rebound_failed": None,
+        "catapult_pattern_quality": None,
         "triple_top_resistance_level": None,
         "triple_bottom_support_level": None,
         "triple_pattern_width_columns": None,
@@ -1094,7 +1262,12 @@ def build_structural_event_row(
 ) -> Dict[str, Any]:
     row = {field: None for field in FUNNEL_FIELD_ORDER}
     side = "LONG" if int(fields.get("shadow_triple_top_breakout") or 0) == 1 else "SHORT"
-    reason = "shadow_triple_top_breakout" if side == "LONG" else "shadow_triple_bottom_breakdown"
+    if int(fields.get("shadow_bearish_catapult") or 0) == 1:
+        reason = "shadow_bearish_catapult"
+    elif side == "LONG":
+        reason = "shadow_triple_top_breakout"
+    else:
+        reason = "shadow_triple_bottom_breakdown"
     row.update(
         {
             "symbol": symbol,
@@ -1153,6 +1326,8 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
     shadow_reversal_long_state: ShadowReversalLongState | None = None
     emitted_triple_top_levels: set[float] = set()
     emitted_triple_bottom_levels: set[float] = set()
+    active_bearish_catapult_states: Dict[float, ShadowBearishCatapultState] = {}
+    emitted_bearish_catapult_levels: set[float] = set()
     t_symbol = time.perf_counter()
     counters: Dict[str, Any] = {
         "candles_processed": 0,
@@ -1221,6 +1396,14 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
             emitted_triple_top_levels=emitted_triple_top_levels,
             emitted_triple_bottom_levels=emitted_triple_bottom_levels,
         )
+        bearish_catapult_fields = update_shadow_bearish_catapult_states(
+            active_states=active_bearish_catapult_states,
+            emitted_levels=emitted_bearish_catapult_levels,
+            triple_pattern_fields=triple_pattern_fields,
+            structure=structure,
+            columns=engine.columns,
+            profile=profile,
+        )
         if _has_shadow_triple_pattern_flag(triple_pattern_fields):
             rows.append(
                 build_structural_event_row(
@@ -1234,6 +1417,16 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
                 emitted_triple_top_levels.add(float(triple_pattern_fields["triple_top_resistance_level"]))
             if int(triple_pattern_fields.get("shadow_triple_bottom_breakdown") or 0) == 1:
                 emitted_triple_bottom_levels.add(float(triple_pattern_fields["triple_bottom_support_level"]))
+            counters["structural_events_generated"] += 1
+        if int(bearish_catapult_fields.get("shadow_bearish_catapult") or 0) == 1:
+            rows.append(
+                build_structural_event_row(
+                    symbol=symbol,
+                    reference_ts=close_ts,
+                    structure=structure,
+                    fields=bearish_catapult_fields,
+                )
+            )
             counters["structural_events_generated"] += 1
         setups = evaluate_setups(symbol, profile, engine, structure)
         for setup in setups:
