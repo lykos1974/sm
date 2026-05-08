@@ -239,3 +239,40 @@ This suggests symbol personality / high-beta altcoin behavior must be part of fu
 Important future rule:
 Do not assume one crypto strategy applies uniformly across BTC, ETH, and SOL.
 Future research should classify structural archetypes by asset behavior.
+
+---
+
+## STRUCTURAL_PATTERN_OUTCOME_SUMMARY_V1 — Unified structural edge comparison
+
+Context:
+First unified outcome-analysis pass for canonical structural PnF patterns detected by `shadow_research_scanner.py` and analyzed with `pattern_outcome_analysis.py` across BTC, ETH, and SOL.
+
+Scope:
+- Analysis-only documentation.
+- No strategy changes.
+- No validation changes.
+- No scanner or detector changes.
+- No baseline promotion.
+
+Key verified findings:
+- `bullish_triangle` is currently the strongest verified structural continuation pattern.
+  - BTC: 655 trades, avg_R +1.576, stop_rate 20.8%, tp2_rate 19.8%, median_bars_to_event 2.
+  - ETH: 716 trades, avg_R +1.635, stop_rate 19.0%, tp2_rate 20.5%, median_bars_to_event 2.
+  - SOL: 859 trades, avg_R +1.750, stop_rate 18.7%, tp2_rate 31.2%, median_bars_to_event 1.
+- `bearish_catapult` appears to be a valid slower continuation structure.
+  - BTC: 85 trades, avg_R +1.035, stop_rate 32.9%, tp2_rate 2.35%, median_bars_to_event 26.
+  - ETH: 80 trades, avg_R +1.350, stop_rate 23.8%, tp2_rate 6.25%, median_bars_to_event 27.
+  - SOL: 110 trades, avg_R +1.218, stop_rate 27.3%, tp2_rate 3.64%, median_bars_to_event 23.5.
+
+Interpretation:
+- Bullish triangle belongs to a compression-release family with immediate expansion behavior.
+- Bearish catapult belongs to a continuation-after-trap family with slower directional persistence.
+- Timing profiles differ enough that eventual execution research should treat these as separate structural families.
+
+Decision:
+- Outcome: **KEEP AS RESEARCH**.
+- Rationale: Strong normalized structural findings, but no execution specialization or strategy promotion has been approved.
+- Follow-up: Analyze `bearish_triangle`, `bullish_catapult`, `bullish_signal_reversal`, `bearish_signal_reversal`, and `shakeout`; then pursue overlap analysis, family classification, regime conditioning, and timing-specific execution models.
+
+Detailed report:
+- `experiments/structural_pattern_outcome_summary_v1.md`
