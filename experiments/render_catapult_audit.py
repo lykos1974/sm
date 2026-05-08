@@ -11,8 +11,10 @@ import argparse
 import csv
 import html
 import json
+import math
 import sqlite3
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +54,15 @@ class ReconstructedColumns:
     candles_processed: int
     has_after_context: bool
     box_size: float
+
+
+@dataclass(frozen=True)
+class CatapultLoadResult:
+    rows: list[CatapultAuditRow]
+    total_input_rows: int
+    catapult_rows_before_symbol_filter: int
+    catapult_rows_after_symbol_filter: int
+    catapult_symbols: Counter[str]
 
 
 def resolve_repo_path(path_text: str) -> Path:
@@ -106,23 +117,68 @@ def parse_float(value: Any) -> float | None:
         return None
 
 
+def row_value(row: dict[str, Any], key: str) -> Any | None:
+    if key in row:
+        return row[key]
+    for candidate_key, value in row.items():
+        if str(candidate_key).strip().lstrip("\ufeff") == key:
+            return value
+    return None
+
+
+def is_catapult_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, float):
+        return math.isfinite(value) and value == 1.0
+
+    text = str(value).strip()
+    if not text:
+        return False
+    try:
+        numeric_value = float(text)
+    except ValueError:
+        return False
+    return math.isfinite(numeric_value) and numeric_value == 1.0
+
+
 def is_catapult_row(row: dict[str, str]) -> bool:
-    return parse_int(row.get("shadow_bearish_catapult")) == 1
+    return is_catapult_value(row_value(row, "shadow_bearish_catapult"))
 
 
-def load_catapult_rows(input_csv: Path, symbol_filter: set[str] | None, limit: int | None) -> list[CatapultAuditRow]:
+def load_catapult_rows(input_csv: Path, symbol_filter: set[str] | None, limit: int | None) -> CatapultLoadResult:
     rows: list[CatapultAuditRow] = []
+    total_input_rows = 0
+    catapult_rows_before_symbol_filter = 0
+    catapult_rows_after_symbol_filter = 0
+    catapult_symbols: Counter[str] = Counter()
+
     with input_csv.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for source_row_number, row in enumerate(reader, start=2):
+            total_input_rows += 1
             if not is_catapult_row(row):
                 continue
-            symbol = str(row.get("symbol") or "").strip()
+
+            catapult_rows_before_symbol_filter += 1
+            symbol = str(row_value(row, "symbol") or "").strip()
+            if symbol:
+                catapult_symbols[symbol] += 1
+
             if not symbol:
                 continue
             if symbol_filter is not None and symbol not in symbol_filter:
                 continue
-            reference_ts = parse_int(row.get("reference_ts"))
+
+            catapult_rows_after_symbol_filter += 1
+            if limit is not None and len(rows) >= limit:
+                continue
+
+            reference_ts = parse_int(row_value(row, "reference_ts"))
             if reference_ts is None:
                 continue
             rows.append(
@@ -132,15 +188,19 @@ def load_catapult_rows(input_csv: Path, symbol_filter: set[str] | None, limit: i
                     row=row,
                     symbol=symbol,
                     reference_ts=reference_ts,
-                    support_level=parse_float(row.get("catapult_support_level")),
-                    total_columns=parse_int(row.get("catapult_total_columns")),
-                    origin_width=parse_int(row.get("catapult_origin_width")),
-                    pattern_quality=(row.get("catapult_pattern_quality") or None),
+                    support_level=parse_float(row_value(row, "catapult_support_level")),
+                    total_columns=parse_int(row_value(row, "catapult_total_columns")),
+                    origin_width=parse_int(row_value(row, "catapult_origin_width")),
+                    pattern_quality=(row_value(row, "catapult_pattern_quality") or None),
                 )
             )
-            if limit is not None and len(rows) >= limit:
-                break
-    return rows
+    return CatapultLoadResult(
+        rows=rows,
+        total_input_rows=total_input_rows,
+        catapult_rows_before_symbol_filter=catapult_rows_before_symbol_filter,
+        catapult_rows_after_symbol_filter=catapult_rows_after_symbol_filter,
+        catapult_symbols=catapult_symbols,
+    )
 
 
 def load_candles(database_path: Path, symbol: str, end_ts: int) -> list[dict[str, Any]]:
@@ -452,7 +512,8 @@ def main() -> None:
     database_path = resolve_settings_relative_path(settings_path, settings["database_path"])
     profiles = build_profiles(settings)
     symbol_filter = {part.strip() for part in args.symbol.split(",") if part.strip()} if args.symbol else None
-    audit_rows = load_catapult_rows(input_csv, symbol_filter, args.limit)
+    load_result = load_catapult_rows(input_csv, symbol_filter, args.limit)
+    audit_rows = load_result.rows
 
     rendered: list[tuple[CatapultAuditRow, str, str]] = []
     for audit_row in audit_rows:
@@ -478,6 +539,13 @@ def main() -> None:
 
     index_path = output_dir / "index.html"
     index_path.write_text(render_index(rendered), encoding="utf-8")
+    available_symbols = ", ".join(
+        f"{symbol}={count}" for symbol, count in sorted(load_result.catapult_symbols.items())
+    ) or "none"
+    print(f"Total input rows: {load_result.total_input_rows}")
+    print(f"Catapult rows before symbol filter: {load_result.catapult_rows_before_symbol_filter}")
+    print(f"Catapult rows after symbol filter: {load_result.catapult_rows_after_symbol_filter}")
+    print(f"Symbols available among catapult rows: {available_symbols}")
     print(f"Loaded {len(audit_rows)} bearish catapult row(s) from {input_csv}")
     print(f"Wrote audit index to {index_path}")
 
