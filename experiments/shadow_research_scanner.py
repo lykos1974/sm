@@ -97,7 +97,20 @@ FUNNEL_FIELD_ORDER = [
     "shadow_reversal_long_tp2",
     "shadow_triple_top_breakout",
     "shadow_triple_bottom_breakdown",
+    "shadow_double_top_breakout",
+    "shadow_double_bottom_breakdown",
+    "shadow_bullish_catapult",
     "shadow_bearish_catapult",
+    "shadow_bullish_triangle",
+    "shadow_bearish_triangle",
+    "shadow_bullish_signal_reversal",
+    "shadow_bearish_signal_reversal",
+    "shadow_shakeout",
+    "pattern_width_columns",
+    "pattern_support_level",
+    "pattern_resistance_level",
+    "pattern_break_distance_boxes",
+    "pattern_quality",
     "catapult_support_level",
     "catapult_origin_width",
     "catapult_rebound_columns",
@@ -526,7 +539,8 @@ def _empty_shadow_triple_pattern_fields() -> Dict[str, Any]:
 
 
 def _empty_shadow_bearish_catapult_fields() -> Dict[str, Any]:
-    return {
+    fields = _empty_shadow_core_pattern_fields()
+    fields.update({
         "shadow_bearish_catapult": 0,
         "catapult_support_level": None,
         "catapult_origin_width": None,
@@ -535,7 +549,379 @@ def _empty_shadow_bearish_catapult_fields() -> Dict[str, Any]:
         "catapult_break_distance_boxes": None,
         "catapult_rebound_failed": None,
         "catapult_pattern_quality": None,
+    })
+    return fields
+
+
+def _empty_shadow_core_pattern_fields() -> Dict[str, Any]:
+    return {
+        "shadow_double_top_breakout": 0,
+        "shadow_double_bottom_breakdown": 0,
+        "shadow_bullish_catapult": 0,
+        "shadow_bullish_triangle": 0,
+        "shadow_bearish_triangle": 0,
+        "shadow_bullish_signal_reversal": 0,
+        "shadow_bearish_signal_reversal": 0,
+        "shadow_shakeout": 0,
+        "pattern_width_columns": None,
+        "pattern_support_level": None,
+        "pattern_resistance_level": None,
+        "pattern_break_distance_boxes": None,
+        "pattern_quality": None,
     }
+
+
+def _core_pattern_flag_names() -> tuple[str, ...]:
+    return (
+        "shadow_double_top_breakout",
+        "shadow_double_bottom_breakdown",
+        "shadow_bullish_catapult",
+        "shadow_bullish_triangle",
+        "shadow_bearish_triangle",
+        "shadow_bullish_signal_reversal",
+        "shadow_bearish_signal_reversal",
+        "shadow_shakeout",
+    )
+
+
+def _has_shadow_core_pattern_flag(fields: Dict[str, Any]) -> bool:
+    return any(int(fields.get(name) or 0) == 1 for name in _core_pattern_flag_names())
+
+
+def _first_shadow_core_pattern_flag(fields: Dict[str, Any]) -> str | None:
+    for name in _core_pattern_flag_names():
+        if int(fields.get(name) or 0) == 1:
+            return name
+    return None
+
+
+def _column_kind(column: Any) -> str:
+    return str(getattr(column, "kind", "")).upper()
+
+
+def _column_top(column: Any) -> float:
+    return float(getattr(column, "top", 0.0))
+
+
+def _column_bottom(column: Any) -> float:
+    return float(getattr(column, "bottom", 0.0))
+
+
+def _consecutive_indices(columns: List[Any]) -> bool:
+    if not columns:
+        return False
+    indices = [int(getattr(col, "idx", -1)) for col in columns]
+    return indices == list(range(indices[0], indices[0] + len(indices)))
+
+
+def _pattern_break_distance(break_level: float, reference_level: float, box_size: float, direction: str) -> float | None:
+    if box_size <= 0:
+        return None
+    if direction == "UP":
+        return round((break_level - reference_level) / box_size, 4)
+    return round((reference_level - break_level) / box_size, 4)
+
+
+def _emit_core_pattern(
+    *,
+    flag_name: str,
+    width_columns: int,
+    support_level: float | None,
+    resistance_level: float | None,
+    break_distance_boxes: float | None,
+    quality: str,
+) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    fields[flag_name] = 1
+    fields["pattern_width_columns"] = width_columns
+    fields["pattern_support_level"] = support_level
+    fields["pattern_resistance_level"] = resistance_level
+    fields["pattern_break_distance_boxes"] = break_distance_boxes
+    fields["pattern_quality"] = quality
+    return fields
+
+
+def _strict_double_top_breakout_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    if len(columns) < 3 or float(profile.box_size) <= 0:
+        return fields
+    current = columns[-1]
+    if _column_kind(current) != "X" or str(structure.get("latest_signal_name") or "").upper() != "BUY":
+        return fields
+    sequence = columns[-3:]
+    if not _consecutive_indices(sequence) or [_column_kind(col) for col in sequence] != ["X", "O", "X"]:
+        return fields
+    first_x, pullback_o, breakout_x = sequence
+    resistance_level = _column_top(first_x)
+    current_top = _column_top(breakout_x)
+    if current_top <= resistance_level:
+        return fields
+    return _emit_core_pattern(
+        flag_name="shadow_double_top_breakout",
+        width_columns=3,
+        support_level=_column_bottom(pullback_o),
+        resistance_level=resistance_level,
+        break_distance_boxes=_pattern_break_distance(current_top, resistance_level, float(profile.box_size), "UP"),
+        quality="STRICT_CONSECUTIVE_3_COL_DOUBLE_TOP",
+    )
+
+
+def _strict_double_bottom_breakdown_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    if len(columns) < 3 or float(profile.box_size) <= 0:
+        return fields
+    current = columns[-1]
+    if _column_kind(current) != "O" or str(structure.get("latest_signal_name") or "").upper() != "SELL":
+        return fields
+    sequence = columns[-3:]
+    if not _consecutive_indices(sequence) or [_column_kind(col) for col in sequence] != ["O", "X", "O"]:
+        return fields
+    first_o, rebound_x, breakdown_o = sequence
+    support_level = _column_bottom(first_o)
+    current_bottom = _column_bottom(breakdown_o)
+    if current_bottom >= support_level:
+        return fields
+    return _emit_core_pattern(
+        flag_name="shadow_double_bottom_breakdown",
+        width_columns=3,
+        support_level=support_level,
+        resistance_level=_column_top(rebound_x),
+        break_distance_boxes=_pattern_break_distance(current_bottom, support_level, float(profile.box_size), "DOWN"),
+        quality="STRICT_CONSECUTIVE_3_COL_DOUBLE_BOTTOM",
+    )
+
+
+def _strict_bullish_catapult_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    if len(columns) < 7 or float(profile.box_size) <= 0:
+        return fields
+    current = columns[-1]
+    if _column_kind(current) != "X" or str(structure.get("latest_signal_name") or "").upper() != "BUY":
+        return fields
+    sequence = columns[-7:]
+    if not _consecutive_indices(sequence) or [_column_kind(col) for col in sequence] != ["X", "O", "X", "O", "X", "O", "X"]:
+        return fields
+    first_test, _, second_test, _, first_breakout, pullback, second_breakout = sequence
+    resistance_level = _column_top(first_test)
+    if _column_top(second_test) != resistance_level:
+        return fields
+    first_breakout_top = _column_top(first_breakout)
+    second_breakout_top = _column_top(second_breakout)
+    first_breakout_bottom = _column_bottom(first_breakout)
+    second_breakout_bottom = _column_bottom(second_breakout)
+    resistance_tolerance = 0.25 * float(profile.box_size)
+    if first_breakout_bottom > resistance_level + resistance_tolerance or first_breakout_top <= resistance_level:
+        return fields
+    if second_breakout_bottom > resistance_level + resistance_tolerance or second_breakout_top <= resistance_level:
+        return fields
+    if (_column_height_boxes(first_breakout, float(profile.box_size)) or 0) < 2:
+        return fields
+    if (_column_height_boxes(second_breakout, float(profile.box_size)) or 0) < 2:
+        return fields
+    return _emit_core_pattern(
+        flag_name="shadow_bullish_catapult",
+        width_columns=7,
+        support_level=_column_bottom(pullback),
+        resistance_level=resistance_level,
+        break_distance_boxes=_pattern_break_distance(second_breakout_top, resistance_level, float(profile.box_size), "UP"),
+        quality="STRICT_CONSECUTIVE_7_COL_BULLISH_CATAPULT",
+    )
+
+
+def _strict_triangle_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    if len(columns) < 5 or float(profile.box_size) <= 0:
+        return fields
+    latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
+    sequence = columns[-5:]
+    if not _consecutive_indices(sequence):
+        return fields
+    kinds = [_column_kind(col) for col in sequence]
+    if kinds == ["X", "O", "X", "O", "X"] and latest_signal_name == "BUY":
+        first_x, first_o, lower_high_x, higher_low_o, breakout_x = sequence
+        resistance_level = _column_top(lower_high_x)
+        if _column_top(lower_high_x) >= _column_top(first_x):
+            return fields
+        if _column_bottom(higher_low_o) <= _column_bottom(first_o):
+            return fields
+        if _column_top(breakout_x) <= resistance_level:
+            return fields
+        return _emit_core_pattern(
+            flag_name="shadow_bullish_triangle",
+            width_columns=5,
+            support_level=_column_bottom(higher_low_o),
+            resistance_level=resistance_level,
+            break_distance_boxes=_pattern_break_distance(_column_top(breakout_x), resistance_level, float(profile.box_size), "UP"),
+            quality="STRICT_CONSECUTIVE_5_COL_TRIANGLE_UP_BREAK",
+        )
+    if kinds == ["O", "X", "O", "X", "O"] and latest_signal_name == "SELL":
+        first_o, first_x, higher_low_o, lower_high_x, breakdown_o = sequence
+        support_level = _column_bottom(higher_low_o)
+        if _column_bottom(higher_low_o) <= _column_bottom(first_o):
+            return fields
+        if _column_top(lower_high_x) >= _column_top(first_x):
+            return fields
+        if _column_bottom(breakdown_o) >= support_level:
+            return fields
+        return _emit_core_pattern(
+            flag_name="shadow_bearish_triangle",
+            width_columns=5,
+            support_level=support_level,
+            resistance_level=_column_top(lower_high_x),
+            break_distance_boxes=_pattern_break_distance(_column_bottom(breakdown_o), support_level, float(profile.box_size), "DOWN"),
+            quality="STRICT_CONSECUTIVE_5_COL_TRIANGLE_DOWN_BREAK",
+        )
+    return fields
+
+
+def _strict_signal_reversal_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    if len(columns) < 6 or float(profile.box_size) <= 0:
+        return fields
+    latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
+    sequence = columns[-6:]
+    if not _consecutive_indices(sequence):
+        return fields
+    kinds = [_column_kind(col) for col in sequence]
+    if kinds == ["O", "X", "O", "X", "O", "X"] and latest_signal_name == "BUY":
+        first_o = sequence[0]
+        first_x = sequence[1]
+        lower_low_o = sequence[2]
+        lower_high_x = sequence[3]
+        confirming_o = sequence[4]
+        breakout_x = sequence[5]
+        if _column_bottom(lower_low_o) >= _column_bottom(first_o):
+            return fields
+        if _column_top(lower_high_x) >= _column_top(first_x):
+            return fields
+        resistance_level = _column_top(lower_high_x)
+        if _column_top(breakout_x) <= resistance_level:
+            return fields
+        return _emit_core_pattern(
+            flag_name="shadow_bearish_signal_reversal",
+            width_columns=6,
+            support_level=_column_bottom(confirming_o),
+            resistance_level=resistance_level,
+            break_distance_boxes=_pattern_break_distance(_column_top(breakout_x), resistance_level, float(profile.box_size), "UP"),
+            quality="STRICT_CONSECUTIVE_6_COL_BEARISH_SIGNAL_REVERSED",
+        )
+    if kinds == ["X", "O", "X", "O", "X", "O"] and latest_signal_name == "SELL":
+        first_x = sequence[0]
+        first_o = sequence[1]
+        higher_high_x = sequence[2]
+        higher_low_o = sequence[3]
+        confirming_x = sequence[4]
+        breakdown_o = sequence[5]
+        if _column_top(higher_high_x) <= _column_top(first_x):
+            return fields
+        if _column_bottom(higher_low_o) <= _column_bottom(first_o):
+            return fields
+        support_level = _column_bottom(higher_low_o)
+        if _column_bottom(breakdown_o) >= support_level:
+            return fields
+        return _emit_core_pattern(
+            flag_name="shadow_bullish_signal_reversal",
+            width_columns=6,
+            support_level=support_level,
+            resistance_level=_column_top(confirming_x),
+            break_distance_boxes=_pattern_break_distance(_column_bottom(breakdown_o), support_level, float(profile.box_size), "DOWN"),
+            quality="STRICT_CONSECUTIVE_6_COL_BULLISH_SIGNAL_REVERSED",
+        )
+    return fields
+
+def _strict_shakeout_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
+    fields = _empty_shadow_core_pattern_fields()
+    if len(columns) < 5 or float(profile.box_size) <= 0:
+        return fields
+    current = columns[-1]
+    if _column_kind(current) != "X" or str(structure.get("latest_signal_name") or "").upper() != "BUY":
+        return fields
+    sequence = columns[-5:]
+    if not _consecutive_indices(sequence) or [_column_kind(col) for col in sequence] != ["X", "O", "X", "O", "X"]:
+        return fields
+    first_top_x, first_o, second_top_x, shakeout_o, recovery_x = sequence
+    if _column_top(second_top_x) != _column_top(first_top_x):
+        return fields
+    if _column_bottom(shakeout_o) >= _column_bottom(first_o):
+        return fields
+    resistance_level = _column_top(second_top_x)
+    if _column_top(recovery_x) <= resistance_level:
+        return fields
+    return _emit_core_pattern(
+        flag_name="shadow_shakeout",
+        width_columns=5,
+        support_level=_column_bottom(first_o),
+        resistance_level=resistance_level,
+        break_distance_boxes=_pattern_break_distance(_column_top(recovery_x), resistance_level, float(profile.box_size), "UP"),
+        quality="STRICT_CONSECUTIVE_5_COL_SHAKEOUT",
+    )
+
+
+def _core_pattern_event_level(flag: str, fields: Dict[str, Any]) -> float | None:
+    up_break_flags = {
+        "shadow_double_top_breakout",
+        "shadow_bullish_catapult",
+        "shadow_bullish_triangle",
+        "shadow_bearish_signal_reversal",
+        "shadow_shakeout",
+    }
+    level = fields.get("pattern_resistance_level") if flag in up_break_flags else fields.get("pattern_support_level")
+    return float(level) if isinstance(level, (int, float)) else None
+
+
+def _compute_shadow_core_pattern_field_sets(
+    *,
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    emitted_core_pattern_keys: set[tuple[str, float | None, int]] | None = None,
+) -> List[Dict[str, Any]]:
+    """Detect diagnostic-only core PnF structural patterns on the current event.
+
+    All detectors inspect only the current consecutive terminal column sequence
+    required by the textbook pattern. They produce structural flags and audit
+    diagnostics only; no entry, stop, target, validation, or strategy fields are
+    derived here. More specific patterns are allowed to co-exist with their
+    underlying double-top/double-bottom signal so pattern counts remain auditable.
+    """
+    detectors = (
+        _strict_double_top_breakout_fields,
+        _strict_double_bottom_breakdown_fields,
+        _strict_bullish_catapult_fields,
+        _strict_triangle_fields,
+        _strict_signal_reversal_fields,
+        _strict_shakeout_fields,
+    )
+    field_sets: List[Dict[str, Any]] = []
+    current_idx = int(getattr(columns[-1], "idx", len(columns) - 1)) if columns else -1
+    for detector in detectors:
+        fields = detector(structure=structure, columns=columns, profile=profile)
+        flag = _first_shadow_core_pattern_flag(fields)
+        if flag is None:
+            continue
+        key = (flag, _core_pattern_event_level(flag, fields), current_idx)
+        if emitted_core_pattern_keys is not None:
+            if key in emitted_core_pattern_keys:
+                continue
+            emitted_core_pattern_keys.add(key)
+        field_sets.append(fields)
+    return field_sets
+
+
+def _compute_shadow_core_pattern_fields(
+    *,
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    emitted_core_pattern_keys: set[tuple[str, float | None, int]] | None = None,
+) -> Dict[str, Any]:
+    field_sets = _compute_shadow_core_pattern_field_sets(
+        structure=structure,
+        columns=columns,
+        profile=profile,
+        emitted_core_pattern_keys=emitted_core_pattern_keys,
+    )
+    return field_sets[0] if field_sets else _empty_shadow_core_pattern_fields()
 
 
 def _pattern_compaction_hint(width_columns: int | None) -> str | None:
@@ -730,6 +1116,11 @@ def _strict_bearish_catapult_fields(
     fields.update(
         {
             "shadow_bearish_catapult": 1,
+            "pattern_width_columns": 7,
+            "pattern_support_level": support_level,
+            "pattern_resistance_level": float(getattr(_rebound, "top", 0.0)),
+            "pattern_break_distance_boxes": round((support_level - second_breakdown_bottom) / box_size, 4),
+            "pattern_quality": "STRICT_CONSECUTIVE_7_COL_BEARISH_CATAPULT",
             "catapult_support_level": support_level,
             "catapult_origin_width": 5,
             "catapult_rebound_columns": 1,
@@ -1179,7 +1570,20 @@ def build_funnel_row(
         "shadow_reversal_long_tp2": None,
         "shadow_triple_top_breakout": 0,
         "shadow_triple_bottom_breakdown": 0,
+        "shadow_double_top_breakout": 0,
+        "shadow_double_bottom_breakdown": 0,
+        "shadow_bullish_catapult": 0,
         "shadow_bearish_catapult": 0,
+        "shadow_bullish_triangle": 0,
+        "shadow_bearish_triangle": 0,
+        "shadow_bullish_signal_reversal": 0,
+        "shadow_bearish_signal_reversal": 0,
+        "shadow_shakeout": 0,
+        "pattern_width_columns": None,
+        "pattern_support_level": None,
+        "pattern_resistance_level": None,
+        "pattern_break_distance_boxes": None,
+        "pattern_quality": None,
         "catapult_support_level": None,
         "catapult_origin_width": None,
         "catapult_rebound_columns": None,
@@ -1236,13 +1640,23 @@ def build_structural_event_row(
     *, symbol: str, reference_ts: int, structure: Dict[str, Any], fields: Dict[str, Any]
 ) -> Dict[str, Any]:
     row = {field: None for field in FUNNEL_FIELD_ORDER}
-    side = "LONG" if int(fields.get("shadow_triple_top_breakout") or 0) == 1 else "SHORT"
-    if int(fields.get("shadow_bearish_catapult") or 0) == 1:
-        reason = "shadow_bearish_catapult"
-    elif side == "LONG":
-        reason = "shadow_triple_top_breakout"
-    else:
-        reason = "shadow_triple_bottom_breakdown"
+    reason = _first_shadow_core_pattern_flag(fields)
+    if reason is None:
+        if int(fields.get("shadow_bearish_catapult") or 0) == 1:
+            reason = "shadow_bearish_catapult"
+        elif int(fields.get("shadow_triple_top_breakout") or 0) == 1:
+            reason = "shadow_triple_top_breakout"
+        else:
+            reason = "shadow_triple_bottom_breakdown"
+    long_event_reasons = {
+        "shadow_triple_top_breakout",
+        "shadow_double_top_breakout",
+        "shadow_bullish_catapult",
+        "shadow_bullish_triangle",
+        "shadow_bearish_signal_reversal",
+        "shadow_shakeout",
+    }
+    side = "LONG" if reason in long_event_reasons else "SHORT"
     row.update(
         {
             "symbol": symbol,
@@ -1303,6 +1717,7 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
     emitted_triple_bottom_levels: set[float] = set()
     active_bearish_catapult_states: Dict[float, Any] = {}
     emitted_bearish_catapult_levels: set[float] = set()
+    emitted_core_pattern_keys: set[tuple[str, float | None, int]] = set()
     t_symbol = time.perf_counter()
     counters: Dict[str, Any] = {
         "candles_processed": 0,
@@ -1379,6 +1794,22 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
             columns=engine.columns,
             profile=profile,
         )
+        core_pattern_field_sets = _compute_shadow_core_pattern_field_sets(
+            structure=structure,
+            columns=engine.columns,
+            profile=profile,
+            emitted_core_pattern_keys=emitted_core_pattern_keys,
+        )
+        for core_pattern_fields in core_pattern_field_sets:
+            rows.append(
+                build_structural_event_row(
+                    symbol=symbol,
+                    reference_ts=close_ts,
+                    structure=structure,
+                    fields=core_pattern_fields,
+                )
+            )
+            counters["structural_events_generated"] += 1
         if _has_shadow_triple_pattern_flag(triple_pattern_fields):
             rows.append(
                 build_structural_event_row(
