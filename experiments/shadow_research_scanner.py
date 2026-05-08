@@ -104,6 +104,9 @@ FUNNEL_FIELD_ORDER = [
     "breakdown_distance_boxes",
     "prior_test_count",
     "pattern_compaction_hint",
+    "breakout_column_height_boxes",
+    "pattern_is_compact_preferred",
+    "pattern_is_broad_warning",
     "early_trend_candidate_flag",
     "blocked_by_existing_open_trade",
     "blocked_by_watch_cap",
@@ -508,6 +511,9 @@ def _empty_shadow_triple_pattern_fields() -> Dict[str, Any]:
         "breakdown_distance_boxes": None,
         "prior_test_count": None,
         "pattern_compaction_hint": None,
+        "breakout_column_height_boxes": None,
+        "pattern_is_compact_preferred": None,
+        "pattern_is_broad_warning": None,
     }
 
 
@@ -521,20 +527,41 @@ def _pattern_compaction_hint(width_columns: int | None) -> str | None:
     return "BROAD"
 
 
-def _cluster_prior_tests(prior_columns: List[Any], level_attr: str, candidate_level: float, box_size: float) -> List[Any]:
-    tolerance = max(float(box_size) * 0.5, 1e-9)
-    return [col for col in prior_columns if abs(float(getattr(col, level_attr, 0.0)) - candidate_level) <= tolerance]
+def _exact_prior_tests(prior_columns: List[Any], level_attr: str, candidate_level: float) -> List[Any]:
+    return [col for col in prior_columns if float(getattr(col, level_attr, 0.0)) == candidate_level]
+
+
+def _column_height_boxes(column: Any, box_size: float) -> int | None:
+    if box_size <= 0:
+        return None
+    return int(round(abs(float(getattr(column, "top", 0.0)) - float(getattr(column, "bottom", 0.0))) / box_size))
+
+
+def _apply_triple_pattern_compaction_diagnostics(out: Dict[str, Any], width_columns: int | None) -> None:
+    compaction_hint = _pattern_compaction_hint(width_columns)
+    out["pattern_compaction_hint"] = compaction_hint
+    out["pattern_is_compact_preferred"] = 1 if compaction_hint in {"COMPACT", "BALANCED"} else 0
+    out["pattern_is_broad_warning"] = 1 if compaction_hint == "BROAD" else 0
 
 
 def _compute_shadow_triple_pattern_fields(
-    *, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile, recent_window_columns: int = 21
+    *,
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    emitted_triple_top_levels: set[float] | None = None,
+    emitted_triple_bottom_levels: set[float] | None = None,
+    recent_window_columns: int = 21,
 ) -> Dict[str, Any]:
-    """Classify local triple-top/bottom PnF structural events.
+    """Classify sparse v2 triple-top/bottom PnF structural events.
 
     This helper is intentionally diagnostic-only. It uses the scanner's
     close-updated PnF columns and the existing BUY/SELL signal semantics as
     the breakout/breakdown confirmation, then inspects only a bounded local
     column window so event processing remains O(1) per structural change.
+    v2 emits fresh defended-level breaks only: prior defenses must be exact
+    same-level tests, the current break column is excluded from defense counts,
+    and caller-provided per-symbol emitted-level state suppresses repeats.
     """
     out = _empty_shadow_triple_pattern_fields()
     if len(columns) < 5:
@@ -549,13 +576,23 @@ def _compute_shadow_triple_pattern_fields(
     latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
     local_columns = columns[-recent_window_columns:]
     current_idx = int(getattr(current, "idx", len(columns) - 1))
+    breakout_column_height_boxes = _column_height_boxes(current, box_size)
 
     if current_kind == "X" and latest_signal_name == "BUY":
+        out["breakout_column_height_boxes"] = breakout_column_height_boxes
+        if breakout_column_height_boxes is None or breakout_column_height_boxes < 2:
+            return out
         prior_x = [col for col in local_columns[:-1] if str(getattr(col, "kind", "")).upper() == "X"]
         current_top = float(getattr(current, "top", 0.0))
-        candidate_levels = sorted({float(getattr(col, "top", 0.0)) for col in prior_x if float(getattr(col, "top", 0.0)) < current_top}, reverse=True)
+        emitted_levels = emitted_triple_top_levels or set()
+        candidate_levels = sorted(
+            {float(getattr(col, "top", 0.0)) for col in prior_x if float(getattr(col, "top", 0.0)) < current_top},
+            reverse=True,
+        )
         for resistance_level in candidate_levels:
-            tests = _cluster_prior_tests(prior_x, "top", resistance_level, box_size)
+            if resistance_level in emitted_levels:
+                continue
+            tests = _exact_prior_tests(prior_x, "top", resistance_level)
             if len(tests) < 2:
                 continue
             earliest_idx = min(int(getattr(col, "idx", 0)) for col in tests)
@@ -567,15 +604,23 @@ def _compute_shadow_triple_pattern_fields(
             out["triple_pattern_width_columns"] = width_columns
             out["breakout_distance_boxes"] = round((current_top - resistance_level) / box_size, 4)
             out["prior_test_count"] = len(tests)
-            out["pattern_compaction_hint"] = _pattern_compaction_hint(width_columns)
+            _apply_triple_pattern_compaction_diagnostics(out, width_columns)
             return out
 
     if current_kind == "O" and latest_signal_name == "SELL":
+        out["breakout_column_height_boxes"] = breakout_column_height_boxes
+        if breakout_column_height_boxes is None or breakout_column_height_boxes < 2:
+            return out
         prior_o = [col for col in local_columns[:-1] if str(getattr(col, "kind", "")).upper() == "O"]
         current_bottom = float(getattr(current, "bottom", 0.0))
-        candidate_levels = sorted({float(getattr(col, "bottom", 0.0)) for col in prior_o if float(getattr(col, "bottom", 0.0)) > current_bottom})
+        emitted_levels = emitted_triple_bottom_levels or set()
+        candidate_levels = sorted(
+            {float(getattr(col, "bottom", 0.0)) for col in prior_o if float(getattr(col, "bottom", 0.0)) > current_bottom}
+        )
         for support_level in candidate_levels:
-            tests = _cluster_prior_tests(prior_o, "bottom", support_level, box_size)
+            if support_level in emitted_levels:
+                continue
+            tests = _exact_prior_tests(prior_o, "bottom", support_level)
             if len(tests) < 2:
                 continue
             earliest_idx = min(int(getattr(col, "idx", 0)) for col in tests)
@@ -587,7 +632,7 @@ def _compute_shadow_triple_pattern_fields(
             out["triple_pattern_width_columns"] = width_columns
             out["breakdown_distance_boxes"] = round((support_level - current_bottom) / box_size, 4)
             out["prior_test_count"] = len(tests)
-            out["pattern_compaction_hint"] = _pattern_compaction_hint(width_columns)
+            _apply_triple_pattern_compaction_diagnostics(out, width_columns)
             return out
 
     return out
@@ -913,6 +958,8 @@ def build_funnel_row(
     columns: List[Any],
     profile: PnFProfile,
     shadow_reversal_long_fields: Dict[str, Any] | None = None,
+    emitted_triple_top_levels: set[float] | None = None,
+    emitted_triple_bottom_levels: set[float] | None = None,
 ) -> Dict[str, Any]:
     shadow_v4_status = setup.get("shadow_v4_status", setup.get("status"))
     shadow_v4_watch_flags = str(setup.get("watch_flags") or "").strip()
@@ -1004,6 +1051,9 @@ def build_funnel_row(
         "breakdown_distance_boxes": None,
         "prior_test_count": None,
         "pattern_compaction_hint": None,
+        "breakout_column_height_boxes": None,
+        "pattern_is_compact_preferred": None,
+        "pattern_is_broad_warning": None,
         "early_trend_candidate_flag": setup.get("early_trend_candidate_flag"),
         "blocked_by_existing_open_trade": 0,
         "blocked_by_watch_cap": 0,
@@ -1012,7 +1062,15 @@ def build_funnel_row(
     row.update(_compute_shadow_continuation_fields(setup=setup, structure=structure, columns=columns, profile=profile))
     row.update(_compute_shadow_krausz_short_fields(structure=structure, columns=columns))
     row.update(_compute_shadow_krausz_bounce_short_fields(structure=structure, columns=columns, profile=profile))
-    row.update(_compute_shadow_triple_pattern_fields(structure=structure, columns=columns, profile=profile))
+    row.update(
+        _compute_shadow_triple_pattern_fields(
+            structure=structure,
+            columns=columns,
+            profile=profile,
+            emitted_triple_top_levels=emitted_triple_top_levels,
+            emitted_triple_bottom_levels=emitted_triple_bottom_levels,
+        )
+    )
     if shadow_reversal_long_fields is not None:
         row.update(shadow_reversal_long_fields)
     return row
@@ -1093,7 +1151,8 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
     previous_event_state: ShadowEventState | None = None
     shadow_continuation_pending_candidate_id: str | None = None
     shadow_reversal_long_state: ShadowReversalLongState | None = None
-    emitted_triple_pattern_events: set[tuple[str, int, str]] = set()
+    emitted_triple_top_levels: set[float] = set()
+    emitted_triple_bottom_levels: set[float] = set()
     t_symbol = time.perf_counter()
     counters: Dict[str, Any] = {
         "candles_processed": 0,
@@ -1155,9 +1214,14 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
             close_price=close_price,
             structure=structure,
         )
-        triple_pattern_fields = _compute_shadow_triple_pattern_fields(structure=structure, columns=engine.columns, profile=profile)
-        triple_event_key = _shadow_triple_pattern_event_key(symbol, engine.columns, triple_pattern_fields)
-        if triple_event_key is not None and triple_event_key not in emitted_triple_pattern_events:
+        triple_pattern_fields = _compute_shadow_triple_pattern_fields(
+            structure=structure,
+            columns=engine.columns,
+            profile=profile,
+            emitted_triple_top_levels=emitted_triple_top_levels,
+            emitted_triple_bottom_levels=emitted_triple_bottom_levels,
+        )
+        if _has_shadow_triple_pattern_flag(triple_pattern_fields):
             rows.append(
                 build_structural_event_row(
                     symbol=symbol,
@@ -1166,7 +1230,10 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
                     fields=triple_pattern_fields,
                 )
             )
-            emitted_triple_pattern_events.add(triple_event_key)
+            if int(triple_pattern_fields.get("shadow_triple_top_breakout") or 0) == 1:
+                emitted_triple_top_levels.add(float(triple_pattern_fields["triple_top_resistance_level"]))
+            if int(triple_pattern_fields.get("shadow_triple_bottom_breakdown") or 0) == 1:
+                emitted_triple_bottom_levels.add(float(triple_pattern_fields["triple_bottom_support_level"]))
             counters["structural_events_generated"] += 1
         setups = evaluate_setups(symbol, profile, engine, structure)
         for setup in setups:
@@ -1178,6 +1245,8 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
                 columns=engine.columns,
                 profile=profile,
                 shadow_reversal_long_fields=shadow_reversal_long_fields,
+                emitted_triple_top_levels=emitted_triple_top_levels,
+                emitted_triple_bottom_levels=emitted_triple_bottom_levels,
             )
             if str(setup.get("side") or "").upper() == "LONG" and str(structure.get("breakout_context") or "").upper() == "LATE_EXTENSION":
                 current_col = engine.columns[-1] if engine.columns else None
