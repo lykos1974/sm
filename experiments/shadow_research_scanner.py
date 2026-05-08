@@ -143,17 +143,6 @@ class ShadowReversalLongState:
     initial_active_leg_boxes: int | None
 
 
-@dataclass
-class ShadowBearishCatapultState:
-    support_level: float
-    origin_breakdown_idx: int
-    origin_start_idx: int
-    origin_width: int
-    origin_test_count: int
-    origin_resistance_level: float
-    rebound_column_indices: set[int]
-
-
 @dataclass(frozen=True)
 class CachedStructureSnapshot:
     structure: Dict[str, Any]
@@ -671,130 +660,116 @@ def _compute_shadow_triple_pattern_fields(
 
 
 def _catapult_pattern_quality(total_columns: int | None) -> str | None:
-    return _pattern_compaction_hint(total_columns)
+    if total_columns == 7:
+        return "STRICT_CONSECUTIVE_7_COL"
+    return None
 
 
-def _origin_resistance_level(columns: List[Any], origin_start_idx: int, origin_breakdown_idx: int) -> float | None:
-    local_origin_columns = [
-        col
-        for col in columns[-21:]
-        if origin_start_idx <= int(getattr(col, "idx", -1)) <= origin_breakdown_idx
-        and str(getattr(col, "kind", "")).upper() == "X"
-    ]
-    if not local_origin_columns:
-        return None
-    return max(float(getattr(col, "top", 0.0)) for col in local_origin_columns)
-
-
-def _state_from_triple_bottom_origin(
-    *, columns: List[Any], triple_pattern_fields: Dict[str, Any]
-) -> ShadowBearishCatapultState | None:
-    if int(triple_pattern_fields.get("shadow_triple_bottom_breakdown") or 0) != 1 or not columns:
-        return None
-    support_level = triple_pattern_fields.get("triple_bottom_support_level")
-    origin_width = triple_pattern_fields.get("triple_pattern_width_columns")
-    origin_test_count = triple_pattern_fields.get("prior_test_count")
-    if support_level is None or origin_width is None or origin_test_count is None:
-        return None
-    current = columns[-1]
-    origin_breakdown_idx = int(getattr(current, "idx", len(columns) - 1))
-    origin_width_value = int(origin_width)
-    origin_start_idx = origin_breakdown_idx - origin_width_value + 1
-    resistance_level = _origin_resistance_level(columns, origin_start_idx, origin_breakdown_idx)
-    if resistance_level is None:
-        return None
-    return ShadowBearishCatapultState(
-        support_level=float(support_level),
-        origin_breakdown_idx=origin_breakdown_idx,
-        origin_start_idx=origin_start_idx,
-        origin_width=origin_width_value,
-        origin_test_count=int(origin_test_count),
-        origin_resistance_level=float(resistance_level),
-        rebound_column_indices=set(),
-    )
-
-
-def _current_column_crosses_catapult_support(current: Any, support_level: float, box_size: float) -> bool:
-    if box_size <= 0:
-        return False
-    current_top = float(getattr(current, "top", 0.0))
-    current_bottom = float(getattr(current, "bottom", 0.0))
-    # The second O column must attack the original support area, not merely
-    # continue a lower sell leg. Requiring the column to span the support keeps
-    # the breakdown level anchored to the originating triple bottom.
-    return current_top >= support_level - (0.25 * box_size) and current_bottom < support_level
-
-
-def update_shadow_bearish_catapult_states(
-    *,
-    active_states: Dict[float, ShadowBearishCatapultState],
-    emitted_levels: set[float],
-    triple_pattern_fields: Dict[str, Any],
-    structure: Dict[str, Any],
-    columns: List[Any],
-    profile: PnFProfile,
-    max_total_columns: int = 21,
+def _strict_bearish_catapult_fields(
+    *, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile
 ) -> Dict[str, Any]:
-    fields = _empty_shadow_bearish_catapult_fields()
-    origin_state = _state_from_triple_bottom_origin(columns=columns, triple_pattern_fields=triple_pattern_fields)
-    if origin_state is not None and origin_state.support_level not in emitted_levels:
-        active_states[origin_state.support_level] = origin_state
+    """Detect only the textbook seven-consecutive-column bearish catapult.
 
-    if not columns:
+    The strict sequence is:
+    O support test -> X -> O support test -> X -> first O breakdown ->
+    single X rebound -> second O breakdown.
+
+    This intentionally avoids carrying state across a broad/local window; the
+    current column must be the seventh consecutive column in the catapult.
+    """
+    fields = _empty_shadow_bearish_catapult_fields()
+    if len(columns) < 7:
         return fields
+
     box_size = float(profile.box_size)
     if box_size <= 0:
         return fields
 
     current = columns[-1]
-    current_idx = int(getattr(current, "idx", len(columns) - 1))
-    current_kind = str(getattr(current, "kind", "")).upper()
-    latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
+    if str(getattr(current, "kind", "")).upper() != "O":
+        return fields
+    if str(structure.get("latest_signal_name") or "").upper() != "SELL":
+        return fields
 
-    stale_levels: List[float] = []
-    for support_level, state in list(active_states.items()):
-        if support_level in emitted_levels or current_idx <= state.origin_breakdown_idx:
-            continue
+    sequence = columns[-7:]
+    sequence_indices = [int(getattr(col, "idx", -1)) for col in sequence]
+    if sequence_indices != list(range(sequence_indices[0], sequence_indices[0] + 7)):
+        return fields
 
-        total_columns = current_idx - state.origin_start_idx + 1
-        if total_columns > max_total_columns:
-            stale_levels.append(support_level)
-            continue
+    expected_kinds = ["O", "X", "O", "X", "O", "X", "O"]
+    actual_kinds = [str(getattr(col, "kind", "")).upper() for col in sequence]
+    if actual_kinds != expected_kinds:
+        return fields
 
-        if current_kind == "X":
-            current_top = float(getattr(current, "top", 0.0))
-            if latest_signal_name == "BUY" or current_top >= state.origin_resistance_level:
-                stale_levels.append(support_level)
-                continue
-            state.rebound_column_indices.add(current_idx)
-            continue
+    first_test, _, second_test, _, first_breakdown, _rebound, second_breakdown = sequence
+    support_level = float(getattr(first_test, "bottom", 0.0))
+    if float(getattr(second_test, "bottom", 0.0)) != support_level:
+        return fields
 
-        if current_kind != "O" or latest_signal_name != "SELL" or not state.rebound_column_indices:
-            continue
-        if total_columns < 7:
-            continue
-        if not _current_column_crosses_catapult_support(current, state.support_level, box_size):
-            continue
+    first_breakdown_bottom = float(getattr(first_breakdown, "bottom", 0.0))
+    second_breakdown_bottom = float(getattr(second_breakdown, "bottom", 0.0))
+    first_breakdown_top = float(getattr(first_breakdown, "top", 0.0))
+    second_breakdown_top = float(getattr(second_breakdown, "top", 0.0))
 
-        current_bottom = float(getattr(current, "bottom", 0.0))
-        fields.update(
-            {
-                "shadow_bearish_catapult": 1,
-                "catapult_support_level": state.support_level,
-                "catapult_origin_width": state.origin_width,
-                "catapult_rebound_columns": len(state.rebound_column_indices),
-                "catapult_total_columns": total_columns,
-                "catapult_break_distance_boxes": round((state.support_level - current_bottom) / box_size, 4),
-                "catapult_rebound_failed": 1,
-                "catapult_pattern_quality": _catapult_pattern_quality(total_columns),
-            }
-        )
-        emitted_levels.add(support_level)
-        stale_levels.append(support_level)
-        break
+    # Both sell columns must be actual triple-bottom breakdowns of the same
+    # defended support. Requiring the O columns to span the support prevents a
+    # drifting continuation leg from being misclassified as a catapult.
+    support_tolerance = 0.25 * box_size
+    if first_breakdown_top < support_level - support_tolerance or first_breakdown_bottom >= support_level:
+        return fields
+    if second_breakdown_top < support_level - support_tolerance or second_breakdown_bottom >= support_level:
+        return fields
 
-    for support_level in stale_levels:
-        active_states.pop(support_level, None)
+    first_breakdown_height = _column_height_boxes(first_breakdown, box_size)
+    second_breakdown_height = _column_height_boxes(second_breakdown, box_size)
+    if first_breakdown_height is None or first_breakdown_height < 2:
+        return fields
+    if second_breakdown_height is None or second_breakdown_height < 2:
+        return fields
+
+    fields.update(
+        {
+            "shadow_bearish_catapult": 1,
+            "catapult_support_level": support_level,
+            "catapult_origin_width": 5,
+            "catapult_rebound_columns": 1,
+            "catapult_total_columns": 7,
+            "catapult_break_distance_boxes": round((support_level - second_breakdown_bottom) / box_size, 4),
+            "catapult_rebound_failed": 1,
+            "catapult_pattern_quality": _catapult_pattern_quality(7),
+        }
+    )
+    return fields
+
+
+def update_shadow_bearish_catapult_states(
+    *,
+    active_states: Dict[float, Any],
+    emitted_levels: set[float],
+    triple_pattern_fields: Dict[str, Any],
+    structure: Dict[str, Any],
+    columns: List[Any],
+    profile: PnFProfile,
+    max_total_columns: int = 7,
+) -> Dict[str, Any]:
+    """Emit strict bearish catapults without broad/local-window state.
+
+    The legacy implementation tracked a prior triple-bottom breakdown through a
+    broad local window and waited for a later weak rebound failure. The research
+    definition is now stricter: only the current seven consecutive PnF columns
+    may participate in the catapult, so any carried active state is discarded.
+    """
+    del triple_pattern_fields, max_total_columns
+    active_states.clear()
+
+    fields = _strict_bearish_catapult_fields(structure=structure, columns=columns, profile=profile)
+    support_level = fields.get("catapult_support_level")
+    if int(fields.get("shadow_bearish_catapult") or 0) != 1 or support_level is None:
+        return fields
+    if float(support_level) in emitted_levels:
+        return _empty_shadow_bearish_catapult_fields()
+
+    emitted_levels.add(float(support_level))
     return fields
 
 
@@ -1326,7 +1301,7 @@ def process_symbol(symbol: str, profile: PnFProfile, candles: List[dict]) -> tup
     shadow_reversal_long_state: ShadowReversalLongState | None = None
     emitted_triple_top_levels: set[float] = set()
     emitted_triple_bottom_levels: set[float] = set()
-    active_bearish_catapult_states: Dict[float, ShadowBearishCatapultState] = {}
+    active_bearish_catapult_states: Dict[float, Any] = {}
     emitted_bearish_catapult_levels: set[float] = set()
     t_symbol = time.perf_counter()
     counters: Dict[str, Any] = {

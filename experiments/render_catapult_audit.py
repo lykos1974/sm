@@ -315,7 +315,12 @@ def outcome_text(row: dict[str, str]) -> str:
 def infer_marker_indices(audit_row: CatapultAuditRow, trigger_idx: int, columns_by_idx: dict[int, PnFColumn]) -> tuple[set[int], set[int], int | None]:
     origin_breakdown_idx: int | None = None
     rebound_indices: set[int] = set()
-    if audit_row.total_columns is not None and audit_row.origin_width is not None:
+    if audit_row.total_columns == 7 and audit_row.origin_width == 5:
+        origin_breakdown_idx = trigger_idx - 2
+        rebound_idx = trigger_idx - 1
+        if rebound_idx in columns_by_idx and str(columns_by_idx[rebound_idx].kind).upper() == "X":
+            rebound_indices = {rebound_idx}
+    elif audit_row.total_columns is not None and audit_row.origin_width is not None:
         origin_start_idx = trigger_idx - audit_row.total_columns + 1
         origin_breakdown_idx = origin_start_idx + audit_row.origin_width - 1
         rebound_indices = {
@@ -442,7 +447,7 @@ th.level {{ position: sticky; left: 0; background: #f9fafb; text-align: right; }
 <tr><th>After-context complete</th><td>{after_note}</td></tr>
 <tr><th>Candles processed</th><td>{reconstruction.candles_processed}</td></tr>
 </table>
-<p class=\"legend\"><span class=\"origin\">ORIGIN = original triple-bottom breakdown column</span><span class=\"rebound\">REBOUND = intervening X column(s)</span><span class=\"trigger\">TRIGGER = second breakdown/catapult column</span><span class=\"support\">outlined row = catapult_support_level</span></p>
+<p class=\"legend\"><span class=\"origin\">ORIGIN = first strict triple-bottom breakdown column (column 5 of 7)</span><span class=\"rebound\">REBOUND = single consecutive X rebound column (column 6 of 7)</span><span class=\"trigger\">TRIGGER = second strict triple-bottom breakdown/catapult column (column 7 of 7)</span><span class=\"support\">outlined row = catapult_support_level</span></p>
 <table>
 {render_column_table(audit_row=audit_row, reconstruction=reconstruction)}
 </table>
