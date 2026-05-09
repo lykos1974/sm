@@ -7,6 +7,7 @@ import json
 import sqlite3
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -105,6 +106,13 @@ FUNNEL_FIELD_ORDER = [
     "shadow_5col_bearish_compression_break",
     "shadow_bullish_catapult",
     "shadow_bearish_catapult",
+    "shadow_bullish_catapult_canonical",
+    "shadow_bearish_catapult_canonical",
+    "catapult_origin_signal_type",
+    "catapult_followup_signal_type",
+    "catapult_reaction_depth_boxes",
+    "catapult_invalidated_origin",
+    "catapult_reject_reason",
     "catapult_has_prior_triple_signal",
     "catapult_has_reaction_column",
     "catapult_has_followup_double_signal",
@@ -580,6 +588,14 @@ def _empty_shadow_core_pattern_fields() -> Dict[str, Any]:
         "shadow_5col_bullish_compression_break": 0,
         "shadow_5col_bearish_compression_break": 0,
         "shadow_bullish_catapult": 0,
+        "shadow_bearish_catapult": 0,
+        "shadow_bullish_catapult_canonical": 0,
+        "shadow_bearish_catapult_canonical": 0,
+        "catapult_origin_signal_type": None,
+        "catapult_followup_signal_type": None,
+        "catapult_reaction_depth_boxes": None,
+        "catapult_invalidated_origin": 0,
+        "catapult_reject_reason": None,
         "shadow_bullish_triangle": 0,
         "shadow_bearish_triangle": 0,
         "shadow_bullish_signal_reversal": 0,
@@ -722,59 +738,108 @@ def _strict_double_bottom_breakdown_fields(*, structure: Dict[str, Any], columns
 
 
 
-def _catapult_canonical_diagnostics(sequence: List[Any], direction: str, box_size: float) -> Dict[str, int]:
-    """Return textbook catapult component diagnostics for a 7-column terminal sequence.
+def _catapult_canonical_diagnostics(sequence: List[Any], direction: str, box_size: float) -> Dict[str, Any]:
+    """Return canonical catapult diagnostics for a 7-column terminal sequence.
 
-    A canonical catapult is a prior triple signal, one reaction column, then a
-    follow-up double signal in the same direction. These diagnostics are
-    intentionally informational only and do not change existing catapult flags.
+    Canonical catapults are deliberately narrower than the broad 7-column
+    continuation/catapult flags: the first five columns must pass the fixed
+    strict triple-top/bottom validator, column six must be the opposite reaction
+    column without fully invalidating the origin breakout/breakdown, and columns
+    five through seven must pass the strict double-top/bottom validator.
     """
-    diagnostics = {
+    diagnostics: Dict[str, Any] = {
+        "shadow_bullish_catapult_canonical": 0,
+        "shadow_bearish_catapult_canonical": 0,
+        "catapult_origin_signal_type": None,
+        "catapult_followup_signal_type": None,
+        "catapult_reaction_depth_boxes": None,
+        "catapult_invalidated_origin": 0,
+        "catapult_reject_reason": None,
         "catapult_has_prior_triple_signal": 0,
         "catapult_has_reaction_column": 0,
         "catapult_has_followup_double_signal": 0,
         "catapult_is_canonical_candidate": 0,
     }
     if len(sequence) != 7 or box_size <= 0:
+        diagnostics["catapult_reject_reason"] = "INSUFFICIENT_CANONICAL_SEQUENCE"
         return diagnostics
 
     if direction == "UP":
         expected_kinds = ["X", "O", "X", "O", "X", "O", "X"]
-        if [_column_kind(col) for col in sequence] != expected_kinds:
-            return diagnostics
-        first_test, _first_reaction, second_test, _second_reaction, prior_breakout, reaction, followup = sequence
-        resistance_level = _column_top(first_test)
-        tolerance = 0.25 * box_size
-        prior_triple_signal = (
-            _column_top(second_test) == resistance_level
-            and _column_bottom(prior_breakout) <= resistance_level + tolerance
-            and _column_top(prior_breakout) > resistance_level
-        )
-        reaction_column = _column_kind(reaction) == "O"
-        followup_double_signal = _column_top(followup) > _column_top(prior_breakout)
+        origin_signal = "TRIPLE_TOP_BREAKOUT"
+        followup_signal = "DOUBLE_TOP_BREAKOUT"
+        canonical_flag = "shadow_bullish_catapult_canonical"
+        origin_structure = {"latest_signal_name": "BUY"}
+        double_structure = {"latest_signal_name": "BUY"}
     elif direction == "DOWN":
         expected_kinds = ["O", "X", "O", "X", "O", "X", "O"]
-        if [_column_kind(col) for col in sequence] != expected_kinds:
-            return diagnostics
-        first_test, _first_reaction, second_test, _second_reaction, prior_breakdown, reaction, followup = sequence
-        support_level = _column_bottom(first_test)
-        tolerance = 0.25 * box_size
-        prior_triple_signal = (
-            _column_bottom(second_test) == support_level
-            and _column_top(prior_breakdown) >= support_level - tolerance
-            and _column_bottom(prior_breakdown) < support_level
-        )
-        reaction_column = _column_kind(reaction) == "X"
-        followup_double_signal = _column_bottom(followup) < _column_bottom(prior_breakdown)
+        origin_signal = "TRIPLE_BOTTOM_BREAKDOWN"
+        followup_signal = "DOUBLE_BOTTOM_BREAKDOWN"
+        canonical_flag = "shadow_bearish_catapult_canonical"
+        origin_structure = {"latest_signal_name": "SELL"}
+        double_structure = {"latest_signal_name": "SELL"}
     else:
+        diagnostics["catapult_reject_reason"] = "INVALID_DIRECTION"
         return diagnostics
 
-    diagnostics["catapult_has_prior_triple_signal"] = int(prior_triple_signal)
-    diagnostics["catapult_has_reaction_column"] = int(reaction_column)
-    diagnostics["catapult_has_followup_double_signal"] = int(followup_double_signal)
-    diagnostics["catapult_is_canonical_candidate"] = int(prior_triple_signal and reaction_column and followup_double_signal)
-    return diagnostics
+    diagnostics["catapult_origin_signal_type"] = origin_signal
+    diagnostics["catapult_followup_signal_type"] = followup_signal
+    if [_column_kind(col) for col in sequence] != expected_kinds or not _consecutive_indices(sequence):
+        diagnostics["catapult_reject_reason"] = "SEQUENCE_NOT_CANONICAL_7COL"
+        return diagnostics
 
+    origin_columns = sequence[:5]
+    followup_columns = sequence[4:7]
+    if direction == "UP":
+        origin_valid, _origin_diagnostics = _is_strict_triple_top_breakout(
+            structure=origin_structure, columns=origin_columns, profile=PnFProfile("catapult_origin", box_size, 3)
+        )
+        followup_valid = int(
+            _strict_double_top_breakout_fields(
+                structure=double_structure, columns=followup_columns, profile=PnFProfile("catapult_followup", box_size, 3)
+            ).get("shadow_double_top_breakout")
+            or 0
+        ) == 1
+        origin_break_extreme = _column_top(sequence[4])
+        origin_invalidation_level = _column_bottom(sequence[4])
+        reaction_extreme = _column_bottom(sequence[5])
+        invalidated_origin = reaction_extreme <= origin_invalidation_level
+        reaction_depth = round((origin_break_extreme - reaction_extreme) / box_size, 4)
+    else:
+        origin_valid, _origin_diagnostics = _is_strict_triple_bottom_breakdown(
+            structure=origin_structure, columns=origin_columns, profile=PnFProfile("catapult_origin", box_size, 3)
+        )
+        followup_valid = int(
+            _strict_double_bottom_breakdown_fields(
+                structure=double_structure, columns=followup_columns, profile=PnFProfile("catapult_followup", box_size, 3)
+            ).get("shadow_double_bottom_breakdown")
+            or 0
+        ) == 1
+        origin_break_extreme = _column_bottom(sequence[4])
+        origin_invalidation_level = _column_top(sequence[4])
+        reaction_extreme = _column_top(sequence[5])
+        invalidated_origin = reaction_extreme >= origin_invalidation_level
+        reaction_depth = round((reaction_extreme - origin_break_extreme) / box_size, 4)
+
+    diagnostics["catapult_has_prior_triple_signal"] = int(origin_valid)
+    diagnostics["catapult_has_reaction_column"] = 1
+    diagnostics["catapult_has_followup_double_signal"] = int(followup_valid)
+    diagnostics["catapult_reaction_depth_boxes"] = reaction_depth
+    diagnostics["catapult_invalidated_origin"] = int(invalidated_origin)
+
+    if not origin_valid:
+        diagnostics["catapult_reject_reason"] = "NO_STRICT_PRIOR_TRIPLE_SIGNAL"
+        return diagnostics
+    if invalidated_origin:
+        diagnostics["catapult_reject_reason"] = "REACTION_INVALIDATED_ORIGIN"
+        return diagnostics
+    if not followup_valid:
+        diagnostics["catapult_reject_reason"] = "FOLLOWUP_NOT_STRICT_DOUBLE_SIGNAL"
+        return diagnostics
+
+    diagnostics[canonical_flag] = 1
+    diagnostics["catapult_is_canonical_candidate"] = 1
+    return diagnostics
 
 def _generic_7col_continuation_fields(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> Dict[str, Any]:
     fields = _empty_shadow_core_pattern_fields()
@@ -790,7 +855,7 @@ def _generic_7col_continuation_fields(*, structure: Dict[str, Any], columns: Lis
         current_top = _column_top(sequence[-1])
         if current_top <= prior_x_high:
             return fields
-        return _emit_core_pattern(
+        fields = _emit_core_pattern(
             flag_name="shadow_7col_bullish_continuation",
             width_columns=7,
             support_level=_column_bottom(sequence[-2]),
@@ -798,12 +863,16 @@ def _generic_7col_continuation_fields(*, structure: Dict[str, Any], columns: Lis
             break_distance_boxes=_pattern_break_distance(current_top, prior_x_high, float(profile.box_size), "UP"),
             quality="GENERIC_7_COL_BULLISH_CONTINUATION",
         )
+        fields.update(_catapult_canonical_diagnostics(sequence, "UP", float(profile.box_size)))
+        if int(fields.get("catapult_is_canonical_candidate") or 0) != 1 and fields.get("catapult_reject_reason") is None:
+            fields["catapult_reject_reason"] = "GENERIC_7COL_CONTINUATION_ONLY"
+        return fields
     if kinds == ["O", "X", "O", "X", "O", "X", "O"] and latest_signal_name == "SELL":
         prior_o_low = min(_column_bottom(col) for col in sequence[:-1] if _column_kind(col) == "O")
         current_bottom = _column_bottom(sequence[-1])
         if current_bottom >= prior_o_low:
             return fields
-        return _emit_core_pattern(
+        fields = _emit_core_pattern(
             flag_name="shadow_7col_bearish_continuation",
             width_columns=7,
             support_level=prior_o_low,
@@ -811,6 +880,10 @@ def _generic_7col_continuation_fields(*, structure: Dict[str, Any], columns: Lis
             break_distance_boxes=_pattern_break_distance(current_bottom, prior_o_low, float(profile.box_size), "DOWN"),
             quality="GENERIC_7_COL_BEARISH_CONTINUATION",
         )
+        fields.update(_catapult_canonical_diagnostics(sequence, "DOWN", float(profile.box_size)))
+        if int(fields.get("catapult_is_canonical_candidate") or 0) != 1 and fields.get("catapult_reject_reason") is None:
+            fields["catapult_reject_reason"] = "GENERIC_7COL_CONTINUATION_ONLY"
+        return fields
     return fields
 
 
@@ -1814,6 +1887,13 @@ def build_funnel_row(
         "shadow_5col_bearish_compression_break": 0,
         "shadow_bullish_catapult": 0,
         "shadow_bearish_catapult": 0,
+        "shadow_bullish_catapult_canonical": 0,
+        "shadow_bearish_catapult_canonical": 0,
+        "catapult_origin_signal_type": None,
+        "catapult_followup_signal_type": None,
+        "catapult_reaction_depth_boxes": None,
+        "catapult_invalidated_origin": 0,
+        "catapult_reject_reason": None,
         "shadow_bullish_triangle": 0,
         "shadow_bearish_triangle": 0,
         "shadow_bullish_signal_reversal": 0,
@@ -2186,6 +2266,31 @@ def main() -> None:
     totals["output_write_s"] = time.perf_counter() - t_write
     total_candles = int(totals["candles_processed"])
     event_ratio = (float(totals["events_processed"]) / float(total_candles)) if total_candles else 0.0
+    broad_catapults = sum(
+        1
+        for row in all_rows
+        if int(row.get("shadow_bullish_catapult") or 0) == 1 or int(row.get("shadow_bearish_catapult") or 0) == 1
+    )
+    canonical_catapults = sum(
+        1
+        for row in all_rows
+        if int(row.get("shadow_bullish_catapult_canonical") or 0) == 1
+        or int(row.get("shadow_bearish_catapult_canonical") or 0) == 1
+    )
+    generic_7col_continuations = sum(
+        1
+        for row in all_rows
+        if int(row.get("shadow_7col_bullish_continuation") or 0) == 1
+        or int(row.get("shadow_7col_bearish_continuation") or 0) == 1
+    )
+    catapult_reject_reasons = Counter(
+        str(row.get("catapult_reject_reason"))
+        for row in all_rows
+        if row.get("catapult_reject_reason") not in (None, "")
+    )
+    reject_reason_text = ",".join(
+        f"{reason}={count}" for reason, count in sorted(catapult_reject_reasons.items())
+    ) or "none"
     print(
         f"[EVENT_TOTAL] elapsed_s={totals['elapsed_s']:.3f} "
         f"candle_load_s={totals['candle_load_s']:.3f} "
@@ -2202,6 +2307,12 @@ def main() -> None:
         f"event_ratio={event_ratio:.6f}"
     )
     print(f"Wrote {len(all_rows)} shadow research rows to {output_path}")
+    print(
+        f"[CATAPULT_COUNTS] broad_catapults={broad_catapults} "
+        f"canonical_catapults={canonical_catapults} "
+        f"generic_7col_continuations={generic_7col_continuations} "
+        f"reject_reasons={reject_reason_text}"
+    )
 
 
 if __name__ == "__main__":
