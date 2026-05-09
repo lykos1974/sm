@@ -129,6 +129,11 @@ FUNNEL_FIELD_ORDER = [
     "triple_top_resistance_level",
     "triple_bottom_support_level",
     "triple_pattern_width_columns",
+    "triple_reject_reason",
+    "triple_left_test_level",
+    "triple_middle_test_level",
+    "triple_trigger_break_level",
+    "triple_sequence_valid",
     "breakout_distance_boxes",
     "breakdown_distance_boxes",
     "prior_test_count",
@@ -536,6 +541,11 @@ def _empty_shadow_triple_pattern_fields() -> Dict[str, Any]:
         "triple_top_resistance_level": None,
         "triple_bottom_support_level": None,
         "triple_pattern_width_columns": None,
+        "triple_reject_reason": None,
+        "triple_left_test_level": None,
+        "triple_middle_test_level": None,
+        "triple_trigger_break_level": None,
+        "triple_sequence_valid": 0,
         "breakout_distance_boxes": None,
         "breakdown_distance_boxes": None,
         "prior_test_count": None,
@@ -1115,6 +1125,98 @@ def _apply_triple_pattern_compaction_diagnostics(out: Dict[str, Any], width_colu
     out["pattern_is_broad_warning"] = 1 if compaction_hint == "BROAD" else 0
 
 
+def _is_strict_triple_top_breakout(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> tuple[bool, Dict[str, Any]]:
+    """Validate an exact X O X O X triple-top breakout ending at current column."""
+    diagnostics: Dict[str, Any] = {
+        "triple_reject_reason": None,
+        "triple_left_test_level": None,
+        "triple_middle_test_level": None,
+        "triple_trigger_break_level": None,
+        "triple_sequence_valid": 0,
+    }
+    box_size = float(profile.box_size)
+    if len(columns) < 5:
+        diagnostics["triple_reject_reason"] = "INSUFFICIENT_COLUMNS"
+        return False, diagnostics
+    if box_size <= 0:
+        diagnostics["triple_reject_reason"] = "INVALID_BOX_SIZE"
+        return False, diagnostics
+
+    current = columns[-1]
+    if _column_kind(current) != "X" or str(structure.get("latest_signal_name") or "").upper() != "BUY":
+        diagnostics["triple_reject_reason"] = "CURRENT_COLUMN_NOT_BUY_TRIGGER"
+        return False, diagnostics
+
+    sequence = columns[-5:]
+    if not _consecutive_indices(sequence) or [_column_kind(col) for col in sequence] != ["X", "O", "X", "O", "X"]:
+        diagnostics["triple_reject_reason"] = "SEQUENCE_NOT_EXACT_XOXOX"
+        return False, diagnostics
+    diagnostics["triple_sequence_valid"] = 1
+
+    left_x, _first_reaction_o, middle_x, _second_reaction_o, trigger_x = sequence
+    left_level = _column_top(left_x)
+    middle_level = _column_top(middle_x)
+    diagnostics["triple_left_test_level"] = left_level
+    diagnostics["triple_middle_test_level"] = middle_level
+    if left_level != middle_level:
+        diagnostics["triple_reject_reason"] = "PRIOR_X_TOPS_NOT_EQUAL"
+        return False, diagnostics
+
+    trigger_break_level = left_level + box_size
+    diagnostics["triple_trigger_break_level"] = trigger_break_level
+    if _column_top(trigger_x) <= left_level:
+        diagnostics["triple_reject_reason"] = "TRIGGER_DID_NOT_BREAK_RESISTANCE"
+        return False, diagnostics
+
+    return True, diagnostics
+
+
+def _is_strict_triple_bottom_breakdown(*, structure: Dict[str, Any], columns: List[Any], profile: PnFProfile) -> tuple[bool, Dict[str, Any]]:
+    """Validate an exact O X O X O triple-bottom breakdown ending at current column."""
+    diagnostics: Dict[str, Any] = {
+        "triple_reject_reason": None,
+        "triple_left_test_level": None,
+        "triple_middle_test_level": None,
+        "triple_trigger_break_level": None,
+        "triple_sequence_valid": 0,
+    }
+    box_size = float(profile.box_size)
+    if len(columns) < 5:
+        diagnostics["triple_reject_reason"] = "INSUFFICIENT_COLUMNS"
+        return False, diagnostics
+    if box_size <= 0:
+        diagnostics["triple_reject_reason"] = "INVALID_BOX_SIZE"
+        return False, diagnostics
+
+    current = columns[-1]
+    if _column_kind(current) != "O" or str(structure.get("latest_signal_name") or "").upper() != "SELL":
+        diagnostics["triple_reject_reason"] = "CURRENT_COLUMN_NOT_SELL_TRIGGER"
+        return False, diagnostics
+
+    sequence = columns[-5:]
+    if not _consecutive_indices(sequence) or [_column_kind(col) for col in sequence] != ["O", "X", "O", "X", "O"]:
+        diagnostics["triple_reject_reason"] = "SEQUENCE_NOT_EXACT_OXOXO"
+        return False, diagnostics
+    diagnostics["triple_sequence_valid"] = 1
+
+    left_o, _first_rebound_x, middle_o, _second_rebound_x, trigger_o = sequence
+    left_level = _column_bottom(left_o)
+    middle_level = _column_bottom(middle_o)
+    diagnostics["triple_left_test_level"] = left_level
+    diagnostics["triple_middle_test_level"] = middle_level
+    if left_level != middle_level:
+        diagnostics["triple_reject_reason"] = "PRIOR_O_BOTTOMS_NOT_EQUAL"
+        return False, diagnostics
+
+    trigger_break_level = left_level - box_size
+    diagnostics["triple_trigger_break_level"] = trigger_break_level
+    if _column_bottom(trigger_o) >= left_level:
+        diagnostics["triple_reject_reason"] = "TRIGGER_DID_NOT_BREAK_SUPPORT"
+        return False, diagnostics
+
+    return True, diagnostics
+
+
 def _compute_shadow_triple_pattern_fields(
     *,
     structure: Dict[str, Any],
@@ -1122,89 +1224,58 @@ def _compute_shadow_triple_pattern_fields(
     profile: PnFProfile,
     emitted_triple_top_levels: set[float] | None = None,
     emitted_triple_bottom_levels: set[float] | None = None,
-    recent_window_columns: int = 21,
 ) -> Dict[str, Any]:
-    """Classify sparse v2 triple-top/bottom PnF structural events.
+    """Classify exact 5-column triple-top/bottom PnF structural events.
 
-    This helper is intentionally diagnostic-only. It uses the scanner's
-    close-updated PnF columns and the existing BUY/SELL signal semantics as
-    the breakout/breakdown confirmation, then inspects only a bounded local
-    column window so event processing remains O(1) per structural change.
-    v2 emits fresh defended-level breaks only: prior defenses must be exact
-    same-level tests, the current break column is excluded from defense counts,
-    and caller-provided per-symbol emitted-level state suppresses repeats.
+    Strict triples are terminal 5-column bodies only: X O X O X for tops and
+    O X O X O for bottoms. The first and middle tests must be at the same
+    level, and the current trigger column must break beyond that shared level.
     """
     out = _empty_shadow_triple_pattern_fields()
-    if len(columns) < 5:
-        return out
-
     box_size = float(profile.box_size)
-    if box_size <= 0:
-        return out
+    if columns and box_size > 0:
+        out["breakout_column_height_boxes"] = _column_height_boxes(columns[-1], box_size)
 
-    current = columns[-1]
-    current_kind = str(getattr(current, "kind", "")).upper()
+    current_kind = _column_kind(columns[-1]) if columns else ""
     latest_signal_name = str(structure.get("latest_signal_name") or "").upper()
-    local_columns = columns[-recent_window_columns:]
-    current_idx = int(getattr(current, "idx", len(columns) - 1))
-    breakout_column_height_boxes = _column_height_boxes(current, box_size)
 
     if current_kind == "X" and latest_signal_name == "BUY":
-        out["breakout_column_height_boxes"] = breakout_column_height_boxes
-        if breakout_column_height_boxes is None or breakout_column_height_boxes < 2:
+        is_valid, diagnostics = _is_strict_triple_top_breakout(structure=structure, columns=columns, profile=profile)
+        out.update(diagnostics)
+        if not is_valid:
             return out
-        prior_x = [col for col in local_columns[:-1] if str(getattr(col, "kind", "")).upper() == "X"]
-        current_top = float(getattr(current, "top", 0.0))
+        resistance_level = float(out["triple_left_test_level"])
         emitted_levels = emitted_triple_top_levels or set()
-        candidate_levels = sorted(
-            {float(getattr(col, "top", 0.0)) for col in prior_x if float(getattr(col, "top", 0.0)) < current_top},
-            reverse=True,
-        )
-        for resistance_level in candidate_levels:
-            if resistance_level in emitted_levels:
-                continue
-            tests = _exact_prior_tests(prior_x, "top", resistance_level)
-            if len(tests) < 2:
-                continue
-            earliest_idx = min(int(getattr(col, "idx", 0)) for col in tests)
-            width_columns = current_idx - earliest_idx + 1
-            if width_columns < 5:
-                continue
-            out["shadow_triple_top_breakout"] = 1
-            out["triple_top_resistance_level"] = resistance_level
-            out["triple_pattern_width_columns"] = width_columns
-            out["breakout_distance_boxes"] = round((current_top - resistance_level) / box_size, 4)
-            out["prior_test_count"] = len(tests)
-            _apply_triple_pattern_compaction_diagnostics(out, width_columns)
+        if resistance_level in emitted_levels:
+            out["triple_reject_reason"] = "TRIPLE_TOP_LEVEL_ALREADY_EMITTED"
             return out
+        current_top = _column_top(columns[-1])
+        out["shadow_triple_top_breakout"] = 1
+        out["triple_top_resistance_level"] = resistance_level
+        out["triple_pattern_width_columns"] = 5
+        out["breakout_distance_boxes"] = round((current_top - resistance_level) / box_size, 4)
+        out["prior_test_count"] = 2
+        _apply_triple_pattern_compaction_diagnostics(out, 5)
+        return out
 
     if current_kind == "O" and latest_signal_name == "SELL":
-        out["breakout_column_height_boxes"] = breakout_column_height_boxes
-        if breakout_column_height_boxes is None or breakout_column_height_boxes < 2:
+        is_valid, diagnostics = _is_strict_triple_bottom_breakdown(structure=structure, columns=columns, profile=profile)
+        out.update(diagnostics)
+        if not is_valid:
             return out
-        prior_o = [col for col in local_columns[:-1] if str(getattr(col, "kind", "")).upper() == "O"]
-        current_bottom = float(getattr(current, "bottom", 0.0))
+        support_level = float(out["triple_left_test_level"])
         emitted_levels = emitted_triple_bottom_levels or set()
-        candidate_levels = sorted(
-            {float(getattr(col, "bottom", 0.0)) for col in prior_o if float(getattr(col, "bottom", 0.0)) > current_bottom}
-        )
-        for support_level in candidate_levels:
-            if support_level in emitted_levels:
-                continue
-            tests = _exact_prior_tests(prior_o, "bottom", support_level)
-            if len(tests) < 2:
-                continue
-            earliest_idx = min(int(getattr(col, "idx", 0)) for col in tests)
-            width_columns = current_idx - earliest_idx + 1
-            if width_columns < 5:
-                continue
-            out["shadow_triple_bottom_breakdown"] = 1
-            out["triple_bottom_support_level"] = support_level
-            out["triple_pattern_width_columns"] = width_columns
-            out["breakdown_distance_boxes"] = round((support_level - current_bottom) / box_size, 4)
-            out["prior_test_count"] = len(tests)
-            _apply_triple_pattern_compaction_diagnostics(out, width_columns)
+        if support_level in emitted_levels:
+            out["triple_reject_reason"] = "TRIPLE_BOTTOM_LEVEL_ALREADY_EMITTED"
             return out
+        current_bottom = _column_bottom(columns[-1])
+        out["shadow_triple_bottom_breakdown"] = 1
+        out["triple_bottom_support_level"] = support_level
+        out["triple_pattern_width_columns"] = 5
+        out["breakdown_distance_boxes"] = round((support_level - current_bottom) / box_size, 4)
+        out["prior_test_count"] = 2
+        _apply_triple_pattern_compaction_diagnostics(out, 5)
+        return out
 
     return out
 
@@ -1767,6 +1838,11 @@ def build_funnel_row(
         "triple_top_resistance_level": None,
         "triple_bottom_support_level": None,
         "triple_pattern_width_columns": None,
+        "triple_reject_reason": None,
+        "triple_left_test_level": None,
+        "triple_middle_test_level": None,
+        "triple_trigger_break_level": None,
+        "triple_sequence_valid": 0,
         "breakout_distance_boxes": None,
         "breakdown_distance_boxes": None,
         "prior_test_count": None,
