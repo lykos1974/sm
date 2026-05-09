@@ -738,6 +738,13 @@ def _strict_double_bottom_breakdown_fields(*, structure: Dict[str, Any], columns
 
 
 
+def _catapult_canonical_diagnostics(
+    sequence: List[Any],
+    direction: str,
+    box_size: float,
+    *,
+    emit_canonical_flags: bool = True,
+) -> Dict[str, Any]:
 def _catapult_canonical_diagnostics(sequence: List[Any], direction: str, box_size: float) -> Dict[str, Any]:
     """Return canonical catapult diagnostics for a 7-column terminal sequence.
 
@@ -837,6 +844,10 @@ def _catapult_canonical_diagnostics(sequence: List[Any], direction: str, box_siz
         diagnostics["catapult_reject_reason"] = "FOLLOWUP_NOT_STRICT_DOUBLE_SIGNAL"
         return diagnostics
 
+    if not emit_canonical_flags:
+        diagnostics["catapult_reject_reason"] = "GENERIC_7COL_CONTINUATION_ONLY"
+        return diagnostics
+
     diagnostics[canonical_flag] = 1
     diagnostics["catapult_is_canonical_candidate"] = 1
     return diagnostics
@@ -863,8 +874,10 @@ def _generic_7col_continuation_fields(*, structure: Dict[str, Any], columns: Lis
             break_distance_boxes=_pattern_break_distance(current_top, prior_x_high, float(profile.box_size), "UP"),
             quality="GENERIC_7_COL_BULLISH_CONTINUATION",
         )
-        fields.update(_catapult_canonical_diagnostics(sequence, "UP", float(profile.box_size)))
-        if int(fields.get("catapult_is_canonical_candidate") or 0) != 1 and fields.get("catapult_reject_reason") is None:
+        fields.update(
+            _catapult_canonical_diagnostics(sequence, "UP", float(profile.box_size), emit_canonical_flags=False)
+        )
+        if fields.get("catapult_reject_reason") is None:
             fields["catapult_reject_reason"] = "GENERIC_7COL_CONTINUATION_ONLY"
         return fields
     if kinds == ["O", "X", "O", "X", "O", "X", "O"] and latest_signal_name == "SELL":
@@ -880,8 +893,10 @@ def _generic_7col_continuation_fields(*, structure: Dict[str, Any], columns: Lis
             break_distance_boxes=_pattern_break_distance(current_bottom, prior_o_low, float(profile.box_size), "DOWN"),
             quality="GENERIC_7_COL_BEARISH_CONTINUATION",
         )
-        fields.update(_catapult_canonical_diagnostics(sequence, "DOWN", float(profile.box_size)))
-        if int(fields.get("catapult_is_canonical_candidate") or 0) != 1 and fields.get("catapult_reject_reason") is None:
+        fields.update(
+            _catapult_canonical_diagnostics(sequence, "DOWN", float(profile.box_size), emit_canonical_flags=False)
+        )
+        if fields.get("catapult_reject_reason") is None:
             fields["catapult_reject_reason"] = "GENERIC_7COL_CONTINUATION_ONLY"
         return fields
     return fields
