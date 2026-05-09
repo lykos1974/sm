@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Render standalone visual audit pages for shadow bearish catapult rows.
+"""Render standalone visual audit pages for shadow catapult rows.
 
 This script is intentionally audit/visualization-only. It rebuilds PnF columns
-from historical candle closes and renders sampled `shadow_bearish_catapult == 1`
+from historical candle closes and renders sampled broad or canonical catapult
 rows without changing scanner, strategy, or validation behavior.
 """
 from __future__ import annotations
@@ -146,11 +146,26 @@ def is_catapult_value(value: Any) -> bool:
     return math.isfinite(numeric_value) and numeric_value == 1.0
 
 
-def is_catapult_row(row: dict[str, str]) -> bool:
-    return is_catapult_value(row_value(row, "shadow_bearish_catapult"))
+def is_catapult_row(row: dict[str, str], canonical_only: bool = False) -> bool:
+    if canonical_only:
+        return is_catapult_value(row_value(row, "shadow_bullish_catapult_canonical")) or is_catapult_value(
+            row_value(row, "shadow_bearish_catapult_canonical")
+        )
+    return is_catapult_value(row_value(row, "shadow_bullish_catapult")) or is_catapult_value(
+        row_value(row, "shadow_bearish_catapult")
+    )
 
 
-def load_catapult_rows(input_csv: Path, symbol_filter: set[str] | None, limit: int | None) -> CatapultLoadResult:
+def catapult_level(row: dict[str, str]) -> float | None:
+    support_level = parse_float(row_value(row, "catapult_support_level"))
+    if support_level is not None:
+        return support_level
+    return parse_float(row_value(row, "pattern_resistance_level"))
+
+
+def load_catapult_rows(
+    input_csv: Path, symbol_filter: set[str] | None, limit: int | None, canonical_only: bool = False
+) -> CatapultLoadResult:
     rows: list[CatapultAuditRow] = []
     total_input_rows = 0
     catapult_rows_before_symbol_filter = 0
@@ -161,7 +176,7 @@ def load_catapult_rows(input_csv: Path, symbol_filter: set[str] | None, limit: i
         reader = csv.DictReader(handle)
         for source_row_number, row in enumerate(reader, start=2):
             total_input_rows += 1
-            if not is_catapult_row(row):
+            if not is_catapult_row(row, canonical_only=canonical_only):
                 continue
 
             catapult_rows_before_symbol_filter += 1
@@ -188,7 +203,7 @@ def load_catapult_rows(input_csv: Path, symbol_filter: set[str] | None, limit: i
                     row=row,
                     symbol=symbol,
                     reference_ts=reference_ts,
-                    support_level=parse_float(row_value(row, "catapult_support_level")),
+                    support_level=catapult_level(row),
                     total_columns=parse_int(row_value(row, "catapult_total_columns")),
                     origin_width=parse_int(row_value(row, "catapult_origin_width")),
                     pattern_quality=(row_value(row, "catapult_pattern_quality") or None),
@@ -489,7 +504,7 @@ th {{ background: #f9fafb; text-align: left; }}
 </head>
 <body>
 <h1>Bearish Catapult Audit Index</h1>
-<p>Standalone visual audit output for rows where <code>shadow_bearish_catapult == 1</code>.</p>
+<p>Standalone visual audit output for selected broad/canonical catapult rows.</p>
 <table>
 <tr><th>#</th><th>Symbol</th><th>Reference TS</th><th>Support</th><th>Quality</th><th>Outcome</th><th>Status</th><th>Audit</th></tr>
 {''.join(body)}
@@ -500,11 +515,12 @@ th {{ background: #f9fafb; text-align: left; }}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Render visual audit HTML for detected bearish PnF catapults")
+    parser = argparse.ArgumentParser(description="Render visual audit HTML for detected PnF catapults")
     parser.add_argument("--input-csv", default=DEFAULT_INPUT_CSV)
     parser.add_argument("--settings", default=DEFAULT_SETTINGS)
     parser.add_argument("--symbol", default=None, help="Optional symbol filter. Comma-separated values are accepted.")
     parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of catapult rows to render.")
+    parser.add_argument("--canonical-only", action="store_true", help="Render only canonical catapult rows.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     args = parser.parse_args()
 
@@ -517,7 +533,7 @@ def main() -> None:
     database_path = resolve_settings_relative_path(settings_path, settings["database_path"])
     profiles = build_profiles(settings)
     symbol_filter = {part.strip() for part in args.symbol.split(",") if part.strip()} if args.symbol else None
-    load_result = load_catapult_rows(input_csv, symbol_filter, args.limit)
+    load_result = load_catapult_rows(input_csv, symbol_filter, args.limit, canonical_only=args.canonical_only)
     audit_rows = load_result.rows
 
     rendered: list[tuple[CatapultAuditRow, str, str]] = []
@@ -551,7 +567,8 @@ def main() -> None:
     print(f"Catapult rows before symbol filter: {load_result.catapult_rows_before_symbol_filter}")
     print(f"Catapult rows after symbol filter: {load_result.catapult_rows_after_symbol_filter}")
     print(f"Symbols available among catapult rows: {available_symbols}")
-    print(f"Loaded {len(audit_rows)} bearish catapult row(s) from {input_csv}")
+    filter_label = "canonical catapult" if args.canonical_only else "catapult"
+    print(f"Loaded {len(audit_rows)} {filter_label} row(s) from {input_csv}")
     print(f"Wrote audit index to {index_path}")
 
 
