@@ -745,6 +745,7 @@ def _catapult_canonical_diagnostics(
     *,
     emit_canonical_flags: bool = True,
 ) -> Dict[str, Any]:
+def _catapult_canonical_diagnostics(sequence: List[Any], direction: str, box_size: float) -> Dict[str, Any]:
     """Return canonical catapult diagnostics for a 7-column terminal sequence.
 
     Canonical catapults are deliberately narrower than the broad 7-column
