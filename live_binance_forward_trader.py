@@ -188,7 +188,117 @@ def _dec(value: Any) -> Decimal:
 
 def console(event: str, message: str, details: dict[str, Any] | None = None) -> None:
     suffix = f" {json.dumps(details, sort_keys=True, default=str)}" if details else ""
-    print(f"{now_iso()} {event} {message}{suffix}", flush=True)
+    message_part = f" {message}" if message else ""
+    print(f"{now_iso()} {event}{message_part}{suffix}", flush=True)
+
+
+def compact_visibility_payload(data: dict[str, Any]) -> dict[str, Any]:
+    return {key: (float(value) if isinstance(value, Decimal) else value) for key, value in data.items()}
+
+
+def log_market_snapshot(symbol: str, profile: PnFProfile, candles: list[Candle]) -> None:
+    engine, _latest_ts = _replay_close_confirmed_pnf(profile, candles)
+    last_candle = candles[-1] if candles else None
+    console(
+        "MARKET",
+        symbol,
+        compact_visibility_payload(
+            {
+                "last_close": last_candle.close if last_candle is not None else None,
+                "last_candle_time": last_candle.close_time if last_candle is not None else None,
+                "pnf_last_price": engine.last_price,
+                "trend": engine.market_state(),
+                "latest_signal": engine.latest_signal_name(),
+            }
+        ),
+    )
+
+
+def log_signal_detail(signal: TriangleSignal, profile: PnFProfile, last_close: float | None) -> None:
+    console(
+        "SIGNAL_DETAIL",
+        signal.symbol,
+        compact_visibility_payload(
+            {
+                "pattern": signal.pattern,
+                "side": signal.side,
+                "entry": signal.entry_price,
+                "stop": signal.stop_price,
+                "tp1": signal.tp1_price,
+                "tp2": signal.tp2_price,
+                "breakout_level": signal.entry_price,
+                "support": signal.support_level,
+                "resistance": signal.resistance_level,
+                "box_size": _dec(profile.box_size),
+                "reversal": int(profile.reversal_boxes),
+                "trigger_column": signal.trigger_column_idx,
+                "last_close": last_close,
+                "trigger_timestamp": signal.trigger_ts,
+            }
+        ),
+    )
+
+
+def log_order_detail(symbol: str, order: dict[str, Any]) -> None:
+    price = _dec(order["price"]) if order.get("price") not in (None, "") else None
+    quantity = _dec(order["quantity"]) if order.get("quantity") not in (None, "") else None
+    notional = price * quantity if price is not None and quantity is not None else None
+    reduce_only_raw = order.get("reduceOnly", False)
+    reduce_only = str(reduce_only_raw).lower() == "true" if isinstance(reduce_only_raw, str) else bool(reduce_only_raw)
+    console(
+        "ORDER_DETAIL",
+        symbol,
+        compact_visibility_payload(
+            {
+                "type": order.get("type"),
+                "side": order.get("side"),
+                "price": price,
+                "qty": quantity,
+                "notional": notional,
+                "reduce_only": reduce_only,
+            }
+        ),
+    )
+
+
+def log_position_open_detail(signal: TriangleSignal, lifecycle: dict[str, Any]) -> None:
+    console(
+        "POSITION_OPEN_DETAIL",
+        "",
+        {
+            "symbol": signal.symbol,
+            "avg_fill_price": lifecycle.get("avg_fill_price"),
+            "requested_entry": float(signal.entry_price),
+            "slippage": lifecycle.get("entry_slippage"),
+            "executed_qty": lifecycle.get("executed_qty"),
+            "fees": lifecycle.get("entry_commission"),
+            "position_side": signal.side,
+        },
+    )
+
+
+def log_position_closed_detail(
+    *,
+    exit_price: Decimal,
+    requested_exit: Decimal | None,
+    realized_pnl: float,
+    fees: Decimal | float | None,
+    reason: str,
+) -> None:
+    requested = float(requested_exit) if requested_exit is not None else None
+    slippage = float(exit_price - requested_exit) if requested_exit is not None else None
+    console(
+        "POSITION_CLOSED_DETAIL",
+        "",
+        {
+            "exit_price": float(exit_price),
+            "requested_exit": requested,
+            "slippage": slippage,
+            "realized_pnl": realized_pnl,
+            "fees": float(fees) if isinstance(fees, Decimal) else fees,
+            "reason": reason,
+        },
+    )
 
 
 def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
@@ -694,6 +804,7 @@ def apply_entry_lifecycle(
     status_response: dict[str, Any],
     trades_response: Any,
     lifecycle: dict[str, Any],
+    verbose_market_logs: bool = False,
 ) -> None:
     entry_status = str(lifecycle.get("entry_order_status") or "")
     trade_status = "POSITION_OPEN" if entry_status == "FILLED" else "ORDER_SENT"
@@ -730,9 +841,11 @@ def apply_entry_lifecycle(
         ),
     )
     conn.commit()
+    if verbose_market_logs and entry_status == "FILLED":
+        log_position_open_detail(signal, lifecycle)
 
 
-def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool) -> None:
+def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool, verbose_market_logs: bool = False) -> None:
     if not live_enabled:
         return
     rows = conn.execute(
@@ -774,6 +887,7 @@ def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesCl
                 status_response=status_response,
                 trades_response=trades_response,
                 lifecycle=lifecycle,
+                verbose_market_logs=verbose_market_logs,
             )
             console("ORDER_STATUS", f"{symbol} trade_id={trade_id}", lifecycle)
         except Exception as exc:
@@ -787,6 +901,7 @@ def record_submitted_entry_order(
     *,
     order: dict[str, Any],
     notional_usdt: Decimal,
+    verbose_market_logs: bool = False,
 ) -> dict[str, Any]:
     raw_response = client.submit_order(order)
     order_id, client_order_id = extract_order_ids(order, raw_response)
@@ -833,6 +948,7 @@ def record_submitted_entry_order(
         status_response=status_response,
         trades_response=trades_response,
         lifecycle=lifecycle,
+        verbose_market_logs=verbose_market_logs,
     )
     return {"order_response": raw_response, "order_status": status_response, "user_trades": trades_response, "lifecycle": lifecycle}
 
@@ -1077,7 +1193,7 @@ def process_self_test_signal(
     return True
 
 
-def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool) -> None:
+def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool, verbose_market_logs: bool = False) -> None:
     rows = conn.execute(
         """
         SELECT id, symbol, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price, raw_order_response, executed_qty
@@ -1098,16 +1214,21 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
         ).fetchall()
         for close_time, high, low in candles:
             exit_price = None
+            exit_reason = None
             if side == "LONG":
                 if float(low) <= float(stop):
                     exit_price = Decimal(str(stop))
+                    exit_reason = "STOP"
                 elif float(high) >= float(tp2):
                     exit_price = Decimal(str(tp2))
+                    exit_reason = "TP2"
             else:
                 if float(high) >= float(stop):
                     exit_price = Decimal(str(stop))
+                    exit_reason = "STOP"
                 elif float(low) <= float(tp2):
                     exit_price = Decimal(str(tp2))
+                    exit_reason = "TP2"
             if exit_price is None:
                 continue
 
@@ -1126,6 +1247,14 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                 )
                 conn.commit()
                 console("POSITION_CLOSED", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r})
+                if verbose_market_logs:
+                    log_position_closed_detail(
+                        exit_price=exit_price,
+                        requested_exit=exit_price,
+                        realized_pnl=realized_r,
+                        fees=None,
+                        reason=exit_reason or "STOP",
+                    )
                 break
 
             if not client.has_credentials:
@@ -1150,6 +1279,7 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                 if reason is not None:
                     raise RuntimeError(reason)
                 raw_close_response = client.submit_order(close_order or {})
+                requested_exit = _dec(close_order["price"]) if close_order is not None else exit_price
             except Exception as exc:
                 conn.execute(
                     "UPDATE live_trades_binance SET status = 'EXIT_PENDING', notes = ? WHERE id = ?",
@@ -1175,6 +1305,14 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
             )
             conn.commit()
             console("POSITION_CLOSED", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r})
+            if verbose_market_logs:
+                log_position_closed_detail(
+                    exit_price=exit_price,
+                    requested_exit=requested_exit,
+                    realized_pnl=realized_r,
+                    fees=None,
+                    reason=exit_reason or "STOP",
+                )
             break
 
 
@@ -1211,6 +1349,7 @@ def log_startup(args: argparse.Namespace) -> None:
 def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
     demo = bool(getattr(args, "demo", False))
     enable_demo_doubles = bool(getattr(args, "enable_demo_doubles", False))
+    verbose_market_logs = bool(getattr(args, "verbose_market_logs", False))
     live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
     dry_run = not live_enabled
     api_key_env, api_secret_env = binance_env_names(demo)
@@ -1233,8 +1372,8 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             return
 
         settings = load_settings(Path(args.settings))
-        poll_pending_entry_orders(conn, client, live_enabled=live_enabled)
-        update_open_trade_exits(conn, client, live_enabled=live_enabled)
+        poll_pending_entry_orders(conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
+        update_open_trade_exits(conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
         configured_symbols = [s for s in settings.get("symbols", []) if s in ALLOWED_SYMBOLS]
         for symbol in configured_symbols:
             console("SCAN", symbol)
@@ -1246,6 +1385,8 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             if not candles:
                 console("BLOCKED", f"{symbol} has no 1m candles")
                 continue
+            if verbose_market_logs:
+                log_market_snapshot(symbol, profile, candles)
             latest_close_time = latest_candle_close_time(candles)
             last_processed = get_last_processed_close_time(conn, symbol)
             if latest_close_time is None or last_processed == latest_close_time:
@@ -1261,9 +1402,13 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 continue
 
             console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side}", signal.__dict__)
+            if verbose_market_logs:
+                log_signal_detail(signal, profile, candles[-1].close if candles else None)
             _spec, order, block_reason = validate_guards(
                 conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles
             )
+            if verbose_market_logs and order is not None:
+                log_order_detail(signal.symbol, order)
             if block_reason is not None:
                 record_signal(
                     conn,
@@ -1316,6 +1461,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                     signal,
                     order=order or {},
                     notional_usdt=notional_usdt,
+                    verbose_market_logs=verbose_market_logs,
                 )
             except Exception as exc:
                 raw_response = {"error": str(exc)}
@@ -1339,6 +1485,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of one pass")
     parser.add_argument("--poll-seconds", type=float, default=30.0, help="Sleep between loop iterations")
     parser.add_argument("--self-test-signal", action="store_true", help="Inject one synthetic allowed dry-run signal through the guarded pipeline")
+    parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
     return parser.parse_args()
 
 
