@@ -1,4 +1,5 @@
 import argparse
+from contextlib import closing
 import os
 import sqlite3
 import tempfile
@@ -212,7 +213,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
             )
             try:
                 trader.process_once(args)
-                with sqlite3.connect(db_path) as conn:
+                with closing(sqlite3.connect(db_path)) as conn:
                     signal_count = conn.execute("SELECT COUNT(*) FROM live_signals_binance").fetchone()[0]
                     trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
             finally:
