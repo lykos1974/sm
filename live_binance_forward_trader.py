@@ -33,8 +33,11 @@ if str(PNF_MVP) not in sys.path:
 from pnf_engine import PnFEngine, PnFProfile  # noqa: E402
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
+BINANCE_DEMO_BASE_URL = "https://demo-fapi.binance.com"
 BINANCE_API_KEY_ENV = "BINANCE_FUTURES_API_KEY"
 BINANCE_API_SECRET_ENV = "BINANCE_FUTURES_API_SECRET"
+BINANCE_DEMO_API_KEY_ENV = "BINANCE_DEMO_FUTURES_API_KEY"
+BINANCE_DEMO_API_SECRET_ENV = "BINANCE_DEMO_FUTURES_API_SECRET"
 MAX_NOTIONAL_USDT = Decimal("1")
 DEFAULT_NOTIONAL_USDT = Decimal("1")
 RECV_WINDOW_MS = 5000
@@ -158,6 +161,17 @@ class BinanceFuturesClient:
     def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
         return self._request_json("POST", "/fapi/v1/order", params=order, signed=True)
 
+    def get_order(self, symbol: str, *, order_id: str | None = None, client_order_id: str | None = None) -> dict[str, Any]:
+        return self._request_json(
+            "GET",
+            "/fapi/v1/order",
+            params={"symbol": symbol, "orderId": order_id, "origClientOrderId": client_order_id},
+            signed=True,
+        )
+
+    def get_user_trades(self, symbol: str, *, order_id: str | None = None) -> Any:
+        return self._request_json("GET", "/fapi/v1/userTrades", params={"symbol": symbol, "orderId": order_id}, signed=True)
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -173,6 +187,13 @@ def _dec(value: Any) -> Decimal:
 def console(event: str, message: str, details: dict[str, Any] | None = None) -> None:
     suffix = f" {json.dumps(details, sort_keys=True, default=str)}" if details else ""
     print(f"{now_iso()} {event} {message}{suffix}", flush=True)
+
+
+def ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def init_live_tables(conn: sqlite3.Connection) -> None:
@@ -239,6 +260,22 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
         """
+    )
+    ensure_columns(
+        conn,
+        "live_trades_binance",
+        {
+            "entry_order_status": "TEXT",
+            "avg_fill_price": "REAL",
+            "executed_qty": "REAL",
+            "entry_order_update_time": "INTEGER",
+            "entry_commission": "REAL",
+            "entry_commission_asset": "TEXT",
+            "entry_slippage": "REAL",
+            "entry_slippage_bps": "REAL",
+            "order_status_response": "TEXT",
+            "user_trades_response": "TEXT",
+        },
     )
     conn.commit()
 
@@ -495,6 +532,232 @@ def record_trade(
     conn.commit()
 
 
+
+def extract_order_ids(order_request: dict[str, Any] | None, order_response: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    order_id = None
+    client_order_id = None
+    if isinstance(order_response, dict):
+        raw_order_id = order_response.get("orderId")
+        order_id = str(raw_order_id) if raw_order_id not in (None, "") else None
+        raw_client_id = order_response.get("clientOrderId")
+        client_order_id = str(raw_client_id) if raw_client_id not in (None, "") else None
+    if client_order_id is None and isinstance(order_request, dict):
+        raw_client_id = order_request.get("newClientOrderId")
+        client_order_id = str(raw_client_id) if raw_client_id not in (None, "") else None
+    return order_id, client_order_id
+
+
+def commission_from_user_trades(user_trades: Any) -> tuple[Decimal | None, str | None]:
+    if not isinstance(user_trades, list):
+        return None, None
+    total = Decimal("0")
+    asset: str | None = None
+    found = False
+    for trade in user_trades:
+        if not isinstance(trade, dict) or trade.get("commission") in (None, ""):
+            continue
+        try:
+            total += _dec(trade.get("commission"))
+        except ValueError:
+            continue
+        trade_asset = str(trade.get("commissionAsset", "")) or None
+        asset = trade_asset if asset is None else (asset if asset == trade_asset else "MIXED")
+        found = True
+    return (total, asset) if found else (None, None)
+
+
+def slippage_from_fill(signal: TriangleSignal, avg_fill_price: Decimal | None) -> tuple[Decimal | None, Decimal | None]:
+    if avg_fill_price is None or signal.entry_price == 0:
+        return None, None
+    signed = avg_fill_price - signal.entry_price if signal.side == "LONG" else signal.entry_price - avg_fill_price
+    return signed, (signed / signal.entry_price) * Decimal("10000")
+
+
+def poll_entry_order_status(
+    client: BinanceFuturesClient,
+    signal: TriangleSignal,
+    order_request: dict[str, Any] | None,
+    order_response: dict[str, Any] | None,
+) -> tuple[dict[str, Any], Any, dict[str, Any]]:
+    order_id, client_order_id = extract_order_ids(order_request, order_response)
+    status_response = client.get_order(binance_symbol(signal.symbol), order_id=order_id, client_order_id=client_order_id)
+    trades_response: Any = []
+    if order_id is not None:
+        try:
+            trades_response = client.get_user_trades(binance_symbol(signal.symbol), order_id=order_id)
+        except Exception as exc:
+            trades_response = {"error": str(exc)}
+
+    status = str(status_response.get("status", ""))
+    avg_fill_price = _dec(status_response.get("avgPrice")) if status_response.get("avgPrice") not in (None, "", "0", 0) else None
+    executed_qty = _dec(status_response.get("executedQty")) if status_response.get("executedQty") not in (None, "") else None
+    commission, commission_asset = commission_from_user_trades(trades_response)
+    slippage, slippage_bps = slippage_from_fill(signal, avg_fill_price)
+    lifecycle = {
+        "entry_order_status": status,
+        "avg_fill_price": float(avg_fill_price) if avg_fill_price is not None else None,
+        "executed_qty": float(executed_qty) if executed_qty is not None else None,
+        "entry_order_update_time": int(status_response.get("updateTime")) if status_response.get("updateTime") not in (None, "") else None,
+        "entry_commission": float(commission) if commission is not None else None,
+        "entry_commission_asset": commission_asset,
+        "entry_slippage": float(slippage) if slippage is not None else None,
+        "entry_slippage_bps": float(slippage_bps) if slippage_bps is not None else None,
+    }
+    return status_response, trades_response, lifecycle
+
+
+def apply_entry_lifecycle(
+    conn: sqlite3.Connection,
+    trade_id: int,
+    *,
+    signal: TriangleSignal,
+    order_request: dict[str, Any] | None,
+    order_response: dict[str, Any] | None,
+    status_response: dict[str, Any],
+    trades_response: Any,
+    lifecycle: dict[str, Any],
+) -> None:
+    entry_status = str(lifecycle.get("entry_order_status") or "")
+    trade_status = "POSITION_OPEN" if entry_status == "FILLED" else "ORDER_SENT"
+    notes = "entry order filled; POSITION_OPEN" if entry_status == "FILLED" else f"entry order not filled; status={entry_status}; exits disabled until FILLED"
+    conn.execute(
+        """
+        UPDATE live_trades_binance
+        SET status = ?, entry_order_status = ?, avg_fill_price = ?, executed_qty = ?,
+            entry_order_update_time = ?, entry_commission = ?, entry_commission_asset = ?,
+            entry_slippage = ?, entry_slippage_bps = ?, fees = ?, order_status_response = ?,
+            user_trades_response = ?, raw_order_response = ?, notes = ?
+        WHERE id = ?
+        """,
+        (
+            trade_status,
+            lifecycle.get("entry_order_status"),
+            lifecycle.get("avg_fill_price"),
+            lifecycle.get("executed_qty"),
+            lifecycle.get("entry_order_update_time"),
+            lifecycle.get("entry_commission"),
+            lifecycle.get("entry_commission_asset"),
+            lifecycle.get("entry_slippage"),
+            lifecycle.get("entry_slippage_bps"),
+            lifecycle.get("entry_commission"),
+            json.dumps(status_response, sort_keys=True, default=str),
+            json.dumps(trades_response, sort_keys=True, default=str),
+            json.dumps(
+                {"order_request": order_request, "order_response": order_response, "order_status": status_response, "user_trades": trades_response},
+                sort_keys=True,
+                default=str,
+            ),
+            notes,
+            int(trade_id),
+        ),
+    )
+    conn.commit()
+
+
+def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool) -> None:
+    if not live_enabled:
+        return
+    rows = conn.execute(
+        """
+        SELECT id, symbol, pattern, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price,
+               raw_order_response
+        FROM live_trades_binance
+        WHERE status = 'ORDER_SENT'
+        """
+    ).fetchall()
+    for row in rows:
+        trade_id, symbol, pattern, side, trigger_ts, entry, stop, tp1, tp2, raw_order_response = row
+        signal = TriangleSignal(
+            symbol=symbol,
+            pattern=pattern,
+            side=side,
+            trigger_ts=int(trigger_ts),
+            entry_price=_dec(entry),
+            stop_price=_dec(stop),
+            tp1_price=_dec(tp1),
+            tp2_price=_dec(tp2),
+            trigger_column_idx=0,
+            support_level=Decimal("0"),
+            resistance_level=Decimal("0"),
+            break_distance_boxes=Decimal("0"),
+            pattern_quality="PERSISTED_ENTRY_ORDER",
+        )
+        try:
+            raw = json.loads(raw_order_response or "{}")
+            order_request = raw.get("order_request") if isinstance(raw, dict) else None
+            order_response = raw.get("order_response") if isinstance(raw, dict) else None
+            status_response, trades_response, lifecycle = poll_entry_order_status(client, signal, order_request, order_response)
+            apply_entry_lifecycle(
+                conn,
+                int(trade_id),
+                signal=signal,
+                order_request=order_request,
+                order_response=order_response,
+                status_response=status_response,
+                trades_response=trades_response,
+                lifecycle=lifecycle,
+            )
+            console("ORDER_STATUS", f"{symbol} trade_id={trade_id}", lifecycle)
+        except Exception as exc:
+            console("ORDER_FAILED", f"{symbol} trade_id={trade_id} status poll", {"error": str(exc)})
+
+
+def record_submitted_entry_order(
+    conn: sqlite3.Connection,
+    client: BinanceFuturesClient,
+    signal: TriangleSignal,
+    *,
+    order: dict[str, Any],
+    notional_usdt: Decimal,
+) -> dict[str, Any]:
+    raw_response = client.submit_order(order)
+    order_id, client_order_id = extract_order_ids(order, raw_response)
+    exchange_order_id = order_id or client_order_id
+    record_signal(
+        conn,
+        signal,
+        decision="ORDER_SENT",
+        block_reason=None,
+        dry_run=False,
+        notional_usdt=notional_usdt,
+        exchange_order_id=exchange_order_id,
+        raw_order_response={"order_request": order, "order_response": raw_response},
+        notes=json.dumps(raw_response),
+    )
+    record_trade(
+        conn,
+        signal,
+        notional_usdt=notional_usdt,
+        exchange_order_id=exchange_order_id,
+        status="ORDER_SENT",
+        dry_run=False,
+        decision="ORDER_SENT",
+        raw_order_response={"order_request": order, "order_response": raw_response},
+        notes="live Binance USD-M futures limit order submitted; awaiting FILLED status before exit management",
+    )
+    trade_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    try:
+        status_response, trades_response, lifecycle = poll_entry_order_status(client, signal, order, raw_response)
+    except Exception as exc:
+        poll_error = {"error": str(exc)}
+        conn.execute(
+            "UPDATE live_trades_binance SET order_status_response = ?, notes = ? WHERE id = ?",
+            (json.dumps(poll_error, sort_keys=True), f"entry order submitted; status poll failed and will retry: {exc}", trade_id),
+        )
+        conn.commit()
+        return {"order_response": raw_response, "order_status": poll_error, "user_trades": [], "lifecycle": {"entry_order_status": "POLL_FAILED"}}
+    apply_entry_lifecycle(
+        conn,
+        trade_id,
+        signal=signal,
+        order_request=order,
+        order_response=raw_response,
+        status_response=status_response,
+        trades_response=trades_response,
+        lifecycle=lifecycle,
+    )
+    return {"order_response": raw_response, "order_status": status_response, "user_trades": trades_response, "lifecycle": lifecycle}
+
 def order_request_from_trade(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any] | None:
     try:
         raw = json.loads(row[-1] or "{}")
@@ -736,13 +999,13 @@ def process_self_test_signal(
 def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool) -> None:
     rows = conn.execute(
         """
-        SELECT id, symbol, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price, raw_order_response
+        SELECT id, symbol, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price, raw_order_response, executed_qty
         FROM live_trades_binance
-        WHERE status IN ('OPEN','ORDER_SENT','POSITION_OPEN','EXIT_PENDING')
+        WHERE status IN ('POSITION_OPEN','EXIT_PENDING')
         """
     ).fetchall()
     for row in rows:
-        trade_id, symbol, side, entry_time, entry, stop, _tp1, tp2, raw_order_response = row
+        trade_id, symbol, side, entry_time, entry, stop, _tp1, tp2, raw_order_response, executed_qty = row
         candles = conn.execute(
             """
             SELECT close_time, high, low
@@ -793,6 +1056,8 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                     raise RuntimeError(f"one-way position mode required for reduceOnly exits: {mode_response}")
                 spec = client.get_symbol_spec(binance_symbol(symbol))
                 entry_order = order_request_from_trade((raw_order_response,))
+                if entry_order is not None and executed_qty not in (None, ""):
+                    entry_order = {**entry_order, "quantity": str(executed_qty)}
                 close_order, reason = build_reduce_only_close_order(
                     trade_id=int(trade_id),
                     symbol=symbol,
@@ -832,10 +1097,41 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
             break
 
 
+def binance_env_names(demo: bool) -> tuple[str, str]:
+    return (BINANCE_DEMO_API_KEY_ENV, BINANCE_DEMO_API_SECRET_ENV) if demo else (BINANCE_API_KEY_ENV, BINANCE_API_SECRET_ENV)
+
+
+def binance_base_url(demo: bool) -> str:
+    return BINANCE_DEMO_BASE_URL if demo else BINANCE_BASE_URL
+
+
+def execution_mode_label(*, demo: bool, dry_run: bool) -> str:
+    venue = "DEMO" if demo else "PRODUCTION"
+    execution = "DRY_RUN" if dry_run else "LIVE"
+    return f"{venue}_{execution}"
+
+
 def process_once(args: argparse.Namespace) -> None:
+    demo = bool(getattr(args, "demo", False))
     live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
     dry_run = not live_enabled
-    client = BinanceFuturesClient(os.environ.get(BINANCE_API_KEY_ENV), os.environ.get(BINANCE_API_SECRET_ENV))
+    api_key_env, api_secret_env = binance_env_names(demo)
+    client = BinanceFuturesClient(
+        os.environ.get(api_key_env),
+        os.environ.get(api_secret_env),
+        base_url=binance_base_url(demo),
+    )
+    console(
+        "STARTUP",
+        f"mode={execution_mode_label(demo=demo, dry_run=dry_run)}",
+        {
+            "venue": "DEMO" if demo else "PRODUCTION",
+            "execution": "DRY_RUN" if dry_run else "LIVE",
+            "base_url": client.base_url,
+            "dry_run": dry_run,
+            "api_key_env": api_key_env,
+        },
+    )
     notional_usdt = _dec(args.notional_usdt)
 
     conn = sqlite3.connect(args.db_path)
@@ -849,6 +1145,7 @@ def process_once(args: argparse.Namespace) -> None:
             return
 
         settings = load_settings(Path(args.settings))
+        poll_pending_entry_orders(conn, client, live_enabled=live_enabled)
         update_open_trade_exits(conn, client, live_enabled=live_enabled)
         configured_symbols = [s for s in settings.get("symbols", []) if s in ALLOWED_SYMBOLS]
         for symbol in configured_symbols:
@@ -913,13 +1210,19 @@ def process_once(args: argparse.Namespace) -> None:
 
             try:
                 position_response = client.get_position_risk(binance_symbol(signal.symbol))
-                console("POSITION_OPEN", f"{signal.symbol} exchange position precheck", position_response)
+                console("POSITION_CHECK", f"{signal.symbol} exchange position precheck", position_response)
                 if has_exchange_position(position_response):
                     reason = "exchange reports existing open position"
                     record_signal(conn, signal, decision="BLOCKED", block_reason=reason, dry_run=False, notional_usdt=notional_usdt, notes=json.dumps(position_response))
                     console("BLOCKED", f"{signal.symbol} {signal.pattern}", {"reason": reason})
                     continue
-                raw_response = client.submit_order(order or {})
+                lifecycle_result = record_submitted_entry_order(
+                    conn,
+                    client,
+                    signal,
+                    order=order or {},
+                    notional_usdt=notional_usdt,
+                )
             except Exception as exc:
                 raw_response = {"error": str(exc)}
                 record_signal(conn, signal, decision="ORDER_FAILED", block_reason=str(exc), dry_run=False, notional_usdt=notional_usdt, raw_order_response={"order_request": order, "order_response": raw_response}, notes="API/order error; fail closed")
@@ -927,10 +1230,7 @@ def process_once(args: argparse.Namespace) -> None:
                 console("ORDER_FAILED", f"{signal.symbol} {signal.pattern}", raw_response)
                 continue
 
-            order_id = str(raw_response.get("orderId") or raw_response.get("clientOrderId") or "") or None
-            record_signal(conn, signal, decision="ORDER_SENT", block_reason=None, dry_run=False, notional_usdt=notional_usdt, exchange_order_id=order_id, raw_order_response={"order_request": order, "order_response": raw_response}, notes=json.dumps(raw_response))
-            record_trade(conn, signal, notional_usdt=notional_usdt, exchange_order_id=order_id, status="ORDER_SENT", dry_run=False, decision="ORDER_SENT", raw_order_response={"order_request": order, "order_response": raw_response}, notes="live Binance USD-M futures limit order submitted")
-            console("ORDER_SENT", f"{signal.symbol} {signal.pattern}", raw_response)
+            console("ORDER_SENT", f"{signal.symbol} {signal.pattern}", lifecycle_result)
     finally:
         conn.close()
 
@@ -940,6 +1240,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-path", required=True, help="Path to existing market_data.db")
     parser.add_argument("--settings", required=True, help="Path to settings.json with PnF profiles")
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode even if LIVE_TRADING_ENABLED=1")
+    parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
     parser.add_argument("--notional-usdt", default=str(DEFAULT_NOTIONAL_USDT), help="Fixed order notional; hard-capped at 1 USDT")
     parser.add_argument("--history-bars", type=int, default=5000, help="Number of recent 1m candles used to reconstruct close-confirmed PnF state")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of one pass")
@@ -950,8 +1251,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    mode = "LIVE" if os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run else "DRY_RUN"
-    console("BLOCKED" if mode == "DRY_RUN" else "POSITION_OPEN", f"startup mode={mode}")
+    dry_run = not (os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
+    console(
+        "STARTUP",
+        f"startup mode={execution_mode_label(demo=args.demo, dry_run=dry_run)}",
+        {
+            "venue": "DEMO" if args.demo else "PRODUCTION",
+            "execution": "DRY_RUN" if dry_run else "LIVE",
+            "base_url": binance_base_url(args.demo),
+        },
+    )
 
     if args.loop:
         while True:
