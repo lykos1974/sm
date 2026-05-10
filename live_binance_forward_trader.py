@@ -582,6 +582,8 @@ def detect_latest_strict_triangle(symbol: str, profile: PnFProfile, candles: lis
         return None
     kinds = [_column_kind(col) for col in sequence]
     box_size = _dec(profile.box_size)
+    if box_size <= 0:
+        return None
 
     if kinds == ["X", "O", "X", "O", "X"] and engine.latest_signal_name() == "BUY":
         first_x, first_o, lower_high_x, higher_low_o, breakout_x = sequence
@@ -651,6 +653,8 @@ def detect_latest_strict_double(symbol: str, profile: PnFProfile, candles: list[
         return None
     kinds = [_column_kind(col) for col in sequence]
     box_size = _dec(profile.box_size)
+    if box_size <= 0:
+        return None
 
     if kinds == ["X", "O", "X"] and engine.latest_signal_name() == "BUY":
         prior_x, middle_o, trigger_x = sequence
@@ -1102,7 +1106,18 @@ def parse_symbol_spec(exchange_info: dict[str, Any], symbol: str) -> SymbolSpec:
     )
 
 
+def validate_risk_levels(signal: TriangleSignal) -> str | None:
+    if signal.side == "LONG" and signal.stop_price < signal.entry_price < signal.tp1_price < signal.tp2_price:
+        return None
+    if signal.side == "SHORT" and signal.stop_price > signal.entry_price > signal.tp1_price > signal.tp2_price:
+        return None
+    return "invalid risk levels"
+
+
 def build_entry_order(signal: TriangleSignal, spec: SymbolSpec, notional_usdt: Decimal) -> tuple[dict[str, Any] | None, str | None]:
+    risk_reason = validate_risk_levels(signal)
+    if risk_reason is not None:
+        return None, risk_reason
     if notional_usdt > MAX_NOTIONAL_USDT:
         return None, "notional exceeds 1 USDT"
     if spec.status != "TRADING":
@@ -1210,6 +1225,9 @@ def validate_guards(
         return None, None, "pattern outside live allowlist"
     if signal.pattern in CATAPULT_SIGNAL_NAMES:
         return None, None, "catapult patterns are log-only"
+    risk_reason = validate_risk_levels(signal)
+    if risk_reason is not None:
+        return None, None, risk_reason
     if signal_exists(conn, signal):
         return None, None, "duplicate signal for same symbol/pattern/trigger timestamp"
     if has_existing_open_trade(conn, signal.symbol):
