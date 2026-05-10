@@ -2,6 +2,8 @@ import argparse
 import os
 import sqlite3
 import tempfile
+import os
+import sqlite3
 import unittest
 from decimal import Decimal
 

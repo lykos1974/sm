@@ -779,75 +779,9 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
             break
 
 
-def build_self_test_signal(symbol: str = "BINANCE_FUT:BTCUSDT") -> TriangleSignal:
-    return TriangleSignal(
-        symbol=symbol,
-        pattern="bullish_triangle",
-        side="LONG",
-        trigger_ts=0,
-        entry_price=Decimal("100"),
-        stop_price=Decimal("99"),
-        tp1_price=Decimal("102"),
-        tp2_price=Decimal("103"),
-        trigger_column_idx=0,
-        support_level=Decimal("99"),
-        resistance_level=Decimal("100"),
-        break_distance_boxes=Decimal("1"),
-        pattern_quality="SELF_TEST_SIGNAL",
-    )
-
-
-def process_self_test_signal(
-    conn: sqlite3.Connection,
-    client: BinanceFuturesClient,
-    *,
-    notional_usdt: Decimal,
-    symbol: str = "BINANCE_FUT:BTCUSDT",
-) -> bool:
-    signal = build_self_test_signal(symbol)
-    console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side} self-test", signal.__dict__)
-    _spec, order, block_reason = validate_guards(conn, client, signal, notional_usdt=notional_usdt, live_enabled=False)
-    if block_reason is not None:
-        record_signal(
-            conn,
-            signal,
-            decision="BLOCKED",
-            block_reason=block_reason,
-            dry_run=True,
-            notional_usdt=notional_usdt,
-            notes="SELF_TEST_SIGNAL",
-        )
-        console("BLOCKED", f"{signal.symbol} self-test", {"reason": block_reason})
-        return False
-
-    record_signal(
-        conn,
-        signal,
-        decision="DRY_RUN",
-        block_reason=None,
-        dry_run=True,
-        notional_usdt=notional_usdt,
-        raw_order_response={"would_submit_order": order},
-        notes="SELF_TEST_SIGNAL",
-    )
-    record_trade(
-        conn,
-        signal,
-        notional_usdt=notional_usdt,
-        exchange_order_id=None,
-        status="DRY_RUN",
-        dry_run=True,
-        decision="DRY_RUN",
-        raw_order_response={"would_submit_order": order},
-        notes="SELF_TEST_SIGNAL",
-    )
-    console("BLOCKED", f"{signal.symbol} self-test dry-run; order not sent", {"order": order})
-    return True
-
-
 def process_once(args: argparse.Namespace) -> None:
-    live_env_enabled = os.environ.get("LIVE_TRADING_ENABLED") == "1"
-    live_enabled = bool(live_env_enabled and not args.dry_run)
+    settings = load_settings(Path(args.settings))
+    live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
     dry_run = not live_enabled
     client = BinanceFuturesClient(os.environ.get(BINANCE_API_KEY_ENV), os.environ.get(BINANCE_API_SECRET_ENV))
     notional_usdt = _dec(args.notional_usdt)
@@ -969,6 +903,7 @@ def main() -> None:
     if args.self_test_signal:
         process_once(args)
     elif args.loop:
+    if args.loop:
         while True:
             process_once(args)
             time.sleep(args.poll_seconds)
