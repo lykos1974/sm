@@ -9,6 +9,7 @@ MEXC validator.  Live exchange writes are fail-closed and require
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import hmac
 import json
@@ -1134,8 +1135,7 @@ def process_once(args: argparse.Namespace) -> None:
     )
     notional_usdt = _dec(args.notional_usdt)
 
-    conn = sqlite3.connect(args.db_path)
-    try:
+    with closing(sqlite3.connect(args.db_path)) as conn:
         init_live_tables(conn)
         if args.self_test_signal:
             if os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run:
@@ -1231,8 +1231,6 @@ def process_once(args: argparse.Namespace) -> None:
                 continue
 
             console("ORDER_SENT", f"{signal.symbol} {signal.pattern}", lifecycle_result)
-    finally:
-        conn.close()
 
 
 def parse_args() -> argparse.Namespace:
