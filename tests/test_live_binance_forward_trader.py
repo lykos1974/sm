@@ -46,6 +46,12 @@ def sample_signal(trigger_ts=123456):
     )
 
 
+def replace_signal(signal, **overrides):
+    values = dict(signal.__dict__)
+    values.update(overrides)
+    return trader.TriangleSignal(**values)
+
+
 def sample_double_signal(trigger_ts=123456, pattern="double_top_breakout"):
     if pattern == "double_bottom_breakdown":
         return trader.TriangleSignal(
@@ -553,6 +559,107 @@ class BinanceForwardTraderTests(unittest.TestCase):
         )
         self.assertIsNone(order2)
         self.assertEqual(reason2, "duplicate signal for same symbol/pattern/trigger timestamp")
+
+    def test_invalid_long_risk_levels_are_blocked_before_order_build(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = replace_signal(sample_signal(), stop_price=Decimal("101"))
+        spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+
+        built_order, build_reason = trader.build_entry_order(signal, spec, Decimal("1"))
+        _spec, guarded_order, guard_reason = trader.validate_guards(
+            conn, StaticClient(), signal, notional_usdt=Decimal("1"), live_enabled=False
+        )
+
+        self.assertIsNone(built_order)
+        self.assertEqual(build_reason, "invalid risk levels")
+        self.assertIsNone(guarded_order)
+        self.assertEqual(guard_reason, "invalid risk levels")
+
+    def test_invalid_short_risk_levels_are_blocked_before_order_build(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = replace_signal(
+            sample_signal(),
+            pattern="bearish_triangle",
+            side="SHORT",
+            stop_price=Decimal("99"),
+            tp1_price=Decimal("98"),
+            tp2_price=Decimal("97"),
+        )
+        spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+
+        built_order, build_reason = trader.build_entry_order(signal, spec, Decimal("1"))
+        _spec, guarded_order, guard_reason = trader.validate_guards(
+            conn, StaticClient(), signal, notional_usdt=Decimal("1"), live_enabled=False
+        )
+
+        self.assertIsNone(built_order)
+        self.assertEqual(build_reason, "invalid risk levels")
+        self.assertIsNone(guarded_order)
+        self.assertEqual(guard_reason, "invalid risk levels")
+
+    def test_valid_long_and_short_risk_levels_pass(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        long_signal = sample_signal(trigger_ts=1001)
+        short_signal = replace_signal(
+            sample_signal(trigger_ts=1002),
+            pattern="bearish_triangle",
+            side="SHORT",
+            stop_price=Decimal("101"),
+            tp1_price=Decimal("98"),
+            tp2_price=Decimal("97"),
+        )
+
+        _long_spec, long_order, long_reason = trader.validate_guards(
+            conn, StaticClient(), long_signal, notional_usdt=Decimal("1"), live_enabled=False
+        )
+        _short_spec, short_order, short_reason = trader.validate_guards(
+            conn, StaticClient(), short_signal, notional_usdt=Decimal("1"), live_enabled=False
+        )
+
+        self.assertIsNone(long_reason)
+        self.assertEqual(long_order["side"], "BUY")
+        self.assertIsNone(short_reason)
+        self.assertEqual(short_order["side"], "SELL")
+
+    def test_process_once_records_invalid_risk_levels_and_submits_no_order(self):
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        original_env = os.environ.copy()
+        SubmittingClient.instances.clear()
+        try:
+            os.environ["LIVE_TRADING_ENABLED"] = "1"
+            os.environ[trader.BINANCE_DEMO_API_KEY_ENV] = "key"
+            os.environ[trader.BINANCE_DEMO_API_SECRET_ENV] = "secret"
+            trader.BinanceFuturesClient = SubmittingClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: replace_signal(
+                sample_signal(trigger_ts=1), stop_price=Decimal("101")
+            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({"symbols": ["BINANCE_FUT:SOLUSDT"], "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}}}, fh)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+                args = argparse.Namespace(db_path=db_path, settings=settings_path, dry_run=False, demo=True, enable_demo_doubles=False, notional_usdt="1", history_bars=5000, self_test_signal=False)
+                trader.process_once(args)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    signal_rows = conn.execute("SELECT decision, block_reason FROM live_signals_binance").fetchall()
+                    trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+            os.environ.clear()
+            os.environ.update(original_env)
+
+        self.assertEqual(signal_rows, [("BLOCKED", "invalid risk levels")])
+        self.assertEqual(trade_count, 0)
+        self.assertEqual(SubmittingClient.instances[-1].submitted_orders, [])
 
     def test_order_signing_uses_timestamp_and_hmac_sha256(self):
         client = trader.BinanceFuturesClient("key", "secret")
