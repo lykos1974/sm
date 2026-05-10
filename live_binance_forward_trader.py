@@ -192,6 +192,32 @@ def console(event: str, message: str, details: dict[str, Any] | None = None) -> 
     print(f"{now_iso()} {event}{message_part}{suffix}", flush=True)
 
 
+def db_info_payload(db_path: str | os.PathLike[str], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    absolute_path = Path(db_path).expanduser().absolute()
+    exists = absolute_path.exists()
+    payload: dict[str, Any] = {
+        "db_path": str(absolute_path),
+        "exists": exists,
+        "mtime": datetime.fromtimestamp(absolute_path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds") if exists else None,
+        "resolved_path": str(absolute_path.resolve(strict=False)),
+    }
+    if conn is not None:
+        database_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_file = next((row[2] for row in database_rows if row[1] == "main"), None)
+        payload["sqlite_database_list"] = [
+            {"seq": row[0], "name": row[1], "file": row[2], "realpath": os.path.realpath(row[2]) if row[2] else None}
+            for row in database_rows
+        ]
+        payload["sqlite_realpath"] = os.path.realpath(main_file) if main_file else None
+    else:
+        payload["sqlite_realpath"] = os.path.realpath(absolute_path)
+    return payload
+
+
+def log_db_info(db_path: str | os.PathLike[str], conn: sqlite3.Connection | None = None) -> None:
+    console("DB_INFO", "", db_info_payload(db_path, conn))
+
+
 def compact_visibility_payload(data: dict[str, Any]) -> dict[str, Any]:
     return {key: (float(value) if isinstance(value, Decimal) else value) for key, value in data.items()}
 
@@ -411,7 +437,74 @@ def binance_symbol(symbol: str) -> str:
     return symbol.split(":", 1)[-1].replace("/", "")
 
 
+def log_candle_query(runtime_symbol: str, query_symbol: str) -> None:
+    console(
+        "CANDLE_QUERY",
+        "",
+        {
+            "runtime_symbol": runtime_symbol,
+            "normalized_symbol": binance_symbol(runtime_symbol),
+            "query_symbol": query_symbol,
+            "table": "candles",
+            "interval": "1m",
+        },
+    )
+
+
+def log_candle_result(symbol: str, candles: list[Candle]) -> None:
+    first_candle = candles[0] if candles else None
+    last_candle = candles[-1] if candles else None
+    console(
+        "CANDLE_RESULT",
+        "",
+        {
+            "symbol": symbol,
+            "rows": len(candles),
+            "first_close_time": first_candle.close_time if first_candle is not None else None,
+            "last_close_time": last_candle.close_time if last_candle is not None else None,
+            "last_close": last_candle.close if last_candle is not None else None,
+            "last_high": last_candle.high if last_candle is not None else None,
+            "last_low": last_candle.low if last_candle is not None else None,
+        },
+    )
+
+
+def log_raw_candle_symbol_max_times(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT symbol, MAX(close_time)
+        FROM candles
+        GROUP BY symbol
+        """
+    ).fetchall()
+    target_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+    matching_rows = [
+        {"symbol": str(symbol), "max_close_time": int(max_close_time) if max_close_time is not None else None}
+        for symbol, max_close_time in rows
+        if str(symbol) in target_symbols
+    ]
+    console("RAW_CANDLE_SYMBOL_MAX", "", {"table": "candles", "rows": matching_rows})
+
+
+def log_market_runtime_compare(symbol: str, profile: PnFProfile, candles: list[Candle]) -> None:
+    engine, _latest_ts = _replay_close_confirmed_pnf(profile, candles)
+    last_candle = candles[-1] if candles else None
+    console(
+        "MARKET_RUNTIME_COMPARE",
+        "",
+        compact_visibility_payload(
+            {
+                "symbol": symbol,
+                "latest_candle_close": last_candle.close if last_candle is not None else None,
+                "pnf_last_price": engine.last_price,
+            }
+        ),
+    )
+
+
 def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Candle]:
+    query_symbol = symbol
+    log_candle_query(symbol, query_symbol)
     rows = conn.execute(
         """
         SELECT close_time, close, high, low
@@ -420,9 +513,11 @@ def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Cand
         ORDER BY close_time DESC
         LIMIT ?
         """,
-        (symbol, limit),
+        (query_symbol, limit),
     ).fetchall()
-    return [Candle(int(ts), float(close), float(high), float(low)) for ts, close, high, low in reversed(rows)]
+    candles = [Candle(int(ts), float(close), float(high), float(low)) for ts, close, high, low in reversed(rows)]
+    log_candle_result(query_symbol, candles)
+    return candles
 
 
 def latest_candle_close_time(candles: list[Candle]) -> int | None:
@@ -1344,6 +1439,7 @@ def log_startup(args: argparse.Namespace) -> None:
             "enable_demo_doubles": bool(getattr(args, "enable_demo_doubles", False)),
         },
     )
+    log_db_info(args.db_path)
 
 
 def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
@@ -1363,6 +1459,9 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
     notional_usdt = _dec(args.notional_usdt)
 
     with closing(sqlite3.connect(args.db_path)) as conn:
+        log_db_info(args.db_path, conn)
+        if verbose_market_logs:
+            log_raw_candle_symbol_max_times(conn)
         init_live_tables(conn)
         if args.self_test_signal:
             if os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run:
@@ -1385,6 +1484,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             if not candles:
                 console("BLOCKED", f"{symbol} has no 1m candles")
                 continue
+            log_market_runtime_compare(symbol, profile, candles)
             if verbose_market_logs:
                 log_market_snapshot(symbol, profile, candles)
             latest_close_time = latest_candle_close_time(candles)
