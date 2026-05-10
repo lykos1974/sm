@@ -276,6 +276,119 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertTrue(any(" SIGNAL_DETAIL BINANCE_FUT:SOLUSDT " in line and '"tp2": 103.0' in line for line in lines))
         self.assertTrue(any(" ORDER_DETAIL BINANCE_FUT:SOLUSDT " in line and '"reduce_only": false' in line for line in lines))
 
+
+    def test_process_once_keeps_candle_db_read_only_and_writes_state_db(self):
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        try:
+            trader.BinanceFuturesClient = DemoInitClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: sample_signal(trigger_ts=1)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                candle_db_path = os.path.join(temp_dir, "market_data.db")
+                state_db_path = os.path.join(temp_dir, "binance_state.db")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "symbols": ["BINANCE_FUT:SOLUSDT"],
+                        "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}},
+                    }, fh)
+                with closing(sqlite3.connect(candle_db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+
+                args = argparse.Namespace(
+                    db_path=candle_db_path,
+                    state_db_path=state_db_path,
+                    settings=settings_path,
+                    dry_run=True,
+                    demo=False,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    demo_max_notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    verbose_market_logs=False,
+                )
+                trader.process_once(args)
+
+                with closing(sqlite3.connect(candle_db_path)) as candle_conn:
+                    candle_tables = {row[0] for row in candle_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                with closing(sqlite3.connect(state_db_path)) as state_conn:
+                    state_tables = {row[0] for row in state_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    signal_rows = state_conn.execute("SELECT decision FROM live_signals_binance").fetchall()
+                    trade_rows = state_conn.execute("SELECT decision FROM live_trades_binance").fetchall()
+                    last_processed = state_conn.execute("SELECT last_processed_close_time FROM live_binance_trader_state").fetchone()[0]
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+
+        self.assertEqual(candle_tables, {"candles"})
+        self.assertTrue({"live_signals_binance", "live_trades_binance", "live_binance_trader_state"}.issubset(state_tables))
+        self.assertEqual(signal_rows, [("DRY_RUN",)])
+        self.assertEqual(trade_rows, [("DRY_RUN",)])
+        self.assertEqual(last_processed, 1)
+
+    def test_update_open_trade_exits_reads_candle_db_and_writes_state_db(self):
+        state_conn = sqlite3.connect(":memory:")
+        candle_conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(state_conn)
+            signal = sample_signal(trigger_ts=1)
+            trader.record_trade(
+                state_conn,
+                signal,
+                notional_usdt=Decimal("1"),
+                exchange_order_id=None,
+                status="POSITION_OPEN",
+                dry_run=True,
+                decision="DRY_RUN",
+            )
+            candle_conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, high REAL, low REAL)")
+            candle_conn.execute(
+                "INSERT INTO candles(symbol, interval, close_time, high, low) VALUES(?,?,?,?,?)",
+                ("SOLUSDT", "1m", signal.trigger_ts + 60_000, 104, 100),
+            )
+            candle_conn.commit()
+
+            trader.update_open_trade_exits(state_conn, candle_conn, LifecycleClient("FILLED"), live_enabled=False)
+            row = state_conn.execute("SELECT status, exit_price, realized_r FROM live_trades_binance").fetchone()
+            candle_tables = {row[0] for row in candle_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            state_conn.close()
+            candle_conn.close()
+
+        self.assertEqual(row, ("POSITION_CLOSED", 103.0, 3.0))
+        self.assertEqual(candle_tables, {"candles"})
+
+    def test_demo_live_notional_cap_can_be_explicitly_raised_only_for_demo_live(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = replace_signal(sample_signal(), entry_price=Decimal("10"), stop_price=Decimal("9"), tp1_price=Decimal("12"), tp2_price=Decimal("13"))
+        _spec, order, reason = trader.validate_guards(
+            conn,
+            LiveClient(),
+            signal,
+            notional_usdt=Decimal("5"),
+            live_enabled=True,
+            demo=True,
+            demo_max_notional_usdt=Decimal("5"),
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(Decimal(order["quantity"]) * Decimal(order["price"]), Decimal("5.000"))
+
+        _spec2, order2, reason2 = trader.validate_guards(
+            conn,
+            LiveClient(),
+            sample_signal(trigger_ts=999),
+            notional_usdt=Decimal("5"),
+            live_enabled=False,
+            demo=True,
+            demo_max_notional_usdt=Decimal("5"),
+        )
+        self.assertIsNone(order2)
+        self.assertIn("notional exceeds effective cap", reason2)
+
     def test_verbose_lifecycle_logs_position_open_detail_on_fill(self):
         conn = sqlite3.connect(":memory:")
         trader.init_live_tables(conn)

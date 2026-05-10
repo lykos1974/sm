@@ -218,6 +218,20 @@ def log_db_info(db_path: str | os.PathLike[str], conn: sqlite3.Connection | None
     console("DB_INFO", "", db_info_payload(db_path, conn))
 
 
+def sqlite_readonly_uri(db_path: str | os.PathLike[str]) -> str:
+    return Path(db_path).expanduser().absolute().as_uri() + "?mode=ro"
+
+
+def connect_candle_db_readonly(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def resolve_state_db_path(args: argparse.Namespace) -> str:
+    return str(getattr(args, "state_db_path", None) or args.db_path)
+
+
 def compact_visibility_payload(data: dict[str, Any]) -> dict[str, Any]:
     return {key: (float(value) if isinstance(value, Decimal) else value) for key, value in data.items()}
 
@@ -1114,12 +1128,18 @@ def validate_risk_levels(signal: TriangleSignal) -> str | None:
     return "invalid risk levels"
 
 
-def build_entry_order(signal: TriangleSignal, spec: SymbolSpec, notional_usdt: Decimal) -> tuple[dict[str, Any] | None, str | None]:
+def build_entry_order(
+    signal: TriangleSignal,
+    spec: SymbolSpec,
+    notional_usdt: Decimal,
+    *,
+    max_notional_usdt: Decimal = MAX_NOTIONAL_USDT,
+) -> tuple[dict[str, Any] | None, str | None]:
     risk_reason = validate_risk_levels(signal)
     if risk_reason is not None:
         return None, risk_reason
-    if notional_usdt > MAX_NOTIONAL_USDT:
-        return None, "notional exceeds 1 USDT"
+    if notional_usdt > max_notional_usdt:
+        return None, f"notional exceeds effective cap: requested={notional_usdt} cap={max_notional_usdt}"
     if spec.status != "TRADING":
         return None, f"symbol status not TRADING: {spec.status}"
     if spec.quote_asset != "USDT":
@@ -1137,10 +1157,11 @@ def build_entry_order(signal: TriangleSignal, spec: SymbolSpec, notional_usdt: D
     if quantity > spec.max_qty:
         return None, f"quantity above maxQty: quantity={quantity} maxQty={spec.max_qty}"
     actual_notional = quantity * price
-    if actual_notional > MAX_NOTIONAL_USDT:
-        return None, f"rounded notional exceeds 1 USDT: {actual_notional}"
+    if actual_notional > max_notional_usdt:
+        return None, f"rounded notional exceeds effective cap: actual={actual_notional} cap={max_notional_usdt}"
     if actual_notional < spec.min_notional:
-        return None, f"min order notional cannot support 1 USDT cap: actual={actual_notional} minNotional={spec.min_notional}"
+        cap_label = "1 USDT cap" if max_notional_usdt == MAX_NOTIONAL_USDT else f"effective cap {max_notional_usdt}"
+        return None, f"min order notional cannot support {cap_label}: actual={actual_notional} minNotional={spec.min_notional}"
     return (
         {
             "symbol": spec.symbol,
@@ -1208,6 +1229,12 @@ def has_exchange_position(position_response: dict[str, Any]) -> bool:
     return False
 
 
+def effective_notional_cap(*, requested_notional_usdt: Decimal, demo: bool, live_enabled: bool, demo_max_notional_usdt: Decimal) -> Decimal:
+    if demo and live_enabled and requested_notional_usdt > MAX_NOTIONAL_USDT and demo_max_notional_usdt >= requested_notional_usdt:
+        return demo_max_notional_usdt
+    return MAX_NOTIONAL_USDT
+
+
 def validate_guards(
     conn: sqlite3.Connection,
     client: BinanceFuturesClient,
@@ -1217,6 +1244,7 @@ def validate_guards(
     live_enabled: bool,
     demo: bool = False,
     allow_demo_doubles: bool = False,
+    demo_max_notional_usdt: Decimal = MAX_NOTIONAL_USDT,
 ) -> tuple[SymbolSpec | None, dict[str, Any] | None, str | None]:
     if signal.symbol not in ALLOWED_SYMBOLS:
         return None, None, "symbol outside live allowlist"
@@ -1232,8 +1260,14 @@ def validate_guards(
         return None, None, "duplicate signal for same symbol/pattern/trigger timestamp"
     if has_existing_open_trade(conn, signal.symbol):
         return None, None, "existing open live trade on symbol"
-    if notional_usdt > MAX_NOTIONAL_USDT:
-        return None, None, "notional exceeds 1 USDT"
+    max_notional_usdt = effective_notional_cap(
+        requested_notional_usdt=notional_usdt,
+        demo=demo,
+        live_enabled=live_enabled,
+        demo_max_notional_usdt=demo_max_notional_usdt,
+    )
+    if notional_usdt > max_notional_usdt:
+        return None, None, f"notional exceeds effective cap: requested={notional_usdt} cap={max_notional_usdt}"
     if live_enabled:
         if not client.has_credentials:
             return None, None, "API credentials missing"
@@ -1247,7 +1281,7 @@ def validate_guards(
         spec = client.get_symbol_spec(binance_symbol(signal.symbol))
     except Exception as exc:
         return None, None, f"exchangeInfo API error: {exc}"
-    order, reason = build_entry_order(signal, spec, notional_usdt)
+    order, reason = build_entry_order(signal, spec, notional_usdt, max_notional_usdt=max_notional_usdt)
     if reason is not None:
         return spec, None, reason
     return spec, order, None
@@ -1306,8 +1340,18 @@ def process_self_test_signal(
     return True
 
 
-def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool, verbose_market_logs: bool = False) -> None:
-    rows = conn.execute(
+def update_open_trade_exits(
+    state_conn: sqlite3.Connection,
+    candle_conn_or_client: sqlite3.Connection | BinanceFuturesClient,
+    client: BinanceFuturesClient | None = None,
+    *,
+    live_enabled: bool,
+    verbose_market_logs: bool = False,
+) -> None:
+    # Backward-compatible two-argument form uses the same connection for tests.
+    candle_conn = state_conn if client is None else candle_conn_or_client
+    active_client = candle_conn_or_client if client is None else client
+    rows = state_conn.execute(
         """
         SELECT id, symbol, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price, raw_order_response, executed_qty
         FROM live_trades_binance
@@ -1316,14 +1360,14 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
     ).fetchall()
     for row in rows:
         trade_id, symbol, side, entry_time, entry, stop, _tp1, tp2, raw_order_response, executed_qty = row
-        candles = conn.execute(
+        candles = candle_conn.execute(
             """
             SELECT close_time, high, low
             FROM candles
-            WHERE symbol = ? AND interval = '1m' AND close_time > ?
+            WHERE symbol IN (?, ?) AND interval = '1m' AND close_time > ?
             ORDER BY close_time ASC
             """,
-            (symbol, int(entry_time)),
+            (binance_symbol(symbol), symbol, int(entry_time)),
         ).fetchall()
         for close_time, high, low in candles:
             exit_price = None
@@ -1350,7 +1394,7 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                 (float(exit_price) - float(entry)) / denom if side == "LONG" else (float(entry) - float(exit_price)) / denom
             )
             if not live_enabled:
-                conn.execute(
+                state_conn.execute(
                     """
                     UPDATE live_trades_binance
                     SET status = 'POSITION_CLOSED', exit_time = ?, exit_price = ?, realized_r = ?
@@ -1358,7 +1402,7 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                     """,
                     (int(close_time), float(exit_price), realized_r, int(trade_id)),
                 )
-                conn.commit()
+                state_conn.commit()
                 console("POSITION_CLOSED", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r})
                 if verbose_market_logs:
                     log_position_closed_detail(
@@ -1370,14 +1414,14 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                     )
                 break
 
-            if not client.has_credentials:
+            if not active_client.has_credentials:
                 console("ORDER_FAILED", f"{symbol} trade_id={trade_id} close blocked", {"reason": "API credentials missing"})
                 break
             try:
-                mode_response = client.get_position_mode()
+                mode_response = active_client.get_position_mode()
                 if not position_mode_is_unambiguous(mode_response):
                     raise RuntimeError(f"one-way position mode required for reduceOnly exits: {mode_response}")
-                spec = client.get_symbol_spec(binance_symbol(symbol))
+                spec = active_client.get_symbol_spec(binance_symbol(symbol))
                 entry_order = order_request_from_trade((raw_order_response,))
                 if entry_order is not None and executed_qty not in (None, ""):
                     entry_order = {**entry_order, "quantity": str(executed_qty)}
@@ -1391,18 +1435,18 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                 )
                 if reason is not None:
                     raise RuntimeError(reason)
-                raw_close_response = client.submit_order(close_order or {})
+                raw_close_response = active_client.submit_order(close_order or {})
                 requested_exit = _dec(close_order["price"]) if close_order is not None else exit_price
             except Exception as exc:
-                conn.execute(
+                state_conn.execute(
                     "UPDATE live_trades_binance SET status = 'EXIT_PENDING', notes = ? WHERE id = ?",
                     (f"reduce-only exit failed closed: {exc}", int(trade_id)),
                 )
-                conn.commit()
+                state_conn.commit()
                 console("ORDER_FAILED", f"{symbol} trade_id={trade_id} reduce-only close", {"error": str(exc)})
                 break
 
-            conn.execute(
+            state_conn.execute(
                 """
                 UPDATE live_trades_binance
                 SET status = 'POSITION_CLOSED', exit_time = ?, exit_price = ?, realized_r = ?, notes = ?
@@ -1416,7 +1460,7 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: BinanceFuturesClie
                     int(trade_id),
                 ),
             )
-            conn.commit()
+            state_conn.commit()
             console("POSITION_CLOSED", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r})
             if verbose_market_logs:
                 log_position_closed_detail(
@@ -1455,9 +1499,12 @@ def log_startup(args: argparse.Namespace) -> None:
             "dry_run": dry_run,
             "api_key_env": binance_env_names(bool(getattr(args, 'demo', False)))[0],
             "enable_demo_doubles": bool(getattr(args, "enable_demo_doubles", False)),
+            "state_db_path": resolve_state_db_path(args),
+            "demo_max_notional_usdt": getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)),
         },
     )
     log_db_info(args.db_path)
+    log_db_info(resolve_state_db_path(args))
 
 
 def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
@@ -1475,22 +1522,29 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
     loop_iteration = 1 if iteration is None else iteration
     console("LOOP_BEGIN", f"iteration={loop_iteration}")
     notional_usdt = _dec(args.notional_usdt)
+    demo_max_notional_usdt = _dec(getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)))
+    state_db_path = resolve_state_db_path(args)
 
-    with closing(sqlite3.connect(args.db_path)) as conn:
-        log_db_info(args.db_path, conn)
-        if verbose_market_logs:
-            log_raw_candle_symbol_max_times(conn)
-        init_live_tables(conn)
-        if args.self_test_signal:
+    if args.self_test_signal:
+        with closing(sqlite3.connect(state_db_path)) as state_conn:
+            log_db_info(state_db_path, state_conn)
+            init_live_tables(state_conn)
             if os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run:
                 console("BLOCKED", "self-test refuses to run unless --dry-run is supplied when LIVE_TRADING_ENABLED=1")
                 return
-            process_self_test_signal(conn, client, notional_usdt=notional_usdt)
+            process_self_test_signal(state_conn, client, notional_usdt=notional_usdt)
             return
 
+    with closing(connect_candle_db_readonly(args.db_path)) as candle_conn, closing(sqlite3.connect(state_db_path)) as state_conn:
+        log_db_info(args.db_path, candle_conn)
+        log_db_info(state_db_path, state_conn)
+        if verbose_market_logs:
+            log_raw_candle_symbol_max_times(candle_conn)
+        init_live_tables(state_conn)
+
         settings = load_settings(Path(args.settings))
-        poll_pending_entry_orders(conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
-        update_open_trade_exits(conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
+        poll_pending_entry_orders(state_conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
+        update_open_trade_exits(state_conn, candle_conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
         configured_symbols = [s for s in settings.get("symbols", []) if s in ALLOWED_SYMBOLS]
         for symbol in configured_symbols:
             console("SCAN", symbol)
@@ -1498,7 +1552,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             if profile is None:
                 console("BLOCKED", f"{symbol} missing PnF profile")
                 continue
-            candles = load_candles(conn, symbol, args.history_bars)
+            candles = load_candles(candle_conn, symbol, args.history_bars)
             if not candles:
                 console("BLOCKED", f"{symbol} has no 1m candles")
                 continue
@@ -1506,7 +1560,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             if verbose_market_logs:
                 log_market_snapshot(symbol, profile, candles)
             latest_close_time = latest_candle_close_time(candles)
-            last_processed = get_last_processed_close_time(conn, symbol)
+            last_processed = get_last_processed_close_time(state_conn, symbol)
             if latest_close_time is None or last_processed == latest_close_time:
                 console("NO_SIGNAL", symbol)
                 continue
@@ -1514,7 +1568,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             allow_demo_doubles = bool(enable_demo_doubles and demo and live_enabled)
             if signal is None and allow_demo_doubles:
                 signal = detect_latest_strict_double(symbol, profile, candles)
-            set_last_processed_close_time(conn, symbol, latest_close_time)
+            set_last_processed_close_time(state_conn, symbol, latest_close_time)
             if signal is None:
                 console("NO_SIGNAL", symbol)
                 continue
@@ -1523,13 +1577,13 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             if verbose_market_logs:
                 log_signal_detail(signal, profile, candles[-1].close if candles else None)
             _spec, order, block_reason = validate_guards(
-                conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles
+                state_conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles, demo_max_notional_usdt=demo_max_notional_usdt
             )
             if verbose_market_logs and order is not None:
                 log_order_detail(signal.symbol, order)
             if block_reason is not None:
                 record_signal(
-                    conn,
+                    state_conn,
                     signal,
                     decision="BLOCKED",
                     block_reason=block_reason,
@@ -1542,7 +1596,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
 
             if dry_run:
                 record_signal(
-                    conn,
+                    state_conn,
                     signal,
                     decision="DRY_RUN",
                     block_reason=None,
@@ -1552,7 +1606,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                     notes=append_demo_double_note(signal, "LIVE_TRADING_ENABLED is not 1 or --dry-run was supplied"),
                 )
                 record_trade(
-                    conn,
+                    state_conn,
                     signal,
                     notional_usdt=notional_usdt,
                     exchange_order_id=None,
@@ -1570,11 +1624,11 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 console("POSITION_CHECK", f"{signal.symbol} exchange position precheck", position_response)
                 if has_exchange_position(position_response):
                     reason = "exchange reports existing open position"
-                    record_signal(conn, signal, decision="BLOCKED", block_reason=reason, dry_run=False, notional_usdt=notional_usdt, notes=append_demo_double_note(signal, json.dumps(position_response)))
+                    record_signal(state_conn, signal, decision="BLOCKED", block_reason=reason, dry_run=False, notional_usdt=notional_usdt, notes=append_demo_double_note(signal, json.dumps(position_response)))
                     console("BLOCKED", f"{signal.symbol} {signal.pattern}", {"reason": reason})
                     continue
                 lifecycle_result = record_submitted_entry_order(
-                    conn,
+                    state_conn,
                     client,
                     signal,
                     order=order or {},
@@ -1583,8 +1637,8 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 )
             except Exception as exc:
                 raw_response = {"error": str(exc)}
-                record_signal(conn, signal, decision="ORDER_FAILED", block_reason=str(exc), dry_run=False, notional_usdt=notional_usdt, raw_order_response={"order_request": order, "order_response": raw_response}, notes=append_demo_double_note(signal, "API/order error; fail closed"))
-                record_trade(conn, signal, notional_usdt=notional_usdt, exchange_order_id=None, status="ORDER_FAILED", dry_run=False, decision="ORDER_FAILED", block_reason=str(exc), raw_order_response={"order_request": order, "order_response": raw_response}, notes=append_demo_double_note(signal, "API/order error; fail closed"))
+                record_signal(state_conn, signal, decision="ORDER_FAILED", block_reason=str(exc), dry_run=False, notional_usdt=notional_usdt, raw_order_response={"order_request": order, "order_response": raw_response}, notes=append_demo_double_note(signal, "API/order error; fail closed"))
+                record_trade(state_conn, signal, notional_usdt=notional_usdt, exchange_order_id=None, status="ORDER_FAILED", dry_run=False, decision="ORDER_FAILED", block_reason=str(exc), raw_order_response={"order_request": order, "order_response": raw_response}, notes=append_demo_double_note(signal, "API/order error; fail closed"))
                 console("ORDER_FAILED", f"{signal.symbol} {signal.pattern}", raw_response)
                 continue
 
@@ -1593,12 +1647,14 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forward-validate strict PnF triangles with guarded Binance USD-M futures micro-orders")
-    parser.add_argument("--db-path", required=True, help="Path to existing market_data.db")
+    parser.add_argument("--db-path", required=True, help="Path to existing market_data.db; opened read-only and used only as the candle source")
+    parser.add_argument("--state-db-path", required=True, help="Path to trader-owned state DB for Binance live signal/trade/state tables")
     parser.add_argument("--settings", required=True, help="Path to settings.json with PnF profiles")
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode even if LIVE_TRADING_ENABLED=1")
     parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
     parser.add_argument("--enable-demo-doubles", action="store_true", help="Enable strict double top/bottom smoke-test execution only for DEMO LIVE mode")
-    parser.add_argument("--notional-usdt", default=str(DEFAULT_NOTIONAL_USDT), help="Fixed order notional; hard-capped at 1 USDT")
+    parser.add_argument("--notional-usdt", default=str(DEFAULT_NOTIONAL_USDT), help="Fixed order notional; capped by the effective notional limit")
+    parser.add_argument("--demo-max-notional-usdt", default=str(MAX_NOTIONAL_USDT), help="Demo-live-only cap; requested notional above 1 USDT is allowed only in --demo with LIVE_TRADING_ENABLED=1 when this value is >= --notional-usdt")
     parser.add_argument("--history-bars", type=int, default=5000, help="Number of recent 1m candles used to reconstruct close-confirmed PnF state")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of one pass")
     parser.add_argument("--poll-seconds", type=float, default=30.0, help="Sleep between loop iterations")
