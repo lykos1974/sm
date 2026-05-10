@@ -171,6 +171,63 @@ class DemoInitClient:
 
 class BinanceForwardTraderTests(unittest.TestCase):
 
+    def test_runtime_symbol_uses_normalized_binance_symbol_for_candle_lookup(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BTCUSDT", "1m", 1700000000000, 50000.25, 50001.0, 49999.0))
+        conn.commit()
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:BTCUSDT", 5000)
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[-1].close, 50000.25)
+        self.assertTrue(any('"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
+        self.assertTrue(any('"normalized_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any('"query_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line for line in lines))
+
+    def test_process_once_logs_runtime_compare_with_normalized_db_candles(self):
+        original_triangle = trader.detect_latest_strict_triangle
+        try:
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: None
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "symbols": ["BINANCE_FUT:BTCUSDT"],
+                        "profiles": {"BINANCE_FUT:BTCUSDT": {"name": "t", "box_size": 100.0, "reversal_boxes": 3}},
+                    }, fh)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BTCUSDT", "1m", 1700000000000, 50000.25, 50001.0, 49999.0))
+                    conn.commit()
+
+                args = argparse.Namespace(
+                    db_path=db_path,
+                    settings=settings_path,
+                    dry_run=True,
+                    demo=False,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    verbose_market_logs=True,
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.process_once(args)
+        finally:
+            trader.detect_latest_strict_triangle = original_triangle
+
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any("CANDLE_QUERY" in line and '"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line and '"query_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line and '"last_close": 50000.25' in line for line in lines))
+        self.assertTrue(any("MARKET_RUNTIME_COMPARE" in line and "BINANCE_FUT:BTCUSDT" in line and '"latest_candle_close": 50000.25' in line for line in lines))
+
     def test_verbose_market_logs_emit_market_signal_and_order_details(self):
         original_client = trader.BinanceFuturesClient
         original_triangle = trader.detect_latest_strict_triangle
@@ -187,7 +244,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
                     }, fh)
                 with closing(sqlite3.connect(db_path)) as conn:
                     conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
-                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
                     conn.commit()
 
                 args = argparse.Namespace(
@@ -252,7 +309,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
                     }, fh)
                 with closing(sqlite3.connect(db_path)) as conn:
                     conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
-                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
                     conn.commit()
 
                 args = argparse.Namespace(
@@ -395,7 +452,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
                     json.dump({"symbols": ["BINANCE_FUT:SOLUSDT"], "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}}}, fh)
                 with closing(sqlite3.connect(db_path)) as conn:
                     conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
-                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
                     conn.commit()
                 args = argparse.Namespace(db_path=db_path, settings=settings_path, dry_run=False, demo=False, enable_demo_doubles=True, notional_usdt="1", history_bars=5000, self_test_signal=False)
                 trader.process_once(args)
@@ -450,7 +507,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
                     json.dump({"symbols": ["BINANCE_FUT:SOLUSDT"], "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}}}, fh)
                 with closing(sqlite3.connect(db_path)) as conn:
                     conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
-                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
                     conn.commit()
                 args = argparse.Namespace(db_path=db_path, settings=settings_path, dry_run=True, demo=True, enable_demo_doubles=True, notional_usdt="1", history_bars=5000, self_test_signal=False)
                 trader.process_once(args)
