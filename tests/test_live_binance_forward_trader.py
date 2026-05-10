@@ -201,9 +201,10 @@ class BinanceForwardTraderTests(unittest.TestCase):
     def test_self_test_refuses_live_env_without_dry_run_flag(self):
         original = os.environ.get("LIVE_TRADING_ENABLED")
         os.environ["LIVE_TRADING_ENABLED"] = "1"
-        with tempfile.NamedTemporaryFile(suffix=".sqlite3") as handle:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "binance.sqlite3")
             args = argparse.Namespace(
-                db_path=handle.name,
+                db_path=db_path,
                 settings="unused-for-self-test.json",
                 dry_run=False,
                 notional_usdt="1",
@@ -211,9 +212,9 @@ class BinanceForwardTraderTests(unittest.TestCase):
             )
             try:
                 trader.process_once(args)
-                conn = sqlite3.connect(handle.name)
-                signal_count = conn.execute("SELECT COUNT(*) FROM live_signals_binance").fetchone()[0]
-                trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
+                with sqlite3.connect(db_path) as conn:
+                    signal_count = conn.execute("SELECT COUNT(*) FROM live_signals_binance").fetchone()[0]
+                    trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
             finally:
                 if original is None:
                     os.environ.pop("LIVE_TRADING_ENABLED", None)
@@ -237,9 +238,10 @@ class BinanceForwardTraderTests(unittest.TestCase):
                 "BINANCE_DEMO_FUTURES_API_SECRET": "demo-secret",
             })
             trader.BinanceFuturesClient = DemoInitClient
-            with tempfile.NamedTemporaryFile(suffix=".sqlite3") as handle:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
                 args = argparse.Namespace(
-                    db_path=handle.name,
+                    db_path=db_path,
                     settings="unused-for-self-test.json",
                     dry_run=True,
                     demo=True,
