@@ -789,6 +789,14 @@ def process_once(args: argparse.Namespace) -> None:
     conn = sqlite3.connect(args.db_path)
     try:
         init_live_tables(conn)
+        if args.self_test_signal:
+            if live_env_enabled and not args.dry_run:
+                console("BLOCKED", "self-test refuses to run unless --dry-run is supplied when LIVE_TRADING_ENABLED=1")
+                return
+            process_self_test_signal(conn, client, notional_usdt=notional_usdt)
+            return
+
+        settings = load_settings(Path(args.settings))
         update_open_trade_exits(conn, client, live_enabled=live_enabled)
         configured_symbols = [s for s in settings.get("symbols", []) if s in ALLOWED_SYMBOLS]
         for symbol in configured_symbols:
@@ -884,6 +892,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-bars", type=int, default=5000, help="Number of recent 1m candles used to reconstruct close-confirmed PnF state")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of one pass")
     parser.add_argument("--poll-seconds", type=float, default=30.0, help="Sleep between loop iterations")
+    parser.add_argument("--self-test-signal", action="store_true", help="Inject one synthetic allowed dry-run signal through the guarded pipeline")
     return parser.parse_args()
 
 
@@ -891,6 +900,9 @@ def main() -> None:
     args = parse_args()
     mode = "LIVE" if os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run else "DRY_RUN"
     console("BLOCKED" if mode == "DRY_RUN" else "POSITION_OPEN", f"startup mode={mode}")
+    if args.self_test_signal:
+        process_once(args)
+    elif args.loop:
     if args.loop:
         while True:
             process_once(args)

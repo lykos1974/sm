@@ -1,3 +1,7 @@
+import argparse
+import os
+import sqlite3
+import tempfile
 import os
 import sqlite3
 import unittest
@@ -133,6 +137,53 @@ class BinanceForwardTraderTests(unittest.TestCase):
         order, reason = trader.build_entry_order(sample_signal(), spec, Decimal("1"))
         self.assertIsNone(order)
         self.assertIn("min order notional cannot support 1 USDT cap", reason)
+
+    def test_self_test_signal_records_once_and_duplicate_blocks_second(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+
+        first = trader.process_self_test_signal(
+            conn, StaticClient(), notional_usdt=Decimal("1"), symbol="BINANCE_FUT:SOLUSDT"
+        )
+        second = trader.process_self_test_signal(
+            conn, StaticClient(), notional_usdt=Decimal("1"), symbol="BINANCE_FUT:SOLUSDT"
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        signal_rows = conn.execute(
+            "SELECT decision, notes FROM live_signals_binance WHERE symbol = 'BINANCE_FUT:SOLUSDT'"
+        ).fetchall()
+        trade_rows = conn.execute(
+            "SELECT status, notes FROM live_trades_binance WHERE symbol = 'BINANCE_FUT:SOLUSDT'"
+        ).fetchall()
+        self.assertEqual(signal_rows, [("DRY_RUN", "SELF_TEST_SIGNAL")])
+        self.assertEqual(trade_rows, [("DRY_RUN", "SELF_TEST_SIGNAL")])
+
+    def test_self_test_refuses_live_env_without_dry_run_flag(self):
+        original = os.environ.get("LIVE_TRADING_ENABLED")
+        os.environ["LIVE_TRADING_ENABLED"] = "1"
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3") as handle:
+            args = argparse.Namespace(
+                db_path=handle.name,
+                settings="unused-for-self-test.json",
+                dry_run=False,
+                notional_usdt="1",
+                self_test_signal=True,
+            )
+            try:
+                trader.process_once(args)
+                conn = sqlite3.connect(handle.name)
+                signal_count = conn.execute("SELECT COUNT(*) FROM live_signals_binance").fetchone()[0]
+                trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
+            finally:
+                if original is None:
+                    os.environ.pop("LIVE_TRADING_ENABLED", None)
+                else:
+                    os.environ["LIVE_TRADING_ENABLED"] = original
+
+        self.assertEqual(signal_count, 0)
+        self.assertEqual(trade_count, 0)
 
 
 if __name__ == "__main__":
