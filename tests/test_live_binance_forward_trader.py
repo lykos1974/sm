@@ -1,10 +1,9 @@
 import argparse
 from contextlib import closing
+import json
 import os
 import sqlite3
 import tempfile
-import os
-import sqlite3
 import unittest
 from decimal import Decimal
 
@@ -46,6 +45,62 @@ def sample_signal(trigger_ts=123456):
     )
 
 
+def sample_double_signal(trigger_ts=123456, pattern="double_top_breakout"):
+    if pattern == "double_bottom_breakdown":
+        return trader.TriangleSignal(
+            symbol="BINANCE_FUT:SOLUSDT",
+            pattern=pattern,
+            side="SHORT",
+            trigger_ts=trigger_ts,
+            entry_price=Decimal("100"),
+            stop_price=Decimal("101"),
+            tp1_price=Decimal("98"),
+            tp2_price=Decimal("97"),
+            trigger_column_idx=7,
+            support_level=Decimal("100"),
+            resistance_level=Decimal("101"),
+            break_distance_boxes=Decimal("1"),
+            pattern_quality="STRICT_CONSECUTIVE_3_COL_DOUBLE_BOTTOM_BREAKDOWN",
+        )
+    return trader.TriangleSignal(
+        symbol="BINANCE_FUT:SOLUSDT",
+        pattern=pattern,
+        side="LONG",
+        trigger_ts=trigger_ts,
+        entry_price=Decimal("100"),
+        stop_price=Decimal("99"),
+        tp1_price=Decimal("102"),
+        tp2_price=Decimal("103"),
+        trigger_column_idx=7,
+        support_level=Decimal("99"),
+        resistance_level=Decimal("100"),
+        break_distance_boxes=Decimal("1"),
+        pattern_quality="STRICT_CONSECUTIVE_3_COL_DOUBLE_TOP_BREAKOUT",
+    )
+
+
+class FakeColumn:
+    def __init__(self, idx, kind, top, bottom):
+        self.idx = idx
+        self.kind = kind
+        self.top = top
+        self.bottom = bottom
+
+
+class FakePnFEngine:
+    columns = []
+    signal_name = None
+
+    def __init__(self, profile):
+        self.columns = list(self.__class__.columns)
+
+    def update_from_price(self, close_time, close):
+        return None
+
+    def latest_signal_name(self):
+        return self.__class__.signal_name
+
+
 class StaticClient:
     has_credentials = False
 
@@ -84,6 +139,21 @@ class LifecycleClient(LiveClient):
         return [{"orderId": int(order_id), "commission": "0.00001", "commissionAsset": "USDT"}]
 
 
+class SubmittingClient(LifecycleClient):
+    instances = []
+
+    def __init__(self, api_key=None, api_secret=None, *, base_url=trader.BINANCE_BASE_URL):
+        super().__init__("NEW")
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url
+        self.has_credentials = bool(api_key and api_secret)
+        SubmittingClient.instances.append(self)
+
+    def get_position_risk(self, symbol):
+        return [{"symbol": symbol, "positionAmt": "0"}]
+
+
 class DemoInitClient:
     instances = []
     has_credentials = False
@@ -99,6 +169,184 @@ class DemoInitClient:
 
 
 class BinanceForwardTraderTests(unittest.TestCase):
+
+    def test_detect_latest_strict_double_top_breakout(self):
+        original_engine = trader.PnFEngine
+        try:
+            FakePnFEngine.columns = [
+                FakeColumn(5, "X", "100", "98"),
+                FakeColumn(6, "O", "99", "97"),
+                FakeColumn(7, "X", "101", "99"),
+            ]
+            FakePnFEngine.signal_name = "BUY"
+            trader.PnFEngine = FakePnFEngine
+            signal = trader.detect_latest_strict_double(
+                "BINANCE_FUT:SOLUSDT",
+                trader.PnFProfile("test", 1.0, 3),
+                [trader.Candle(111, 101.0, 101.0, 101.0)],
+            )
+        finally:
+            trader.PnFEngine = original_engine
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.pattern, "double_top_breakout")
+        self.assertEqual(signal.side, "LONG")
+        self.assertEqual(signal.entry_price, Decimal("100"))
+        self.assertEqual(signal.stop_price, Decimal("99.0"))
+        self.assertEqual(signal.tp1_price, Decimal("102.0"))
+        self.assertEqual(signal.tp2_price, Decimal("103.0"))
+
+    def test_detect_latest_strict_double_bottom_breakdown(self):
+        original_engine = trader.PnFEngine
+        try:
+            FakePnFEngine.columns = [
+                FakeColumn(5, "O", "102", "100"),
+                FakeColumn(6, "X", "103", "101"),
+                FakeColumn(7, "O", "101", "99"),
+            ]
+            FakePnFEngine.signal_name = "SELL"
+            trader.PnFEngine = FakePnFEngine
+            signal = trader.detect_latest_strict_double(
+                "BINANCE_FUT:SOLUSDT",
+                trader.PnFProfile("test", 1.0, 3),
+                [trader.Candle(222, 99.0, 99.0, 99.0)],
+            )
+        finally:
+            trader.PnFEngine = original_engine
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.pattern, "double_bottom_breakdown")
+        self.assertEqual(signal.side, "SHORT")
+        self.assertEqual(signal.entry_price, Decimal("100"))
+        self.assertEqual(signal.stop_price, Decimal("101.0"))
+        self.assertEqual(signal.tp1_price, Decimal("98.0"))
+        self.assertEqual(signal.tp2_price, Decimal("97.0"))
+
+    def test_enable_demo_doubles_only_works_with_demo(self):
+        original_env = os.environ.copy()
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        original_double = trader.detect_latest_strict_double
+        SubmittingClient.instances = []
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "LIVE_TRADING_ENABLED": "1",
+                "BINANCE_FUTURES_API_KEY": "prod-key",
+                "BINANCE_FUTURES_API_SECRET": "prod-secret",
+            })
+            trader.BinanceFuturesClient = SubmittingClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: None
+            trader.detect_latest_strict_double = lambda symbol, profile, candles: sample_double_signal(trigger_ts=1)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({"symbols": ["BINANCE_FUT:SOLUSDT"], "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}}}, fh)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+                args = argparse.Namespace(db_path=db_path, settings=settings_path, dry_run=False, demo=False, enable_demo_doubles=True, notional_usdt="1", history_bars=5000, self_test_signal=False)
+                trader.process_once(args)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    signal_count = conn.execute("SELECT COUNT(*) FROM live_signals_binance").fetchone()[0]
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+            trader.detect_latest_strict_double = original_double
+            os.environ.clear()
+            os.environ.update(original_env)
+
+        self.assertEqual(signal_count, 0)
+        self.assertEqual(SubmittingClient.instances[-1].submitted_orders, [])
+
+    def test_production_mode_still_blocks_doubles(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        _spec, order, reason = trader.validate_guards(
+            conn, LiveClient(), sample_double_signal(), notional_usdt=Decimal("1"), live_enabled=True
+        )
+        self.assertIsNone(order)
+        self.assertEqual(reason, "pattern outside live allowlist")
+
+        _spec2, order2, reason2 = trader.validate_guards(
+            conn, LiveClient(), sample_double_signal(), notional_usdt=Decimal("1"), live_enabled=True, demo=False, allow_demo_doubles=True
+        )
+        self.assertIsNone(order2)
+        self.assertEqual(reason2, "pattern outside live allowlist")
+
+
+    def test_demo_doubles_dry_run_sends_no_orders(self):
+        original_env = os.environ.copy()
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        original_double = trader.detect_latest_strict_double
+        SubmittingClient.instances = []
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "LIVE_TRADING_ENABLED": "1",
+                "BINANCE_DEMO_FUTURES_API_KEY": "demo-key",
+                "BINANCE_DEMO_FUTURES_API_SECRET": "demo-secret",
+            })
+            trader.BinanceFuturesClient = SubmittingClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: None
+            trader.detect_latest_strict_double = lambda symbol, profile, candles: sample_double_signal(trigger_ts=1)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({"symbols": ["BINANCE_FUT:SOLUSDT"], "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}}}, fh)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+                args = argparse.Namespace(db_path=db_path, settings=settings_path, dry_run=True, demo=True, enable_demo_doubles=True, notional_usdt="1", history_bars=5000, self_test_signal=False)
+                trader.process_once(args)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    signal_count = conn.execute("SELECT COUNT(*) FROM live_signals_binance").fetchone()[0]
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+            trader.detect_latest_strict_double = original_double
+            os.environ.clear()
+            os.environ.update(original_env)
+
+        self.assertEqual(signal_count, 0)
+        self.assertEqual(SubmittingClient.instances[-1].submitted_orders, [])
+
+    def test_demo_live_double_path_builds_limit_order_and_notes(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = sample_double_signal()
+        _spec, order, reason = trader.validate_guards(
+            conn, LiveClient(), signal, notional_usdt=Decimal("1"), live_enabled=True, demo=True, allow_demo_doubles=True
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(order["type"], "LIMIT")
+        self.assertEqual(order["side"], "BUY")
+        result = trader.record_submitted_entry_order(conn, LifecycleClient("NEW"), signal, order=order, notional_usdt=Decimal("1"))
+        self.assertEqual(result["lifecycle"]["entry_order_status"], "NEW")
+        row = conn.execute("SELECT pattern, notes FROM live_signals_binance").fetchone()
+        self.assertEqual(row[0], "double_top_breakout")
+        self.assertIn("DEMO_DOUBLE_SMOKE_TEST", row[1])
+
+    def test_demo_double_duplicate_guard_works(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = sample_double_signal()
+        _spec, _order, reason = trader.validate_guards(
+            conn, LiveClient(), signal, notional_usdt=Decimal("1"), live_enabled=True, demo=True, allow_demo_doubles=True
+        )
+        self.assertIsNone(reason)
+        trader.record_signal(conn, signal, decision="ORDER_SENT", block_reason=None, dry_run=False, notional_usdt=Decimal("1"))
+        _spec2, order2, reason2 = trader.validate_guards(
+            conn, LiveClient(), signal, notional_usdt=Decimal("1"), live_enabled=True, demo=True, allow_demo_doubles=True
+        )
+        self.assertIsNone(order2)
+        self.assertEqual(reason2, "duplicate signal for same symbol/pattern/trigger timestamp")
+
     def test_order_signing_uses_timestamp_and_hmac_sha256(self):
         client = trader.BinanceFuturesClient("key", "secret")
         signed = client._signed_params({"symbol": "SOLUSDT", "side": "BUY"}, timestamp=1700000000000)

@@ -45,6 +45,7 @@ RECV_WINDOW_MS = 5000
 
 ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:SOLUSDT"}
 ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
+DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
 OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "EXIT_PENDING"}
 
@@ -357,12 +358,17 @@ def _consecutive_indices(columns: list[Any]) -> bool:
     return bool(indices) and indices == list(range(indices[0], indices[0] + len(indices)))
 
 
-def detect_latest_strict_triangle(symbol: str, profile: PnFProfile, candles: list[Candle]) -> TriangleSignal | None:
+def _replay_close_confirmed_pnf(profile: PnFProfile, candles: list[Candle]) -> tuple[PnFEngine, int | None]:
     engine = PnFEngine(profile)
     latest_ts = None
     for candle in candles:
         engine.update_from_price(candle.close_time, candle.close)
         latest_ts = candle.close_time
+    return engine, latest_ts
+
+
+def detect_latest_strict_triangle(symbol: str, profile: PnFProfile, candles: list[Candle]) -> TriangleSignal | None:
+    engine, latest_ts = _replay_close_confirmed_pnf(profile, candles)
     if latest_ts is None or len(engine.columns) < 5:
         return None
 
@@ -428,6 +434,77 @@ def detect_latest_strict_triangle(symbol: str, profile: PnFProfile, candles: lis
             pattern_quality="STRICT_CONSECUTIVE_5_COL_TRIANGLE_DOWN_BREAK",
         )
     return None
+
+
+def detect_latest_strict_double(symbol: str, profile: PnFProfile, candles: list[Candle]) -> TriangleSignal | None:
+    engine, latest_ts = _replay_close_confirmed_pnf(profile, candles)
+    if latest_ts is None or len(engine.columns) < 3:
+        return None
+
+    sequence = engine.columns[-3:]
+    if not _consecutive_indices(sequence):
+        return None
+    kinds = [_column_kind(col) for col in sequence]
+    box_size = _dec(profile.box_size)
+
+    if kinds == ["X", "O", "X"] and engine.latest_signal_name() == "BUY":
+        prior_x, middle_o, trigger_x = sequence
+        breakout_level = _column_top(prior_x)
+        trigger_level = _column_top(trigger_x)
+        if trigger_level <= breakout_level:
+            return None
+        break_distance_boxes = (trigger_level - breakout_level) / box_size
+        risk = max(break_distance_boxes, Decimal("1")) * box_size
+        return TriangleSignal(
+            symbol=symbol,
+            pattern="double_top_breakout",
+            side="LONG",
+            trigger_ts=latest_ts,
+            entry_price=breakout_level,
+            stop_price=breakout_level - risk,
+            tp1_price=breakout_level + (Decimal("2") * risk),
+            tp2_price=breakout_level + (Decimal("3") * risk),
+            trigger_column_idx=int(getattr(trigger_x, "idx")),
+            support_level=_column_bottom(middle_o),
+            resistance_level=breakout_level,
+            break_distance_boxes=break_distance_boxes,
+            pattern_quality="STRICT_CONSECUTIVE_3_COL_DOUBLE_TOP_BREAKOUT",
+        )
+
+    if kinds == ["O", "X", "O"] and engine.latest_signal_name() == "SELL":
+        prior_o, middle_x, trigger_o = sequence
+        breakdown_level = _column_bottom(prior_o)
+        trigger_level = _column_bottom(trigger_o)
+        if trigger_level >= breakdown_level:
+            return None
+        break_distance_boxes = (breakdown_level - trigger_level) / box_size
+        risk = max(break_distance_boxes, Decimal("1")) * box_size
+        return TriangleSignal(
+            symbol=symbol,
+            pattern="double_bottom_breakdown",
+            side="SHORT",
+            trigger_ts=latest_ts,
+            entry_price=breakdown_level,
+            stop_price=breakdown_level + risk,
+            tp1_price=breakdown_level - (Decimal("2") * risk),
+            tp2_price=breakdown_level - (Decimal("3") * risk),
+            trigger_column_idx=int(getattr(trigger_o, "idx")),
+            support_level=breakdown_level,
+            resistance_level=_column_top(middle_x),
+            break_distance_boxes=break_distance_boxes,
+            pattern_quality="STRICT_CONSECUTIVE_3_COL_DOUBLE_BOTTOM_BREAKDOWN",
+        )
+    return None
+
+
+def is_demo_double_signal(signal: TriangleSignal) -> bool:
+    return signal.pattern in DEMO_DOUBLE_PATTERNS
+
+
+def append_demo_double_note(signal: TriangleSignal, notes: str | None) -> str | None:
+    if not is_demo_double_signal(signal):
+        return notes
+    return "DEMO_DOUBLE_SMOKE_TEST" if not notes else f"DEMO_DOUBLE_SMOKE_TEST; {notes}"
 
 
 def has_existing_open_trade(conn: sqlite3.Connection, symbol: str) -> bool:
@@ -723,7 +800,7 @@ def record_submitted_entry_order(
         notional_usdt=notional_usdt,
         exchange_order_id=exchange_order_id,
         raw_order_response={"order_request": order, "order_response": raw_response},
-        notes=json.dumps(raw_response),
+        notes=append_demo_double_note(signal, json.dumps(raw_response)),
     )
     record_trade(
         conn,
@@ -734,7 +811,7 @@ def record_submitted_entry_order(
         dry_run=False,
         decision="ORDER_SENT",
         raw_order_response={"order_request": order, "order_response": raw_response},
-        notes="live Binance USD-M futures limit order submitted; awaiting FILLED status before exit management",
+        notes=append_demo_double_note(signal, "live Binance USD-M futures limit order submitted; awaiting FILLED status before exit management"),
     )
     trade_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
     try:
@@ -912,10 +989,13 @@ def validate_guards(
     *,
     notional_usdt: Decimal,
     live_enabled: bool,
+    demo: bool = False,
+    allow_demo_doubles: bool = False,
 ) -> tuple[SymbolSpec | None, dict[str, Any] | None, str | None]:
     if signal.symbol not in ALLOWED_SYMBOLS:
         return None, None, "symbol outside live allowlist"
-    if signal.pattern not in ALLOWED_PATTERNS:
+    demo_doubles_enabled = bool(demo and live_enabled and allow_demo_doubles)
+    if signal.pattern not in ALLOWED_PATTERNS and not (demo_doubles_enabled and signal.pattern in DEMO_DOUBLE_PATTERNS):
         return None, None, "pattern outside live allowlist"
     if signal.pattern in CATAPULT_SIGNAL_NAMES:
         return None, None, "catapult patterns are log-only"
@@ -1114,6 +1194,7 @@ def execution_mode_label(*, demo: bool, dry_run: bool) -> str:
 
 def process_once(args: argparse.Namespace) -> None:
     demo = bool(getattr(args, "demo", False))
+    enable_demo_doubles = bool(getattr(args, "enable_demo_doubles", False))
     live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
     dry_run = not live_enabled
     api_key_env, api_secret_env = binance_env_names(demo)
@@ -1131,6 +1212,7 @@ def process_once(args: argparse.Namespace) -> None:
             "base_url": client.base_url,
             "dry_run": dry_run,
             "api_key_env": api_key_env,
+            "enable_demo_doubles": enable_demo_doubles,
         },
     )
     notional_usdt = _dec(args.notional_usdt)
@@ -1162,13 +1244,16 @@ def process_once(args: argparse.Namespace) -> None:
             if latest_close_time is None or last_processed == latest_close_time:
                 continue
             signal = detect_latest_strict_triangle(symbol, profile, candles)
+            allow_demo_doubles = bool(enable_demo_doubles and demo and live_enabled)
+            if signal is None and allow_demo_doubles:
+                signal = detect_latest_strict_double(symbol, profile, candles)
             set_last_processed_close_time(conn, symbol, latest_close_time)
             if signal is None:
                 continue
 
             console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side}", signal.__dict__)
             _spec, order, block_reason = validate_guards(
-                conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled
+                conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles
             )
             if block_reason is not None:
                 record_signal(
@@ -1178,7 +1263,7 @@ def process_once(args: argparse.Namespace) -> None:
                     block_reason=block_reason,
                     dry_run=dry_run,
                     notional_usdt=notional_usdt,
-                    notes="fail-closed guard",
+                    notes=append_demo_double_note(signal, "fail-closed guard"),
                 )
                 console("BLOCKED", f"{signal.symbol} {signal.pattern}", {"reason": block_reason})
                 continue
@@ -1192,7 +1277,7 @@ def process_once(args: argparse.Namespace) -> None:
                     dry_run=True,
                     notional_usdt=notional_usdt,
                     raw_order_response={"would_submit_order": order},
-                    notes="LIVE_TRADING_ENABLED is not 1 or --dry-run was supplied",
+                    notes=append_demo_double_note(signal, "LIVE_TRADING_ENABLED is not 1 or --dry-run was supplied"),
                 )
                 record_trade(
                     conn,
@@ -1203,7 +1288,7 @@ def process_once(args: argparse.Namespace) -> None:
                     dry_run=True,
                     decision="DRY_RUN",
                     raw_order_response={"would_submit_order": order},
-                    notes="dry-run only; no exchange order submitted",
+                    notes=append_demo_double_note(signal, "dry-run only; no exchange order submitted"),
                 )
                 console("BLOCKED", f"{signal.symbol} dry-run; order not sent", {"order": order})
                 continue
@@ -1213,7 +1298,7 @@ def process_once(args: argparse.Namespace) -> None:
                 console("POSITION_CHECK", f"{signal.symbol} exchange position precheck", position_response)
                 if has_exchange_position(position_response):
                     reason = "exchange reports existing open position"
-                    record_signal(conn, signal, decision="BLOCKED", block_reason=reason, dry_run=False, notional_usdt=notional_usdt, notes=json.dumps(position_response))
+                    record_signal(conn, signal, decision="BLOCKED", block_reason=reason, dry_run=False, notional_usdt=notional_usdt, notes=append_demo_double_note(signal, json.dumps(position_response)))
                     console("BLOCKED", f"{signal.symbol} {signal.pattern}", {"reason": reason})
                     continue
                 lifecycle_result = record_submitted_entry_order(
@@ -1225,8 +1310,8 @@ def process_once(args: argparse.Namespace) -> None:
                 )
             except Exception as exc:
                 raw_response = {"error": str(exc)}
-                record_signal(conn, signal, decision="ORDER_FAILED", block_reason=str(exc), dry_run=False, notional_usdt=notional_usdt, raw_order_response={"order_request": order, "order_response": raw_response}, notes="API/order error; fail closed")
-                record_trade(conn, signal, notional_usdt=notional_usdt, exchange_order_id=None, status="ORDER_FAILED", dry_run=False, decision="ORDER_FAILED", block_reason=str(exc), raw_order_response={"order_request": order, "order_response": raw_response}, notes="API/order error; fail closed")
+                record_signal(conn, signal, decision="ORDER_FAILED", block_reason=str(exc), dry_run=False, notional_usdt=notional_usdt, raw_order_response={"order_request": order, "order_response": raw_response}, notes=append_demo_double_note(signal, "API/order error; fail closed"))
+                record_trade(conn, signal, notional_usdt=notional_usdt, exchange_order_id=None, status="ORDER_FAILED", dry_run=False, decision="ORDER_FAILED", block_reason=str(exc), raw_order_response={"order_request": order, "order_response": raw_response}, notes=append_demo_double_note(signal, "API/order error; fail closed"))
                 console("ORDER_FAILED", f"{signal.symbol} {signal.pattern}", raw_response)
                 continue
 
@@ -1239,6 +1324,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settings", required=True, help="Path to settings.json with PnF profiles")
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode even if LIVE_TRADING_ENABLED=1")
     parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
+    parser.add_argument("--enable-demo-doubles", action="store_true", help="Enable strict double top/bottom smoke-test execution only for DEMO LIVE mode")
     parser.add_argument("--notional-usdt", default=str(DEFAULT_NOTIONAL_USDT), help="Fixed order notional; hard-capped at 1 USDT")
     parser.add_argument("--history-bars", type=int, default=5000, help="Number of recent 1m candles used to reconstruct close-confirmed PnF state")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of one pass")
