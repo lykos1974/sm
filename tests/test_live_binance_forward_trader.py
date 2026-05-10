@@ -1,5 +1,6 @@
 import argparse
-from contextlib import closing
+import io
+from contextlib import closing, redirect_stdout
 import json
 import os
 import sqlite3
@@ -169,6 +170,90 @@ class DemoInitClient:
 
 
 class BinanceForwardTraderTests(unittest.TestCase):
+
+    def test_process_once_logs_loop_scan_no_signal_without_startup(self):
+        original_triangle = trader.detect_latest_strict_triangle
+        try:
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: None
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "symbols": ["BINANCE_FUT:SOLUSDT"],
+                        "profiles": {
+                            "BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}
+                        },
+                    }, fh)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+
+                args = argparse.Namespace(
+                    db_path=db_path,
+                    settings=settings_path,
+                    dry_run=True,
+                    demo=False,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.process_once(args, iteration=17)
+                    trader.process_once(args, iteration=18)
+        finally:
+            trader.detect_latest_strict_triangle = original_triangle
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(sum(" STARTUP " in line for line in lines), 0)
+        self.assertTrue(any(" LOOP_BEGIN iteration=17" in line for line in lines))
+        self.assertTrue(any(" LOOP_BEGIN iteration=18" in line for line in lines))
+        self.assertEqual(sum(" SCAN BINANCE_FUT:SOLUSDT" in line for line in lines), 2)
+        self.assertEqual(sum(" NO_SIGNAL BINANCE_FUT:SOLUSDT" in line for line in lines), 2)
+
+    def test_main_logs_startup_once_across_loop_iterations(self):
+        original_parse_args = trader.parse_args
+        original_process_once = trader.process_once
+        original_sleep = trader.time.sleep
+        calls = []
+        args = argparse.Namespace(
+            db_path="unused.sqlite3",
+            settings="unused.json",
+            dry_run=True,
+            demo=True,
+            enable_demo_doubles=True,
+            notional_usdt="1",
+            history_bars=5000,
+            self_test_signal=False,
+            loop=True,
+            poll_seconds=0,
+        )
+
+        def fake_process_once(parsed_args, *, iteration=None):
+            calls.append(iteration)
+            if len(calls) >= 2:
+                raise SystemExit
+
+        try:
+            trader.parse_args = lambda: args
+            trader.process_once = fake_process_once
+            trader.time.sleep = lambda seconds: None
+            output = io.StringIO()
+            with redirect_stdout(output):
+                with self.assertRaises(SystemExit):
+                    trader.main()
+        finally:
+            trader.parse_args = original_parse_args
+            trader.process_once = original_process_once
+            trader.time.sleep = original_sleep
+
+        events = output.getvalue().splitlines()
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(sum(" STARTUP " in line for line in events), 1)
+        self.assertIn("STARTUP mode=DEMO_DRY_RUN", events[0])
 
     def test_detect_latest_strict_double_top_breakout(self):
         original_engine = trader.PnFEngine
