@@ -59,6 +59,44 @@ class LiveClient(StaticClient):
         return {"dualSidePosition": False}
 
 
+class LifecycleClient(LiveClient):
+    def __init__(self, status="FILLED"):
+        self.submitted_orders = []
+        self.status = status
+
+    def submit_order(self, order):
+        self.submitted_orders.append(order)
+        return {"orderId": 42, "clientOrderId": order["newClientOrderId"], "status": "NEW"}
+
+    def get_order(self, symbol, *, order_id=None, client_order_id=None):
+        return {
+            "symbol": symbol,
+            "orderId": int(order_id),
+            "clientOrderId": client_order_id,
+            "status": self.status,
+            "avgPrice": "100.50" if self.status == "FILLED" else "0",
+            "executedQty": "0.009" if self.status in {"FILLED", "PARTIALLY_FILLED"} else "0",
+            "updateTime": 1700000000001,
+        }
+
+    def get_user_trades(self, symbol, *, order_id=None):
+        return [{"orderId": int(order_id), "commission": "0.00001", "commissionAsset": "USDT"}]
+
+
+class DemoInitClient:
+    instances = []
+    has_credentials = False
+
+    def __init__(self, api_key, api_secret, *, base_url=trader.BINANCE_BASE_URL):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url
+        DemoInitClient.instances.append(self)
+
+    def get_symbol_spec(self, symbol):
+        return trader.parse_symbol_spec(EXCHANGE_INFO, symbol)
+
+
 class BinanceForwardTraderTests(unittest.TestCase):
     def test_order_signing_uses_timestamp_and_hmac_sha256(self):
         client = trader.BinanceFuturesClient("key", "secret")
@@ -184,6 +222,102 @@ class BinanceForwardTraderTests(unittest.TestCase):
 
         self.assertEqual(signal_count, 0)
         self.assertEqual(trade_count, 0)
+
+
+    def test_demo_mode_uses_demo_base_url_and_env_vars(self):
+        original_env = os.environ.copy()
+        original_client = trader.BinanceFuturesClient
+        DemoInitClient.instances = []
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "BINANCE_FUTURES_API_KEY": "prod-key",
+                "BINANCE_FUTURES_API_SECRET": "prod-secret",
+                "BINANCE_DEMO_FUTURES_API_KEY": "demo-key",
+                "BINANCE_DEMO_FUTURES_API_SECRET": "demo-secret",
+            })
+            trader.BinanceFuturesClient = DemoInitClient
+            with tempfile.NamedTemporaryFile(suffix=".sqlite3") as handle:
+                args = argparse.Namespace(
+                    db_path=handle.name,
+                    settings="unused-for-self-test.json",
+                    dry_run=True,
+                    demo=True,
+                    notional_usdt="1",
+                    self_test_signal=True,
+                )
+                trader.process_once(args)
+        finally:
+            trader.BinanceFuturesClient = original_client
+            os.environ.clear()
+            os.environ.update(original_env)
+
+        self.assertEqual(DemoInitClient.instances[-1].base_url, trader.BINANCE_DEMO_BASE_URL)
+        self.assertEqual(DemoInitClient.instances[-1].api_key, "demo-key")
+        self.assertEqual(DemoInitClient.instances[-1].api_secret, "demo-secret")
+
+    def test_dry_run_self_test_sends_no_orders(self):
+        class NoOrdersClient(StaticClient):
+            def submit_order(self, order):
+                raise AssertionError("dry-run must not submit orders")
+
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        self.assertTrue(trader.process_self_test_signal(conn, NoOrdersClient(), notional_usdt=Decimal("1")))
+
+    def test_filled_entry_order_marks_position_open_and_records_fill(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = sample_signal()
+        spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+        order, reason = trader.build_entry_order(signal, spec, Decimal("1"))
+        self.assertIsNone(reason)
+        result = trader.record_submitted_entry_order(conn, LifecycleClient("FILLED"), signal, order=order, notional_usdt=Decimal("1"))
+
+        row = conn.execute(
+            "SELECT status, entry_order_status, avg_fill_price, executed_qty, entry_commission, entry_slippage FROM live_trades_binance"
+        ).fetchone()
+        self.assertEqual(row[0], "POSITION_OPEN")
+        self.assertEqual(row[1], "FILLED")
+        self.assertEqual(row[2], 100.5)
+        self.assertEqual(row[3], 0.009)
+        self.assertEqual(row[4], 0.00001)
+        self.assertEqual(row[5], 0.5)
+        self.assertEqual(result["lifecycle"]["entry_order_status"], "FILLED")
+
+    def test_new_or_partially_filled_entry_does_not_trigger_exits(self):
+        for status in ("NEW", "PARTIALLY_FILLED"):
+            conn = sqlite3.connect(":memory:")
+            trader.init_live_tables(conn)
+            signal = sample_signal(trigger_ts=123456 if status == "NEW" else 123457)
+            spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+            order, reason = trader.build_entry_order(signal, spec, Decimal("1"))
+            self.assertIsNone(reason)
+            client = LifecycleClient(status)
+            trader.record_submitted_entry_order(conn, client, signal, order=order, notional_usdt=Decimal("1"))
+            conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, high REAL, low REAL)")
+            conn.execute(
+                "INSERT INTO candles(symbol, interval, close_time, high, low) VALUES(?,?,?,?,?)",
+                (signal.symbol, "1m", signal.trigger_ts + 60_000, 104, 98),
+            )
+            conn.commit()
+            trader.update_open_trade_exits(conn, client, live_enabled=True)
+            row = conn.execute("SELECT status, exit_time FROM live_trades_binance").fetchone()
+            self.assertEqual(row[0], "ORDER_SENT")
+            self.assertIsNone(row[1])
+
+    def test_reduce_only_close_order_remains_reduce_only_true(self):
+        spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+        close, reason = trader.build_reduce_only_close_order(
+            trade_id=99,
+            symbol="BINANCE_FUT:SOLUSDT",
+            side="LONG",
+            exit_price=Decimal("103"),
+            entry_order={"quantity": "0.009"},
+            spec=spec,
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(close["reduceOnly"], "true")
 
 
 if __name__ == "__main__":
