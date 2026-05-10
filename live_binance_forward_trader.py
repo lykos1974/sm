@@ -503,7 +503,7 @@ def log_market_runtime_compare(symbol: str, profile: PnFProfile, candles: list[C
 
 
 def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Candle]:
-    query_symbol = symbol
+    query_symbol = binance_symbol(symbol)
     log_candle_query(symbol, query_symbol)
     rows = conn.execute(
         """
