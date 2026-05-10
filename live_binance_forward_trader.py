@@ -1192,7 +1192,23 @@ def execution_mode_label(*, demo: bool, dry_run: bool) -> str:
     return f"{venue}_{execution}"
 
 
-def process_once(args: argparse.Namespace) -> None:
+def log_startup(args: argparse.Namespace) -> None:
+    dry_run = not (os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
+    console(
+        "STARTUP",
+        f"mode={execution_mode_label(demo=bool(getattr(args, 'demo', False)), dry_run=dry_run)}",
+        {
+            "venue": "DEMO" if bool(getattr(args, 'demo', False)) else "PRODUCTION",
+            "execution": "DRY_RUN" if dry_run else "LIVE",
+            "base_url": binance_base_url(bool(getattr(args, 'demo', False))),
+            "dry_run": dry_run,
+            "api_key_env": binance_env_names(bool(getattr(args, 'demo', False)))[0],
+            "enable_demo_doubles": bool(getattr(args, "enable_demo_doubles", False)),
+        },
+    )
+
+
+def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
     demo = bool(getattr(args, "demo", False))
     enable_demo_doubles = bool(getattr(args, "enable_demo_doubles", False))
     live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
@@ -1203,18 +1219,8 @@ def process_once(args: argparse.Namespace) -> None:
         os.environ.get(api_secret_env),
         base_url=binance_base_url(demo),
     )
-    console(
-        "STARTUP",
-        f"mode={execution_mode_label(demo=demo, dry_run=dry_run)}",
-        {
-            "venue": "DEMO" if demo else "PRODUCTION",
-            "execution": "DRY_RUN" if dry_run else "LIVE",
-            "base_url": client.base_url,
-            "dry_run": dry_run,
-            "api_key_env": api_key_env,
-            "enable_demo_doubles": enable_demo_doubles,
-        },
-    )
+    loop_iteration = 1 if iteration is None else iteration
+    console("LOOP_BEGIN", f"iteration={loop_iteration}")
     notional_usdt = _dec(args.notional_usdt)
 
     with closing(sqlite3.connect(args.db_path)) as conn:
@@ -1231,6 +1237,7 @@ def process_once(args: argparse.Namespace) -> None:
         update_open_trade_exits(conn, client, live_enabled=live_enabled)
         configured_symbols = [s for s in settings.get("symbols", []) if s in ALLOWED_SYMBOLS]
         for symbol in configured_symbols:
+            console("SCAN", symbol)
             profile = get_profile(settings, symbol)
             if profile is None:
                 console("BLOCKED", f"{symbol} missing PnF profile")
@@ -1242,6 +1249,7 @@ def process_once(args: argparse.Namespace) -> None:
             latest_close_time = latest_candle_close_time(candles)
             last_processed = get_last_processed_close_time(conn, symbol)
             if latest_close_time is None or last_processed == latest_close_time:
+                console("NO_SIGNAL", symbol)
                 continue
             signal = detect_latest_strict_triangle(symbol, profile, candles)
             allow_demo_doubles = bool(enable_demo_doubles and demo and live_enabled)
@@ -1249,6 +1257,7 @@ def process_once(args: argparse.Namespace) -> None:
                 signal = detect_latest_strict_double(symbol, profile, candles)
             set_last_processed_close_time(conn, symbol, latest_close_time)
             if signal is None:
+                console("NO_SIGNAL", symbol)
                 continue
 
             console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side}", signal.__dict__)
@@ -1335,23 +1344,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    dry_run = not (os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
-    console(
-        "STARTUP",
-        f"startup mode={execution_mode_label(demo=args.demo, dry_run=dry_run)}",
-        {
-            "venue": "DEMO" if args.demo else "PRODUCTION",
-            "execution": "DRY_RUN" if dry_run else "LIVE",
-            "base_url": binance_base_url(args.demo),
-        },
-    )
+    log_startup(args)
 
     if args.loop:
+        iteration = 1
         while True:
-            process_once(args)
+            process_once(args, iteration=iteration)
+            iteration += 1
             time.sleep(args.poll_seconds)
     else:
-        process_once(args)
+        process_once(args, iteration=1)
 
 
 if __name__ == "__main__":
