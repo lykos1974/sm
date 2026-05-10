@@ -171,6 +171,71 @@ class DemoInitClient:
 
 class BinanceForwardTraderTests(unittest.TestCase):
 
+    def test_verbose_market_logs_emit_market_signal_and_order_details(self):
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        try:
+            trader.BinanceFuturesClient = DemoInitClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: sample_signal(trigger_ts=1)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "symbols": ["BINANCE_FUT:SOLUSDT"],
+                        "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}},
+                    }, fh)
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+
+                args = argparse.Namespace(
+                    db_path=db_path,
+                    settings=settings_path,
+                    dry_run=True,
+                    demo=True,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    verbose_market_logs=True,
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.process_once(args)
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any(" MARKET BINANCE_FUT:SOLUSDT " in line and '"last_close": 101.0' in line for line in lines))
+        self.assertTrue(any(" SIGNAL_DETAIL BINANCE_FUT:SOLUSDT " in line and '"tp2": 103.0' in line for line in lines))
+        self.assertTrue(any(" ORDER_DETAIL BINANCE_FUT:SOLUSDT " in line and '"reduce_only": false' in line for line in lines))
+
+    def test_verbose_lifecycle_logs_position_open_detail_on_fill(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = sample_signal()
+        spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+        order, reason = trader.build_entry_order(signal, spec, Decimal("1"))
+        self.assertIsNone(reason)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            trader.record_submitted_entry_order(
+                conn,
+                LifecycleClient("FILLED"),
+                signal,
+                order=order,
+                notional_usdt=Decimal("1"),
+                verbose_market_logs=True,
+            )
+
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any(" POSITION_OPEN_DETAIL " in line and '"avg_fill_price": 100.5' in line for line in lines))
+        self.assertTrue(any('"requested_entry": 100.0' in line and '"position_side": "LONG"' in line for line in lines))
+
     def test_process_once_logs_loop_scan_no_signal_without_startup(self):
         original_triangle = trader.detect_latest_strict_triangle
         try:
