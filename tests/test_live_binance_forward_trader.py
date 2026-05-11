@@ -984,6 +984,293 @@ class BinanceForwardTraderTests(unittest.TestCase):
             self.assertEqual(row[0], "ORDER_SENT")
             self.assertIsNone(row[1])
 
+
+
+    def _reconcile_conn_with_position_open_trade(
+        self,
+        *,
+        executed_qty="0.009",
+        avg_fill_price="100.50",
+        status="POSITION_OPEN",
+        side="LONG",
+        trigger_ts=123456,
+    ):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        trader.init_live_tables(conn)
+        signal = replace_signal(
+            sample_signal(trigger_ts=trigger_ts),
+            side=side,
+            pattern="bearish_triangle" if side == "SHORT" else "bullish_triangle",
+            stop_price=Decimal("101") if side == "SHORT" else Decimal("99"),
+            tp1_price=Decimal("98") if side == "SHORT" else Decimal("102"),
+            tp2_price=Decimal("97") if side == "SHORT" else Decimal("103"),
+        )
+        trader.record_trade(
+            conn,
+            signal,
+            notional_usdt=Decimal("1"),
+            exchange_order_id="42",
+            status=status,
+            dry_run=False,
+            decision="ORDER_SENT",
+            raw_order_response={"order_request": {"quantity": executed_qty}},
+        )
+        conn.execute(
+            """
+            UPDATE live_trades_binance
+            SET avg_fill_price = ?, executed_qty = ?, entry_order_status = 'FILLED'
+            WHERE symbol = ? AND trigger_timestamp = ?
+            """,
+            (avg_fill_price, executed_qty, "BINANCE_FUT:SOLUSDT", trigger_ts),
+        )
+        conn.commit()
+        return conn
+
+    def _binance_sol_position(self, *, qty="0.009", entry="100.50", amt=None):
+        amount = amt if amt is not None else qty
+        return trader.parse_binance_open_positions(
+            [{"symbol": "SOLUSDT", "positionAmt": amount, "entryPrice": entry, "positionSide": "BOTH"}],
+            "BINANCE_FUT:SOLUSDT",
+        )
+
+    def test_reconcile_positions_matching_position_and_state_row(self):
+        conn = self._reconcile_conn_with_position_open_trade()
+
+        logs = trader.build_position_reconciliation_logs(
+            self._binance_sol_position(),
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+        binance_log = next(log for log in logs if log["source"] == "BINANCE")
+        local_log = next(log for log in logs if log["source"] == "LOCAL")
+
+        self.assertEqual(binance_log["reconcile_status"], "MATCHED")
+        self.assertEqual(local_log["reconcile_status"], "MATCHED")
+        self.assertTrue(binance_log["has_matching_local_state_row"])
+        self.assertTrue(local_log["has_matching_binance_position"])
+        self.assertEqual(binance_log["mismatch_warnings"], [])
+        self.assertEqual(local_log["mismatch_warnings"], [])
+        self.assertEqual(local_log["stop_price"], 99.0)
+        self.assertEqual(local_log["tp2_price"], 103.0)
+
+    def test_reconcile_positions_binance_position_without_local_row(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        trader.init_live_tables(conn)
+
+        logs = trader.build_position_reconciliation_logs(
+            self._binance_sol_position(),
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["source"], "BINANCE")
+        self.assertEqual(logs[0]["reconcile_status"], "BINANCE_ONLY")
+        self.assertFalse(logs[0]["has_matching_local_state_row"])
+        self.assertEqual(logs[0]["mismatch_warnings"], ["BINANCE_ONLY"])
+
+    def test_reconcile_positions_local_row_without_binance_position(self):
+        conn = self._reconcile_conn_with_position_open_trade()
+
+        logs = trader.build_position_reconciliation_logs(
+            [],
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["source"], "LOCAL")
+        self.assertEqual(logs[0]["reconcile_status"], "LOCAL_ONLY")
+        self.assertFalse(logs[0]["has_matching_binance_position"])
+        self.assertEqual(logs[0]["mismatch_warnings"], ["LOCAL_ONLY"])
+
+    def test_reconcile_positions_duplicate_local_open_rows_warning(self):
+        conn = self._reconcile_conn_with_position_open_trade(trigger_ts=123456)
+        trader.record_trade(
+            conn,
+            sample_signal(trigger_ts=123457),
+            notional_usdt=Decimal("1"),
+            exchange_order_id="43",
+            status="POSITION_OPEN",
+            dry_run=False,
+            decision="ORDER_SENT",
+            raw_order_response={"order_request": {"quantity": "0.010"}},
+        )
+        conn.execute(
+            "UPDATE live_trades_binance SET avg_fill_price = 100.50, executed_qty = 0.010 WHERE trigger_timestamp = 123457"
+        )
+        conn.commit()
+
+        logs = trader.build_position_reconciliation_logs(
+            self._binance_sol_position(qty="0.009"),
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+
+        self.assertTrue(any("DUPLICATE_LOCAL_OPEN_ROWS" in log["mismatch_warnings"] for log in logs))
+        self.assertEqual(sum(log["source"] == "LOCAL" for log in logs), 2)
+
+    def test_reconcile_positions_side_mismatch_warning(self):
+        conn = self._reconcile_conn_with_position_open_trade(side="SHORT")
+
+        logs = trader.build_position_reconciliation_logs(
+            self._binance_sol_position(amt="0.009"),
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+
+        self.assertTrue(all(log["reconcile_status"] == "SIDE_MISMATCH" for log in logs))
+        self.assertTrue(all("SIDE_MISMATCH" in log["mismatch_warnings"] for log in logs))
+
+    def test_reconcile_positions_status_mismatch_warning(self):
+        conn = self._reconcile_conn_with_position_open_trade(status="ORDER_SENT")
+
+        logs = trader.build_position_reconciliation_logs(
+            self._binance_sol_position(),
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+
+        self.assertTrue(all(log["reconcile_status"] == "STATUS_MISMATCH" for log in logs))
+        self.assertTrue(all("STATUS_MISMATCH" in log["mismatch_warnings"] for log in logs))
+
+    def test_reconcile_positions_qty_mismatch_label(self):
+        conn = self._reconcile_conn_with_position_open_trade(executed_qty="0.008")
+
+        logs = trader.build_position_reconciliation_logs(
+            self._binance_sol_position(qty="0.009"),
+            trader.load_local_open_trades_for_reconciliation(conn),
+        )
+
+        self.assertTrue(all(log["reconcile_status"] == "QTY_MISMATCH" for log in logs))
+        self.assertTrue(all("QTY_MISMATCH" in log["mismatch_warnings"] for log in logs))
+
+    def test_reconcile_positions_main_loop_exits_once_and_does_not_call_process_once(self):
+        class ReconcileOnlyClient:
+            instances = []
+
+            def __init__(self, api_key=None, api_secret=None, *, base_url=trader.BINANCE_BASE_URL):
+                self.api_key = api_key
+                self.api_secret = api_secret
+                self.base_url = base_url
+                self.has_credentials = True
+                self.position_risk_calls = []
+                self.submitted_orders = []
+                ReconcileOnlyClient.instances.append(self)
+
+            def get_position_risk(self, symbol):
+                self.position_risk_calls.append(symbol)
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+
+            def submit_order(self, order):
+                self.submitted_orders.append(order)
+                raise AssertionError("reconciliation must not submit orders")
+
+        original_client = trader.BinanceFuturesClient
+        original_env = os.environ.copy()
+        original_parse_args = trader.parse_args
+        original_process_once = trader.process_once
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "BINANCE_FUTURES_API_KEY": "prod-key",
+                "BINANCE_FUTURES_API_SECRET": "prod-secret",
+            })
+            trader.BinanceFuturesClient = ReconcileOnlyClient
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state_db_path = os.path.join(temp_dir, "state.db")
+                with closing(sqlite3.connect(state_db_path)) as conn:
+                    trader.init_live_tables(conn)
+                args = argparse.Namespace(
+                    db_path=os.path.join(temp_dir, "missing-market-data.db"),
+                    state_db_path=state_db_path,
+                    settings=os.path.join(temp_dir, "missing-settings.json"),
+                    dry_run=True,
+                    demo=False,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    demo_max_notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    verbose_market_logs=False,
+                    reconcile_positions=True,
+                    loop=True,
+                    poll_seconds=0,
+                )
+                trader.parse_args = lambda: args
+                trader.process_once = lambda parsed_args, *, iteration=None: (_ for _ in ()).throw(
+                    AssertionError("process_once must not be called in reconcile mode")
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.main()
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.parse_args = original_parse_args
+            trader.process_once = original_process_once
+            os.environ.clear()
+            os.environ.update(original_env)
+
+        self.assertIn("LOOP_IGNORED", output.getvalue())
+        self.assertIn("RECONCILE_POSITION", output.getvalue())
+        self.assertNotIn("SCAN", output.getvalue())
+        self.assertEqual(ReconcileOnlyClient.instances[-1].submitted_orders, [])
+        self.assertEqual(sorted(ReconcileOnlyClient.instances[-1].position_risk_calls), ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+
+    def test_reconcile_positions_calls_no_write_helpers_or_candle_db(self):
+        class ReconcileOnlyClient:
+            def __init__(self, api_key=None, api_secret=None, *, base_url=trader.BINANCE_BASE_URL):
+                self.has_credentials = True
+
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+
+        original_client = trader.BinanceFuturesClient
+        original_env = os.environ.copy()
+        original_parse_args = trader.parse_args
+        original_init = trader.init_live_tables
+        original_poll = trader.poll_pending_entry_orders
+        original_update = trader.update_open_trade_exits
+        original_candle = trader.connect_candle_db_readonly
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "BINANCE_FUTURES_API_KEY": "prod-key",
+                "BINANCE_FUTURES_API_SECRET": "prod-secret",
+            })
+            trader.BinanceFuturesClient = ReconcileOnlyClient
+            trader.init_live_tables = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("init_live_tables called"))
+            trader.poll_pending_entry_orders = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("poll called"))
+            trader.update_open_trade_exits = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("update exits called"))
+            trader.connect_candle_db_readonly = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("candle DB opened"))
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state_db_path = os.path.join(temp_dir, "state.db")
+                with closing(sqlite3.connect(state_db_path)) as conn:
+                    original_init(conn)
+                trader.parse_args = lambda: argparse.Namespace(
+                    db_path=os.path.join(temp_dir, "missing-market-data.db"),
+                    state_db_path=state_db_path,
+                    settings=os.path.join(temp_dir, "missing-settings.json"),
+                    dry_run=True,
+                    demo=False,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    demo_max_notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    verbose_market_logs=False,
+                    reconcile_positions=True,
+                    loop=False,
+                    poll_seconds=0,
+                )
+                with redirect_stdout(io.StringIO()):
+                    trader.main()
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.parse_args = original_parse_args
+            trader.init_live_tables = original_init
+            trader.poll_pending_entry_orders = original_poll
+            trader.update_open_trade_exits = original_update
+            trader.connect_candle_db_readonly = original_candle
+            os.environ.clear()
+            os.environ.update(original_env)
+
     def test_reduce_only_close_order_remains_reduce_only_true(self):
         spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
         close, reason = trader.build_reduce_only_close_order(
