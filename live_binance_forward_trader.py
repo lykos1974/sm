@@ -48,6 +48,8 @@ ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
 DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
 OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "EXIT_PENDING"}
+RECONCILE_PRICE_MISMATCH_BPS = Decimal("1")
+RECONCILE_MIN_PRICE_MISMATCH = Decimal("0.00000001")
 
 
 @dataclass(frozen=True)
@@ -225,6 +227,13 @@ def sqlite_readonly_uri(db_path: str | os.PathLike[str]) -> str:
 def connect_candle_db_readonly(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
     conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
     conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def connect_state_db_readonly(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
+    conn.execute("PRAGMA query_only = ON")
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -1214,6 +1223,346 @@ def position_mode_is_unambiguous(mode_response: dict[str, Any]) -> bool:
     return mode_response.get("dualSidePosition") is False
 
 
+def _position_risk_rows(position_response: Any) -> list[dict[str, Any]]:
+    rows: Any = position_response
+    if isinstance(position_response, dict):
+        rows = position_response.get("positions", position_response.get("data", position_response))
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def parse_binance_open_positions(position_response: Any, runtime_symbol: str) -> list[dict[str, Any]]:
+    positions: list[dict[str, Any]] = []
+    for row in _position_risk_rows(position_response):
+        try:
+            position_amt = _dec(row.get("positionAmt", "0"))
+        except ValueError:
+            continue
+        if position_amt == 0:
+            continue
+        position_side = str(row.get("positionSide") or "").upper()
+        side = position_side if position_side in {"LONG", "SHORT"} else ("LONG" if position_amt > 0 else "SHORT")
+        positions.append(
+            {
+                "symbol": runtime_symbol,
+                "side": side,
+                "qty": abs(position_amt),
+                "entry_price": _dec(row.get("entryPrice", "0")),
+                "avg_fill_price": None,
+                "stop_price": None,
+                "tp2_price": None,
+                "status": "BINANCE_POSITION_OPEN",
+                "raw_position": row,
+            }
+        )
+    return positions
+
+
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _quantity_from_raw_order_response(raw_order_response: Any) -> Decimal | None:
+    try:
+        parsed = json.loads(raw_order_response or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    request = parsed.get("order_request") or parsed.get("would_submit_order")
+    if not isinstance(request, dict) or request.get("quantity") in (None, ""):
+        return None
+    try:
+        return _dec(request.get("quantity"))
+    except ValueError:
+        return None
+
+
+def load_local_open_trades_for_reconciliation(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if not table_exists(conn, "live_trades_binance"):
+        return []
+    placeholders = ",".join("?" for _ in sorted(OPEN_TRADE_STATUSES))
+    symbol_placeholders = ",".join("?" for _ in sorted(ALLOWED_SYMBOLS))
+    rows = conn.execute(
+        f"""
+        SELECT id, symbol, side, entry_price, avg_fill_price, executed_qty, stop_price, tp2_price, status, raw_order_response
+        FROM live_trades_binance
+        WHERE status IN ({placeholders}) AND symbol IN ({symbol_placeholders})
+        ORDER BY symbol, side, id
+        """,
+        (*sorted(OPEN_TRADE_STATUSES), *sorted(ALLOWED_SYMBOLS)),
+    ).fetchall()
+    trades: list[dict[str, Any]] = []
+    for row in rows:
+        qty = (
+            _dec(row["executed_qty"])
+            if row["executed_qty"] not in (None, "")
+            else _quantity_from_raw_order_response(row["raw_order_response"])
+        )
+        trades.append(
+            {
+                "id": int(row["id"]),
+                "symbol": str(row["symbol"]),
+                "side": str(row["side"]).upper(),
+                "qty": qty,
+                "entry_price": _dec(row["entry_price"]),
+                "avg_fill_price": _dec(row["avg_fill_price"]) if row["avg_fill_price"] not in (None, "") else None,
+                "stop_price": _dec(row["stop_price"]),
+                "tp2_price": _dec(row["tp2_price"]),
+                "status": str(row["status"]),
+            }
+        )
+    return trades
+
+
+def _decimal_payload(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def _position_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("symbol")), str(row.get("side")).upper())
+
+
+def _qty_distance(binance_qty: Decimal | None, local_qty: Decimal | None) -> tuple[int, Decimal]:
+    if isinstance(binance_qty, Decimal) and isinstance(local_qty, Decimal):
+        return (0, abs(binance_qty - local_qty))
+    return (1, Decimal("0"))
+
+
+def _closest_qty_local_trade(
+    binance_position: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda trade: (
+            _qty_distance(binance_position.get("qty"), trade.get("qty")),
+            int(trade.get("id", 0)),
+        ),
+    )
+
+
+def _prices_diverge_materially(local_price: Decimal | None, binance_entry: Decimal | None) -> bool:
+    if not isinstance(local_price, Decimal) or not isinstance(binance_entry, Decimal):
+        return False
+    tolerance = max(abs(binance_entry) * RECONCILE_PRICE_MISMATCH_BPS / Decimal("10000"), RECONCILE_MIN_PRICE_MISMATCH)
+    return abs(local_price - binance_entry) > tolerance
+
+
+def _matching_warnings(binance_position: dict[str, Any], local_trade: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    binance_qty = binance_position.get("qty")
+    local_qty = local_trade.get("qty")
+    if isinstance(binance_qty, Decimal) and isinstance(local_qty, Decimal) and binance_qty != local_qty:
+        warnings.append("QTY_MISMATCH")
+    if local_trade.get("status") != "POSITION_OPEN":
+        warnings.append("STATUS_MISMATCH")
+    local_price = local_trade.get("avg_fill_price") if local_trade.get("avg_fill_price") is not None else local_trade.get("entry_price")
+    if _prices_diverge_materially(local_price, binance_position.get("entry_price")):
+        warnings.append("ENTRY_PRICE_MISMATCH")
+    return warnings
+
+
+def _primary_reconcile_status(warnings: list[str]) -> str:
+    for status in ("STATUS_MISMATCH", "QTY_MISMATCH", "SIDE_MISMATCH", "DUPLICATE_LOCAL_OPEN_ROWS", "ENTRY_PRICE_MISMATCH"):
+        if status in warnings:
+            return status
+    return "MATCHED"
+
+
+def _duplicate_local_symbol_warnings(local_trades: list[dict[str, Any]]) -> dict[str, list[str]]:
+    counts: dict[str, int] = {}
+    for trade in local_trades:
+        counts[str(trade.get("symbol"))] = counts.get(str(trade.get("symbol")), 0) + 1
+    return {symbol: ["DUPLICATE_LOCAL_OPEN_ROWS"] for symbol, count in counts.items() if count > 1}
+
+
+def _binance_payload(
+    position: dict[str, Any],
+    *,
+    match: dict[str, Any] | None,
+    reconcile_status: str,
+    warnings: list[str],
+) -> dict[str, Any]:
+    return {
+        "source": "BINANCE",
+        "reconcile_status": reconcile_status,
+        "matched_local_trade_id": match.get("id") if match is not None else None,
+        "symbol": position["symbol"],
+        "side": position["side"],
+        "qty": _decimal_payload(position.get("qty")),
+        "entry_price": _decimal_payload(position.get("entry_price")),
+        "avg_fill_price": _decimal_payload(position.get("avg_fill_price")),
+        "stop_price": _decimal_payload(position.get("stop_price")),
+        "tp2_price": _decimal_payload(position.get("tp2_price")),
+        "status": position.get("status"),
+        "has_matching_local_state_row": match is not None,
+        "mismatch_warnings": warnings,
+    }
+
+
+def _local_payload(
+    trade: dict[str, Any],
+    *,
+    match: dict[str, Any] | None,
+    reconcile_status: str,
+    warnings: list[str],
+) -> dict[str, Any]:
+    return {
+        "source": "LOCAL",
+        "reconcile_status": reconcile_status,
+        "local_trade_id": trade.get("id"),
+        "symbol": trade["symbol"],
+        "side": trade["side"],
+        "qty": _decimal_payload(trade.get("qty")),
+        "entry_price": _decimal_payload(trade.get("entry_price")),
+        "avg_fill_price": _decimal_payload(trade.get("avg_fill_price")),
+        "stop_price": _decimal_payload(trade.get("stop_price")),
+        "tp2_price": _decimal_payload(trade.get("tp2_price")),
+        "status": trade.get("status"),
+        "has_matching_binance_position": match is not None,
+        "mismatch_warnings": warnings,
+    }
+
+
+def build_position_reconciliation_logs(
+    binance_positions: list[dict[str, Any]],
+    local_trades: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    local_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    local_by_symbol_side: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    binance_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    binance_by_symbol_side: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    duplicate_warnings = _duplicate_local_symbol_warnings(local_trades)
+    logs: list[dict[str, Any]] = []
+    matched_local_ids: set[int] = set()
+
+    for trade in local_trades:
+        local_by_symbol.setdefault(str(trade.get("symbol")), []).append(trade)
+        local_by_symbol_side.setdefault(_position_key(trade), []).append(trade)
+    for position in binance_positions:
+        binance_by_symbol.setdefault(str(position.get("symbol")), []).append(position)
+        binance_by_symbol_side.setdefault(_position_key(position), []).append(position)
+
+    for position in sorted(
+        binance_positions,
+        key=lambda item: (_position_key(item), str(item.get("qty"))),
+    ):
+        same_side_candidates = [
+            trade
+            for trade in local_by_symbol_side.get(_position_key(position), [])
+            if int(trade.get("id", 0)) not in matched_local_ids
+        ]
+        match = _closest_qty_local_trade(position, same_side_candidates)
+        if match is not None:
+            matched_local_ids.add(int(match.get("id", 0)))
+            warnings = _matching_warnings(position, match) + duplicate_warnings.get(str(position.get("symbol")), [])
+            reconcile_status = _primary_reconcile_status(warnings)
+            logs.append(_binance_payload(position, match=match, reconcile_status=reconcile_status, warnings=warnings))
+            logs.append(_local_payload(match, match=position, reconcile_status=reconcile_status, warnings=warnings))
+            continue
+
+        same_symbol_local = local_by_symbol.get(str(position.get("symbol")), [])
+        if same_symbol_local:
+            warnings = ["SIDE_MISMATCH"] + duplicate_warnings.get(str(position.get("symbol")), [])
+            reconcile_status = "SIDE_MISMATCH"
+        else:
+            warnings = ["BINANCE_ONLY"]
+            reconcile_status = "BINANCE_ONLY"
+        logs.append(_binance_payload(position, match=None, reconcile_status=reconcile_status, warnings=warnings))
+
+    for trade in sorted(
+        local_trades,
+        key=lambda item: (_position_key(item), int(item.get("id", 0))),
+    ):
+        trade_id = int(trade.get("id", 0))
+        if trade_id in matched_local_ids:
+            continue
+        same_symbol_binance = binance_by_symbol.get(str(trade.get("symbol")), [])
+        same_side_binance = binance_by_symbol_side.get(_position_key(trade), [])
+        warnings = duplicate_warnings.get(str(trade.get("symbol")), []).copy()
+        if same_symbol_binance and not same_side_binance:
+            warnings.insert(0, "SIDE_MISMATCH")
+            reconcile_status = "SIDE_MISMATCH"
+        else:
+            warnings.insert(0, "LOCAL_ONLY")
+            reconcile_status = "LOCAL_ONLY"
+        logs.append(_local_payload(trade, match=None, reconcile_status=reconcile_status, warnings=warnings))
+    return logs
+
+
+def run_position_reconciliation_report(conn: sqlite3.Connection, client: BinanceFuturesClient) -> None:
+    if not client.has_credentials:
+        console("RECONCILE_POSITION", "blocked", {"reconcile_status": "API_CREDENTIALS_MISSING", "mismatch_warnings": ["API_CREDENTIALS_MISSING"]})
+        return
+
+    binance_positions: list[dict[str, Any]] = []
+    for runtime_symbol in sorted(ALLOWED_SYMBOLS):
+        response = client.get_position_risk(binance_symbol(runtime_symbol))
+        symbol_positions = parse_binance_open_positions(response, runtime_symbol)
+        binance_positions.extend(symbol_positions)
+        if not symbol_positions:
+            console(
+                "RECONCILE_POSITION",
+                runtime_symbol,
+                {
+                    "source": "BINANCE",
+                    "reconcile_status": "NO_BINANCE_POSITION",
+                    "symbol": runtime_symbol,
+                    "side": None,
+                    "qty": 0.0,
+                    "entry_price": None,
+                    "avg_fill_price": None,
+                    "stop_price": None,
+                    "tp2_price": None,
+                    "status": "NO_BINANCE_POSITION",
+                    "has_matching_local_state_row": False,
+                    "mismatch_warnings": [],
+                },
+            )
+
+    local_trades = load_local_open_trades_for_reconciliation(conn)
+    if not table_exists(conn, "live_trades_binance"):
+        console(
+            "RECONCILE_POSITION",
+            "local state table missing",
+            {"source": "LOCAL", "reconcile_status": "LOCAL_STATE_TABLE_MISSING", "mismatch_warnings": ["LOCAL_STATE_TABLE_MISSING"]},
+        )
+    for payload in build_position_reconciliation_logs(binance_positions, local_trades):
+        console("RECONCILE_POSITION", str(payload.get("symbol", "")), payload)
+
+
+def run_reconciliation_once(args: argparse.Namespace) -> None:
+    demo = bool(getattr(args, "demo", False))
+    api_key_env, api_secret_env = binance_env_names(demo)
+    client = BinanceFuturesClient(
+        os.environ.get(api_key_env),
+        os.environ.get(api_secret_env),
+        base_url=binance_base_url(demo),
+    )
+    if bool(getattr(args, "loop", False)):
+        console(
+            "RECONCILE_POSITION",
+            "--loop ignored; reconciliation runs once",
+            {"reconcile_status": "LOOP_IGNORED", "mismatch_warnings": []},
+        )
+    state_db_path = resolve_state_db_path(args)
+    with closing(connect_state_db_readonly(state_db_path)) as state_conn:
+        log_db_info(state_db_path, state_conn)
+        run_position_reconciliation_report(state_conn, client)
+
+
 def has_exchange_position(position_response: dict[str, Any]) -> bool:
     rows: Any = position_response if isinstance(position_response, list) else position_response.get("positions", position_response.get("data"))
     if isinstance(rows, dict):
@@ -1525,6 +1874,9 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
     demo_max_notional_usdt = _dec(getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)))
     state_db_path = resolve_state_db_path(args)
 
+    if bool(getattr(args, "reconcile_positions", False)):
+        raise RuntimeError("--reconcile-positions must be handled by main() before process_once()")
+
     if args.self_test_signal:
         with closing(sqlite3.connect(state_db_path)) as state_conn:
             log_db_info(state_db_path, state_conn)
@@ -1660,12 +2012,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-seconds", type=float, default=30.0, help="Sleep between loop iterations")
     parser.add_argument("--self-test-signal", action="store_true", help="Inject one synthetic allowed dry-run signal through the guarded pipeline")
     parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
+    parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     log_startup(args)
+
+    if bool(getattr(args, "reconcile_positions", False)):
+        run_reconciliation_once(args)
+        return
 
     if args.loop:
         iteration = 1
