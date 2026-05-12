@@ -74,6 +74,32 @@ def _count_label(rows: list[dict[str, Any]], label_status: str) -> int:
     return sum(1 for row in rows if str(row.get("label_status") or "").upper() == label_status)
 
 
+def _count_candidate_rows(rows: list[dict[str, Any]]) -> int:
+    return sum(1 for row in rows if str(row.get("status") or "").upper() == "CANDIDATE")
+
+
+def _is_resolved(row: dict[str, Any]) -> bool:
+    status = str(row.get("resolution_status") or "").upper()
+    return bool(status) and status not in {"PENDING", "UNRESOLVED", "NEVER_ACTIVATED"}
+
+
+def _is_non_ambiguous_resolved(row: dict[str, Any]) -> bool:
+    status = str(row.get("resolution_status") or "").upper()
+    return _is_resolved(row) and status != RES_AMBIGUOUS
+
+
+def _count_resolved(rows: list[dict[str, Any]]) -> int:
+    return sum(1 for row in rows if _is_resolved(row))
+
+
+def _count_non_ambiguous_wins(rows: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for row in rows
+        if _is_non_ambiguous_resolved(row) and (_safe_float(row.get("realized_r_multiple")) or 0.0) > 0.0
+    )
+
+
 def _numeric_series(rows: list[dict[str, Any]], field: str) -> list[float]:
     return [
         value
@@ -96,6 +122,10 @@ def _build_outcome_scorecard(rows: list[dict[str, Any]]) -> dict[str, Any]:
     tp2_count = _count_resolution(rows, RES_TP2)
     ambiguous_count = _count_resolution(rows, RES_AMBIGUOUS)
     expired_count = _count_resolution(rows, RES_EXPIRED)
+    candidate_rows_registered = _count_candidate_rows(rows)
+    resolved_rows = _count_resolved(rows)
+    non_ambiguous_rows = [row for row in rows if _is_non_ambiguous_resolved(row)]
+    non_ambiguous_win_count = _count_non_ambiguous_wins(rows)
 
     tp1_touch_count = sum(
         1
@@ -129,6 +159,9 @@ def _build_outcome_scorecard(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ambiguous_rate": _rate(ambiguous_count, total_rows),
         "expired_count": expired_count,
         "expired_rate": _rate(expired_count, total_rows),
+        "candidate_rows_registered": candidate_rows_registered,
+        "resolved_rows": resolved_rows,
+        "win_rate_non_ambiguous": _rate(non_ambiguous_win_count, len(non_ambiguous_rows)),
         "avg_realized_r_multiple": statistics.mean(realized_values) if realized_values else None,
         "median_realized_r_multiple": statistics.median(realized_values) if realized_values else None,
         "total_realized_r_multiple": sum(realized_values) if realized_values else None,
@@ -149,6 +182,10 @@ def _build_group_row(bucket: list[dict[str, Any]], group_key: tuple[Any, ...], g
     outcome_proxy_values = _numeric_series(bucket, "outcome_r_proxy")
 
     tp2_count = _count_resolution(bucket, RES_TP2)
+    candidate_rows_registered = _count_candidate_rows(bucket)
+    resolved_rows = _count_resolved(bucket)
+    non_ambiguous_rows = [row for row in bucket if _is_non_ambiguous_resolved(row)]
+    non_ambiguous_win_count = _count_non_ambiguous_wins(bucket)
     tp1_touch_count = sum(
         1
         for row in bucket
@@ -158,12 +195,16 @@ def _build_group_row(bucket: list[dict[str, Any]], group_key: tuple[Any, ...], g
     out.update(
         {
             "row_count": len(bucket),
+            "candidate_rows_registered": candidate_rows_registered,
             "valid_labeled_rows": _count_label(bucket, LABEL_LABELED),
             "invalid_rows": _count_label(bucket, LABEL_INVALID),
             "activated_count": _count_activation(bucket, ACTIVATED),
             "never_activated_count": _count_activation(bucket, NEVER_ACTIVATED),
             "tp1_touch_count": tp1_touch_count,
             "tp2_count": tp2_count,
+            "resolved_rows": resolved_rows,
+            "win_rate_non_ambiguous": _rate(non_ambiguous_win_count, len(non_ambiguous_rows)),
+            "tp1_to_tp2_conversion_rate": _rate(tp2_count, tp1_touch_count),
             "stopped_count": _count_resolution(bucket, RES_STOPPED),
             "tp1_only_count": _count_resolution(bucket, RES_TP1_ONLY),
             "tp1_then_be_count": _count_resolution(bucket, RES_TP1_BE),
@@ -263,6 +304,9 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Any]:
             "valid_labeled_rows": scorecard.get("valid_labeled_rows"),
             "tp2_count": scorecard.get("tp2_count"),
             "tp1_to_tp2_conversion_rate": scorecard.get("tp1_to_tp2_conversion_rate"),
+            "candidate_rows_registered": scorecard.get("candidate_rows_registered"),
+            "resolved_rows": scorecard.get("resolved_rows"),
+            "win_rate_non_ambiguous": scorecard.get("win_rate_non_ambiguous"),
         },
     }
 

@@ -56,6 +56,23 @@ BREAKOUT_POST_BULLISH_PULLBACK = "POST_BREAKOUT_PULLBACK"
 BREAKOUT_POST_BEARISH_REBOUND = "POST_BREAKDOWN_REBOUND"
 BREAKOUT_LATE_EXTENSION = "LATE_EXTENSION"
 DECISION_VERSION = "v4_diag"
+CONTINUATION_EXECUTION_V1_VERSION = "continuation_execution_v1_research"
+
+ENTRY_DISTANCE_BELOW_BREAKOUT = "BELOW_BREAKOUT"
+ENTRY_DISTANCE_IMMEDIATE = "IMMEDIATE"
+ENTRY_DISTANCE_EARLY = "EARLY"
+ENTRY_DISTANCE_LATE = "LATE"
+ENTRY_DISTANCE_EXTENDED = "EXTENDED"
+ENTRY_DISTANCE_UNKNOWN = "UNKNOWN"
+
+CONT_EXEC_BASELINE_DIAGNOSTIC = "BASELINE_DIAGNOSTIC"
+CONT_EXEC_CONTINUATION_PRIMARY = "CONTINUATION_PRIMARY"
+CONT_EXEC_CONTINUATION_ACCEPTABLE = "CONTINUATION_ACCEPTABLE"
+CONT_EXEC_CONTINUATION_LATE_WATCH = "CONTINUATION_LATE_WATCH"
+CONT_EXEC_CONTINUATION_EXTENDED_REJECT = "CONTINUATION_EXTENDED_REJECT"
+CONT_EXEC_PULLBACK_CONFIRMED = "PULLBACK_CONFIRMED"
+CONT_EXEC_PULLBACK_WATCH = "PULLBACK_WATCH"
+CONT_EXEC_REJECT = "REJECT"
 
 
 def _box_size(profile: Any) -> float:
@@ -82,6 +99,316 @@ def _safe_float(value: Any) -> Optional[float]:
     except Exception:
         return None
 
+
+
+def _is_continuation_execution_v1_enabled(profile: Any, structure_state: Dict[str, Any]) -> bool:
+    return bool(
+        getattr(profile, "continuation_execution_v1_enabled", False)
+        or structure_state.get("continuation_execution_v1_enabled", False)
+        or structure_state.get("execution_model") == CONTINUATION_EXECUTION_V1_VERSION
+    )
+
+
+def _clamp_score(value: float) -> float:
+    return float(max(0.0, min(100.0, value)))
+
+
+def _classify_entry_distance_bucket(entry_distance_boxes: Optional[float]) -> str:
+    if entry_distance_boxes is None:
+        return ENTRY_DISTANCE_UNKNOWN
+    if entry_distance_boxes < 0.0:
+        return ENTRY_DISTANCE_BELOW_BREAKOUT
+    if entry_distance_boxes <= 1.0:
+        return ENTRY_DISTANCE_IMMEDIATE
+    if entry_distance_boxes <= 2.0:
+        return ENTRY_DISTANCE_EARLY
+    if entry_distance_boxes <= 3.0:
+        return ENTRY_DISTANCE_LATE
+    return ENTRY_DISTANCE_EXTENDED
+
+
+def _normalize_pattern_family(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    normalized = text.replace("-", "_").replace(" ", "_")
+    if "triangle" in normalized:
+        if "bear" in normalized or "sell" in normalized or "down" in normalized:
+            return "bearish_triangle"
+        if "bull" in normalized or "buy" in normalized or "up" in normalized:
+            return "bullish_triangle"
+        return "triangle"
+    if "double_top" in normalized or normalized in {"buy", "double_top_breakout"}:
+        return "double_top_breakout"
+    if "double_bottom" in normalized or normalized in {"sell", "double_bottom_breakdown"}:
+        return "double_bottom_breakdown"
+    return normalized
+
+
+def _extract_pattern_family(structure_state: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "pattern_family",
+        "pattern_name",
+        "latest_pattern_name",
+        "latest_signal_type",
+        "latest_signal_name",
+    ):
+        family = _normalize_pattern_family(structure_state.get(key))
+        if family:
+            return family
+    return None
+
+
+def _is_aligned_triangle(pattern_family: Optional[str], side: str) -> bool:
+    if side == "LONG":
+        return pattern_family == "bullish_triangle"
+    if side == "SHORT":
+        return pattern_family == "bearish_triangle"
+    return False
+
+
+def _aligned_trend_regime(side: str, trend_regime: Optional[str]) -> bool:
+    if side == "LONG":
+        return trend_regime == "BULLISH_REGIME"
+    if side == "SHORT":
+        return trend_regime == "BEARISH_REGIME"
+    return False
+
+
+def _opposing_trend_regime(side: str, trend_regime: Optional[str]) -> bool:
+    if side == "LONG":
+        return trend_regime == "BEARISH_REGIME"
+    if side == "SHORT":
+        return trend_regime == "BULLISH_REGIME"
+    return False
+
+
+def _compute_extension_penalty(
+    *,
+    entry_distance_bucket: str,
+    breakout_context: Optional[str],
+    is_extended: bool,
+    active_leg_boxes: int,
+) -> float:
+    penalty = 0.0
+    if entry_distance_bucket == ENTRY_DISTANCE_LATE:
+        penalty += 35.0
+    elif entry_distance_bucket == ENTRY_DISTANCE_EXTENDED:
+        penalty += 70.0
+    if is_extended:
+        penalty += 25.0
+    if breakout_context == BREAKOUT_LATE_EXTENSION:
+        penalty += 35.0
+    if active_leg_boxes >= 4:
+        penalty += 20.0
+    elif active_leg_boxes == 3:
+        penalty += 10.0
+    return _clamp_score(penalty)
+
+
+def _distance_policy_action(entry_distance_bucket: str, pattern_family: Optional[str], side: str) -> str:
+    if entry_distance_bucket == ENTRY_DISTANCE_IMMEDIATE:
+        return "ALLOW_PRIMARY"
+    if entry_distance_bucket == ENTRY_DISTANCE_EARLY:
+        return "ALLOW_ACCEPTABLE"
+    if entry_distance_bucket == ENTRY_DISTANCE_LATE:
+        if _is_aligned_triangle(pattern_family, side):
+            return "DOWNGRADE_WATCH_TRIANGLE_EXCEPTION"
+        return "DOWNGRADE_WATCH"
+    if entry_distance_bucket == ENTRY_DISTANCE_EXTENDED:
+        return "REJECT_EXTENDED"
+    if entry_distance_bucket == ENTRY_DISTANCE_BELOW_BREAKOUT:
+        return "PULLBACK_CONTEXT"
+    return "INSUFFICIENT_DISTANCE_DATA"
+
+
+def _continuation_execution_class(
+    *,
+    entry_distance_bucket: str,
+    continuation_quality_score: float,
+    extension_penalty: float,
+    breakout_context: Optional[str],
+    pullback_quality: Optional[str],
+) -> str:
+    if entry_distance_bucket == ENTRY_DISTANCE_EXTENDED or extension_penalty >= 80.0:
+        return CONT_EXEC_CONTINUATION_EXTENDED_REJECT
+    if entry_distance_bucket == ENTRY_DISTANCE_LATE:
+        return CONT_EXEC_CONTINUATION_LATE_WATCH
+    if entry_distance_bucket == ENTRY_DISTANCE_IMMEDIATE and continuation_quality_score >= 70.0:
+        return CONT_EXEC_CONTINUATION_PRIMARY
+    if entry_distance_bucket == ENTRY_DISTANCE_EARLY and continuation_quality_score >= 60.0:
+        return CONT_EXEC_CONTINUATION_ACCEPTABLE
+    if breakout_context in (BREAKOUT_POST_BULLISH_PULLBACK, BREAKOUT_POST_BEARISH_REBOUND):
+        if pullback_quality == PULLBACK_HEALTHY and continuation_quality_score >= 68.0 and extension_penalty < 35.0:
+            return CONT_EXEC_PULLBACK_CONFIRMED
+        return CONT_EXEC_PULLBACK_WATCH
+    if continuation_quality_score < 35.0:
+        return CONT_EXEC_REJECT
+    return CONT_EXEC_BASELINE_DIAGNOSTIC
+
+
+def _compute_entry_distance_boxes(
+    *,
+    side: str,
+    entry_price: Optional[float],
+    breakout_level: Optional[float],
+    box_size: float,
+) -> Optional[float]:
+    if entry_price is None or breakout_level is None or box_size <= 0:
+        return None
+    if side == "LONG":
+        return (float(entry_price) - float(breakout_level)) / float(box_size)
+    if side == "SHORT":
+        return (float(breakout_level) - float(entry_price)) / float(box_size)
+    return None
+
+
+def _compute_continuation_quality_score(
+    *,
+    side: str,
+    entry_distance_bucket: str,
+    breakout_context: Optional[str],
+    trend_regime: Optional[str],
+    is_extended: bool,
+    active_leg_boxes: int,
+    pattern_family: Optional[str],
+    pullback_quality: Optional[str],
+    risk_quality: Optional[str],
+    reward_quality: Optional[str],
+) -> float:
+    score = 50.0
+
+    if entry_distance_bucket == ENTRY_DISTANCE_IMMEDIATE:
+        score += 18.0
+    elif entry_distance_bucket == ENTRY_DISTANCE_EARLY:
+        score += 8.0
+    elif entry_distance_bucket == ENTRY_DISTANCE_LATE:
+        score -= 22.0
+    elif entry_distance_bucket == ENTRY_DISTANCE_EXTENDED:
+        score -= 45.0
+    elif entry_distance_bucket == ENTRY_DISTANCE_BELOW_BREAKOUT:
+        score += 0.0 if breakout_context in (BREAKOUT_POST_BULLISH_PULLBACK, BREAKOUT_POST_BEARISH_REBOUND) else -10.0
+    else:
+        score -= 15.0
+
+    if breakout_context in (BREAKOUT_FRESH_BULLISH, BREAKOUT_FRESH_BEARISH):
+        score += 14.0
+    elif breakout_context in (BREAKOUT_POST_BULLISH_PULLBACK, BREAKOUT_POST_BEARISH_REBOUND):
+        score += 4.0
+    elif breakout_context == BREAKOUT_LATE_EXTENSION:
+        score -= 30.0
+    elif breakout_context == BREAKOUT_NONE:
+        score -= 10.0
+
+    if _aligned_trend_regime(side, trend_regime):
+        score += 10.0
+    elif _opposing_trend_regime(side, trend_regime):
+        score -= 15.0
+    elif trend_regime in ("RANGE_REGIME", "EARLY_REGIME"):
+        score -= 5.0
+
+    if is_extended:
+        score -= 25.0
+    if breakout_context == BREAKOUT_LATE_EXTENSION:
+        score -= 30.0
+    if active_leg_boxes >= 4:
+        score -= 20.0
+    elif active_leg_boxes == 3:
+        score -= 8.0
+    elif active_leg_boxes <= 2:
+        score += 6.0
+
+    if _is_aligned_triangle(pattern_family, side):
+        score += 8.0
+    elif pattern_family is None:
+        score -= 2.0
+
+    if pullback_quality == PULLBACK_HEALTHY:
+        score += 8.0
+    elif pullback_quality == PULLBACK_SHALLOW:
+        score -= 4.0
+    elif pullback_quality == PULLBACK_DEEP:
+        score -= 12.0
+    elif pullback_quality == PULLBACK_BROKEN:
+        score -= 40.0
+
+    if risk_quality == RISK_TIGHT:
+        score += 8.0
+    elif risk_quality == RISK_NORMAL:
+        score += 3.0
+    elif risk_quality == RISK_WIDE:
+        score -= 15.0
+
+    if reward_quality == REWARD_STRONG:
+        score += 8.0
+    elif reward_quality == REWARD_GOOD:
+        score += 5.0
+    elif reward_quality == REWARD_POOR:
+        score -= 30.0
+
+    return _clamp_score(score)
+
+
+def _compute_continuation_diagnostics(
+    *,
+    side: str,
+    profile: Any,
+    structure_state: Dict[str, Any],
+    entry_price: Optional[float],
+    breakout_level: Optional[float],
+    pullback_quality: Optional[str] = None,
+    risk_quality: Optional[str] = None,
+    reward_quality: Optional[str] = None,
+) -> Dict[str, Any]:
+    box = _box_size(profile)
+    breakout_context = structure_state.get("breakout_context")
+    trend_regime = structure_state.get("trend_regime")
+    is_extended = bool(structure_state.get("is_extended_move", False))
+    active_leg_boxes = int(structure_state.get("active_leg_boxes") or 0)
+    pattern_family = _extract_pattern_family(structure_state)
+    entry_distance_boxes = _compute_entry_distance_boxes(
+        side=side,
+        entry_price=entry_price,
+        breakout_level=breakout_level,
+        box_size=box,
+    )
+    entry_distance_bucket = _classify_entry_distance_bucket(entry_distance_boxes)
+    extension_penalty = _compute_extension_penalty(
+        entry_distance_bucket=entry_distance_bucket,
+        breakout_context=breakout_context,
+        is_extended=is_extended,
+        active_leg_boxes=active_leg_boxes,
+    )
+    continuation_quality_score = _compute_continuation_quality_score(
+        side=side,
+        entry_distance_bucket=entry_distance_bucket,
+        breakout_context=breakout_context,
+        trend_regime=trend_regime,
+        is_extended=is_extended,
+        active_leg_boxes=active_leg_boxes,
+        pattern_family=pattern_family,
+        pullback_quality=pullback_quality,
+        risk_quality=risk_quality,
+        reward_quality=reward_quality,
+    )
+    return {
+        "entry_distance_boxes": entry_distance_boxes,
+        "entry_distance_bucket": entry_distance_bucket,
+        "breakout_level": breakout_level,
+        "continuation_quality_score": continuation_quality_score,
+        "extension_penalty": extension_penalty,
+        "continuation_execution_class": _continuation_execution_class(
+            entry_distance_bucket=entry_distance_bucket,
+            continuation_quality_score=continuation_quality_score,
+            extension_penalty=extension_penalty,
+            breakout_context=breakout_context,
+            pullback_quality=pullback_quality,
+        ),
+        "pattern_family": pattern_family,
+        "distance_policy_action": _distance_policy_action(entry_distance_bucket, pattern_family, side),
+    }
 
 def _pullback_position_long(support: float, resistance: float, current_bottom: float) -> float:
     span = max(float(resistance) - float(support), 1e-9)
@@ -478,6 +805,14 @@ def _base_result(
     early_trend_diag_context_bias: Optional[str] = None,
     early_trend_diag_regime_bias: Optional[str] = None,
     early_trend_diag_score: Optional[float] = None,
+    entry_distance_boxes: Optional[float] = None,
+    entry_distance_bucket: Optional[str] = None,
+    breakout_level: Optional[float] = None,
+    continuation_quality_score: Optional[float] = None,
+    extension_penalty: Optional[float] = None,
+    continuation_execution_class: Optional[str] = None,
+    pattern_family: Optional[str] = None,
+    distance_policy_action: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "strategy": "pullback_retest",
@@ -518,6 +853,14 @@ def _base_result(
         "early_trend_diag_context_bias": early_trend_diag_context_bias,
         "early_trend_diag_regime_bias": early_trend_diag_regime_bias,
         "early_trend_diag_score": early_trend_diag_score,
+        "entry_distance_boxes": entry_distance_boxes,
+        "entry_distance_bucket": entry_distance_bucket,
+        "breakout_level": breakout_level,
+        "continuation_quality_score": continuation_quality_score,
+        "extension_penalty": extension_penalty,
+        "continuation_execution_class": continuation_execution_class,
+        "pattern_family": pattern_family,
+        "distance_policy_action": distance_policy_action,
         "breakout_context": breakout_context,
         "reject_reason": reject_reason,
         "reason": reason,
@@ -555,21 +898,120 @@ def evaluate_pullback_retest_long(
     if current is None:
         return None
 
+    current_top = _safe_float(structure_state.get("current_column_top"))
+    if current_top is None:
+        current_top = _col_top(current)
+    preliminary_diag = _compute_continuation_diagnostics(
+        side="LONG",
+        profile=profile,
+        structure_state=structure_state,
+        entry_price=current_top if current_kind == "X" else None,
+        breakout_level=resistance,
+    )
+
     if trend != "BULLISH":
         return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
-            reason="Bullish trend state not present", reject_reason="trend_not_bullish", breakout_context=breakout_context)
+            reason="Bullish trend state not present", reject_reason="trend_not_bullish", breakout_context=breakout_context, **preliminary_diag)
     if support is None or resistance is None:
         return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
-            reason="Support / resistance unavailable", reject_reason="missing_structure_levels", breakout_context=breakout_context)
+            reason="Support / resistance unavailable", reject_reason="missing_structure_levels", breakout_context=breakout_context, **preliminary_diag)
     if resistance <= support:
         return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
-            reason="Invalid structure range", reject_reason="invalid_structure_range", breakout_context=breakout_context)
+            reason="Invalid structure range", reject_reason="invalid_structure_range", breakout_context=breakout_context, **preliminary_diag)
+
+    if (
+        _is_continuation_execution_v1_enabled(profile, structure_state)
+        and current_kind == "X"
+        and breakout_context == BREAKOUT_FRESH_BULLISH
+        and trend_regime == "BULLISH_REGIME"
+    ):
+        ideal_entry = current_top
+        breakout_level = resistance
+        invalidation = breakout_level - box
+        risk = ideal_entry - invalidation
+        if risk <= 0:
+            return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
+                reason="Continuation v1 long has non-positive risk distance", reject_reason="non_positive_risk",
+                breakout_context=breakout_context, zone_low=breakout_level, zone_high=ideal_entry,
+                ideal_entry=ideal_entry, invalidation=invalidation, **preliminary_diag)
+        tp1 = ideal_entry + 2.0 * risk
+        tp2 = ideal_entry + 3.0 * risk
+        rr1 = (tp1 - ideal_entry) / risk
+        rr2 = (tp2 - ideal_entry) / risk
+        risk_quality = _classify_risk_quality(risk, profile)
+        reward_quality = _classify_reward_quality(rr1, rr2)
+        diag = _compute_continuation_diagnostics(
+            side="LONG",
+            profile=profile,
+            structure_state=structure_state,
+            entry_price=ideal_entry,
+            breakout_level=breakout_level,
+            risk_quality=risk_quality,
+            reward_quality=reward_quality,
+        )
+        score = float(diag["continuation_quality_score"] or 0.0)
+        grade = _quality_grade(int(round(score)))
+        watch_flags: List[str] = []
+        reject_flags: List[str] = []
+        decision_path = "long_eval->continuation_execution_v1"
+        bucket = str(diag.get("entry_distance_bucket") or ENTRY_DISTANCE_UNKNOWN)
+        penalty = float(diag.get("extension_penalty") or 0.0)
+        pattern_family = diag.get("pattern_family")
+        if reward_quality == REWARD_POOR:
+            status = STATUS_REJECT
+            reason = "Continuation v1 long reward-to-risk below minimum threshold"
+            reject_reason = "rr_too_low"
+            reject_flags.append("rr_too_low")
+            decision_path += "->reject_rr_too_low"
+        elif bucket == ENTRY_DISTANCE_EXTENDED or penalty >= 80.0 or breakout_context == BREAKOUT_LATE_EXTENSION or is_extended:
+            status = STATUS_REJECT
+            reason = "Continuation v1 long rejected extended continuation"
+            reject_reason = "continuation_extended"
+            reject_flags.append("continuation_extended")
+            decision_path += "->reject_extended_continuation"
+        elif bucket == ENTRY_DISTANCE_LATE:
+            status = STATUS_WATCH
+            reason = "Continuation v1 long is late; kept as WATCH for research"
+            reject_reason = None
+            watch_flags.append("late_entry_distance")
+            if _is_aligned_triangle(pattern_family, "LONG"):
+                watch_flags.append("triangle_late_exception")
+            decision_path += "->watch_late_entry_distance"
+        elif score >= 68.0 and bucket in (ENTRY_DISTANCE_IMMEDIATE, ENTRY_DISTANCE_EARLY) and risk_quality != RISK_WIDE:
+            status = STATUS_CANDIDATE
+            reason = "Continuation v1 bullish early continuation research candidate"
+            reject_reason = None
+            decision_path += "->candidate_continuation_v1"
+        elif score >= 45.0:
+            status = STATUS_WATCH
+            reason = "Continuation v1 long exists but quality is not yet strong enough"
+            reject_reason = None
+            watch_flags.append("continuation_quality_not_strong_enough")
+            decision_path += "->watch_quality_not_strong_enough"
+        else:
+            status = STATUS_REJECT
+            reason = "Continuation v1 long quality is insufficient"
+            reject_reason = "continuation_quality_too_low"
+            reject_flags.append("continuation_quality_too_low")
+            decision_path += "->reject_quality_too_low"
+        return _base_result(
+            symbol=symbol, side="LONG", status=status, reason=reason, reject_reason=reject_reason,
+            breakout_context=breakout_context, zone_low=breakout_level, zone_high=ideal_entry,
+            ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
+            rr1=rr1, rr2=rr2, risk_quality=risk_quality, reward_quality=reward_quality,
+            quality_score=score, quality_grade=grade, decision_version=CONTINUATION_EXECUTION_V1_VERSION,
+            decision_path=decision_path, watch_flags="|".join(watch_flags), reject_flags="|".join(reject_flags),
+            invalidation_distance_boxes=risk / box if box > 0 else None,
+            breakout_context_rank=_breakout_context_rank(breakout_context, "LONG"),
+            extension_risk_score=penalty, is_baseline_profile_match=0, **diag
+        )
+
     if slope != "BEARISH_PULLBACK":
         return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
-            reason="No bearish pullback active for long retest", reject_reason="wrong_immediate_slope", breakout_context=breakout_context)
+            reason="No bearish pullback active for long retest", reject_reason="wrong_immediate_slope", breakout_context=breakout_context, **preliminary_diag)
     if current_kind != "O":
         return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
-            reason="Current column is not an O pullback column", reject_reason="wrong_current_column_kind", breakout_context=breakout_context)
+            reason="Current column is not an O pullback column", reject_reason="wrong_current_column_kind", breakout_context=breakout_context, **preliminary_diag)
 
     if current_bottom is None:
         current_bottom = _col_bottom(current)
@@ -584,9 +1026,13 @@ def evaluate_pullback_retest_long(
     risk = ideal_entry - invalidation
 
     if risk <= 0:
+        pullback_diag = _compute_continuation_diagnostics(
+            side="LONG", profile=profile, structure_state=structure_state,
+            entry_price=ideal_entry, breakout_level=resistance,
+        )
         return _base_result(symbol=symbol, side="LONG", status=STATUS_REJECT,
             reason="Non-positive risk distance", reject_reason="non_positive_risk", breakout_context=breakout_context,
-            zone_low=zone_low, zone_high=zone_high, ideal_entry=ideal_entry, invalidation=invalidation)
+            zone_low=zone_low, zone_high=zone_high, ideal_entry=ideal_entry, invalidation=invalidation, **pullback_diag)
 
     tp1 = ideal_entry + 2.0 * risk
     tp2 = ideal_entry + 3.0 * risk
@@ -711,6 +1157,17 @@ def evaluate_pullback_retest_long(
             reason = "promoted_by_structure_edge_filter"
             decision_path += "->override_candidate_structure_edge_filter"
 
+    pullback_diag = _compute_continuation_diagnostics(
+        side="LONG",
+        profile=profile,
+        structure_state=structure_state,
+        entry_price=ideal_entry,
+        breakout_level=resistance,
+        pullback_quality=pullback_quality,
+        risk_quality=risk_quality,
+        reward_quality=reward_quality,
+    )
+
     checklist_failed_items = [
         item
         for item, passed in (
@@ -749,6 +1206,7 @@ def evaluate_pullback_retest_long(
         early_trend_diag_context_bias=early_trend_diag["early_trend_diag_context_bias"],
         early_trend_diag_regime_bias=early_trend_diag["early_trend_diag_regime_bias"],
         early_trend_diag_score=early_trend_diag["early_trend_diag_score"],
+        **pullback_diag,
     )
 
 
@@ -785,21 +1243,120 @@ def evaluate_pullback_retest_short(
     if current is None:
         return None
 
+    current_bottom = _safe_float(structure_state.get("current_column_bottom"))
+    if current_bottom is None:
+        current_bottom = _col_bottom(current)
+    preliminary_diag = _compute_continuation_diagnostics(
+        side="SHORT",
+        profile=profile,
+        structure_state=structure_state,
+        entry_price=current_bottom if current_kind == "O" else None,
+        breakout_level=support,
+    )
+
     if trend not in ("BULLISH", "BEARISH"):
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
-            reason="Trend state unavailable", reject_reason="missing_trend_state", breakout_context=breakout_context)
+            reason="Trend state unavailable", reject_reason="missing_trend_state", breakout_context=breakout_context, **preliminary_diag)
     if support is None or resistance is None:
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
-            reason="Support / resistance unavailable", reject_reason="missing_structure_levels", breakout_context=breakout_context)
+            reason="Support / resistance unavailable", reject_reason="missing_structure_levels", breakout_context=breakout_context, **preliminary_diag)
     if resistance <= support:
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
-            reason="Invalid structure range", reject_reason="invalid_structure_range", breakout_context=breakout_context)
+            reason="Invalid structure range", reject_reason="invalid_structure_range", breakout_context=breakout_context, **preliminary_diag)
+
+    if (
+        _is_continuation_execution_v1_enabled(profile, structure_state)
+        and current_kind == "O"
+        and breakout_context == BREAKOUT_FRESH_BEARISH
+        and trend_regime == "BEARISH_REGIME"
+    ):
+        ideal_entry = current_bottom
+        breakout_level = support
+        invalidation = breakout_level + box
+        risk = invalidation - ideal_entry
+        if risk <= 0:
+            return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
+                reason="Continuation v1 short has non-positive risk distance", reject_reason="non_positive_risk",
+                breakout_context=breakout_context, zone_low=ideal_entry, zone_high=breakout_level,
+                ideal_entry=ideal_entry, invalidation=invalidation, **preliminary_diag)
+        tp1 = ideal_entry - 2.0 * risk
+        tp2 = ideal_entry - 3.0 * risk
+        rr1 = (ideal_entry - tp1) / risk
+        rr2 = (ideal_entry - tp2) / risk
+        risk_quality = _classify_risk_quality(risk, profile)
+        reward_quality = _classify_reward_quality(rr1, rr2)
+        diag = _compute_continuation_diagnostics(
+            side="SHORT",
+            profile=profile,
+            structure_state=structure_state,
+            entry_price=ideal_entry,
+            breakout_level=breakout_level,
+            risk_quality=risk_quality,
+            reward_quality=reward_quality,
+        )
+        score = float(diag["continuation_quality_score"] or 0.0)
+        grade = _quality_grade(int(round(score)))
+        watch_flags: List[str] = []
+        reject_flags: List[str] = []
+        decision_path = "short_eval->continuation_execution_v1"
+        bucket = str(diag.get("entry_distance_bucket") or ENTRY_DISTANCE_UNKNOWN)
+        penalty = float(diag.get("extension_penalty") or 0.0)
+        pattern_family = diag.get("pattern_family")
+        if reward_quality == REWARD_POOR:
+            status = STATUS_REJECT
+            reason = "Continuation v1 short reward-to-risk below minimum threshold"
+            reject_reason = "rr_too_low"
+            reject_flags.append("rr_too_low")
+            decision_path += "->reject_rr_too_low"
+        elif bucket == ENTRY_DISTANCE_EXTENDED or penalty >= 80.0 or breakout_context == BREAKOUT_LATE_EXTENSION or is_extended:
+            status = STATUS_REJECT
+            reason = "Continuation v1 short rejected extended continuation"
+            reject_reason = "continuation_extended"
+            reject_flags.append("continuation_extended")
+            decision_path += "->reject_extended_continuation"
+        elif bucket == ENTRY_DISTANCE_LATE:
+            status = STATUS_WATCH
+            reason = "Continuation v1 short is late; kept as WATCH for research"
+            reject_reason = None
+            watch_flags.append("late_entry_distance")
+            if _is_aligned_triangle(pattern_family, "SHORT"):
+                watch_flags.append("triangle_late_exception")
+            decision_path += "->watch_late_entry_distance"
+        elif score >= 68.0 and bucket in (ENTRY_DISTANCE_IMMEDIATE, ENTRY_DISTANCE_EARLY) and risk_quality != RISK_WIDE:
+            status = STATUS_CANDIDATE
+            reason = "Continuation v1 bearish early continuation research candidate"
+            reject_reason = None
+            decision_path += "->candidate_continuation_v1"
+        elif score >= 45.0:
+            status = STATUS_WATCH
+            reason = "Continuation v1 short exists but quality is not yet strong enough"
+            reject_reason = None
+            watch_flags.append("continuation_quality_not_strong_enough")
+            decision_path += "->watch_quality_not_strong_enough"
+        else:
+            status = STATUS_REJECT
+            reason = "Continuation v1 short quality is insufficient"
+            reject_reason = "continuation_quality_too_low"
+            reject_flags.append("continuation_quality_too_low")
+            decision_path += "->reject_quality_too_low"
+        return _base_result(
+            symbol=symbol, side="SHORT", status=status, reason=reason, reject_reason=reject_reason,
+            breakout_context=breakout_context, zone_low=ideal_entry, zone_high=breakout_level,
+            ideal_entry=ideal_entry, invalidation=invalidation, risk=risk, tp1=tp1, tp2=tp2,
+            rr1=rr1, rr2=rr2, risk_quality=risk_quality, reward_quality=reward_quality,
+            quality_score=score, quality_grade=grade, decision_version=CONTINUATION_EXECUTION_V1_VERSION,
+            decision_path=decision_path, watch_flags="|".join(watch_flags), reject_flags="|".join(reject_flags),
+            invalidation_distance_boxes=risk / box if box > 0 else None,
+            breakout_context_rank=_breakout_context_rank(breakout_context, "SHORT"),
+            extension_risk_score=penalty, is_baseline_profile_match=0, **diag
+        )
+
     if current_kind != "O":
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
-            reason="Short reversal branch requires O column after failure", reject_reason="wrong_current_column_kind", breakout_context=breakout_context)
+            reason="Short reversal branch requires O column after failure", reject_reason="wrong_current_column_kind", breakout_context=breakout_context, **preliminary_diag)
     if slope not in ("BEARISH_PULLBACK", "BEARISH"):
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
-            reason="Short reversal branch requires bearish downslope after failure", reject_reason="wrong_immediate_slope", breakout_context=breakout_context)
+            reason="Short reversal branch requires bearish downslope after failure", reject_reason="wrong_immediate_slope", breakout_context=breakout_context, **preliminary_diag)
 
     bullish_failure_context = (
         trend == "BULLISH"
@@ -810,12 +1367,11 @@ def evaluate_pullback_retest_short(
     )
     if not bullish_failure_context:
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_WATCH,
-            reason="Short reversal candidate exists but no clear bullish failure context yet", reject_reason=None, breakout_context=breakout_context)
+            reason="Short reversal candidate exists but no clear bullish failure context yet", reject_reason=None, breakout_context=breakout_context, **preliminary_diag)
 
     if current_top is None:
         current_top = _col_top(current)
 
-    current_bottom = _col_bottom(current)
     zone_high = current_top
     zone_low = max(support, current_bottom)
     if zone_low > zone_high:
@@ -826,9 +1382,13 @@ def evaluate_pullback_retest_short(
     risk = invalidation - ideal_entry
 
     if risk <= 0:
+        rebound_diag = _compute_continuation_diagnostics(
+            side="SHORT", profile=profile, structure_state=structure_state,
+            entry_price=ideal_entry, breakout_level=support,
+        )
         return _base_result(symbol=symbol, side="SHORT", status=STATUS_REJECT,
             reason="Non-positive risk distance", reject_reason="non_positive_risk", breakout_context=breakout_context,
-            zone_low=zone_low, zone_high=zone_high, ideal_entry=ideal_entry, invalidation=invalidation)
+            zone_low=zone_low, zone_high=zone_high, ideal_entry=ideal_entry, invalidation=invalidation, **rebound_diag)
 
     tp1 = ideal_entry - 2.0 * risk
     tp2 = ideal_entry - 3.0 * risk
@@ -936,6 +1496,17 @@ def evaluate_pullback_retest_short(
         reject_flags.append("quality_too_low")
         decision_path += "->reject_quality_too_low"
 
+    rebound_diag = _compute_continuation_diagnostics(
+        side="SHORT",
+        profile=profile,
+        structure_state=structure_state,
+        entry_price=ideal_entry,
+        breakout_level=support,
+        pullback_quality=rebound_quality,
+        risk_quality=risk_quality,
+        reward_quality=reward_quality,
+    )
+
     return _base_result(
         symbol=symbol, side="SHORT", status=status, reason=reason, reject_reason=reject_reason,
         breakout_context=breakout_context, zone_low=zone_low, zone_high=zone_high,
@@ -960,4 +1531,5 @@ def evaluate_pullback_retest_short(
         early_trend_diag_context_bias=early_trend_diag["early_trend_diag_context_bias"],
         early_trend_diag_regime_bias=early_trend_diag["early_trend_diag_regime_bias"],
         early_trend_diag_score=early_trend_diag["early_trend_diag_score"],
+        **rebound_diag,
     )
