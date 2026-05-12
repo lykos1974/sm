@@ -46,6 +46,14 @@ OPTIONAL_DIAGNOSTIC_SETUP_FIELDS = {
     "breakout_context_rank",
     "extension_risk_score",
     "is_baseline_profile_match",
+    "entry_distance_boxes",
+    "entry_distance_bucket",
+    "breakout_level",
+    "continuation_quality_score",
+    "extension_penalty",
+    "continuation_execution_class",
+    "pattern_family",
+    "distance_policy_action",
 }
 DEFAULT_FUNNEL_CSV_PATH = "exports/strategy_funnel_diagnostics.csv"
 DEFAULT_PERF_JSON_PATH = "exports/strategy_perf_summary.json"
@@ -90,6 +98,14 @@ FUNNEL_FIELD_ORDER = [
     "breakout_context_rank",
     "extension_risk_score",
     "is_baseline_profile_match",
+    "entry_distance_boxes",
+    "entry_distance_bucket",
+    "breakout_level",
+    "continuation_quality_score",
+    "extension_penalty",
+    "continuation_execution_class",
+    "pattern_family",
+    "distance_policy_action",
     "shadow_v4_version",
     "shadow_v4_status",
     "shadow_v4_reason",
@@ -644,6 +660,14 @@ def build_funnel_row(
         "breakout_context_rank": setup.get("breakout_context_rank"),
         "extension_risk_score": setup.get("extension_risk_score"),
         "is_baseline_profile_match": setup.get("is_baseline_profile_match"),
+        "entry_distance_boxes": setup.get("entry_distance_boxes"),
+        "entry_distance_bucket": setup.get("entry_distance_bucket"),
+        "breakout_level": setup.get("breakout_level"),
+        "continuation_quality_score": setup.get("continuation_quality_score"),
+        "extension_penalty": setup.get("extension_penalty"),
+        "continuation_execution_class": setup.get("continuation_execution_class"),
+        "pattern_family": setup.get("pattern_family"),
+        "distance_policy_action": setup.get("distance_policy_action"),
         "shadow_v4_version": setup.get("shadow_v4_version", setup.get("decision_version")),
         "shadow_v4_status": shadow_v4_status,
         "shadow_v4_reason": setup.get("shadow_v4_reason", setup.get("reason")),
@@ -780,6 +804,11 @@ def main() -> None:
         help="Optional parquet output path for funnel diagnostics (requires pandas or pyarrow)",
     )
     parser.add_argument(
+        "--continuation-execution-v1",
+        action="store_true",
+        help="Research/backtest only: enable Continuation Execution v1 candidates; default keeps baseline behavior",
+    )
+    parser.add_argument(
         "--incremental-shadow-structure",
         action="store_true",
         help="Run incremental structure shadow comparison without changing strategy behavior",
@@ -820,8 +849,12 @@ def main() -> None:
     )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)
+    if args.continuation_execution_v1:
+        for profile in profiles.values():
+            setattr(profile, "continuation_execution_v1_enabled", True)
 
     print(f"BE MODE: {BE_MODE} | BE_TRIGGER_R: {BE_TRIGGER_R}")
+    print(f"Continuation Execution v1 research mode: {bool(args.continuation_execution_v1)}")
 
     funnel_rows: List[Dict[str, Any]] = []
     run_perf: Dict[str, Any] = {
@@ -847,6 +880,7 @@ def main() -> None:
                 "incremental_fast" if use_incremental_fast else ("incremental" if use_incremental_authoritative else "legacy")
             ),
             "allow_multiple_trades_per_symbol": allow_multiple_trades_per_symbol,
+            "continuation_execution_v1_enabled": bool(args.continuation_execution_v1),
         },
     }
     if use_incremental_shadow:
