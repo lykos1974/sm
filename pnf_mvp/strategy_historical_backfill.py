@@ -46,6 +46,14 @@ OPTIONAL_DIAGNOSTIC_SETUP_FIELDS = {
     "breakout_context_rank",
     "extension_risk_score",
     "is_baseline_profile_match",
+    "entry_distance_boxes",
+    "entry_distance_bucket",
+    "breakout_level",
+    "continuation_quality_score",
+    "extension_penalty",
+    "continuation_execution_class",
+    "pattern_family",
+    "distance_policy_action",
 }
 DEFAULT_FUNNEL_CSV_PATH = "exports/strategy_funnel_diagnostics.csv"
 DEFAULT_PERF_JSON_PATH = "exports/strategy_perf_summary.json"
@@ -90,6 +98,14 @@ FUNNEL_FIELD_ORDER = [
     "breakout_context_rank",
     "extension_risk_score",
     "is_baseline_profile_match",
+    "entry_distance_boxes",
+    "entry_distance_bucket",
+    "breakout_level",
+    "continuation_quality_score",
+    "extension_penalty",
+    "continuation_execution_class",
+    "pattern_family",
+    "distance_policy_action",
     "shadow_v4_version",
     "shadow_v4_status",
     "shadow_v4_reason",
@@ -644,6 +660,14 @@ def build_funnel_row(
         "breakout_context_rank": setup.get("breakout_context_rank"),
         "extension_risk_score": setup.get("extension_risk_score"),
         "is_baseline_profile_match": setup.get("is_baseline_profile_match"),
+        "entry_distance_boxes": setup.get("entry_distance_boxes"),
+        "entry_distance_bucket": setup.get("entry_distance_bucket"),
+        "breakout_level": setup.get("breakout_level"),
+        "continuation_quality_score": setup.get("continuation_quality_score"),
+        "extension_penalty": setup.get("extension_penalty"),
+        "continuation_execution_class": setup.get("continuation_execution_class"),
+        "pattern_family": setup.get("pattern_family"),
+        "distance_policy_action": setup.get("distance_policy_action"),
         "shadow_v4_version": setup.get("shadow_v4_version", setup.get("decision_version")),
         "shadow_v4_status": shadow_v4_status,
         "shadow_v4_reason": setup.get("shadow_v4_reason", setup.get("reason")),
@@ -755,7 +779,7 @@ def main() -> None:
     parser.add_argument("--reset-validation-db", action="store_true")
     parser.add_argument(
         "--funnel-csv",
-        default=DEFAULT_FUNNEL_CSV_PATH,
+        default=None,
         help="CSV path for evaluated-setup funnel diagnostics export",
     )
     parser.add_argument(
@@ -780,6 +804,11 @@ def main() -> None:
         help="Optional parquet output path for funnel diagnostics (requires pandas or pyarrow)",
     )
     parser.add_argument(
+        "--continuation-execution-v1",
+        action="store_true",
+        help="Research/backtest only: enable Continuation Execution v1 candidates; default keeps baseline behavior",
+    )
+    parser.add_argument(
         "--incremental-shadow-structure",
         action="store_true",
         help="Run incremental structure shadow comparison without changing strategy behavior",
@@ -800,6 +829,7 @@ def main() -> None:
             "--use-incremental-structure and --use-incremental-structure-fast are mutually exclusive; choose one mode"
         )
     use_incremental_fast = bool(args.use_incremental_structure_fast)
+    funnel_enabled = bool(args.funnel_csv or args.funnel_parquet)
     use_incremental_authoritative = bool(args.use_incremental_structure)
     use_incremental_shadow = bool(args.incremental_shadow_structure or use_incremental_authoritative)
     if use_incremental_fast:
@@ -820,8 +850,12 @@ def main() -> None:
     )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)
+    if args.continuation_execution_v1:
+        for profile in profiles.values():
+            setattr(profile, "continuation_execution_v1_enabled", True)
 
     print(f"BE MODE: {BE_MODE} | BE_TRIGGER_R: {BE_TRIGGER_R}")
+    print(f"Continuation Execution v1 research mode: {bool(args.continuation_execution_v1)}")
 
     funnel_rows: List[Dict[str, Any]] = []
     run_perf: Dict[str, Any] = {
@@ -847,6 +881,7 @@ def main() -> None:
                 "incremental_fast" if use_incremental_fast else ("incremental" if use_incremental_authoritative else "legacy")
             ),
             "allow_multiple_trades_per_symbol": allow_multiple_trades_per_symbol,
+            "continuation_execution_v1_enabled": bool(args.continuation_execution_v1),
         },
     }
     if use_incremental_shadow:
@@ -1132,39 +1167,40 @@ def main() -> None:
                         ):
                             blocked_by_open_trade = True
 
-                t_funnel_row = time.perf_counter()
-                funnel_row = build_funnel_row(
-                        symbol=symbol,
-                        reference_ts=close_ts,
-                        setup=setup,
-                        structure=structure,
-                        blocked_by_existing_open_trade=blocked_by_open_trade,
-                        blocked_by_watch_cap=blocked_by_watch_cap,
-                        registered_to_validation=registered_to_validation,
-                        columns=engine.columns,
-                        profile=profile,
-                    )
-                if str(setup.get("side") or "").upper() == "LONG" and str(structure.get("breakout_context") or "").upper() == "LATE_EXTENSION":
-                    current_col = engine.columns[-1] if engine.columns else None
-                    current_col_kind = str(getattr(current_col, "kind", "")).upper() if current_col is not None else ""
-                    current_col_idx = getattr(current_col, "idx", None) if current_col is not None else None
-                    if int(funnel_row.get("shadow_continuation_candidate") or 0) == 1 and current_col_kind == "O" and current_col_idx is not None:
-                        shadow_continuation_pending_candidate_id = f"{symbol}:{int(current_col_idx)}"
-                        funnel_row["shadow_continuation_candidate_id"] = shadow_continuation_pending_candidate_id
-                    if int(funnel_row.get("shadow_continuation_trigger") or 0) == 1:
-                        prev_o = engine.columns[-2] if len(engine.columns) >= 2 else None
-                        prev_o_idx = getattr(prev_o, "idx", None) if prev_o is not None else None
-                        expected_candidate_id = f"{symbol}:{int(prev_o_idx)}" if prev_o_idx is not None else None
-                        if shadow_continuation_pending_candidate_id is None or expected_candidate_id != shadow_continuation_pending_candidate_id:
-                            funnel_row["shadow_continuation_trigger"] = 0
-                            funnel_row["shadow_entry_price"] = None
-                            funnel_row["shadow_stop_price"] = None
-                        else:
+                if funnel_enabled:
+                    t_funnel_row = time.perf_counter()
+                    funnel_row = build_funnel_row(
+                            symbol=symbol,
+                            reference_ts=close_ts,
+                            setup=setup,
+                            structure=structure,
+                            blocked_by_existing_open_trade=blocked_by_open_trade,
+                            blocked_by_watch_cap=blocked_by_watch_cap,
+                            registered_to_validation=registered_to_validation,
+                            columns=engine.columns,
+                            profile=profile,
+                        )
+                    if str(setup.get("side") or "").upper() == "LONG" and str(structure.get("breakout_context") or "").upper() == "LATE_EXTENSION":
+                        current_col = engine.columns[-1] if engine.columns else None
+                        current_col_kind = str(getattr(current_col, "kind", "")).upper() if current_col is not None else ""
+                        current_col_idx = getattr(current_col, "idx", None) if current_col is not None else None
+                        if int(funnel_row.get("shadow_continuation_candidate") or 0) == 1 and current_col_kind == "O" and current_col_idx is not None:
+                            shadow_continuation_pending_candidate_id = f"{symbol}:{int(current_col_idx)}"
                             funnel_row["shadow_continuation_candidate_id"] = shadow_continuation_pending_candidate_id
-                            shadow_continuation_pending_candidate_id = None
-                if (not args.shadow_candidates_only_funnel) or _has_shadow_candidate_flag(funnel_row):
-                    funnel_rows.append(funnel_row)
-                symbol_perf["funnel_row_build_s"] += time.perf_counter() - t_funnel_row
+                        if int(funnel_row.get("shadow_continuation_trigger") or 0) == 1:
+                            prev_o = engine.columns[-2] if len(engine.columns) >= 2 else None
+                            prev_o_idx = getattr(prev_o, "idx", None) if prev_o is not None else None
+                            expected_candidate_id = f"{symbol}:{int(prev_o_idx)}" if prev_o_idx is not None else None
+                            if shadow_continuation_pending_candidate_id is None or expected_candidate_id != shadow_continuation_pending_candidate_id:
+                                funnel_row["shadow_continuation_trigger"] = 0
+                                funnel_row["shadow_entry_price"] = None
+                                funnel_row["shadow_stop_price"] = None
+                            else:
+                                funnel_row["shadow_continuation_candidate_id"] = shadow_continuation_pending_candidate_id
+                                shadow_continuation_pending_candidate_id = None
+                    if (not args.shadow_candidates_only_funnel) or _has_shadow_candidate_flag(funnel_row):
+                        funnel_rows.append(funnel_row)
+                    symbol_perf["funnel_row_build_s"] += time.perf_counter() - t_funnel_row
 
             if i % progress_every == 0:
                 perf_snapshot = validation_store.get_perf_snapshot()
@@ -1309,16 +1345,19 @@ def main() -> None:
             )
         )
 
-    t_funnel_csv_write = time.perf_counter()
-    csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
-    run_perf["totals"]["funnel_csv_write_s"] = time.perf_counter() - t_funnel_csv_write
+    csv_file: str | None = None
+    if args.funnel_csv:
+        t_funnel_csv_write = time.perf_counter()
+        csv_file = write_funnel_csv(funnel_rows, args.funnel_csv)
+        run_perf["totals"]["funnel_csv_write_s"] = time.perf_counter() - t_funnel_csv_write
     parquet_file: str | None = None
     if args.funnel_parquet:
         parquet_file = write_funnel_parquet(funnel_rows, args.funnel_parquet)
     counts = status_counts(funnel_rows)
 
     print(f"validation_rows={table_row_count(validation_db_path)}")
-    print(f"funnel_csv={csv_file}")
+    if csv_file is not None:
+        print(f"funnel_csv={csv_file}")
     if parquet_file is not None:
         print(f"funnel_parquet={parquet_file}")
     print(

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-SCHEMA_VERSION = "setup_dataset.v1"
+SCHEMA_VERSION = "setup_dataset.v2"
 
 # Stable export order for frozen setup datasets.
 EXPORT_COLUMNS: tuple[str, ...] = (
@@ -36,6 +36,15 @@ EXPORT_COLUMNS: tuple[str, ...] = (
     "tp2",
     "rr1",
     "rr2",
+    "entry_distance_boxes",
+    "entry_distance_bucket",
+    "breakout_level",
+    "continuation_quality_score",
+    "extension_penalty",
+    "continuation_execution_class",
+    "pattern_family",
+    "distance_policy_action",
+    "is_baseline_profile_match",
     "raw_setup_json",
     "raw_structure_json",
 )
@@ -74,5 +83,14 @@ class SetupDatasetRecord:
     tp2: float | None
     rr1: float | None
     rr2: float | None
+    entry_distance_boxes: float | None
+    entry_distance_bucket: str | None
+    breakout_level: float | None
+    continuation_quality_score: float | None
+    extension_penalty: float | None
+    continuation_execution_class: str | None
+    pattern_family: str | None
+    distance_policy_action: str | None
+    is_baseline_profile_match: int | None
     raw_setup_json: str | None
     raw_structure_json: str | None
