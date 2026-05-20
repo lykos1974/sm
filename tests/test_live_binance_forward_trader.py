@@ -176,6 +176,118 @@ class DemoInitClient:
 
 
 class BinanceForwardTraderTests(unittest.TestCase):
+    def test_research_rule_matching_eth_long_watch_setup_passes(self):
+        rule = {
+            "rule_id": "eth-long-cont-persist-v1",
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": {"min": 4, "max": 6},
+            "quality_score": {"min": 40, "max": 90},
+        }
+        setup = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": 5,
+            "quality_score": 70,
+        }
+        matched, reason = trader.evaluate_research_rule(setup, rule)
+        self.assertTrue(matched)
+        self.assertIsNone(reason)
+
+    def test_research_rule_rejects_btc_short_wrong_breakout_and_missing_field(self):
+        rule = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": {"min": 4, "max": 6},
+            "quality_score": {"min": 40, "max": 90},
+        }
+        bad_symbol = {"symbol": "BINANCE_FUT:BTCUSDT", "side": "LONG", "status": "WATCH", "breakout_context": "LATE_EXTENSION", "pullback_quality": "HEALTHY", "trend_regime": "BULLISH_REGIME", "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT", "entry_distance_bucket": "BELOW_BREAKOUT", "active_leg_boxes": 5, "quality_score": 70}
+        bad_side = {**bad_symbol, "symbol": "BINANCE_FUT:ETHUSDT", "side": "SHORT"}
+        bad_context = {**bad_symbol, "symbol": "BINANCE_FUT:ETHUSDT", "breakout_context": "POST_BREAKOUT_PULLBACK"}
+        missing_field = dict(bad_symbol)
+        missing_field.pop("trend_regime")
+        self.assertFalse(trader.evaluate_research_rule(bad_symbol, rule)[0])
+        self.assertFalse(trader.evaluate_research_rule(bad_side, rule)[0])
+        self.assertFalse(trader.evaluate_research_rule(bad_context, rule)[0])
+        matched, reason = trader.evaluate_research_rule(missing_field, rule)
+        self.assertFalse(matched)
+        self.assertIn("missing required setup field", str(reason))
+
+    def test_research_rule_json_refuses_without_demo_or_dry_run(self):
+        args = argparse.Namespace(
+            db_path="unused.sqlite3",
+            state_db_path="unused-state.sqlite3",
+            settings="unused-settings.json",
+            dry_run=False,
+            demo=False,
+            enable_demo_doubles=False,
+            notional_usdt="1",
+            demo_max_notional_usdt="1",
+            history_bars=5000,
+            self_test_signal=False,
+            verbose_market_logs=False,
+            reconcile_positions=False,
+            research_rule_json="/tmp/rule.json",
+        )
+        original_loader = trader.load_research_rule
+        original_client = trader.BinanceFuturesClient
+        try:
+            trader.load_research_rule = lambda _path: {"rule_id": "x"}
+            trader.BinanceFuturesClient = DemoInitClient
+            with self.assertRaisesRegex(RuntimeError, "requires --demo or --dry-run"):
+                trader.process_once(args)
+        finally:
+            trader.load_research_rule = original_loader
+            trader.BinanceFuturesClient = original_client
+
+    def test_research_rule_supports_integer_filters_for_active_leg_boxes(self):
+        rule = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "integer_filters": {"active_leg_boxes": {"allowed": [4, 5, 6]}},
+            "numeric_thresholds": {"quality_score": {"min": 40, "max": 90}},
+        }
+        setup_ok = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": 5,
+            "quality_score": 80,
+        }
+        setup_bad = dict(setup_ok)
+        setup_bad["active_leg_boxes"] = 7
+        self.assertTrue(trader.evaluate_research_rule(setup_ok, rule)[0])
+        self.assertFalse(trader.evaluate_research_rule(setup_bad, rule)[0])
+
 
     def test_runtime_symbol_uses_normalized_binance_symbol_for_candle_lookup(self):
         conn = sqlite3.connect(":memory:")
