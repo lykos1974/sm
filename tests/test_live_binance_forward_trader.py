@@ -304,7 +304,8 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(candles[-1].close, 50000.25)
         self.assertTrue(any('"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
         self.assertTrue(any('"normalized_symbol": "BTCUSDT"' in line for line in lines))
-        self.assertTrue(any('"query_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any('"primary_query_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
+        self.assertTrue(any('"fallback_query_symbol": "BTCUSDT"' in line for line in lines))
         self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line for line in lines))
 
     def test_process_once_logs_runtime_compare_with_normalized_db_candles(self):
@@ -342,9 +343,46 @@ class BinanceForwardTraderTests(unittest.TestCase):
             trader.detect_latest_strict_triangle = original_triangle
 
         lines = output.getvalue().splitlines()
-        self.assertTrue(any("CANDLE_QUERY" in line and '"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line and '"query_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any("CANDLE_QUERY" in line and '"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line and '"primary_query_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
         self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line and '"last_close": 50000.25' in line for line in lines))
         self.assertTrue(any("MARKET_RUNTIME_COMPARE" in line and "BINANCE_FUT:BTCUSDT" in line and '"latest_candle_close": 50000.25' in line for line in lines))
+
+    def test_load_candles_prefers_prefixed_runtime_symbol(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:ETHUSDT", "1m", 1, 101.0, 102.0, 100.0))
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("ETHUSDT", "1m", 1, 201.0, 202.0, 200.0))
+        conn.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:ETHUSDT", 10)
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].close, 101.0)
+        self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BINANCE_FUT:ETHUSDT"' in line and '"rows": 1' in line for line in output.getvalue().splitlines()))
+
+    def test_load_candles_falls_back_to_unprefixed_symbol(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("ETHUSDT", "1m", 1, 201.0, 202.0, 200.0))
+        conn.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:ETHUSDT", 10)
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].close, 201.0)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any("CANDLE_QUERY" in line and '"primary_query_symbol": "BINANCE_FUT:ETHUSDT"' in line and '"fallback_query_symbol": "ETHUSDT"' in line for line in lines))
+        self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "ETHUSDT"' in line and '"rows": 1' in line for line in lines))
+
+    def test_load_candles_no_rows_returns_empty_and_logs_rows_zero(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:ETHUSDT", 10)
+        self.assertEqual(candles, [])
+        self.assertTrue(any("CANDLE_RESULT" in line and '"rows": 0' in line for line in output.getvalue().splitlines()))
 
     def test_verbose_market_logs_emit_market_signal_and_order_details(self):
         original_client = trader.BinanceFuturesClient

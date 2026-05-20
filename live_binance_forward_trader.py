@@ -567,27 +567,29 @@ def binance_symbol(symbol: str) -> str:
     return symbol.split(":", 1)[-1].replace("/", "")
 
 
-def log_candle_query(runtime_symbol: str, query_symbol: str) -> None:
+def log_candle_query(runtime_symbol: str, primary_query_symbol: str, fallback_query_symbol: str | None = None) -> None:
     console(
         "CANDLE_QUERY",
         "",
         {
             "runtime_symbol": runtime_symbol,
             "normalized_symbol": binance_symbol(runtime_symbol),
-            "query_symbol": query_symbol,
+            "primary_query_symbol": primary_query_symbol,
+            "fallback_query_symbol": fallback_query_symbol,
             "table": "candles",
             "interval": "1m",
         },
     )
 
 
-def log_candle_result(symbol: str, candles: list[Candle]) -> None:
+def log_candle_result(symbol: str, candles: list[Candle], *, runtime_symbol: str | None = None) -> None:
     first_candle = candles[0] if candles else None
     last_candle = candles[-1] if candles else None
     console(
         "CANDLE_RESULT",
         "",
         {
+            "runtime_symbol": runtime_symbol,
             "symbol": symbol,
             "rows": len(candles),
             "first_close_time": first_candle.close_time if first_candle is not None else None,
@@ -633,8 +635,10 @@ def log_market_runtime_compare(symbol: str, profile: PnFProfile, candles: list[C
 
 
 def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Candle]:
-    query_symbol = binance_symbol(symbol)
-    log_candle_query(symbol, query_symbol)
+    primary_query_symbol = symbol
+    fallback_query_symbol = binance_symbol(symbol)
+    use_fallback = primary_query_symbol != fallback_query_symbol
+    log_candle_query(symbol, primary_query_symbol, fallback_query_symbol if use_fallback else None)
     rows = conn.execute(
         """
         SELECT close_time, close, high, low
@@ -643,10 +647,23 @@ def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Cand
         ORDER BY close_time DESC
         LIMIT ?
         """,
-        (query_symbol, limit),
+        (primary_query_symbol, limit),
     ).fetchall()
+    query_used = primary_query_symbol
+    if not rows and use_fallback:
+        rows = conn.execute(
+            """
+            SELECT close_time, close, high, low
+            FROM candles
+            WHERE symbol = ? AND interval = '1m'
+            ORDER BY close_time DESC
+            LIMIT ?
+            """,
+            (fallback_query_symbol, limit),
+        ).fetchall()
+        query_used = fallback_query_symbol
     candles = [Candle(int(ts), float(close), float(high), float(low)) for ts, close, high, low in reversed(rows)]
-    log_candle_result(query_symbol, candles)
+    log_candle_result(query_used, candles, runtime_symbol=symbol)
     return candles
 
 
