@@ -224,6 +224,113 @@ def sqlite_readonly_uri(db_path: str | os.PathLike[str]) -> str:
     return Path(db_path).expanduser().absolute().as_uri() + "?mode=ro"
 
 
+RESEARCH_RULE_REQUIRED_FIELDS = (
+    "symbol",
+    "side",
+    "status",
+    "breakout_context",
+    "pullback_quality",
+    "trend_regime",
+    "continuation_execution_class",
+    "entry_distance_bucket",
+    "active_leg_boxes",
+    "quality_score",
+)
+
+
+def load_research_rule(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError("research rule JSON must be an object")
+    return payload
+
+
+def _rule_match_text(field: str, setup: dict[str, Any], rule: dict[str, Any]) -> str | None:
+    expected = rule.get(field)
+    if expected is None:
+        return None
+    actual = str(setup.get(field) or "").upper()
+    expected_upper = str(expected).upper()
+    if actual != expected_upper:
+        return f"{field} mismatch: actual={actual or 'MISSING'} expected={expected_upper}"
+    return None
+
+
+def _rule_match_range(field: str, setup: dict[str, Any], rule: dict[str, Any]) -> str | None:
+    if field not in rule:
+        return None
+    bounds = rule.get(field)
+    if not isinstance(bounds, dict):
+        return f"{field} rule range invalid"
+    minimum = bounds.get("min")
+    maximum = bounds.get("max")
+    raw = setup.get(field)
+    if raw is None:
+        return f"{field} missing"
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        return f"{field} invalid: {raw}"
+    if minimum is not None and value < Decimal(str(minimum)):
+        return f"{field} below min: {value}<{minimum}"
+    if maximum is not None and value > Decimal(str(maximum)):
+        return f"{field} above max: {value}>{maximum}"
+    return None
+
+
+def _normalize_range_rule(rule: dict[str, Any], field: str) -> dict[str, Any] | None:
+    direct = rule.get(field)
+    if isinstance(direct, dict):
+        return direct
+    numeric_thresholds = rule.get("numeric_thresholds")
+    if isinstance(numeric_thresholds, dict):
+        numeric_rule = numeric_thresholds.get(field)
+        if isinstance(numeric_rule, dict):
+            return numeric_rule
+    integer_filters = rule.get("integer_filters")
+    if isinstance(integer_filters, dict):
+        integer_rule = integer_filters.get(field)
+        if isinstance(integer_rule, dict):
+            if "allowed" in integer_rule:
+                allowed = integer_rule.get("allowed")
+                if isinstance(allowed, list) and allowed:
+                    try:
+                        allowed_dec = [Decimal(str(item)) for item in allowed]
+                    except (InvalidOperation, ValueError):
+                        return {"__invalid__": True}
+                    return {"min": min(allowed_dec), "max": max(allowed_dec), "allowed_exact": allowed_dec}
+            return integer_rule
+    return None
+
+
+def evaluate_research_rule(setup: dict[str, Any], rule: dict[str, Any]) -> tuple[bool, str | None]:
+    for field in RESEARCH_RULE_REQUIRED_FIELDS:
+        if setup.get(field) is None:
+            return False, f"missing required setup field: {field}"
+    for field in ("symbol", "side", "status", "breakout_context", "pullback_quality", "trend_regime", "continuation_execution_class", "entry_distance_bucket"):
+        reason = _rule_match_text(field, setup, rule)
+        if reason is not None:
+            return False, reason
+    for field in ("active_leg_boxes", "quality_score"):
+        normalized = _normalize_range_rule(rule, field)
+        if normalized is None:
+            continue
+        if normalized.get("__invalid__"):
+            return False, f"{field} rule range invalid"
+        reason = _rule_match_range(field, setup, {field: normalized})
+        if reason is not None:
+            return False, reason
+        allowed_exact = normalized.get("allowed_exact")
+        if isinstance(allowed_exact, list):
+            value = Decimal(str(setup.get(field)))
+            if value not in allowed_exact:
+                return False, f"{field} not in allowed list: {value}"
+    return True, None
+
+
 def connect_candle_db_readonly(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
     conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
     conn.execute("PRAGMA query_only = ON")
@@ -460,27 +567,29 @@ def binance_symbol(symbol: str) -> str:
     return symbol.split(":", 1)[-1].replace("/", "")
 
 
-def log_candle_query(runtime_symbol: str, query_symbol: str) -> None:
+def log_candle_query(runtime_symbol: str, primary_query_symbol: str, fallback_query_symbol: str | None = None) -> None:
     console(
         "CANDLE_QUERY",
         "",
         {
             "runtime_symbol": runtime_symbol,
             "normalized_symbol": binance_symbol(runtime_symbol),
-            "query_symbol": query_symbol,
+            "primary_query_symbol": primary_query_symbol,
+            "fallback_query_symbol": fallback_query_symbol,
             "table": "candles",
             "interval": "1m",
         },
     )
 
 
-def log_candle_result(symbol: str, candles: list[Candle]) -> None:
+def log_candle_result(symbol: str, candles: list[Candle], *, runtime_symbol: str | None = None) -> None:
     first_candle = candles[0] if candles else None
     last_candle = candles[-1] if candles else None
     console(
         "CANDLE_RESULT",
         "",
         {
+            "runtime_symbol": runtime_symbol,
             "symbol": symbol,
             "rows": len(candles),
             "first_close_time": first_candle.close_time if first_candle is not None else None,
@@ -526,8 +635,10 @@ def log_market_runtime_compare(symbol: str, profile: PnFProfile, candles: list[C
 
 
 def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Candle]:
-    query_symbol = binance_symbol(symbol)
-    log_candle_query(symbol, query_symbol)
+    primary_query_symbol = symbol
+    fallback_query_symbol = binance_symbol(symbol)
+    use_fallback = primary_query_symbol != fallback_query_symbol
+    log_candle_query(symbol, primary_query_symbol, fallback_query_symbol if use_fallback else None)
     rows = conn.execute(
         """
         SELECT close_time, close, high, low
@@ -536,10 +647,23 @@ def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Cand
         ORDER BY close_time DESC
         LIMIT ?
         """,
-        (query_symbol, limit),
+        (primary_query_symbol, limit),
     ).fetchall()
+    query_used = primary_query_symbol
+    if not rows and use_fallback:
+        rows = conn.execute(
+            """
+            SELECT close_time, close, high, low
+            FROM candles
+            WHERE symbol = ? AND interval = '1m'
+            ORDER BY close_time DESC
+            LIMIT ?
+            """,
+            (fallback_query_symbol, limit),
+        ).fetchall()
+        query_used = fallback_query_symbol
     candles = [Candle(int(ts), float(close), float(high), float(low)) for ts, close, high, low in reversed(rows)]
-    log_candle_result(query_symbol, candles)
+    log_candle_result(query_used, candles, runtime_symbol=symbol)
     return candles
 
 
@@ -1873,6 +1997,10 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
     notional_usdt = _dec(args.notional_usdt)
     demo_max_notional_usdt = _dec(getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)))
     state_db_path = resolve_state_db_path(args)
+    research_rule = load_research_rule(getattr(args, "research_rule_json", None))
+
+    if research_rule is not None and not (demo or args.dry_run):
+        raise RuntimeError("--research-rule-json requires --demo or --dry-run (forward testing only)")
 
     if bool(getattr(args, "reconcile_positions", False)):
         raise RuntimeError("--reconcile-positions must be handled by main() before process_once()")
@@ -1946,6 +2074,30 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 console("BLOCKED", f"{signal.symbol} {signal.pattern}", {"reason": block_reason})
                 continue
 
+            if research_rule is not None:
+                setup = dict(research_rule.get("setup", {}))
+                setup.setdefault("symbol", signal.symbol)
+                setup.setdefault("side", signal.side)
+                matched, reject_reason = evaluate_research_rule(setup, research_rule)
+                rule_payload = {
+                    "symbol": setup.get("symbol"),
+                    "side": setup.get("side"),
+                    "status": setup.get("status"),
+                    "breakout_context": setup.get("breakout_context"),
+                    "pullback_quality": setup.get("pullback_quality"),
+                    "trend_regime": setup.get("trend_regime"),
+                    "continuation_execution_class": setup.get("continuation_execution_class"),
+                    "entry_distance_bucket": setup.get("entry_distance_bucket"),
+                    "active_leg_boxes": setup.get("active_leg_boxes"),
+                    "quality_score": setup.get("quality_score"),
+                    "rule_id": research_rule.get("rule_id"),
+                    "rule_match": matched,
+                    "reject_reason": reject_reason,
+                }
+                console("RULE_MATCHED" if matched else "RULE_REJECTED", signal.symbol, rule_payload)
+                if not matched:
+                    continue
+
             if dry_run:
                 record_signal(
                     state_conn,
@@ -2013,6 +2165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test-signal", action="store_true", help="Inject one synthetic allowed dry-run signal through the guarded pipeline")
     parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
     parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
+    parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
     return parser.parse_args()
 
 

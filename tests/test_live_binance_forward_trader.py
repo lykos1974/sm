@@ -176,6 +176,118 @@ class DemoInitClient:
 
 
 class BinanceForwardTraderTests(unittest.TestCase):
+    def test_research_rule_matching_eth_long_watch_setup_passes(self):
+        rule = {
+            "rule_id": "eth-long-cont-persist-v1",
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": {"min": 4, "max": 6},
+            "quality_score": {"min": 40, "max": 90},
+        }
+        setup = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": 5,
+            "quality_score": 70,
+        }
+        matched, reason = trader.evaluate_research_rule(setup, rule)
+        self.assertTrue(matched)
+        self.assertIsNone(reason)
+
+    def test_research_rule_rejects_btc_short_wrong_breakout_and_missing_field(self):
+        rule = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": {"min": 4, "max": 6},
+            "quality_score": {"min": 40, "max": 90},
+        }
+        bad_symbol = {"symbol": "BINANCE_FUT:BTCUSDT", "side": "LONG", "status": "WATCH", "breakout_context": "LATE_EXTENSION", "pullback_quality": "HEALTHY", "trend_regime": "BULLISH_REGIME", "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT", "entry_distance_bucket": "BELOW_BREAKOUT", "active_leg_boxes": 5, "quality_score": 70}
+        bad_side = {**bad_symbol, "symbol": "BINANCE_FUT:ETHUSDT", "side": "SHORT"}
+        bad_context = {**bad_symbol, "symbol": "BINANCE_FUT:ETHUSDT", "breakout_context": "POST_BREAKOUT_PULLBACK"}
+        missing_field = dict(bad_symbol)
+        missing_field.pop("trend_regime")
+        self.assertFalse(trader.evaluate_research_rule(bad_symbol, rule)[0])
+        self.assertFalse(trader.evaluate_research_rule(bad_side, rule)[0])
+        self.assertFalse(trader.evaluate_research_rule(bad_context, rule)[0])
+        matched, reason = trader.evaluate_research_rule(missing_field, rule)
+        self.assertFalse(matched)
+        self.assertIn("missing required setup field", str(reason))
+
+    def test_research_rule_json_refuses_without_demo_or_dry_run(self):
+        args = argparse.Namespace(
+            db_path="unused.sqlite3",
+            state_db_path="unused-state.sqlite3",
+            settings="unused-settings.json",
+            dry_run=False,
+            demo=False,
+            enable_demo_doubles=False,
+            notional_usdt="1",
+            demo_max_notional_usdt="1",
+            history_bars=5000,
+            self_test_signal=False,
+            verbose_market_logs=False,
+            reconcile_positions=False,
+            research_rule_json="/tmp/rule.json",
+        )
+        original_loader = trader.load_research_rule
+        original_client = trader.BinanceFuturesClient
+        try:
+            trader.load_research_rule = lambda _path: {"rule_id": "x"}
+            trader.BinanceFuturesClient = DemoInitClient
+            with self.assertRaisesRegex(RuntimeError, "requires --demo or --dry-run"):
+                trader.process_once(args)
+        finally:
+            trader.load_research_rule = original_loader
+            trader.BinanceFuturesClient = original_client
+
+    def test_research_rule_supports_integer_filters_for_active_leg_boxes(self):
+        rule = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "integer_filters": {"active_leg_boxes": {"allowed": [4, 5, 6]}},
+            "numeric_thresholds": {"quality_score": {"min": 40, "max": 90}},
+        }
+        setup_ok = {
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "WATCH",
+            "breakout_context": "LATE_EXTENSION",
+            "pullback_quality": "HEALTHY",
+            "trend_regime": "BULLISH_REGIME",
+            "continuation_execution_class": "CONTINUATION_EXTENDED_REJECT",
+            "entry_distance_bucket": "BELOW_BREAKOUT",
+            "active_leg_boxes": 5,
+            "quality_score": 80,
+        }
+        setup_bad = dict(setup_ok)
+        setup_bad["active_leg_boxes"] = 7
+        self.assertTrue(trader.evaluate_research_rule(setup_ok, rule)[0])
+        self.assertFalse(trader.evaluate_research_rule(setup_bad, rule)[0])
+
 
     def test_runtime_symbol_uses_normalized_binance_symbol_for_candle_lookup(self):
         conn = sqlite3.connect(":memory:")
@@ -192,7 +304,8 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(candles[-1].close, 50000.25)
         self.assertTrue(any('"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
         self.assertTrue(any('"normalized_symbol": "BTCUSDT"' in line for line in lines))
-        self.assertTrue(any('"query_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any('"primary_query_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
+        self.assertTrue(any('"fallback_query_symbol": "BTCUSDT"' in line for line in lines))
         self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line for line in lines))
 
     def test_process_once_logs_runtime_compare_with_normalized_db_candles(self):
@@ -230,9 +343,46 @@ class BinanceForwardTraderTests(unittest.TestCase):
             trader.detect_latest_strict_triangle = original_triangle
 
         lines = output.getvalue().splitlines()
-        self.assertTrue(any("CANDLE_QUERY" in line and '"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line and '"query_symbol": "BTCUSDT"' in line for line in lines))
+        self.assertTrue(any("CANDLE_QUERY" in line and '"runtime_symbol": "BINANCE_FUT:BTCUSDT"' in line and '"primary_query_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
         self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line and '"last_close": 50000.25' in line for line in lines))
         self.assertTrue(any("MARKET_RUNTIME_COMPARE" in line and "BINANCE_FUT:BTCUSDT" in line and '"latest_candle_close": 50000.25' in line for line in lines))
+
+    def test_load_candles_prefers_prefixed_runtime_symbol(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:ETHUSDT", "1m", 1, 101.0, 102.0, 100.0))
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("ETHUSDT", "1m", 1, 201.0, 202.0, 200.0))
+        conn.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:ETHUSDT", 10)
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].close, 101.0)
+        self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BINANCE_FUT:ETHUSDT"' in line and '"rows": 1' in line for line in output.getvalue().splitlines()))
+
+    def test_load_candles_falls_back_to_unprefixed_symbol(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("ETHUSDT", "1m", 1, 201.0, 202.0, 200.0))
+        conn.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:ETHUSDT", 10)
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].close, 201.0)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any("CANDLE_QUERY" in line and '"primary_query_symbol": "BINANCE_FUT:ETHUSDT"' in line and '"fallback_query_symbol": "ETHUSDT"' in line for line in lines))
+        self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "ETHUSDT"' in line and '"rows": 1' in line for line in lines))
+
+    def test_load_candles_no_rows_returns_empty_and_logs_rows_zero(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+        conn.commit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            candles = trader.load_candles(conn, "BINANCE_FUT:ETHUSDT", 10)
+        self.assertEqual(candles, [])
+        self.assertTrue(any("CANDLE_RESULT" in line and '"rows": 0' in line for line in output.getvalue().splitlines()))
 
     def test_verbose_market_logs_emit_market_signal_and_order_details(self):
         original_client = trader.BinanceFuturesClient
