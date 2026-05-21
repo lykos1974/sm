@@ -56,6 +56,7 @@ class ValidateFailureFiltersTests(unittest.TestCase):
         self.assertEqual(selected[1]["stopped_lift"], "0.3")
 
     def test_exclusion_and_metrics_with_5plus_bucket_and_normalization(self) -> None:
+    def test_exclusion_and_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             recurring = base / "recurring_rows.csv"
@@ -111,6 +112,26 @@ class ValidateFailureFiltersTests(unittest.TestCase):
             self.assertEqual(out["excluded_rows"], 0)
             summary = Path(out["failure_filter_summary_md"]).read_text(encoding="utf-8")
             self.assertIn("CRITICAL matching warning", summary)
+                top_n_failure_clusters=1,
+                min_cluster_size=2,
+            )
+            self.assertEqual(out["selected_failure_clusters"], 1)
+            self.assertEqual(out["excluded_rows"], 3)
+            self.assertEqual(out["retained_rows"], 3)
+
+            with Path(out["excluded_rows_csv"]).open("r", encoding="utf-8") as handle:
+                excluded = list(csv.DictReader(handle))
+            self.assertEqual({r["row_identity"] for r in excluded}, {"1", "2", "3"})
+
+            with Path(out["filter_effects_csv"]).open("r", encoding="utf-8") as handle:
+                effects = {r["metric"]: r for r in csv.DictReader(handle)}
+            self.assertAlmostEqual(float(effects["tp2_ratio"]["before"]), 0.5)
+            self.assertAlmostEqual(float(effects["tp2_ratio"]["after"]), 2 / 3)
+            self.assertEqual(int(float(effects["tp2_count_removed"]["after"])), 1)
+
+            summary = Path(out["failure_filter_summary_md"]).read_text(encoding="utf-8")
+            self.assertIn("Do failure filters improve continuation quality?", summary)
+            self.assertIn("LONG vs SHORT effect", summary)
 
 
 if __name__ == "__main__":

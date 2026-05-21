@@ -79,6 +79,8 @@ def _normalized_geometry(row: dict[str, Any]) -> dict[str, str]:
 def _build_cluster_key(row: dict[str, Any]) -> tuple[str, ...]:
     normalized = _normalized_geometry(row)
     return tuple(normalized[f] for f in CLUSTER_FIELDS)
+def _build_cluster_key(row: dict[str, Any]) -> tuple[str, ...]:
+    return tuple((row.get(field, "") or "").strip() for field in CLUSTER_FIELDS)
 
 
 def _select_failure_clusters(rows: list[dict[str, Any]], *, top_n: int, min_cluster_size: int) -> list[dict[str, Any]]:
@@ -147,9 +149,24 @@ def validate_failure_filters(*, recurring_rows_csv: str, failure_clusters_csv: s
     after = _metric_block(retained_rows)
 
     filter_effects = [
-        {"metric": "tp2_ratio", "before": before["tp2_ratio"], "after": after["tp2_ratio"], "delta": after["tp2_ratio"] - before["tp2_ratio"]},
-        {"metric": "stopped_ratio", "before": before["stopped_ratio"], "after": after["stopped_ratio"], "delta": after["stopped_ratio"] - before["stopped_ratio"]},
-        {"metric": "mean_realized_r_multiple", "before": before["mean_realized_r_multiple"], "after": after["mean_realized_r_multiple"], "delta": after["mean_realized_r_multiple"] - before["mean_realized_r_multiple"]},
+        {
+            "metric": "tp2_ratio",
+            "before": before["tp2_ratio"],
+            "after": after["tp2_ratio"],
+            "delta": after["tp2_ratio"] - before["tp2_ratio"],
+        },
+        {
+            "metric": "stopped_ratio",
+            "before": before["stopped_ratio"],
+            "after": after["stopped_ratio"],
+            "delta": after["stopped_ratio"] - before["stopped_ratio"],
+        },
+        {
+            "metric": "mean_realized_r_multiple",
+            "before": before["mean_realized_r_multiple"],
+            "after": after["mean_realized_r_multiple"],
+            "delta": after["mean_realized_r_multiple"] - before["mean_realized_r_multiple"],
+        },
         {"metric": "rows", "before": before["rows"], "after": after["rows"], "delta": after["rows"] - before["rows"]},
         {"metric": "tp2_count_retained", "before": before["tp2_count"], "after": after["tp2_count"], "delta": after["tp2_count"] - before["tp2_count"]},
         {"metric": "tp2_count_removed", "before": 0, "after": before["tp2_count"] - after["tp2_count"], "delta": before["tp2_count"] - after["tp2_count"]},
