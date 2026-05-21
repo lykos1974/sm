@@ -32,11 +32,53 @@ def _norm(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+def _norm_intish(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(int(float(raw)))
+    except (TypeError, ValueError):
+        return raw
+
+
 def _load_rows(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
 
 
+def _recurring_bucket_from_count(value: Any) -> str:
+    c = int(_safe_float(value, default=0.0))
+    if c <= 1:
+        return "1"
+    if c == 2:
+        return "2"
+    if c == 3:
+        return "3"
+    if c == 4:
+        return "4"
+    return "5+"
+
+
+def _normalized_geometry(row: dict[str, Any]) -> dict[str, str]:
+    recurring_bucket = (row.get("recurring_count_bucket") or "").strip()
+    if not recurring_bucket:
+        recurring_bucket = _recurring_bucket_from_count(row.get("recurring_match_count", "0"))
+
+    return {
+        "active_leg_boxes": _norm_intish(row.get("active_leg_boxes")),
+        "entry_distance_bucket": _norm(row.get("entry_distance_bucket")),
+        "recurring_count_bucket": _norm(recurring_bucket),
+        "pullback_quality": _norm(row.get("pullback_quality")),
+        "trend_regime": _norm(row.get("trend_regime")),
+        "side": _norm(row.get("side")),
+        "symbol": _norm(row.get("symbol")),
+    }
+
+
+def _build_cluster_key(row: dict[str, Any]) -> tuple[str, ...]:
+    normalized = _normalized_geometry(row)
+    return tuple(normalized[f] for f in CLUSTER_FIELDS)
 def _build_cluster_key(row: dict[str, Any]) -> tuple[str, ...]:
     return tuple((row.get(field, "") or "").strip() for field in CLUSTER_FIELDS)
 
@@ -85,6 +127,9 @@ def validate_failure_filters(*, recurring_rows_csv: str, failure_clusters_csv: s
     failure_clusters = _load_rows(Path(failure_clusters_csv).resolve())
     out_dir = Path(output_root).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    recurring_columns = sorted(recurring_rows[0].keys()) if recurring_rows else []
+    failure_columns = sorted(failure_clusters[0].keys()) if failure_clusters else []
 
     population = [r for r in recurring_rows if _norm(r.get("resolution_status")) in INCLUDED_RESOLUTIONS]
     if not population:
@@ -147,6 +192,10 @@ def validate_failure_filters(*, recurring_rows_csv: str, failure_clusters_csv: s
         top_symbol, top_count = excluded_symbol_counts.most_common(1)[0]
         if (top_count / len(excluded_rows)) > 0.7:
             warnings.append(f"symbol concentration warning: excluded set is {top_count/len(excluded_rows):.1%} {top_symbol}.")
+    if selected_clusters and not excluded_rows:
+        warnings.append(
+            "CRITICAL matching warning: selected failure clusters excluded zero rows; verify schema/value compatibility."
+        )
 
     summary_lines = [
         "# Failure Filter Validation Summary",
@@ -154,6 +203,8 @@ def validate_failure_filters(*, recurring_rows_csv: str, failure_clusters_csv: s
         f"Input TP2/STOPPED population: {len(population)} rows",
         f"Selected failure clusters: {len(selected_clusters)} (top_n={top_n_failure_clusters}, min_cluster_size={min_cluster_size})",
         f"Excluded rows: {len(excluded_rows)} ({removed_share:.1%})",
+        f"Recurring rows columns: {', '.join(recurring_columns) if recurring_columns else 'none'}",
+        f"Failure clusters columns: {', '.join(failure_columns) if failure_columns else 'none'}",
         "",
         "## BEFORE vs AFTER",
         f"- TP2 ratio: {before['tp2_ratio']:.4f} -> {after['tp2_ratio']:.4f}",
