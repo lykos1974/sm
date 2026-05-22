@@ -77,7 +77,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
     }
 
 
-def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str, output_root: str, forward_structural_window: int = 20, cost_r_deduction: float = 0.0, min_oos_sample: int = 20, train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20) -> dict[str, str]:
+def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str, output_root: str, forward_structural_window: int = 20, cost_r_deduction: float = 0.0, min_oos_sample: int = 20, train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20, seed_pullback_quality: str = "DEEP", seed_breakout_context: str = "LATE_EXTENSION", allow_any_breakout_context: bool = False) -> dict[str, str]:
     rows = _load_rows(Path(labeled_dataset_path).resolve())
     _, _, identities = _select_identity_method(rows)
     row_identity_map = {id(row): row_id for row, row_id in zip(rows, identities)}
@@ -97,7 +97,9 @@ def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str
         for idx, row in enumerate(symbol_rows):
             if _norm(row.get("side")) != "LONG" or _norm(row.get("resolution_status")) != "STOPPED":
                 continue
-            if _norm(row.get("pullback_quality")) != "DEEP" or _norm(row.get("breakout_context")) != "LATE_EXTENSION":
+            if _norm(row.get("pullback_quality")) != _norm(seed_pullback_quality):
+                continue
+            if not allow_any_breakout_context and _norm(row.get("breakout_context")) != _norm(seed_breakout_context):
                 continue
             if unresolved_active_trade:
                 overlap_skips += 1
@@ -169,7 +171,7 @@ def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str
     summary_lines = [
         "# Execution Realism Summary",
         "",
-        "Hypothesis evaluated: FAILED LONG + DEEP + LATE_EXTENSION -> first future same-symbol SHORT WATCH.",
+        f"Hypothesis evaluated: FAILED LONG + {_norm(seed_pullback_quality)} + {"ANY_BREAKOUT_CONTEXT" if allow_any_breakout_context else _norm(seed_breakout_context)} -> first future same-symbol SHORT WATCH.",
         "",
         f"- selected signals: {all_metrics['selected_signals']}",
         f"- resolved trades: {all_metrics['resolved_trades']}",
@@ -218,6 +220,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-fraction", type=float, default=0.60)
     p.add_argument("--validation-fraction", type=float, default=0.20)
     p.add_argument("--oos-fraction", type=float, default=0.20)
+    p.add_argument("--seed-pullback-quality", default="DEEP")
+    p.add_argument("--seed-breakout-context", default="LATE_EXTENSION")
+    p.add_argument("--allow-any-breakout-context", action="store_true")
     return p
 
 
@@ -232,4 +237,7 @@ if __name__ == "__main__":
         train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
         oos_fraction=args.oos_fraction,
+        seed_pullback_quality=args.seed_pullback_quality,
+        seed_breakout_context=args.seed_breakout_context,
+        allow_any_breakout_context=args.allow_any_breakout_context,
     )
