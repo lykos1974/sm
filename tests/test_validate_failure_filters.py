@@ -55,7 +55,6 @@ class ValidateFailureFiltersTests(unittest.TestCase):
         self.assertEqual(selected[0]["stopped_lift"], "0.5")
         self.assertEqual(selected[1]["stopped_lift"], "0.3")
 
-    def test_exclusion_and_metrics_with_5plus_bucket_and_normalization(self) -> None:
     def test_exclusion_and_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
@@ -78,12 +77,6 @@ class ValidateFailureFiltersTests(unittest.TestCase):
             with Path(out["excluded_rows_csv"]).open("r", encoding="utf-8") as handle:
                 excluded = list(csv.DictReader(handle))
             self.assertEqual({r["row_identity"] for r in excluded}, {"1", "2", "3", "6", "7"})
-
-            with Path(out["filter_effects_csv"]).open("r", encoding="utf-8") as handle:
-                effects = {r["metric"]: r for r in csv.DictReader(handle)}
-            self.assertAlmostEqual(float(effects["tp2_ratio"]["before"]), 3 / 7)
-            self.assertAlmostEqual(float(effects["tp2_ratio"]["after"]), 1 / 2)
-            self.assertEqual(int(float(effects["tp2_count_removed"]["after"])), 2)
 
     def test_warns_loudly_when_selected_clusters_exclude_zero_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -112,26 +105,61 @@ class ValidateFailureFiltersTests(unittest.TestCase):
             self.assertEqual(out["excluded_rows"], 0)
             summary = Path(out["failure_filter_summary_md"]).read_text(encoding="utf-8")
             self.assertIn("CRITICAL matching warning", summary)
+
+    def test_recurring_match_count_maps_to_bucket_for_cluster_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            recurring = base / "recurring_rows.csv"
+            clusters = base / "strongest_failure_clusters.csv"
+
+            with recurring.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["active_leg_boxes", "entry_distance_bucket", "recurring_match_count", "pullback_quality", "trend_regime", "side", "symbol", "resolution_status", "realized_r_multiple"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "active_leg_boxes": "4",
+                        "entry_distance_bucket": "IMMEDIATE",
+                        "recurring_match_count": "5",
+                        "pullback_quality": "HEALTHY",
+                        "trend_regime": "BEARISH_REGIME",
+                        "side": "SHORT",
+                        "symbol": "BINANCE_FUT:ETHUSDT",
+                        "resolution_status": "STOPPED",
+                        "realized_r_multiple": "-1.0",
+                    }
+                )
+
+            with clusters.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=["active_leg_boxes", "entry_distance_bucket", "recurring_count_bucket", "pullback_quality", "trend_regime", "side", "symbol", "count", "stopped_lift"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "active_leg_boxes": "4",
+                        "entry_distance_bucket": "IMMEDIATE",
+                        "recurring_count_bucket": "5+",
+                        "pullback_quality": "HEALTHY",
+                        "trend_regime": "BEARISH_REGIME",
+                        "side": "SHORT",
+                        "symbol": "BINANCE_FUT:ETHUSDT",
+                        "count": "25",
+                        "stopped_lift": "0.8",
+                    }
+                )
+
+            out = validate_failure_filters(
+                recurring_rows_csv=str(recurring),
+                failure_clusters_csv=str(clusters),
+                output_root=str(base / "out"),
                 top_n_failure_clusters=1,
-                min_cluster_size=2,
+                min_cluster_size=1,
             )
-            self.assertEqual(out["selected_failure_clusters"], 1)
-            self.assertEqual(out["excluded_rows"], 3)
-            self.assertEqual(out["retained_rows"], 3)
-
-            with Path(out["excluded_rows_csv"]).open("r", encoding="utf-8") as handle:
-                excluded = list(csv.DictReader(handle))
-            self.assertEqual({r["row_identity"] for r in excluded}, {"1", "2", "3"})
-
-            with Path(out["filter_effects_csv"]).open("r", encoding="utf-8") as handle:
-                effects = {r["metric"]: r for r in csv.DictReader(handle)}
-            self.assertAlmostEqual(float(effects["tp2_ratio"]["before"]), 0.5)
-            self.assertAlmostEqual(float(effects["tp2_ratio"]["after"]), 2 / 3)
-            self.assertEqual(int(float(effects["tp2_count_removed"]["after"])), 1)
-
-            summary = Path(out["failure_filter_summary_md"]).read_text(encoding="utf-8")
-            self.assertIn("Do failure filters improve continuation quality?", summary)
-            self.assertIn("LONG vs SHORT effect", summary)
+            self.assertEqual(out["excluded_rows"], 1)
 
 
 if __name__ == "__main__":

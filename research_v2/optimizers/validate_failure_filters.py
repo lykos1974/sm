@@ -79,8 +79,6 @@ def _normalized_geometry(row: dict[str, Any]) -> dict[str, str]:
 def _build_cluster_key(row: dict[str, Any]) -> tuple[str, ...]:
     normalized = _normalized_geometry(row)
     return tuple(normalized[f] for f in CLUSTER_FIELDS)
-def _build_cluster_key(row: dict[str, Any]) -> tuple[str, ...]:
-    return tuple((row.get(field, "") or "").strip() for field in CLUSTER_FIELDS)
 
 
 def _select_failure_clusters(rows: list[dict[str, Any]], *, top_n: int, min_cluster_size: int) -> list[dict[str, Any]]:
@@ -141,9 +139,11 @@ def validate_failure_filters(*, recurring_rows_csv: str, failure_clusters_csv: s
         min_cluster_size=min_cluster_size,
     )
     selected_keys = {_build_cluster_key(row) for row in selected_clusters}
+    population_keys = [_build_cluster_key(r) for r in population]
+    matched_keys = {key for key in population_keys if key in selected_keys}
 
-    excluded_rows = [r for r in population if _build_cluster_key(r) in selected_keys]
-    retained_rows = [r for r in population if _build_cluster_key(r) not in selected_keys]
+    excluded_rows = [r for r, key in zip(population, population_keys) if key in selected_keys]
+    retained_rows = [r for r, key in zip(population, population_keys) if key not in selected_keys]
 
     before = _metric_block(population)
     after = _metric_block(retained_rows)
@@ -205,6 +205,12 @@ def validate_failure_filters(*, recurring_rows_csv: str, failure_clusters_csv: s
         f"Excluded rows: {len(excluded_rows)} ({removed_share:.1%})",
         f"Recurring rows columns: {', '.join(recurring_columns) if recurring_columns else 'none'}",
         f"Failure clusters columns: {', '.join(failure_columns) if failure_columns else 'none'}",
+        f"Selected keys count: {len(selected_keys)}",
+        f"Matched keys count: {len(matched_keys)}",
+        "First 5 selected cluster normalized keys:",
+        *[f"- {key}" for key in list(sorted(selected_keys))[:5]],
+        "First 5 matched normalized keys:",
+        *[f"- {key}" for key in list(sorted(matched_keys))[:5]],
         "",
         "## BEFORE vs AFTER",
         f"- TP2 ratio: {before['tp2_ratio']:.4f} -> {after['tp2_ratio']:.4f}",
