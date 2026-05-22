@@ -168,10 +168,11 @@ def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str
 
     out_dir = Path(output_root).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    breakout_label = "ANY_BREAKOUT_CONTEXT" if allow_any_breakout_context else _norm(seed_breakout_context)
     summary_lines = [
         "# Execution Realism Summary",
         "",
-        f"Hypothesis evaluated: FAILED LONG + {_norm(seed_pullback_quality)} + {"ANY_BREAKOUT_CONTEXT" if allow_any_breakout_context else _norm(seed_breakout_context)} -> first future same-symbol SHORT WATCH.",
+        f"Hypothesis evaluated: FAILED LONG + {_norm(seed_pullback_quality)} + {breakout_label} -> first future same-symbol SHORT WATCH.",
         "",
         f"- selected signals: {all_metrics['selected_signals']}",
         f"- resolved trades: {all_metrics['resolved_trades']}",
