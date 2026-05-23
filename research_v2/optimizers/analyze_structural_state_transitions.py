@@ -37,7 +37,7 @@ def _split_rows(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     return {"train": ordered[:train_end], "validation": ordered[train_end:validation_end], "oos": ordered[validation_end:]}
 
 
-def _find_first_transition(symbol_rows: list[dict[str, Any]], seed_idx: int, forward_structural_window: int) -> tuple[dict[str, str], list[dict[str, str]]]:
+def _find_first_transition(symbol_rows: list[dict[str, Any]], seed_idx: int, forward_structural_window: int, *, exclude_same_timestamp_opposite: bool = False) -> tuple[dict[str, str], list[dict[str, str]]]:
     seed_row = symbol_rows[seed_idx]
     seed_side = _norm(seed_row.get("side"))
     opposite_side = "SHORT" if seed_side == "LONG" else "LONG"
@@ -59,12 +59,15 @@ def _find_first_transition(symbol_rows: list[dict[str, Any]], seed_idx: int, for
     max_idx = min(len(symbol_rows), seed_idx + forward_structural_window + 1)
     for idx in range(seed_idx + 1, max_idx):
         row = symbol_rows[idx]
+        candidate_ts = str(row.get("reference_ts") or "")
         side = _norm(row.get("side"))
         status = _norm(row.get("status"))
         resolution = _norm(row.get("resolution_status"))
         distance = idx - seed_idx
 
         if side == opposite_side:
+            if exclude_same_timestamp_opposite and candidate_ts <= seed_ts:
+                continue
             if first_distance["opposite_watch"] is None and status == "WATCH":
                 first_distance["opposite_watch"] = distance
             if first_distance["opposite_candidate"] is None and status == "CANDIDATE":
@@ -130,7 +133,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     return metrics
 
 
-def analyze_structural_state_transitions(*, labeled_dataset_path: str, output_root: str, forward_structural_window: int = 20, seed_side: str = "LONG", seed_pullback_quality: str = "DEEP", seed_resolution_status: str = "STOPPED") -> dict[str, Any]:
+def analyze_structural_state_transitions(*, labeled_dataset_path: str, output_root: str, forward_structural_window: int = 20, seed_side: str = "LONG", seed_pullback_quality: str = "DEEP", seed_resolution_status: str = "STOPPED", exclude_same_timestamp_opposite: bool = False) -> dict[str, Any]:
     rows = _load_rows(Path(labeled_dataset_path).resolve())
     _, _, identities = _select_identity_method(rows)
     row_identity_map = {id(row): row_id for row, row_id in zip(rows, identities)}
@@ -151,7 +154,7 @@ def analyze_structural_state_transitions(*, labeled_dataset_path: str, output_ro
                 continue
             if _norm(row.get("pullback_quality")) != _norm(seed_pullback_quality):
                 continue
-            transition_data, warnings = _find_first_transition(symbol_rows, idx, forward_structural_window)
+            transition_data, warnings = _find_first_transition(symbol_rows, idx, forward_structural_window, exclude_same_timestamp_opposite=exclude_same_timestamp_opposite)
             seed_record = {
                 "seed_row_identity": row_identity_map[id(row)],
                 "seed_symbol": symbol,
@@ -277,6 +280,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-side", default="LONG")
     parser.add_argument("--seed-pullback-quality", default="DEEP")
     parser.add_argument("--seed-resolution-status", default="STOPPED")
+    parser.add_argument("--exclude-same-timestamp-opposite", action="store_true")
     return parser
 
 
@@ -289,4 +293,5 @@ if __name__ == "__main__":
         seed_side=args.seed_side,
         seed_pullback_quality=args.seed_pullback_quality,
         seed_resolution_status=args.seed_resolution_status,
+        exclude_same_timestamp_opposite=args.exclude_same_timestamp_opposite,
     )

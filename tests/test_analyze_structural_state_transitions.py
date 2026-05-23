@@ -89,3 +89,23 @@ def test_same_timestamp_warning_and_split_metrics_exist(tmp_path: Path) -> None:
     with (out / "structural_state_transition_split_metrics.csv").open("r", encoding="utf-8") as h:
         splits = [r["split"] for r in csv.DictReader(h)]
     assert set(splits) == {"train", "validation", "oos"}
+
+
+def test_exclude_same_timestamp_opposite_toggle(tmp_path: Path) -> None:
+    rows = [
+        {"row_id":"e0","symbol":"ETH","reference_ts":"2024-01-01T00:00:00Z","side":"LONG","status":"WATCH","resolution_status":"STOPPED","pullback_quality":"DEEP","strategy":"S"},
+        {"row_id":"e1","symbol":"ETH","reference_ts":"2024-01-01T00:00:00Z","side":"SHORT","status":"WATCH","resolution_status":"OPEN","pullback_quality":"X","strategy":"S"},
+        {"row_id":"e2","symbol":"ETH","reference_ts":"2024-01-01T00:00:10Z","side":"SHORT","status":"WATCH","resolution_status":"OPEN","pullback_quality":"X","strategy":"S"},
+    ]
+    data = tmp_path / "labeled.csv"
+    out_default = tmp_path / "out_default"
+    out_excluded = tmp_path / "out_excluded"
+    _write_csv(data, rows)
+
+    analyze_structural_state_transitions(labeled_dataset_path=str(data), output_root=str(out_default), forward_structural_window=5)
+    analyze_structural_state_transitions(labeled_dataset_path=str(data), output_root=str(out_excluded), forward_structural_window=5, exclude_same_timestamp_opposite=True)
+
+    default_seed = list(csv.DictReader((out_default / "structural_state_transition_rows.csv").open("r", encoding="utf-8")))[0]
+    excluded_seed = list(csv.DictReader((out_excluded / "structural_state_transition_rows.csv").open("r", encoding="utf-8")))[0]
+    assert default_seed["opposite_watch_distance"] == "1"
+    assert excluded_seed["opposite_watch_distance"] == "2"

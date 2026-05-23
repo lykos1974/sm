@@ -39,10 +39,13 @@ def _split_rows(rows: list[dict[str, Any]], train_fraction: float, validation_fr
     return {"train": ordered[:train_end], "validation": ordered[train_end:validation_end], "oos": ordered[validation_end:]}
 
 
-def _first_short_watch(symbol_rows: list[dict[str, Any]], seed_idx: int, forward_window_structural: int) -> tuple[int | None, dict[str, Any] | None]:
+def _first_short_watch(symbol_rows: list[dict[str, Any]], seed_idx: int, forward_window_structural: int, *, exclude_same_timestamp_opposite: bool = False) -> tuple[int | None, dict[str, Any] | None]:
+    seed_ts = str(symbol_rows[seed_idx].get("reference_ts") or "")
     max_idx = min(len(symbol_rows), seed_idx + forward_window_structural + 1)
     for idx in range(seed_idx + 1, max_idx):
         row = symbol_rows[idx]
+        if exclude_same_timestamp_opposite and str(row.get("reference_ts") or "") <= seed_ts:
+            continue
         if _norm(row.get("side")) == "SHORT" and _norm(row.get("status")) == "WATCH":
             return idx, row
     return None, None
@@ -77,7 +80,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | int]:
     }
 
 
-def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str, output_root: str, forward_structural_window: int = 20, cost_r_deduction: float = 0.0, min_oos_sample: int = 20, train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20, seed_pullback_quality: str = "DEEP", seed_breakout_context: str = "LATE_EXTENSION", allow_any_breakout_context: bool = False) -> dict[str, str]:
+def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str, output_root: str, forward_structural_window: int = 20, cost_r_deduction: float = 0.0, min_oos_sample: int = 20, train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20, seed_pullback_quality: str = "DEEP", seed_breakout_context: str = "LATE_EXTENSION", allow_any_breakout_context: bool = False, exclude_same_timestamp_opposite: bool = False) -> dict[str, str]:
     rows = _load_rows(Path(labeled_dataset_path).resolve())
     _, _, identities = _select_identity_method(rows)
     row_identity_map = {id(row): row_id for row, row_id in zip(rows, identities)}
@@ -108,7 +111,7 @@ def validate_execution_realism_surviving_hypothesis(*, labeled_dataset_path: str
                 overlap_skips += 1
                 continue
 
-            selected_idx, selected = _first_short_watch(symbol_rows, idx, forward_structural_window)
+            selected_idx, selected = _first_short_watch(symbol_rows, idx, forward_structural_window, exclude_same_timestamp_opposite=exclude_same_timestamp_opposite)
             if selected is None or selected_idx is None:
                 continue
 
@@ -224,6 +227,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed-pullback-quality", default="DEEP")
     p.add_argument("--seed-breakout-context", default="LATE_EXTENSION")
     p.add_argument("--allow-any-breakout-context", action="store_true")
+    p.add_argument("--exclude-same-timestamp-opposite", action="store_true")
     return p
 
 
@@ -241,4 +245,5 @@ if __name__ == "__main__":
         seed_pullback_quality=args.seed_pullback_quality,
         seed_breakout_context=args.seed_breakout_context,
         allow_any_breakout_context=args.allow_any_breakout_context,
+        exclude_same_timestamp_opposite=args.exclude_same_timestamp_opposite,
     )

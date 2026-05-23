@@ -150,3 +150,21 @@ def test_no_hindsight_selection_unchanged_with_relaxed_breakout_context(tmp_path
         trades = list(csv.DictReader(handle))
     assert len(trades) == 1
     assert trades[0]["selected_row_identity"] == "row_id:n2"
+
+
+def test_exclude_same_timestamp_opposite_for_execution_realism(tmp_path: Path) -> None:
+    rows = [
+        {"row_id":"x1","symbol":"ETH","reference_ts":"2024-01-01T00:00:00Z","side":"LONG","status":"CANDIDATE","resolution_status":"STOPPED","pullback_quality":"DEEP","breakout_context":"LATE_EXTENSION","realized_r_multiple":"-1"},
+        {"row_id":"x2","symbol":"ETH","reference_ts":"2024-01-01T00:00:00Z","side":"SHORT","status":"WATCH","resolution_status":"STOPPED","pullback_quality":"X","breakout_context":"Y","realized_r_multiple":"-0.5"},
+        {"row_id":"x3","symbol":"ETH","reference_ts":"2024-01-01T00:01:00Z","side":"SHORT","status":"WATCH","resolution_status":"TP2","pullback_quality":"X","breakout_context":"Y","realized_r_multiple":"2"},
+    ]
+    data = tmp_path / "labeled.csv"
+    out_default = tmp_path / "out_default"
+    out_excluded = tmp_path / "out_excluded"
+    _write_csv(data, rows)
+    validate_execution_realism_surviving_hypothesis(labeled_dataset_path=str(data), output_root=str(out_default), forward_structural_window=5)
+    validate_execution_realism_surviving_hypothesis(labeled_dataset_path=str(data), output_root=str(out_excluded), forward_structural_window=5, exclude_same_timestamp_opposite=True)
+    default_trade = list(csv.DictReader((out_default / "execution_realism_trades.csv").open("r", encoding="utf-8")))[0]
+    excluded_trade = list(csv.DictReader((out_excluded / "execution_realism_trades.csv").open("r", encoding="utf-8")))[0]
+    assert default_trade["selected_row_identity"] == "row_id:x2"
+    assert excluded_trade["selected_row_identity"] == "row_id:x3"

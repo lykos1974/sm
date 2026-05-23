@@ -42,10 +42,13 @@ def _split_rows(rows: list[dict[str, Any]], train_fraction: float, validation_fr
     return {"train": ordered[:train_end], "validation": ordered[train_end:validation_end], "oos": ordered[validation_end:]}
 
 
-def _find_first_opposite_watch(symbol_rows: list[dict[str, Any]], seed_idx: int, forward_window_structural: int) -> tuple[int | None, dict[str, Any] | None]:
+def _find_first_opposite_watch(symbol_rows: list[dict[str, Any]], seed_idx: int, forward_window_structural: int, *, exclude_same_timestamp_opposite: bool = False) -> tuple[int | None, dict[str, Any] | None]:
+    seed_ts = str(symbol_rows[seed_idx].get("reference_ts") or "")
     max_idx = min(len(symbol_rows), seed_idx + forward_window_structural + 1)
     for idx in range(seed_idx + 1, max_idx):
         row = symbol_rows[idx]
+        if exclude_same_timestamp_opposite and str(row.get("reference_ts") or "") <= seed_ts:
+            continue
         if _norm(row.get("side")) == "SHORT" and _norm(row.get("status")) == "WATCH":
             return idx, row
     return None, None
@@ -84,7 +87,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def analyze_watch_promotion_after_failed_continuation(*, labeled_dataset_path: str, output_root: str, forward_window_structural: int = 20, min_sample_size: int = 20, train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20) -> dict[str, str]:
+def analyze_watch_promotion_after_failed_continuation(*, labeled_dataset_path: str, output_root: str, forward_window_structural: int = 20, min_sample_size: int = 20, train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20, exclude_same_timestamp_opposite: bool = False) -> dict[str, str]:
     rows = _load_rows(Path(labeled_dataset_path).resolve())
     _, _, identities = _select_identity_method(rows)
     row_identity_map = {id(row): row_id for row, row_id in zip(rows, identities)}
@@ -119,7 +122,7 @@ def analyze_watch_promotion_after_failed_continuation(*, labeled_dataset_path: s
                 })
 
             if side == "LONG" and _norm(row.get("resolution_status")) == "STOPPED":
-                watch_idx, watch_row = _find_first_opposite_watch(symbol_rows, idx, forward_window_structural)
+                watch_idx, watch_row = _find_first_opposite_watch(symbol_rows, idx, forward_window_structural, exclude_same_timestamp_opposite=exclude_same_timestamp_opposite)
                 seed_payload = {
                     "seed_row_identity": row_identity_map[id(row)],
                     "seed_symbol": symbol,
@@ -255,6 +258,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train-fraction", type=float, default=0.60)
     p.add_argument("--validation-fraction", type=float, default=0.20)
     p.add_argument("--oos-fraction", type=float, default=0.20)
+    p.add_argument("--exclude-same-timestamp-opposite", action="store_true")
     return p
 
 
@@ -268,4 +272,5 @@ if __name__ == "__main__":
         train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
         oos_fraction=args.oos_fraction,
+        exclude_same_timestamp_opposite=args.exclude_same_timestamp_opposite,
     )
