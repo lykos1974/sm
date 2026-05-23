@@ -68,3 +68,21 @@ def test_no_cross_symbol_contamination(tmp_path: Path) -> None:
 
     result = audit_same_timestamp_opposite_states(labeled_dataset_path=str(data), output_root=str(out))
     assert result["opposite_groups"] == 0
+
+
+def test_symbol_summary_uses_full_binance_fut_symbols(tmp_path: Path) -> None:
+    rows = [
+        {"row_id":"1","symbol":"BINANCE_FUT:ETHUSDT","reference_ts":"2024-01-01T00:00:00Z","side":"LONG","status":"WATCH","resolution_status":"OPEN","pullback_quality":"DEEP","breakout_context":"CTX","continuation_execution_class":"A","strategy":"S"},
+        {"row_id":"2","symbol":"BINANCE_FUT:ETHUSDT","reference_ts":"2024-01-01T00:00:00Z","side":"SHORT","status":"WATCH","resolution_status":"OPEN","pullback_quality":"DEEP","breakout_context":"CTX","continuation_execution_class":"A","strategy":"S"},
+        {"row_id":"3","symbol":"BINANCE_FUT:BTCUSDT","reference_ts":"2024-01-01T01:00:00Z","side":"LONG","status":"WATCH","resolution_status":"OPEN","pullback_quality":"DEEP","breakout_context":"CTX","continuation_execution_class":"A","strategy":"S"},
+        {"row_id":"4","symbol":"BINANCE_FUT:BTCUSDT","reference_ts":"2024-01-01T01:00:00Z","side":"SHORT","status":"WATCH","resolution_status":"OPEN","pullback_quality":"DEEP","breakout_context":"CTX","continuation_execution_class":"A","strategy":"S"},
+        {"row_id":"5","symbol":"BINANCE_FUT:SOLUSDT","reference_ts":"2024-01-01T02:00:00Z","side":"LONG","status":"WATCH","resolution_status":"OPEN","pullback_quality":"DEEP","breakout_context":"CTX","continuation_execution_class":"A","strategy":"S"},
+    ]
+    data = tmp_path / "labeled.csv"
+    out = tmp_path / "out"
+    _write_csv(data, rows)
+    audit_same_timestamp_opposite_states(labeled_dataset_path=str(data), output_root=str(out))
+    summary = (out / "same_timestamp_opposite_state_summary.md").read_text(encoding="utf-8")
+    assert "BINANCE_FUT:ETHUSDT: groups=1" in summary
+    assert "BINANCE_FUT:BTCUSDT: groups=1" in summary
+    assert "BINANCE_FUT:SOLUSDT: groups=0" in summary

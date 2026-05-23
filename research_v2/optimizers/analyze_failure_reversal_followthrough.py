@@ -57,12 +57,15 @@ def _split_rows(rows: list[dict[str, Any]], train_fraction: float, validation_fr
     }
 
 
-def _find_reversal(symbol_rows: list[dict[str, Any]], seed_idx: int, seed_side: str, forward_window_bars: int) -> tuple[dict[str, Any] | None, int | None]:
+def _find_reversal(symbol_rows: list[dict[str, Any]], seed_idx: int, seed_side: str, forward_window_bars: int, *, exclude_same_timestamp_opposite: bool = False) -> tuple[dict[str, Any] | None, int | None]:
     opposite = "SHORT" if seed_side == "LONG" else "LONG"
+    seed_ts = str(symbol_rows[seed_idx].get("reference_ts") or "")
     max_idx = min(len(symbol_rows), seed_idx + forward_window_bars + 1)
     for idx in range(seed_idx + 1, max_idx):
         candidate = symbol_rows[idx]
         if _norm(candidate.get("side")) != opposite:
+            continue
+        if exclude_same_timestamp_opposite and str(candidate.get("reference_ts") or "") <= seed_ts:
             continue
         if _norm(candidate.get("resolution_status")) != "TP2":
             continue
@@ -70,7 +73,7 @@ def _find_reversal(symbol_rows: list[dict[str, Any]], seed_idx: int, seed_side: 
     return None, None
 
 
-def analyze_failure_reversal_followthrough(*, labeled_dataset_path: str, output_root: str, forward_window_bars: int = 20, min_sample_size: int = 10, split_mode: str = "time", train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20) -> dict[str, Any]:
+def analyze_failure_reversal_followthrough(*, labeled_dataset_path: str, output_root: str, forward_window_bars: int = 20, min_sample_size: int = 10, split_mode: str = "time", train_fraction: float = 0.60, validation_fraction: float = 0.20, oos_fraction: float = 0.20, exclude_same_timestamp_opposite: bool = False) -> dict[str, Any]:
     if split_mode != "time":
         raise ValueError("Only split_mode=time is supported.")
 
@@ -90,7 +93,7 @@ def analyze_failure_reversal_followthrough(*, labeled_dataset_path: str, output_
             side = _norm(row.get("side"))
             if _norm(row.get("resolution_status")) != "STOPPED" or side not in {"LONG", "SHORT"}:
                 continue
-            reversal_row, distance = _find_reversal(symbol_rows, idx, side, forward_window_bars)
+            reversal_row, distance = _find_reversal(symbol_rows, idx, side, forward_window_bars, exclude_same_timestamp_opposite=exclude_same_timestamp_opposite)
             reversal_found = reversal_row is not None
             seeds.append(
                 {
@@ -276,6 +279,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-fraction", type=float, default=0.60)
     parser.add_argument("--validation-fraction", type=float, default=0.20)
     parser.add_argument("--oos-fraction", type=float, default=0.20)
+    parser.add_argument("--exclude-same-timestamp-opposite", action="store_true")
     return parser
 
 
@@ -290,4 +294,5 @@ if __name__ == "__main__":
         train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
         oos_fraction=args.oos_fraction,
+        exclude_same_timestamp_opposite=args.exclude_same_timestamp_opposite,
     )

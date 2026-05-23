@@ -98,3 +98,21 @@ def test_split_uses_chronological_seed_reference_ts(tmp_path: Path) -> None:
     assert train["reversal_success_ratio"] == "1.0"
     assert oos["rows"] == "1"
     assert oos["reversal_success_ratio"] == "0.0"
+
+
+def test_exclude_same_timestamp_opposite_for_reversals(tmp_path: Path) -> None:
+    dataset = tmp_path / "labeled.csv"
+    rows = [
+        {"row_id": "r1", "symbol": "SOL", "reference_ts": "2024-01-01T00:00:00", "side": "LONG", "status": "X", "strategy": "S", "resolution_status": "STOPPED", "breakout_context": "A", "pullback_quality": "DEEP", "active_leg_boxes": "2", "quality_score": "75", "trend_regime": "UP", "continuation_execution_class": "C1", "late_extension": "1", "realized_r_multiple": "-1"},
+        {"row_id": "r2", "symbol": "SOL", "reference_ts": "2024-01-01T00:00:00", "side": "SHORT", "status": "X", "strategy": "S", "resolution_status": "TP2", "breakout_context": "A", "pullback_quality": "DEEP", "active_leg_boxes": "2", "quality_score": "75", "trend_regime": "UP", "continuation_execution_class": "C1", "late_extension": "1", "realized_r_multiple": "2"},
+        {"row_id": "r3", "symbol": "SOL", "reference_ts": "2024-01-01T00:01:00", "side": "SHORT", "status": "X", "strategy": "S", "resolution_status": "TP2", "breakout_context": "A", "pullback_quality": "DEEP", "active_leg_boxes": "2", "quality_score": "75", "trend_regime": "UP", "continuation_execution_class": "C1", "late_extension": "1", "realized_r_multiple": "2"},
+    ]
+    _write_rows(dataset, rows)
+    out_default = tmp_path / "out_default"
+    out_excluded = tmp_path / "out_excluded"
+    analyze_failure_reversal_followthrough(labeled_dataset_path=str(dataset), output_root=str(out_default), forward_window_bars=3)
+    analyze_failure_reversal_followthrough(labeled_dataset_path=str(dataset), output_root=str(out_excluded), forward_window_bars=3, exclude_same_timestamp_opposite=True)
+    default_seed = list(csv.DictReader((out_default / "reversal_seed_rows.csv").open()))[0]
+    excluded_seed = list(csv.DictReader((out_excluded / "reversal_seed_rows.csv").open()))[0]
+    assert default_seed["forward_distance_bars"] == "1"
+    assert excluded_seed["forward_distance_bars"] == "2"

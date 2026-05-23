@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-TARGET_SYMBOLS = ("ETH", "BTC", "SOL")
+TARGET_SYMBOLS = ("BINANCE_FUT:ETHUSDT", "BINANCE_FUT:BTCUSDT", "BINANCE_FUT:SOLUSDT")
 
 
 def _norm(value: Any) -> str:
