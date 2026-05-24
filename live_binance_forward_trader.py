@@ -1702,8 +1702,9 @@ def has_exchange_position(position_response: dict[str, Any]) -> bool:
     return False
 
 
-def effective_notional_cap(*, requested_notional_usdt: Decimal, demo: bool, live_enabled: bool, demo_max_notional_usdt: Decimal) -> Decimal:
-    if demo and live_enabled and requested_notional_usdt > MAX_NOTIONAL_USDT and demo_max_notional_usdt >= requested_notional_usdt:
+def effective_notional_cap(*, requested_notional_usdt: Decimal, demo: bool, live_enabled: bool, demo_max_notional_usdt: Decimal, allow_demo_cap_override: bool = False) -> Decimal:
+    demo_cap_override_allowed = demo and (live_enabled or allow_demo_cap_override)
+    if demo_cap_override_allowed and requested_notional_usdt > MAX_NOTIONAL_USDT and demo_max_notional_usdt >= requested_notional_usdt:
         return demo_max_notional_usdt
     return MAX_NOTIONAL_USDT
 
@@ -1718,6 +1719,7 @@ def validate_guards(
     demo: bool = False,
     allow_demo_doubles: bool = False,
     demo_max_notional_usdt: Decimal = MAX_NOTIONAL_USDT,
+    allow_demo_cap_override: bool = False,
 ) -> tuple[SymbolSpec | None, dict[str, Any] | None, str | None]:
     if signal.symbol not in ALLOWED_SYMBOLS:
         return None, None, "symbol outside live allowlist"
@@ -1738,6 +1740,7 @@ def validate_guards(
         demo=demo,
         live_enabled=live_enabled,
         demo_max_notional_usdt=demo_max_notional_usdt,
+        allow_demo_cap_override=allow_demo_cap_override,
     )
     if notional_usdt > max_notional_usdt:
         return None, None, f"notional exceeds effective cap: requested={notional_usdt} cap={max_notional_usdt}"
@@ -2062,18 +2065,21 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             force_symbol = str(getattr(args, "force_demo_symbol", "BINANCE_FUT:SOLUSDT"))
             force_side = str(getattr(args, "force_demo_side", "LONG")).upper()
             force_notional = _dec(getattr(args, "force_demo_notional_usdt", str(notional_usdt)))
+            forced_demo_cap_arg = getattr(args, "force_demo_max_notional_usdt", None)
+            forced_demo_cap = _dec(forced_demo_cap_arg) if forced_demo_cap_arg is not None else demo_max_notional_usdt
             candles = load_candles(candle_conn, force_symbol, 1)
             if not candles:
                 raise RuntimeError(f"--force-demo-order could not load latest candle for {force_symbol}")
-            console("FORCE_DEMO_ORDER_START", force_symbol, {"side": force_side, "notional_usdt": str(force_notional)})
+            console("FORCE_DEMO_ORDER_START", force_symbol, {"side": force_side, "notional_usdt": str(force_notional), "forced_demo_cap_usdt": str(forced_demo_cap)})
             signal = build_forced_demo_signal(force_symbol, force_side, candles[-1])
             _spec, order, block_reason = validate_guards(
-                state_conn, client, signal, notional_usdt=force_notional, live_enabled=live_enabled, demo=demo, allow_demo_doubles=False, demo_max_notional_usdt=demo_max_notional_usdt
+                state_conn, client, signal, notional_usdt=force_notional, live_enabled=live_enabled, demo=demo, allow_demo_doubles=False, demo_max_notional_usdt=forced_demo_cap
+                , allow_demo_cap_override=forced_demo_cap_arg is not None
             )
             if block_reason is not None:
                 record_signal(state_conn, signal, decision="BLOCKED", block_reason=block_reason, dry_run=dry_run, notional_usdt=force_notional, notes="forced demo self-test")
                 raise RuntimeError(f"FORCE_DEMO_ORDER blocked: {block_reason}")
-            console("FORCE_DEMO_ORDER_BUILD", force_symbol, {"entry": str(signal.entry_price), "stop": str(signal.stop_price), "tp1": str(signal.tp1_price), "tp2": str(signal.tp2_price), "order": order})
+            console("FORCE_DEMO_ORDER_BUILD", force_symbol, {"entry": str(signal.entry_price), "stop": str(signal.stop_price), "tp1": str(signal.tp1_price), "tp2": str(signal.tp2_price), "forced_demo_cap_usdt": str(forced_demo_cap), "order": order})
             if dry_run:
                 record_signal(state_conn, signal, decision="FORCE_DEMO_DRY_RUN", block_reason=None, dry_run=True, notional_usdt=force_notional, raw_order_response={"would_submit_order": order}, notes="forced demo self-test")
                 console("FORCE_DEMO_ORDER_DRY_RUN", force_symbol, {"order": order})
@@ -2232,6 +2238,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-demo-symbol", default="BINANCE_FUT:SOLUSDT", help="Symbol for forced demo self-test order")
     parser.add_argument("--force-demo-side", default="LONG", choices=("LONG", "SHORT"), help="Side for forced demo self-test order")
     parser.add_argument("--force-demo-notional-usdt", default="1.0", help="Notional USDT for forced demo self-test order")
+    parser.add_argument("--force-demo-max-notional-usdt", help="Override notional cap only for --force-demo-order validation (demo mode only)")
     parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
     parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
