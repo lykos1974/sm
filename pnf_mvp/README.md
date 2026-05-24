@@ -77,6 +77,12 @@ Required env vars when/if you want Binance Demo API connectivity checks:
 - `BINANCE_DEMO_FUTURES_API_KEY`
 - `BINANCE_DEMO_FUTURES_API_SECRET`
 
+Forced demo self-test dry-run command:
+```powershell
+$env:LIVE_TRADING_ENABLED="0"
+python live_binance_forward_trader.py --demo --dry-run --force-demo-order --force-demo-symbol BINANCE_FUT:SOLUSDT --db-path "<collector_db>" --state-db-path data/live_binance_forward_state_demo.sqlite3 --settings pnf_mvp/settings.binance_demo_positive_expectancy.json
+```
+
 Safety:
 - Demo only.
 - No real trading by default.

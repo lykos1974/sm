@@ -175,6 +175,14 @@ class DemoInitClient:
         return trader.parse_symbol_spec(EXCHANGE_INFO, symbol)
 
 
+class ForceDemoClient(DemoInitClient):
+    has_credentials = False
+
+    def __init__(self, api_key, api_secret, *, base_url=trader.BINANCE_BASE_URL):
+        super().__init__(api_key, api_secret, base_url=base_url)
+        self.has_credentials = bool(api_key and api_secret)
+
+
 class BinanceForwardTraderTests(unittest.TestCase):
     def test_research_rule_matching_eth_long_watch_setup_passes(self):
         rule = {
@@ -1092,6 +1100,75 @@ class BinanceForwardTraderTests(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         trader.init_live_tables(conn)
         self.assertTrue(trader.process_self_test_signal(conn, NoOrdersClient(), notional_usdt=Decimal("1")))
+
+    def test_force_demo_order_refuses_without_demo(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            market_db = os.path.join(temp_dir, "market.sqlite3")
+            state_db = os.path.join(temp_dir, "state.sqlite3")
+            with sqlite3.connect(market_db) as conn:
+                conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1700000000000, 100.0, 101.0, 99.0))
+                conn.commit()
+            args = argparse.Namespace(
+                db_path=market_db, state_db_path=state_db, settings="unused-settings.json",
+                dry_run=True, demo=False, enable_demo_doubles=False, notional_usdt="1", demo_max_notional_usdt="1", history_bars=5000,
+                self_test_signal=False, force_demo_order=True, force_demo_symbol="BINANCE_FUT:SOLUSDT", force_demo_side="LONG", force_demo_notional_usdt="1.0",
+                verbose_market_logs=False, reconcile_positions=False, research_rule_json=None,
+            )
+            with self.assertRaisesRegex(RuntimeError, "requires --demo"):
+                trader.process_once(args)
+
+    def test_force_demo_order_dry_run_writes_signal_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            market_db = os.path.join(temp_dir, "market.sqlite3")
+            state_db = os.path.join(temp_dir, "state.sqlite3")
+            with sqlite3.connect(market_db) as conn:
+                conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("BINANCE_FUT:SOLUSDT", "1m", 1700000000000, 100.0, 101.0, 99.0))
+                conn.commit()
+            args = argparse.Namespace(
+                db_path=market_db, state_db_path=state_db, settings="unused-settings.json",
+                dry_run=True, demo=True, enable_demo_doubles=False, notional_usdt="1", demo_max_notional_usdt="1", history_bars=5000,
+                self_test_signal=False, force_demo_order=True, force_demo_symbol="BINANCE_FUT:SOLUSDT", force_demo_side="LONG", force_demo_notional_usdt="1.0",
+                verbose_market_logs=False, reconcile_positions=False, research_rule_json=None,
+            )
+            original_client = trader.BinanceFuturesClient
+            trader.BinanceFuturesClient = ForceDemoClient
+            try:
+                trader.process_once(args)
+            finally:
+                trader.BinanceFuturesClient = original_client
+            with sqlite3.connect(state_db) as conn:
+                row = conn.execute("SELECT decision, notes FROM live_signals_binance").fetchone()
+                self.assertEqual(row, ("FORCE_DEMO_DRY_RUN", "forced demo self-test"))
+
+    def test_build_forced_demo_signal_long_price_order(self):
+        signal = trader.build_forced_demo_signal("BINANCE_FUT:SOLUSDT", "LONG", trader.Candle(close_time=1, close=100.0, high=101.0, low=99.0))
+        self.assertLess(signal.stop_price, signal.entry_price)
+        self.assertLess(signal.entry_price, signal.tp1_price)
+        self.assertLess(signal.tp1_price, signal.tp2_price)
+
+    def test_build_forced_demo_signal_short_price_order(self):
+        signal = trader.build_forced_demo_signal("BINANCE_FUT:SOLUSDT", "SHORT", trader.Candle(close_time=1, close=100.0, high=101.0, low=99.0))
+        self.assertGreater(signal.stop_price, signal.entry_price)
+        self.assertGreater(signal.entry_price, signal.tp1_price)
+        self.assertGreater(signal.tp1_price, signal.tp2_price)
+
+    def test_normal_mode_unaffected_when_force_demo_order_disabled(self):
+        args = argparse.Namespace(
+            db_path="unused.sqlite3", state_db_path="unused-state.sqlite3", settings="unused-settings.json",
+            dry_run=False, demo=False, enable_demo_doubles=False, notional_usdt="1", demo_max_notional_usdt="1", history_bars=5000,
+            self_test_signal=True, force_demo_order=False, force_demo_symbol="BINANCE_FUT:SOLUSDT", force_demo_side="LONG", force_demo_notional_usdt="1.0",
+            verbose_market_logs=False, reconcile_positions=False, research_rule_json=None,
+        )
+        original = trader.build_forced_demo_signal
+        try:
+            def _boom(*_args, **_kwargs):
+                raise AssertionError("force-demo path must be inactive")
+            trader.build_forced_demo_signal = _boom
+            trader.process_once(args)
+        finally:
+            trader.build_forced_demo_signal = original
 
     def test_filled_entry_order_marks_position_open_and_records_fill(self):
         conn = sqlite3.connect(":memory:")

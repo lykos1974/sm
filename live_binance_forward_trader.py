@@ -1813,6 +1813,38 @@ def process_self_test_signal(
     return True
 
 
+def build_forced_demo_signal(symbol: str, side: str, candle: Candle) -> TriangleSignal:
+    entry = _dec(candle.close)
+    side_upper = str(side).upper()
+    if side_upper == "LONG":
+        stop = entry * Decimal("0.99")
+        tp1 = entry * Decimal("1.01")
+        tp2 = entry * Decimal("1.02")
+        pattern = "bullish_triangle"
+    elif side_upper == "SHORT":
+        stop = entry * Decimal("1.01")
+        tp1 = entry * Decimal("0.99")
+        tp2 = entry * Decimal("0.98")
+        pattern = "bearish_triangle"
+    else:
+        raise ValueError(f"invalid force demo side: {side}")
+    return TriangleSignal(
+        symbol=symbol,
+        pattern=pattern,
+        side=side_upper,
+        trigger_ts=int(candle.close_time),
+        entry_price=entry,
+        stop_price=stop,
+        tp1_price=tp1,
+        tp2_price=tp2,
+        trigger_column_idx=-1,
+        support_level=min(entry, stop),
+        resistance_level=max(entry, stop),
+        break_distance_boxes=Decimal("0"),
+        pattern_quality="FORCED_DEMO_SELF_TEST",
+    )
+
+
 def update_open_trade_exits(
     state_conn: sqlite3.Connection,
     candle_conn_or_client: sqlite3.Connection | BinanceFuturesClient,
@@ -2021,6 +2053,39 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
         if verbose_market_logs:
             log_raw_candle_symbol_max_times(candle_conn)
         init_live_tables(state_conn)
+        if bool(getattr(args, "force_demo_order", False)):
+            if not demo:
+                raise RuntimeError("--force-demo-order requires --demo")
+            force_live_allowed = live_enabled and client.has_credentials
+            if not (args.dry_run or force_live_allowed):
+                raise RuntimeError("--force-demo-order requires --dry-run, or LIVE_TRADING_ENABLED=1 with demo API credentials")
+            force_symbol = str(getattr(args, "force_demo_symbol", "BINANCE_FUT:SOLUSDT"))
+            force_side = str(getattr(args, "force_demo_side", "LONG")).upper()
+            force_notional = _dec(getattr(args, "force_demo_notional_usdt", str(notional_usdt)))
+            candles = load_candles(candle_conn, force_symbol, 1)
+            if not candles:
+                raise RuntimeError(f"--force-demo-order could not load latest candle for {force_symbol}")
+            console("FORCE_DEMO_ORDER_START", force_symbol, {"side": force_side, "notional_usdt": str(force_notional)})
+            signal = build_forced_demo_signal(force_symbol, force_side, candles[-1])
+            _spec, order, block_reason = validate_guards(
+                state_conn, client, signal, notional_usdt=force_notional, live_enabled=live_enabled, demo=demo, allow_demo_doubles=False, demo_max_notional_usdt=demo_max_notional_usdt
+            )
+            if block_reason is not None:
+                record_signal(state_conn, signal, decision="BLOCKED", block_reason=block_reason, dry_run=dry_run, notional_usdt=force_notional, notes="forced demo self-test")
+                raise RuntimeError(f"FORCE_DEMO_ORDER blocked: {block_reason}")
+            console("FORCE_DEMO_ORDER_BUILD", force_symbol, {"entry": str(signal.entry_price), "stop": str(signal.stop_price), "tp1": str(signal.tp1_price), "tp2": str(signal.tp2_price), "order": order})
+            if dry_run:
+                record_signal(state_conn, signal, decision="FORCE_DEMO_DRY_RUN", block_reason=None, dry_run=True, notional_usdt=force_notional, raw_order_response={"would_submit_order": order}, notes="forced demo self-test")
+                console("FORCE_DEMO_ORDER_DRY_RUN", force_symbol, {"order": order})
+            else:
+                if order is None:
+                    raise RuntimeError("FORCE_DEMO_ORDER could not build order")
+                raw_response = client.submit_order(order)
+                record_signal(state_conn, signal, decision="FORCE_DEMO_SENT", block_reason=None, dry_run=False, notional_usdt=force_notional, raw_order_response={"order_request": order, "order_response": raw_response}, notes="forced demo self-test")
+                console("FORCE_DEMO_ORDER_SENT", force_symbol, {"order": order, "response": raw_response})
+                console("FORCE_DEMO_ORDER_SENT", "protective TP/SL attach/cancel path not implemented in forced mode; entry-only self-test")
+            console("FORCE_DEMO_ORDER_DONE", force_symbol)
+            return
 
         settings = load_settings(Path(args.settings))
         poll_pending_entry_orders(state_conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
@@ -2163,6 +2228,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of one pass")
     parser.add_argument("--poll-seconds", type=float, default=30.0, help="Sleep between loop iterations")
     parser.add_argument("--self-test-signal", action="store_true", help="Inject one synthetic allowed dry-run signal through the guarded pipeline")
+    parser.add_argument("--force-demo-order", action="store_true", help="Force one demo self-test order using latest candle without waiting for strategy signal")
+    parser.add_argument("--force-demo-symbol", default="BINANCE_FUT:SOLUSDT", help="Symbol for forced demo self-test order")
+    parser.add_argument("--force-demo-side", default="LONG", choices=("LONG", "SHORT"), help="Side for forced demo self-test order")
+    parser.add_argument("--force-demo-notional-usdt", default="1.0", help="Notional USDT for forced demo self-test order")
     parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
     parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
