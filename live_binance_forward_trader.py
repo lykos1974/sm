@@ -43,7 +43,7 @@ MAX_NOTIONAL_USDT = Decimal("1")
 DEFAULT_NOTIONAL_USDT = Decimal("1")
 RECV_WINDOW_MS = 5000
 
-ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:SOLUSDT"}
+ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:BNBUSDT", "BINANCE_FUT:SOLUSDT", "BINANCE_FUT:XRPUSDT"}
 ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
 DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
@@ -609,7 +609,7 @@ def log_raw_candle_symbol_max_times(conn: sqlite3.Connection) -> None:
         GROUP BY symbol
         """
     ).fetchall()
-    target_symbols = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+    target_symbols = {"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"}
     matching_rows = [
         {"symbol": str(symbol), "max_close_time": int(max_close_time) if max_close_time is not None else None}
         for symbol, max_close_time in rows

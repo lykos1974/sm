@@ -55,3 +55,31 @@ python app.py
 5. Alerts panel.
 6. Replay mode.
 7. Υποστήριξη παραπάνω feeds/exchanges.
+
+## Binance Demo Forward Trader (positive-expectancy candidates only)
+
+Χρησιμοποίησε το παρακάτω command για **DEMO / shadow** deployment μόνο:
+
+```bash
+LIVE_TRADING_ENABLED=0 \
+python live_binance_forward_trader.py \
+  --demo \
+  --dry-run \
+  --db-path "H:\\pnf screener\\market_collector\\market_collector\\market_collector\\market_data.db" \
+  --state-db-path data/live_binance_forward_state_demo.sqlite3 \
+  --settings pnf_mvp/settings.binance_demo_positive_expectancy.json \
+  --history-bars 5000 \
+  --loop \
+  --poll-seconds 30
+```
+
+Required env vars when/if you want Binance Demo API connectivity checks:
+- `BINANCE_DEMO_FUTURES_API_KEY`
+- `BINANCE_DEMO_FUTURES_API_SECRET`
+
+Safety:
+- Demo only.
+- No real trading by default.
+- ETH/BNB/XRP περιλαμβάνονται μόνο για demo signal-density observation, όχι ως proven positive expectancy.
+- Παρακολούθηση logs συνεχώς.
+- Μην θεωρείς ότι υπάρχει production edge χωρίς νέα validation.
