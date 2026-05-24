@@ -1361,7 +1361,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertIn("RECONCILE_POSITION", output.getvalue())
         self.assertNotIn("SCAN", output.getvalue())
         self.assertEqual(ReconcileOnlyClient.instances[-1].submitted_orders, [])
-        self.assertEqual(sorted(ReconcileOnlyClient.instances[-1].position_risk_calls), ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+        self.assertEqual(sorted(ReconcileOnlyClient.instances[-1].position_risk_calls), ["BNBUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"])
 
     def test_reconcile_positions_calls_no_write_helpers_or_candle_db(self):
         class ReconcileOnlyClient:
