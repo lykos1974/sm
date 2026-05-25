@@ -201,6 +201,8 @@ def label_pole_outcomes(
         row["adverse_persistence_ge_3_box"] = _persistence(adv_series, 3)
         row["volatility_compression_after_signal"] = round(volatility_compression_after_signal, 4)
         row["continuation_after_sideways"] = continuation_after_sideways
+        row["fav_path"] = ",".join(str(int(v)) for v in fav_series)
+        row["adv_path"] = ",".join(str(int(v)) for v in adv_series)
         row["outcome_class"] = _classify_outcome(pattern_name, events)
         out.append(row)
     return out
