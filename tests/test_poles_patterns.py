@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PNF_DIR = ROOT / "pnf_mvp"
@@ -21,6 +22,26 @@ def test_box_count_uses_actual_pnf_boxes_not_price_distance():
     out = detect_pole_patterns(cols, box_size=1)
     assert out[0]["pole_boxes"] == 7
     assert out[0]["retrace_boxes"] == 4
+    assert isinstance(out[0]["pole_boxes"], int)
+    assert isinstance(out[0]["retrace_boxes"], int)
+    assert out[0]["pole_boxes"] < 100
+    assert out[0]["retrace_boxes"] < 100
+    assert out[0]["pole_boxes"] % 100 != 1
+    assert out[0]["retrace_boxes"] % 100 != 1
+    assert out[0]["retrace_ratio"] == round(4 / 7, 4)
+
+
+def test_box_count_normalizes_scaled_price_columns_with_correct_box_size():
+    cols = [
+        PnFColumn(0, "X", 10000, 9600, 0, 1),
+        PnFColumn(1, "O", 9900, 9700, 2, 3),
+        PnFColumn(2, "X", 10600, 10000, 4, 5),
+        PnFColumn(3, "O", 10500, 10200, 6, 7),
+    ]
+    out = detect_pole_patterns(cols, box_size=100)
+    assert out[0]["pole_boxes"] == 7
+    assert out[0]["retrace_boxes"] == 4
+    assert out[0]["retrace_ratio"] == round(4 / 7, 4)
 
 
 def test_detects_high_pole_early_50_retrace():
@@ -169,3 +190,40 @@ def test_audit_load_columns_has_friendly_missing_csv_error():
         "Input columns CSV not found. Generate it first with research_v2.patterns.export_pnf_columns."
         in result.stderr
     )
+
+
+def test_audit_poles_infers_box_size_from_profile_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        csv_path = tmp_path / "columns.csv"
+        out_dir = tmp_path / "out"
+        csv_path.write_text(
+            "\n".join(
+                [
+                    "symbol,profile_name,idx,kind,top,bottom,start_ts,end_ts",
+                    "TEST,TEST_bs100_rev3,0,X,10000,9600,0,1",
+                    "TEST,TEST_bs100_rev3,1,O,9900,9700,2,3",
+                    "TEST,TEST_bs100_rev3,2,X,10600,10000,4,5",
+                    "TEST,TEST_bs100_rev3,3,O,10500,10200,6,7",
+                ]
+            )
+            + "\n"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "research_v2.patterns.audit_poles",
+                "--input-columns-csv",
+                str(csv_path),
+                "--output-root",
+                str(out_dir),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.returncode == 0
+        output_csv = (out_dir / "pole_patterns.csv").read_text()
+        assert ",7,4," in output_csv

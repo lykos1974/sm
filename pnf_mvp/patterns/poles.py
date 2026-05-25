@@ -4,6 +4,8 @@ from typing import Any, Dict, List
 
 
 def _box_count(top: float, bottom: float, box_size: float) -> int:
+    if box_size <= 0:
+        raise ValueError("box_size must be > 0 for box-count diagnostics")
     return int(round((top - bottom) / box_size)) + 1
 
 
