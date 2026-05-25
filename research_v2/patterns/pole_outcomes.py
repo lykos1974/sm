@@ -107,7 +107,9 @@ def label_pole_outcomes(
 
         fav_series: list[int] = []
         adv_series: list[int] = []
+        ranges: list[float] = []
         for col in future:
+            ranges.append(abs(col.top - col.bottom))
             if pattern_name == "HIGH_POLE":
                 # Structural post-reversal anchors:
                 # continuation is bearish expansion on O-columns from reversal bottom,
@@ -127,6 +129,38 @@ def label_pole_outcomes(
         max_adv = max(adv_series)
         t_fav = fav_series.index(max_fav) + 1
         t_adv = adv_series.index(max_adv) + 1
+        mfe_mae_ratio = (max_fav / max_adv) if max_adv > 0 else (float(max_fav) if max_fav > 0 else 0.0)
+
+        def _speed_to_threshold(series: list[int], threshold: int) -> int:
+            for i, v in enumerate(series, start=1):
+                if v >= threshold:
+                    return i
+            return 0
+
+        def _persistence(series: list[int], threshold: int) -> int:
+            longest = 0
+            run = 0
+            for v in series:
+                if v >= threshold:
+                    run += 1
+                    longest = max(longest, run)
+                else:
+                    run = 0
+            return longest
+
+        signal_window = min(3, len(ranges))
+        post_window = min(3, max(0, len(ranges) - signal_window))
+        first_mean = (sum(ranges[:signal_window]) / signal_window) if signal_window else 0.0
+        second_mean = (sum(ranges[signal_window : signal_window + post_window]) / post_window) if post_window else first_mean
+        volatility_compression_after_signal = (second_mean / first_mean) if first_mean > 0 else 0.0
+
+        sideways_cols = min(3, len(fav_series))
+        no_early_resolution = all(
+            fav < continuation_threshold_boxes and adv < invalidation_threshold_boxes
+            for fav, adv in zip(fav_series[:sideways_cols], adv_series[:sideways_cols])
+        )
+        later_continuation = any(fav >= continuation_threshold_boxes for fav in fav_series[sideways_cols:])
+        continuation_after_sideways = 1 if (no_early_resolution and later_continuation) else 0
 
         events: list[tuple[int, str]] = []
         for i, (fav, adv) in enumerate(zip(fav_series, adv_series), start=1):
@@ -152,6 +186,21 @@ def label_pole_outcomes(
         row["net_move_boxes"] = max_fav - max_adv
         row["time_to_max_favorable"] = t_fav
         row["time_to_max_adverse"] = t_adv
+        row["mfe_mae_ratio"] = round(mfe_mae_ratio, 4)
+        row["continuation_speed_to_1_box"] = _speed_to_threshold(fav_series, 1)
+        row["continuation_speed_to_2_box"] = _speed_to_threshold(fav_series, 2)
+        row["continuation_speed_to_3_box"] = _speed_to_threshold(fav_series, 3)
+        row["adverse_speed_to_1_box"] = _speed_to_threshold(adv_series, 1)
+        row["adverse_speed_to_2_box"] = _speed_to_threshold(adv_series, 2)
+        row["adverse_speed_to_3_box"] = _speed_to_threshold(adv_series, 3)
+        row["continuation_persistence_ge_1_box"] = _persistence(fav_series, 1)
+        row["continuation_persistence_ge_2_box"] = _persistence(fav_series, 2)
+        row["continuation_persistence_ge_3_box"] = _persistence(fav_series, 3)
+        row["adverse_persistence_ge_1_box"] = _persistence(adv_series, 1)
+        row["adverse_persistence_ge_2_box"] = _persistence(adv_series, 2)
+        row["adverse_persistence_ge_3_box"] = _persistence(adv_series, 3)
+        row["volatility_compression_after_signal"] = round(volatility_compression_after_signal, 4)
+        row["continuation_after_sideways"] = continuation_after_sideways
         row["outcome_class"] = _classify_outcome(pattern_name, events)
         out.append(row)
     return out
