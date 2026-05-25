@@ -109,11 +109,17 @@ def label_pole_outcomes(
         adv_series: list[int] = []
         for col in future:
             if pattern_name == "HIGH_POLE":
-                favorable = box_move(pole_col.top - col.bottom, box_size)
-                adverse = box_move(col.top - rev_col.bottom, box_size)
+                # Structural post-reversal anchors:
+                # continuation is bearish expansion on O-columns from reversal bottom,
+                # invalidation is bullish expansion on X-columns from reversal top.
+                favorable = box_move(rev_col.bottom - col.bottom, box_size) if col.kind == "O" else 0
+                adverse = box_move(col.top - rev_col.top, box_size) if col.kind == "X" else 0
             else:
-                favorable = box_move(col.top - pole_col.bottom, box_size)
-                adverse = box_move(rev_col.top - col.bottom, box_size)
+                # LOW_POLE mirror:
+                # continuation is bullish expansion on X-columns from reversal top,
+                # invalidation is bearish expansion on O-columns from reversal bottom.
+                favorable = box_move(col.top - rev_col.top, box_size) if col.kind == "X" else 0
+                adverse = box_move(rev_col.bottom - col.bottom, box_size) if col.kind == "O" else 0
             fav_series.append(favorable)
             adv_series.append(adverse)
 
