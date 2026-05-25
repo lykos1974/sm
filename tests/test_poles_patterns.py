@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,3 +147,25 @@ def test_does_not_change_existing_double_top_bottom_behavior():
         PnFColumn(2, "X", 101, 98, 4, 5),
     ]
     assert engine.latest_signal_name() == "BUY"
+
+
+def test_audit_load_columns_has_friendly_missing_csv_error():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.audit_poles",
+            "--input-columns-csv",
+            "/tmp/does-not-exist-columns.csv",
+            "--output-root",
+            "/tmp",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "Input columns CSV not found. Generate it first with research_v2.patterns.export_pnf_columns."
+        in result.stderr
+    )
