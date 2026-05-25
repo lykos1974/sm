@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
+from statistics import median
 
 from research_v2.patterns.pole_outcomes import label_pole_outcomes, load_columns_csv, load_poles_csv
 
@@ -35,6 +36,14 @@ def _bucket_retrace(v: float) -> str:
     if 1.00 <= v <= 1.50:
         return "1.00-1.50"
     return ">1.50"
+
+
+def _bucket_trend_regime(row: dict[str, str]) -> str:
+    for key in ("trend_regime", "regime", "market_regime"):
+        val = row.get(key)
+        if val:
+            return str(val)
+    return "UNKNOWN"
 
 
 def main():
@@ -111,6 +120,40 @@ def main():
             cont = sum(1 for r in subset if _is_continuation(r.get("pattern_name", ""), r.get("outcome_class", "")))
             f.write(f"- {bucket}: {cont}/{denom} continuation ({_pct(cont,denom):.2f}%)\n")
 
+    excursion_report = output_root / "pole_excursion_summary.md"
+    with excursion_report.open("w") as f:
+        f.write("# Pole Excursion Summary (Research-Only)\n\n")
+        f.write("No production trading logic is modified. This report is exploratory excursion analytics only.\n\n")
+
+        def write_bucket_table(name: str, bucket_fn):
+            grouped: dict[str, list[dict[str, str]]] = {}
+            for row in labeled:
+                key = bucket_fn(row)
+                grouped.setdefault(key, []).append(row)
+
+            f.write(f"## {name}\n\n")
+            f.write("| bucket | n | continuation % | avg fav | avg adv | median fav | median adv | fav/adv ratio | cont persistence |\n")
+            f.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+            for bucket, rows in sorted(grouped.items()):
+                fav = [float(r.get("max_favorable_boxes", 0) or 0) for r in rows]
+                adv = [float(r.get("max_adverse_boxes", 0) or 0) for r in rows]
+                persistence = [float(r.get("continuation_persistence_ge_1_box", 0) or 0) for r in rows]
+                cont = sum(1 for r in rows if _is_continuation(r.get("pattern_name", ""), r.get("outcome_class", "")))
+                avg_fav = (sum(fav) / len(fav)) if fav else 0.0
+                avg_adv = (sum(adv) / len(adv)) if adv else 0.0
+                med_fav = median(fav) if fav else 0.0
+                med_adv = median(adv) if adv else 0.0
+                ratio = (avg_fav / avg_adv) if avg_adv > 0 else avg_fav
+                avg_persist = (sum(persistence) / len(persistence)) if persistence else 0.0
+                f.write(
+                    f"| {bucket} | {len(rows)} | {_pct(cont, len(rows)):.2f}% | {avg_fav:.3f} | {avg_adv:.3f} | {med_fav:.3f} | {med_adv:.3f} | {ratio:.3f} | {avg_persist:.3f} |\n"
+                )
+            f.write("\n")
+
+        write_bucket_table("Pole boxes buckets", lambda r: _bucket_pole_size(float(r.get("pole_boxes", 0) or 0)))
+        write_bucket_table("Retrace ratio buckets", lambda r: _bucket_retrace(float(r.get("retrace_ratio", 0) or 0)))
+        write_bucket_table("Opposing-pole-enhanced buckets", lambda r: f"enhanced={str(r.get('enhanced_by_opposing_pole'))}")
+        write_bucket_table("Trend regime buckets", _bucket_trend_regime)
 
 if __name__ == "__main__":
     main()
