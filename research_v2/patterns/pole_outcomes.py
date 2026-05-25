@@ -124,12 +124,22 @@ def label_pole_outcomes(
 
         events: list[tuple[int, str]] = []
         for i, (fav, adv) in enumerate(zip(fav_series, adv_series), start=1):
-            if fav >= continuation_threshold_boxes:
-                events.append((i, "CONT"))
-                break
-            if adv >= invalidation_threshold_boxes:
-                events.append((i, "FAIL"))
-                break
+            # Strictly temporal classification: check thresholds in directional invalidation-first order
+            # per pole type at each observed future column, then stop on first event.
+            if pattern_name == "HIGH_POLE":
+                if adv >= invalidation_threshold_boxes:
+                    events.append((i, "FAIL"))
+                    break
+                if fav >= continuation_threshold_boxes:
+                    events.append((i, "CONT"))
+                    break
+            else:
+                if adv >= invalidation_threshold_boxes:
+                    events.append((i, "FAIL"))
+                    break
+                if fav >= continuation_threshold_boxes:
+                    events.append((i, "CONT"))
+                    break
 
         row["max_favorable_boxes"] = max_fav
         row["max_adverse_boxes"] = max_adv
