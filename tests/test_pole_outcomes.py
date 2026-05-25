@@ -22,31 +22,83 @@ def _base_pole(pattern_name: str) -> dict:
     }
 
 
-def test_high_pole_continuation():
+def test_high_pole_continuation_after_bounce():
     cols = [
         CsvColumn(1, "X", 110, 103),
         CsvColumn(2, "O", 108, 105),
-        CsvColumn(3, "X", 106, 103),
+        CsvColumn(3, "X", 109, 106),  # bounce (X) should not contribute continuation
+        CsvColumn(4, "O", 107, 101),  # continuation on O from rev bottom(105) -> 4 boxes
     ]
     out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
     assert out[0]["outcome_class"] == "BEARISH_CONTINUATION"
 
 
-def test_high_pole_failure():
-    cols = [CsvColumn(1, "X", 110, 103), CsvColumn(2, "O", 108, 105), CsvColumn(3, "X", 112, 109)]
+def test_high_pole_invalidation_after_small_continuation():
+    cols = [
+        CsvColumn(1, "X", 110, 103),
+        CsvColumn(2, "O", 108, 105),
+        CsvColumn(3, "O", 107, 103),  # small continuation: 2 boxes
+        CsvColumn(4, "X", 112, 110),  # invalidation on X from rev top(108) -> 4 boxes
+    ]
     out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
     assert out[0]["outcome_class"] == "FAILED_REVERSAL"
 
 
-def test_low_pole_continuation():
-    cols = [CsvColumn(1, "O", 100, 93), CsvColumn(2, "X", 98, 95), CsvColumn(3, "O", 101, 98)]
+def test_low_pole_continuation_after_pullback():
+    cols = [
+        CsvColumn(1, "O", 100, 93),
+        CsvColumn(2, "X", 98, 95),
+        CsvColumn(3, "O", 97, 94),  # pullback (O) should not contribute continuation
+        CsvColumn(4, "X", 102, 99),  # continuation on X from rev top(98) -> 4 boxes
+    ]
     out = label_pole_outcomes([_base_pole("LOW_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
     assert out[0]["outcome_class"] == "BULLISH_CONTINUATION"
 
 
-def test_low_pole_failure():
-    cols = [CsvColumn(1, "O", 100, 93), CsvColumn(2, "X", 98, 95), CsvColumn(3, "O", 95, 92)]
+def test_low_pole_invalidation_after_small_continuation():
+    cols = [
+        CsvColumn(1, "O", 100, 93),
+        CsvColumn(2, "X", 98, 95),
+        CsvColumn(3, "X", 100, 97),  # small continuation: 2 boxes
+        CsvColumn(4, "O", 96, 90),  # invalidation on O from rev bottom(95) -> 5 boxes
+    ]
     out = label_pole_outcomes([_base_pole("LOW_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
+    assert out[0]["outcome_class"] == "FAILED_REVERSAL"
+
+
+def test_sideways_congestion():
+    cols = [
+        CsvColumn(1, "X", 110, 103),
+        CsvColumn(2, "O", 108, 105),
+        CsvColumn(3, "X", 109, 106),
+        CsvColumn(4, "O", 107, 104),
+        CsvColumn(5, "X", 108, 106),
+    ]
+    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=5, invalidation_threshold_boxes=5)
+    assert out[0]["outcome_class"] == "SIDEWAYS"
+
+
+def test_future_horizon_exhaustion():
+    cols = [
+        CsvColumn(1, "X", 110, 103),
+        CsvColumn(2, "O", 108, 105),
+        CsvColumn(3, "X", 109, 106),
+        CsvColumn(4, "O", 107, 104),
+        CsvColumn(5, "X", 109, 106),
+    ]
+    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=2, continuation_threshold_boxes=5, invalidation_threshold_boxes=5)
+    assert out[0]["future_columns_observed"] == 2
+    assert out[0]["outcome_class"] == "SIDEWAYS"
+
+
+def test_same_column_equal_threshold_prefers_invalidation():
+    cols = [
+        CsvColumn(1, "X", 110, 103),
+        CsvColumn(2, "O", 108, 105),
+        CsvColumn(3, "X", 111, 104),  # adv == 3, fav == 0
+        CsvColumn(4, "O", 108, 102),  # fav == 3, adv == 0
+    ]
+    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
     assert out[0]["outcome_class"] == "FAILED_REVERSAL"
 
 
@@ -59,54 +111,3 @@ def test_insufficient_future_data():
 def test_box_normalization_correctness():
     assert box_move(1.0, 0.5) == 2
     assert box_move(0.24, 0.5) == 0
-
-
-def test_threshold_ordering_continuation_first():
-    cols = [CsvColumn(1, "X", 110, 103), CsvColumn(2, "O", 108, 105), CsvColumn(3, "X", 107, 102), CsvColumn(4, "X", 112, 109)]
-    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
-    assert out[0]["outcome_class"] == "BEARISH_CONTINUATION"
-
-
-def test_threshold_ordering_invalidation_first_then_continuation():
-    cols = [
-        CsvColumn(1, "X", 110, 103),
-        CsvColumn(2, "O", 108, 105),
-        CsvColumn(3, "X", 112, 102),
-        CsvColumn(4, "X", 108, 101),
-    ]
-    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
-    assert out[0]["outcome_class"] == "FAILED_REVERSAL"
-
-
-def test_threshold_ordering_neither_threshold_reached_is_sideways():
-    cols = [
-        CsvColumn(1, "X", 110, 103),
-        CsvColumn(2, "O", 108, 105),
-        CsvColumn(3, "X", 108, 106),
-        CsvColumn(4, "O", 109, 106),
-    ]
-    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=5, invalidation_threshold_boxes=5)
-    assert out[0]["outcome_class"] == "SIDEWAYS"
-
-
-def test_threshold_ordering_equal_threshold_same_column_prefers_invalidation():
-    cols = [
-        CsvColumn(1, "X", 110, 103),
-        CsvColumn(2, "O", 108, 105),
-        CsvColumn(3, "X", 112, 102),
-    ]
-    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
-    assert out[0]["outcome_class"] == "FAILED_REVERSAL"
-
-
-def test_threshold_ordering_future_horizon_exhaustion_is_sideways():
-    cols = [
-        CsvColumn(1, "X", 110, 103),
-        CsvColumn(2, "O", 108, 105),
-        CsvColumn(3, "X", 108, 107),
-        CsvColumn(4, "O", 108, 106),
-        CsvColumn(5, "X", 106, 105),
-    ]
-    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=2, continuation_threshold_boxes=5, invalidation_threshold_boxes=5)
-    assert out[0]["future_columns_observed"] == 2
-    assert out[0]["outcome_class"] == "SIDEWAYS"
