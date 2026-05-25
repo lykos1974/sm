@@ -25,6 +25,10 @@ class CsvColumn:
 
 
 def _load_columns(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            "Input columns CSV not found. Generate it first with research_v2.patterns.export_pnf_columns."
+        )
     columns = []
     with path.open("r", newline="") as f:
         reader = csv.DictReader(f)
