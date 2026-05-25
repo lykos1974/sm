@@ -10,7 +10,19 @@ from pnf_engine import PnFColumn, PnFEngine, PnFProfile
 from patterns.poles import detect_pole_patterns
 
 
-def test_detects_high_pole_on_over_50_percent_o_retrace():
+def test_box_count_uses_actual_pnf_boxes_not_price_distance():
+    cols = [
+        PnFColumn(0, "X", 100, 96, 0, 1),
+        PnFColumn(1, "O", 99, 97, 2, 3),
+        PnFColumn(2, "X", 106, 100, 4, 5),
+        PnFColumn(3, "O", 105, 102, 6, 7),
+    ]
+    out = detect_pole_patterns(cols, box_size=1)
+    assert out[0]["pole_boxes"] == 7
+    assert out[0]["retrace_boxes"] == 4
+
+
+def test_detects_high_pole_early_50_retrace():
     cols = [
         PnFColumn(0, "X", 100, 96, 0, 1),
         PnFColumn(1, "O", 99, 97, 2, 3),
@@ -23,7 +35,18 @@ def test_detects_high_pole_on_over_50_percent_o_retrace():
     assert out[0]["status"] == "EARLY_50_RETRACE"
 
 
-def test_detects_low_pole_on_over_50_percent_x_retrace():
+def test_detects_high_pole_overretrace_classification():
+    cols = [
+        PnFColumn(0, "X", 100, 96, 0, 1),
+        PnFColumn(1, "O", 99, 97, 2, 3),
+        PnFColumn(2, "X", 106, 100, 4, 5),
+        PnFColumn(3, "O", 106, 98, 6, 7),
+    ]
+    out = detect_pole_patterns(cols, box_size=1)
+    assert out[0]["status"] == "OVERRETRACE_POLE"
+
+
+def test_detects_low_pole_early_50_retrace():
     cols = [
         PnFColumn(0, "O", 100, 96, 0, 1),
         PnFColumn(1, "X", 99, 97, 2, 3),
@@ -33,6 +56,18 @@ def test_detects_low_pole_on_over_50_percent_x_retrace():
     out = detect_pole_patterns(cols, box_size=1)
     assert len(out) == 1
     assert out[0]["pattern_name"] == "LOW_POLE"
+    assert out[0]["status"] == "EARLY_50_RETRACE"
+
+
+def test_detects_low_pole_overretrace_classification():
+    cols = [
+        PnFColumn(0, "O", 100, 96, 0, 1),
+        PnFColumn(1, "X", 99, 97, 2, 3),
+        PnFColumn(2, "O", 95, 89, 4, 5),
+        PnFColumn(3, "X", 98, 89, 6, 7),
+    ]
+    out = detect_pole_patterns(cols, box_size=1)
+    assert out[0]["status"] == "OVERRETRACE_POLE"
 
 
 def test_rejects_pole_height_less_or_equal_5_boxes():
@@ -63,6 +98,43 @@ def test_rejects_non_adjacent_reversal_column():
         PnFColumn(4, "O", 105, 102, 6, 7),
     ]
     assert detect_pole_patterns(cols, box_size=1) == []
+
+
+def test_detects_high_to_low_opposing_poles_with_enhancement():
+    cols = [
+        PnFColumn(0, "X", 100, 96, 0, 1),
+        PnFColumn(1, "O", 99, 97, 2, 3),
+        PnFColumn(2, "X", 106, 100, 4, 5),
+        PnFColumn(3, "O", 105, 102, 6, 7),
+        PnFColumn(4, "X", 104, 101, 8, 9),
+        PnFColumn(5, "O", 100, 93, 10, 11),
+        PnFColumn(6, "X", 98, 94, 12, 13),
+    ]
+    out = detect_pole_patterns(cols, box_size=1, max_opposing_distance_columns=4)
+    assert len(out) == 2
+    assert out[0]["pattern_name"] == "HIGH_POLE"
+    assert out[0]["opposing_pole_role"] == "FIRST_POLE"
+    assert out[1]["pattern_name"] == "LOW_POLE"
+    assert out[1]["opposing_pole_role"] == "SECOND_POLE"
+    assert out[1]["enhanced_by_opposing_pole"] is True
+
+
+def test_detects_low_to_high_opposing_poles_with_enhancement():
+    cols = [
+        PnFColumn(0, "O", 100, 96, 0, 1),
+        PnFColumn(1, "X", 99, 97, 2, 3),
+        PnFColumn(2, "O", 95, 89, 4, 5),
+        PnFColumn(3, "X", 93, 90, 6, 7),
+        PnFColumn(4, "O", 92, 90, 8, 9),
+        PnFColumn(5, "X", 99, 93, 10, 11),
+        PnFColumn(6, "O", 98, 95, 12, 13),
+    ]
+    out = detect_pole_patterns(cols, box_size=1, max_opposing_distance_columns=4)
+    assert len(out) == 2
+    assert out[0]["pattern_name"] == "LOW_POLE"
+    assert out[1]["pattern_name"] == "HIGH_POLE"
+    assert out[1]["opposing_pole_role"] == "SECOND_POLE"
+    assert out[1]["enhanced_by_opposing_pole"] is True
 
 
 def test_does_not_change_existing_double_top_bottom_behavior():
