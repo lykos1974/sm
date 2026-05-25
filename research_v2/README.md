@@ -48,3 +48,7 @@ That coupling makes it harder to reproduce research outputs, compare experiments
 - No Rust integration.
 
 This is only a low-risk skeleton to enable future isolated development.
+
+## Pole diagnostics safety note
+
+Poles and opposing poles are reversal diagnostics only. They are not production entries and must be validated against labeled outcomes before any trading use.
