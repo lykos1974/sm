@@ -111,3 +111,15 @@ def test_insufficient_future_data():
 def test_box_normalization_correctness():
     assert box_move(1.0, 0.5) == 2
     assert box_move(0.24, 0.5) == 0
+
+
+def test_path_series_exported() -> None:
+    cols = [
+        CsvColumn(1, "X", 110, 103),
+        CsvColumn(2, "O", 108, 105),
+        CsvColumn(3, "O", 107, 103),
+        CsvColumn(4, "X", 112, 110),
+    ]
+    out = label_pole_outcomes([_base_pole("HIGH_POLE")], cols, box_size=1, future_columns=20, continuation_threshold_boxes=3, invalidation_threshold_boxes=3)
+    assert out[0]["fav_path"] == "2,0"
+    assert out[0]["adv_path"] == "0,4"
