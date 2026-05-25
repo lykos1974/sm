@@ -89,3 +89,7 @@ Safety:
 - ETH/BNB/XRP περιλαμβάνονται μόνο για demo signal-density observation, όχι ως proven positive expectancy.
 - Παρακολούθηση logs συνεχώς.
 - Μην θεωρείς ότι υπάρχει production edge χωρίς νέα validation.
+
+
+## Pole diagnostics note
+Pole patterns (High Pole / Low Pole) are **reversal diagnostics only** and must not be treated as production entries without dedicated validation.
