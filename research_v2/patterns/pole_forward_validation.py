@@ -266,6 +266,7 @@ def main() -> None:
         f.write("## Input/Build Diagnostics\n")
         for k in [
             "rows_loaded_labeled",
+            "rows_loaded_btc",
             "labeled_columns_detected",
             "required_columns_present",
             "required_columns_missing",
