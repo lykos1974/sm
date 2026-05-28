@@ -76,75 +76,88 @@ def _metrics(rows: list[PoleRow]) -> dict[str, float | int]:
     cont_pct = _safe_div(cont, n)
     fail_pct = _safe_div(fail, n)
     expect = mean([r.expectancy for r in rows]) if rows else 0.0
-    asym = cont_pct - fail_pct
     return {
         "sample_size": n,
         "continuation_pct": round(cont_pct, 6),
         "failure_pct": round(fail_pct, 6),
         "expectancy_score": round(expect, 6),
-        "asymmetry_score": round(asym, 6),
+        "asymmetry_score": round(cont_pct - fail_pct, 6),
     }
 
 
 def _build_rows(labeled: list[dict[str, str]], btc: list[dict[str, str]]) -> tuple[list[PoleRow], dict[str, str | int]]:
     diag: dict[str, str | int] = {"rows_loaded_labeled": len(labeled), "rows_loaded_btc": len(btc)}
     if not labeled:
+        diag["required_columns_missing"] = "timestamp|symbol|distance|outcome"
         return [], diag
 
     labeled_headers = set(labeled[0].keys())
     btc_headers = set(btc[0].keys()) if btc else set()
     all_headers = labeled_headers | btc_headers
 
-    ts_col = _pick_column(all_headers, ["timestamp", "entry_timestamp", "ts", "open_time", "time", "datetime"])
-    symbol_col = _pick_column(all_headers, ["symbol", "ticker", "asset"])
-    pattern_col = _pick_column(all_headers, ["pattern_name", "pattern", "pole_type"])
-    distance_col = _pick_column(all_headers, ["opposing_pole_distance_columns", "opposing_pole_distance", "distance_columns", "distance"])
-    outcome_col = _pick_column(all_headers, ["outcome_class", "outcome", "label"])
+    ts_col = _pick_column(labeled_headers, ["timestamp", "entry_timestamp", "ts", "open_time", "time", "datetime"])
+    symbol_col = _pick_column(labeled_headers, ["symbol", "ticker", "asset"])
+    distance_col = _pick_column(labeled_headers, ["opposing_pole_distance_columns", "opposing_pole_distance", "distance_columns", "distance"])
+    outcome_col = _pick_column(labeled_headers, ["outcome_class", "outcome", "label"])
 
-    diag.update({
-        "labeled_columns_detected": "|".join(sorted(labeled_headers)),
-        "timestamp_column_selected": ts_col or "<none>",
-        "symbol_column_selected": symbol_col or "<none>",
-        "distance_column_selected": distance_col or "<none>",
-        "outcome_column_selected": outcome_col or "<none>",
-    })
+    # Optional backfill-only columns from BTC if absent in labeled.
+    btc_ts_col = _pick_column(btc_headers, ["timestamp", "entry_timestamp", "ts", "open_time", "time", "datetime"])
+    btc_symbol_col = _pick_column(btc_headers, ["symbol", "ticker", "asset"])
+    btc_distance_col = _pick_column(btc_headers, ["opposing_pole_distance_columns", "opposing_pole_distance", "distance_columns", "distance"])
 
-    required = {"timestamp": ts_col, "symbol": symbol_col, "distance": distance_col, "outcome": outcome_col}
-    missing_required = [k for k, v in required.items() if not v]
-    diag["required_columns_present"] = "|".join([k for k, v in required.items() if v])
-    diag["required_columns_missing"] = "|".join(missing_required) if missing_required else "<none>"
-    if missing_required:
+    diag.update(
+        {
+            "labeled_columns_detected": "|".join(sorted(labeled_headers)),
+            "required_columns_present": "|".join([k for k, v in {"timestamp": ts_col, "symbol": symbol_col, "distance": distance_col, "outcome": outcome_col}.items() if v]),
+            "required_columns_missing": "|".join([k for k, v in {"timestamp": ts_col, "symbol": symbol_col, "distance": distance_col, "outcome": outcome_col}.items() if not v]) or "<none>",
+            "timestamp_column_selected": ts_col or "<none>",
+            "symbol_column_selected": symbol_col or "<none>",
+            "distance_column_selected": distance_col or "<none>",
+            "outcome_column_selected": outcome_col or "<none>",
+        }
+    )
+
+    if not ts_col or not symbol_col or not outcome_col:
         return [], diag
 
-    btc_index: dict[tuple[str, str, str], dict[str, str]] = {}
-    if btc and ts_col in btc_headers and symbol_col in btc_headers:
+    # Optional BTC merge map by (symbol,timestamp) only; no pattern_name requirement.
+    btc_index: dict[tuple[str, str], dict[str, str]] = {}
+    if btc and btc_ts_col and btc_symbol_col:
         for r in btc:
-            key = (_clean(r.get(symbol_col), ""), _clean(r.get(ts_col), ""), _clean(r.get(pattern_col), "") if pattern_col else "")
-            btc_index[key] = r
+            btc_index[(_clean(r.get(btc_symbol_col), ""), _clean(r.get(btc_ts_col), ""))] = r
 
-    rows_pre = 0
-    rows_valid_distance = 0
-    rows_valid_outcome = 0
+    rows_after_initial_scan = len(labeled)
+    rows_after_timestamp_filter = 0
+    rows_after_symbol_filter = 0
+    rows_with_valid_distance = 0
+    rows_with_valid_outcome = 0
+
     out: list[PoleRow] = []
-
     for r in labeled:
-        rows_pre += 1
-        key = (_clean(r.get(symbol_col), ""), _clean(r.get(ts_col), ""), _clean(r.get(pattern_col), "") if pattern_col else "")
-        ref = btc_index.get(key, {})
+        ts_text = _clean(r.get(ts_col), "")
+        sym_text = _clean(r.get(symbol_col), "")
+        if not ts_text:
+            continue
+        rows_after_timestamp_filter += 1
+        if not sym_text:
+            continue
+        rows_after_symbol_filter += 1
 
-        ts_raw = r.get(ts_col) or ref.get(ts_col)
-        ts = _to_int(ts_raw)
+        ref = btc_index.get((sym_text, ts_text), {})
+        ts = _to_int(ts_text)
         if ts <= 0:
             continue
 
-        distance = _clean((r.get(distance_col) or ref.get(distance_col)))
+        distance = _clean(r.get(distance_col)) if distance_col else "NA"
+        if distance == "NA" and ref and btc_distance_col:
+            distance = _clean(ref.get(btc_distance_col))
         if distance != "NA":
-            rows_valid_distance += 1
+            rows_with_valid_distance += 1
 
-        outcome = _clean((r.get(outcome_col) or ref.get(outcome_col)), "")
+        outcome = _clean(r.get(outcome_col), "")
         if outcome:
-            rows_valid_outcome += 1
-        if not outcome:
+            rows_with_valid_outcome += 1
+        else:
             continue
 
         max_fav = _to_float(r.get("max_favorable_boxes"))
@@ -152,7 +165,7 @@ def _build_rows(labeled: list[dict[str, str]], btc: list[dict[str, str]]) -> tup
         out.append(
             PoleRow(
                 ts=ts,
-                symbol=_clean(r.get(symbol_col), ""),
+                symbol=sym_text,
                 outcome=outcome,
                 distance=distance,
                 enhanced=_clean(r.get("enhanced_by_opposing_pole") or ref.get("enhanced_by_opposing_pole")),
@@ -166,19 +179,23 @@ def _build_rows(labeled: list[dict[str, str]], btc: list[dict[str, str]]) -> tup
         )
 
     sorted_rows = sorted(out, key=lambda x: x.ts)
-    diag.update({
-        "rows_after_initial_scan": rows_pre,
-        "rows_with_valid_distance": rows_valid_distance,
-        "rows_with_valid_outcome": rows_valid_outcome,
-        "rows_after_sorting": len(sorted_rows),
-    })
+    diag.update(
+        {
+            "rows_after_initial_scan": rows_after_initial_scan,
+            "rows_after_timestamp_filter": rows_after_timestamp_filter,
+            "rows_after_symbol_filter": rows_after_symbol_filter,
+            "rows_with_valid_distance": rows_with_valid_distance,
+            "rows_with_valid_outcome": rows_with_valid_outcome,
+            "rows_after_sorting": len(sorted_rows),
+        }
+    )
     return sorted_rows, diag
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Chronological forward pole motif validation (research-only).")
     ap.add_argument("--input-labeled-outcomes-csv", required=True)
-    ap.add_argument("--input-btc-columns-csv", required=True)
+    ap.add_argument("--input-btc-columns-csv", default="")
     ap.add_argument("--input-canonical-motifs-csv", default="")
     ap.add_argument("--output-root", required=True)
     ap.add_argument("--train-ratio", type=float, default=0.5)
@@ -188,7 +205,7 @@ def main() -> None:
     args = ap.parse_args()
 
     labeled = _load_csv(Path(args.input_labeled_outcomes_csv))
-    btc = _load_csv(Path(args.input_btc_columns_csv))
+    btc = _load_csv(Path(args.input_btc_columns_csv)) if args.input_btc_columns_csv else []
     if args.input_canonical_motifs_csv:
         _ = _load_csv(Path(args.input_canonical_motifs_csv))
 
@@ -214,7 +231,7 @@ def main() -> None:
         i += step
 
     thirds = max(n // 3, 1)
-    segments = {"early": rows[:thirds], "middle": rows[thirds:(2 * thirds)], "late": rows[2 * thirds:]}
+    segments = {"early": rows[:thirds], "middle": rows[thirds : (2 * thirds)], "late": rows[2 * thirds :]}
     drift_rows = [{"segment": seg, **_metrics(seg_rows)} for seg, seg_rows in segments.items()]
     dist_cmp = []
     for seg, seg_rows in segments.items():
@@ -236,18 +253,36 @@ def main() -> None:
         w.writerows(windows)
     with (out / "pole_forward_validation_drift.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["segment", "sample_size", "continuation_pct", "failure_pct", "expectancy_score", "asymmetry_score"])
-        w.writeheader(); w.writerows(drift_rows)
+        w.writeheader()
+        w.writerows(drift_rows)
     with (out / "pole_forward_validation_distance_comparison.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["segment", "distance_bucket", "sample_size", "continuation_pct", "failure_pct", "expectancy_score", "asymmetry_score"])
-        w.writeheader(); w.writerows(dist_cmp)
+        w.writeheader()
+        w.writerows(dist_cmp)
 
     with (out / "pole_forward_validation_summary.md").open("w") as f:
         f.write("# Pole Forward Structural Validation (Research-Only)\n\n")
         f.write("Strict chronological replay only. No random split, no regime labels, no execution simulation.\n\n")
         f.write("## Input/Build Diagnostics\n")
-        for k in ["rows_loaded_labeled", "labeled_columns_detected", "required_columns_present", "required_columns_missing", "rows_after_initial_scan", "timestamp_column_selected", "symbol_column_selected", "distance_column_selected", "outcome_column_selected", "rows_with_valid_distance", "rows_with_valid_outcome", "rows_after_sorting"]:
+        for k in [
+            "rows_loaded_labeled",
+            "labeled_columns_detected",
+            "required_columns_present",
+            "required_columns_missing",
+            "timestamp_column_selected",
+            "symbol_column_selected",
+            "distance_column_selected",
+            "outcome_column_selected",
+            "rows_after_initial_scan",
+            "rows_after_timestamp_filter",
+            "rows_after_symbol_filter",
+            "rows_with_valid_distance",
+            "rows_with_valid_outcome",
+            "rows_after_sorting",
+        ]:
             f.write(f"- {k.replace('_', ' ')}: {diag.get(k, '<n/a>')}\n")
         f.write(f"- rows eligible for windows: {n}\n\n")
+
         f.write("## Diagnostics\n")
         f.write(f"- chronological windows evaluated: {len(windows)}\n")
         f.write(f"- rows total: {n}\n")
@@ -263,7 +298,12 @@ def main() -> None:
         d3_big = [r for r in distance3 if r.pole_boxes > 12]
         d3_low_retrace = [r for r in distance3 if r.retrace_ratio <= 1.0]
         d3_high_retrace = [r for r in distance3 if r.retrace_ratio > 1.0]
-        f.write(f"- enhanced=False: {_metrics(d3_plain)}\n- enhanced=True: {_metrics(d3_enhanced)}\n- pole size <=12: {_metrics(d3_small)}\n- pole size >12: {_metrics(d3_big)}\n- retrace <=1.0: {_metrics(d3_low_retrace)}\n- retrace >1.0: {_metrics(d3_high_retrace)}\n\n")
+        f.write(f"- enhanced=False: {_metrics(d3_plain)}\n")
+        f.write(f"- enhanced=True: {_metrics(d3_enhanced)}\n")
+        f.write(f"- pole size <=12: {_metrics(d3_small)}\n")
+        f.write(f"- pole size >12: {_metrics(d3_big)}\n")
+        f.write(f"- retrace <=1.0: {_metrics(d3_low_retrace)}\n")
+        f.write(f"- retrace >1.0: {_metrics(d3_high_retrace)}\n\n")
 
         if n == 0:
             verdict = "INVALID_RUN"
@@ -275,6 +315,7 @@ def main() -> None:
             verdict = "MODERATE"
         else:
             verdict = "LOW"
+
         f.write("## Conclusions\n")
         f.write(f"- spacing law survival confidence: {verdict}\n")
 
