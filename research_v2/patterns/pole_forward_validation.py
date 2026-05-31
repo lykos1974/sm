@@ -12,19 +12,16 @@ CONTINUATION_OUTCOMES = {"BULLISH_CONTINUATION", "BEARISH_CONTINUATION"}
 FAILURE_OUTCOME = "FAILED_REVERSAL"
 
 REQUIRED_LABELED_COLUMNS = {
-    "timestamp",
-    "symbol",
     "outcome_class",
     "max_favorable_boxes",
     "max_adverse_boxes",
     "opposing_pole_distance_columns",
     "enhanced_by_opposing_pole",
     "pole_boxes",
-    "pole_boxes_bucket",
     "retrace_boxes",
     "retrace_ratio",
-    "retrace_ratio_bucket",
 }
+CHRONOLOGICAL_INDEX_COLUMNS = ("reversal_column_index", "pole_column_index")
 
 
 @dataclass(frozen=True)
@@ -59,8 +56,14 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _to_int(value: Any) -> int:
-    return int(_to_float(value, 0.0))
+def _to_optional_int(value: Any) -> int | None:
+    text = _clean(value, na_token="")
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
 
 
 def _safe_div(a: float, b: float) -> float:
@@ -79,9 +82,37 @@ def _detected_columns(rows: list[dict[str, str]]) -> list[str]:
     return sorted(c for c in cols if c)
 
 
+def _select_chronological_index_source(columns: list[str]) -> str:
+    detected = set(columns)
+    return next((column for column in CHRONOLOGICAL_INDEX_COLUMNS if column in detected), "")
+
+
 def _missing_required_columns(columns: list[str]) -> list[str]:
     detected = set(columns)
-    return sorted(REQUIRED_LABELED_COLUMNS - detected)
+    missing = sorted(REQUIRED_LABELED_COLUMNS - detected)
+    if not _select_chronological_index_source(columns):
+        missing.append("reversal_column_index or pole_column_index")
+    return missing
+
+
+def _bucket_pole_size(value: float) -> str:
+    if value <= 8:
+        return "<=8"
+    if value <= 12:
+        return "9-12"
+    if value <= 20:
+        return "13-20"
+    return ">20"
+
+
+def _bucket_retrace_ratio(value: float) -> str:
+    if value < 0.75:
+        return "0.50-0.75"
+    if value < 1.00:
+        return "0.75-1.00"
+    if value <= 1.50:
+        return "1.00-1.50"
+    return ">1.50"
 
 
 def _row_expectancy(outcome: str, max_fav: float, max_adv: float) -> float:
@@ -90,27 +121,32 @@ def _row_expectancy(outcome: str, max_fav: float, max_adv: float) -> float:
     return (0.7 * outcome_score) + (0.3 * asym)
 
 
-def _build_rows_from_labeled(labeled: list[dict[str, str]]) -> list[PoleRow]:
+def _build_rows_from_labeled(labeled: list[dict[str, str]], chronological_index_source: str) -> list[PoleRow]:
     out: list[PoleRow] = []
 
     for r in labeled:
-        ts = _to_int(r.get("timestamp"))
+        chronological_index = _to_optional_int(r.get(chronological_index_source))
+        if chronological_index is None:
+            continue
+
         outcome = _clean(r.get("outcome_class"), na_token="")
         max_fav = _to_float(r.get("max_favorable_boxes"))
         max_adv = _to_float(r.get("max_adverse_boxes"))
+        pole_boxes = _to_float(r.get("pole_boxes"))
+        retrace_ratio = _to_float(r.get("retrace_ratio"))
 
         out.append(
             PoleRow(
-                ts=ts,
+                ts=chronological_index,
                 symbol=_clean(r.get("symbol"), na_token=""),
                 outcome=outcome,
                 distance=_clean(r.get("opposing_pole_distance_columns")),
                 enhanced=_clean(r.get("enhanced_by_opposing_pole")),
-                pole_boxes=_to_float(r.get("pole_boxes")),
-                pole_boxes_bucket=_clean(r.get("pole_boxes_bucket")),
+                pole_boxes=pole_boxes,
+                pole_boxes_bucket=_bucket_pole_size(pole_boxes),
                 retrace_boxes=_to_float(r.get("retrace_boxes")),
-                retrace_ratio=_to_float(r.get("retrace_ratio")),
-                retrace_ratio_bucket=_clean(r.get("retrace_ratio_bucket")),
+                retrace_ratio=retrace_ratio,
+                retrace_ratio_bucket=_bucket_retrace_ratio(retrace_ratio),
                 expectancy=_row_expectancy(outcome, max_fav, max_adv),
             )
         )
@@ -183,9 +219,10 @@ def main() -> None:
     labeled_columns = _detected_columns(labeled)
     btc_columns = _detected_columns(btc)
     missing_required_columns = _missing_required_columns(labeled_columns)
+    chronological_index_source = _select_chronological_index_source(labeled_columns)
 
-    built_rows = [] if missing_required_columns else _build_rows_from_labeled(labeled)
-    rows_after_filtering = [r for r in built_rows if r.ts > 0]
+    built_rows = [] if missing_required_columns else _build_rows_from_labeled(labeled, chronological_index_source)
+    rows_after_filtering = built_rows
     rows = sorted(rows_after_filtering, key=lambda x: x.ts)
     n = len(rows)
 
@@ -305,6 +342,9 @@ def main() -> None:
             "- missing required labeled columns: "
             f"{', '.join(missing_required_columns) if missing_required_columns else 'NONE'}\n"
         )
+        f.write(f"- chronological index source selected: {chronological_index_source or 'NONE'}\n")
+        f.write("- computed pole_boxes_bucket: True\n")
+        f.write("- computed retrace_ratio_bucket: True\n")
         f.write(f"- btc columns csv provided: {bool(btc_path)}\n")
         f.write(f"- btc rows loaded: {len(btc)}\n")
         f.write(f"- detected btc columns: {', '.join(btc_columns) if btc_columns else 'NONE'}\n")
