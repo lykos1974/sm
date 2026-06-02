@@ -158,11 +158,19 @@ def _load_candles(path: Path, symbol: str) -> list[Candle]:
     return _load_candles_csv(path) if path.suffix.lower() == ".csv" else _load_candles_db(path, symbol)
 
 
-def _load_symbol(symbol: str, labels_path: Path, columns_path: Path, candles_path: Path) -> tuple[list[ChronologyObservation], list[Candle], list[dict[str, str]]]:
+def _parse_candle_symbol(value: str) -> tuple[str, str]:
+    symbol, separator, db_symbol = value.partition("=")
+    symbol, db_symbol = symbol.strip().upper(), db_symbol.strip()
+    if not separator or not symbol or not db_symbol:
+        raise argparse.ArgumentTypeError("expected SYMBOL=DB_SYMBOL")
+    return symbol, db_symbol
+
+
+def _load_symbol(symbol: str, labels_path: Path, columns_path: Path, candles_path: Path, candle_symbol: str | None = None) -> tuple[list[ChronologyObservation], list[Candle], list[dict[str, str]]]:
     columns, box_size = _load_columns(columns_path)
     if box_size is None or box_size <= 0:
         raise ValueError(f"{symbol}: matching PnF columns do not expose a positive box size in profile_name")
-    candles = _load_candles(candles_path, symbol)
+    candles = _load_candles(candles_path, candle_symbol or symbol)
     flags: list[dict[str, str]] = []
     observations: list[ChronologyObservation] = []
     with labels_path.open("r", newline="") as handle:
@@ -279,12 +287,13 @@ def _write_summary(path: Path, symbols: list[str], observations: list[Chronology
         handle.write("This candle chronology audit does not register or resolve strategy candidates. `candidate_rows_registered`, `resolved_rows`, `win_rate_non_ambiguous`, `avg_realized_r_multiple`, `total_realized_r_multiple`, and `TP1 -> TP2 conversion` are all `NOT_COMPUTED_FOR_RESEARCH_ONLY_SL_C_CANDLE_CHRONOLOGY`.\n")
 
 
-def run(symbol_inputs: dict[str, Path], columns_inputs: dict[str, Path], candles_inputs: dict[str, Path], output_root: Path) -> None:
+def run(symbol_inputs: dict[str, Path], columns_inputs: dict[str, Path], candles_inputs: dict[str, Path], output_root: Path, candle_symbols: dict[str, str] | None = None) -> None:
     symbols = _check_symbols(symbol_inputs, columns_inputs, candles_inputs)
     _require_paths(symbol_inputs, "symbol-input")
     _require_paths(columns_inputs, "columns-input")
     _require_paths(candles_inputs, "candles-input")
     output_root.mkdir(parents=True, exist_ok=True)
+    candle_symbols = candle_symbols or {}
     existing = [name for name in OUTPUT_NAMES if (output_root / name).exists()]
     if existing:
         raise FileExistsError(f"refusing to overwrite existing chronology output(s): {', '.join(existing)}")
@@ -292,7 +301,7 @@ def run(symbol_inputs: dict[str, Path], columns_inputs: dict[str, Path], candles
     candles_by_symbol: dict[str, list[Candle]] = {}
     flags: list[dict[str, str]] = []
     for symbol in symbols:
-        loaded, candles, symbol_flags = _load_symbol(symbol, symbol_inputs[symbol], columns_inputs[symbol], candles_inputs[symbol])
+        loaded, candles, symbol_flags = _load_symbol(symbol, symbol_inputs[symbol], columns_inputs[symbol], candles_inputs[symbol], candle_symbols.get(symbol))
         observations.extend(loaded)
         candles_by_symbol[symbol] = candles
         flags.extend(symbol_flags)
@@ -325,10 +334,11 @@ def main() -> None:
     parser.add_argument("--symbol-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV")
     parser.add_argument("--columns-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV")
     parser.add_argument("--candles-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV_OR_DB")
+    parser.add_argument("--candle-symbol", action="append", default=[], type=_parse_candle_symbol, metavar="SYMBOL=DB_SYMBOL")
     parser.add_argument("--output-root", required=True, type=Path)
     args = parser.parse_args()
     try:
-        run(dict(args.symbol_input), dict(args.columns_input), dict(args.candles_input), args.output_root)
+        run(dict(args.symbol_input), dict(args.columns_input), dict(args.candles_input), args.output_root, dict(args.candle_symbol))
     except (FileExistsError, OSError, sqlite3.Error, ValueError) as exc:
         parser.error(str(exc))
 
