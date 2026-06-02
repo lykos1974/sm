@@ -118,3 +118,43 @@ def test_loads_explicit_sqlite_candles_input(tmp_path: Path) -> None:
         connection.executemany("INSERT INTO candles VALUES (?, ?, ?, ?)", [("OTHER", 1, 9, 8), ("TEST", 3, 12, 10), ("TEST", 2, 11, 9)])
     candles = _load_candles(db_path, "TEST")
     assert [(candle.ts, candle.high, candle.low) for candle in candles] == [(2, 11.0, 9.0), (3, 12.0, 10.0)]
+
+
+def _write_symbol_db(path: Path, symbol: str) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE candles (symbol TEXT, close_time INTEGER, high REAL, low REAL)")
+        connection.executemany("INSERT INTO candles VALUES (?, ?, ?, ?)", [
+            (symbol, 31, 18, 14),
+            (symbol, 61, 18, 14),
+            (symbol, 91, 18, 11),
+        ])
+
+
+def _db_args(tmp_path: Path, db_path: Path) -> tuple[list[str], Path]:
+    labels, columns = tmp_path / "labels.csv", tmp_path / "columns.csv"
+    _write_labels(labels)
+    _write_columns(columns)
+    output = tmp_path / "output"
+    return ["--symbol-input", f"BTC={labels}", "--columns-input", f"BTC={columns}", "--candles-input", f"BTC={db_path}", "--output-root", str(output)], output
+
+
+def test_candle_symbol_mapping_loads_db_symbol_without_changing_research_symbol(tmp_path: Path) -> None:
+    db_path = tmp_path / "candles.db"
+    _write_symbol_db(db_path, "BINANCE_FUT:BTCUSDT")
+    args, output = _db_args(tmp_path, db_path)
+    subprocess.run([
+        sys.executable, "-m", "research_v2.patterns.pole_core_motif_sl_c_candle_chronology",
+        *args, "--candle-symbol", "BTC=BINANCE_FUT:BTCUSDT",
+    ], check=True)
+    targets = list(csv.DictReader((output / "sl_c_candle_chronology_targets.csv").open()))
+    assert {row["symbol"] for row in targets} == {"BTC"}
+    assert next(row for row in targets if row["row_number"] == "2" and row["r_target"] == "1.0")["classification"] == "TARGET_FIRST"
+
+
+def test_missing_candle_symbol_mapping_preserves_unknown_missing_candles(tmp_path: Path) -> None:
+    db_path = tmp_path / "candles.db"
+    _write_symbol_db(db_path, "BINANCE_FUT:BTCUSDT")
+    args, output = _db_args(tmp_path, db_path)
+    subprocess.run([sys.executable, "-m", "research_v2.patterns.pole_core_motif_sl_c_candle_chronology", *args], check=True)
+    targets = list(csv.DictReader((output / "sl_c_candle_chronology_targets.csv").open()))
+    assert next(row for row in targets if row["row_number"] == "2" and row["r_target"] == "1.0")["classification"] == "UNKNOWN_MISSING_CANDLES"
