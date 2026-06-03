@@ -32,6 +32,7 @@ if str(PNF_MVP) not in sys.path:
     sys.path.insert(0, str(PNF_MVP))
 
 from pnf_engine import PnFEngine, PnFProfile  # noqa: E402
+from patterns.poles import detect_pole_patterns  # noqa: E402
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
 BINANCE_DEMO_BASE_URL = "https://demo-fapi.binance.com"
@@ -46,10 +47,15 @@ RECV_WINDOW_MS = 5000
 ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:BNBUSDT", "BINANCE_FUT:SOLUSDT", "BINANCE_FUT:XRPUSDT"}
 ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
 DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
+DEMO_POLE_MOTIF_PATTERNS = {"pole_motif_low", "pole_motif_high"}
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
 OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "EXIT_PENDING"}
 RECONCILE_PRICE_MISMATCH_BPS = Decimal("1")
 RECONCILE_MIN_PRICE_MISMATCH = Decimal("0.00000001")
+POLE_MOTIF_ENTRY_MODEL = "NEXT_COLUMN_OPEN_ENTRY"
+POLE_MOTIF_STOP_BOXES = Decimal("3")
+POLE_MOTIF_TARGET_R = Decimal("2.5")
+POLE_MOTIF_BREAK_EVEN_TRIGGER_R = Decimal("2")
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,7 @@ class Candle:
     close: float
     high: float
     low: float
+    open: float | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,39 @@ class TriangleSignal:
     resistance_level: Decimal
     break_distance_boxes: Decimal
     pattern_quality: str
+
+
+@dataclass(frozen=True)
+class PoleMotifSignal:
+    symbol: str
+    direction: str
+    entry: Decimal
+    stop: Decimal
+    target: Decimal
+    be_trigger: Decimal
+    trigger_ts: int
+    pattern_name: str
+    pole_column_index: int
+    reversal_column_index: int
+    confirmation_column_index: int
+    setup_key: str
+
+    def to_triangle_signal(self) -> "TriangleSignal":
+        return TriangleSignal(
+            symbol=self.symbol,
+            pattern="pole_motif_low" if self.pattern_name == "LOW_POLE" else "pole_motif_high",
+            side=self.direction,
+            trigger_ts=self.trigger_ts,
+            entry_price=self.entry,
+            stop_price=self.stop,
+            tp1_price=self.be_trigger,
+            tp2_price=self.target,
+            trigger_column_idx=self.confirmation_column_index,
+            support_level=min(self.entry, self.stop),
+            resistance_level=max(self.entry, self.stop),
+            break_distance_boxes=POLE_MOTIF_STOP_BOXES,
+            pattern_quality=f"POLE_MOTIF_DEMO_FORWARD|{POLE_MOTIF_ENTRY_MODEL}|setup={self.setup_key}",
+        )
 
 
 @dataclass(frozen=True)
@@ -543,6 +583,9 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             "entry_slippage_bps": "REAL",
             "order_status_response": "TEXT",
             "user_trades_response": "TEXT",
+            "break_even_armed": "INTEGER NOT NULL DEFAULT 0",
+            "break_even_trigger_price": "REAL",
+            "active_stop_price": "REAL",
         },
     )
     conn.commit()
@@ -634,14 +677,20 @@ def log_market_runtime_compare(symbol: str, profile: PnFProfile, candles: list[C
     )
 
 
+def candle_table_has_open(conn: sqlite3.Connection) -> bool:
+    return "open" in {str(row[1]) for row in conn.execute("PRAGMA table_info(candles)").fetchall()}
+
+
 def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Candle]:
     primary_query_symbol = symbol
     fallback_query_symbol = binance_symbol(symbol)
     use_fallback = primary_query_symbol != fallback_query_symbol
     log_candle_query(symbol, primary_query_symbol, fallback_query_symbol if use_fallback else None)
+    has_open = candle_table_has_open(conn)
+    select_fields = "close_time, close, high, low, open" if has_open else "close_time, close, high, low"
     rows = conn.execute(
-        """
-        SELECT close_time, close, high, low
+        f"""
+        SELECT {select_fields}
         FROM candles
         WHERE symbol = ? AND interval = '1m'
         ORDER BY close_time DESC
@@ -652,8 +701,8 @@ def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Cand
     query_used = primary_query_symbol
     if not rows and use_fallback:
         rows = conn.execute(
-            """
-            SELECT close_time, close, high, low
+            f"""
+            SELECT {select_fields}
             FROM candles
             WHERE symbol = ? AND interval = '1m'
             ORDER BY close_time DESC
@@ -662,7 +711,10 @@ def load_candles(conn: sqlite3.Connection, symbol: str, limit: int) -> list[Cand
             (fallback_query_symbol, limit),
         ).fetchall()
         query_used = fallback_query_symbol
-    candles = [Candle(int(ts), float(close), float(high), float(low)) for ts, close, high, low in reversed(rows)]
+    candles = [
+        Candle(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]) if len(row) > 4 and row[4] is not None else None)
+        for row in reversed(rows)
+    ]
     log_candle_result(query_used, candles, runtime_symbol=symbol)
     return candles
 
@@ -853,6 +905,118 @@ def detect_latest_strict_double(symbol: str, profile: PnFProfile, candles: list[
     return None
 
 
+def pole_direction_for_pattern(pattern_name: str) -> str:
+    pattern = str(pattern_name).upper()
+    if pattern == "LOW_POLE":
+        return "LONG"
+    if pattern == "HIGH_POLE":
+        return "SHORT"
+    raise ValueError(f"unsupported pole motif pattern: {pattern_name}")
+
+
+def pole_motif_setup_key(
+    symbol: str,
+    profile: PnFProfile,
+    pattern_name: str,
+    pole_idx: int,
+    reversal_idx: int,
+    confirmation_idx: int,
+) -> str:
+    return (
+        f"{symbol}|{profile.name}|{pattern_name}|{pole_idx}|{reversal_idx}|{confirmation_idx}|"
+        f"{POLE_MOTIF_ENTRY_MODEL}|SL{POLE_MOTIF_STOP_BOXES:g}|"
+        f"T{POLE_MOTIF_TARGET_R:g}|BE{POLE_MOTIF_BREAK_EVEN_TRIGGER_R:g}"
+    )
+
+
+def pole_motif_price_levels(direction: str, entry: Decimal, box_size: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    risk = POLE_MOTIF_STOP_BOXES * box_size
+    if direction == "LONG":
+        return entry - risk, entry + (risk * POLE_MOTIF_TARGET_R), entry + (risk * POLE_MOTIF_BREAK_EVEN_TRIGGER_R)
+    return entry + risk, entry - (risk * POLE_MOTIF_TARGET_R), entry - (risk * POLE_MOTIF_BREAK_EVEN_TRIGGER_R)
+
+
+def build_pole_motif_signal(
+    *,
+    symbol: str,
+    profile: PnFProfile,
+    pattern: dict[str, Any],
+    entry_candle: Candle,
+    confirmation_idx: int,
+) -> PoleMotifSignal:
+    pattern_name = str(pattern["pattern_name"]).upper()
+    direction = pole_direction_for_pattern(pattern_name)
+    entry_source = entry_candle.open if entry_candle.open is not None else entry_candle.close
+    entry = _dec(entry_source)
+    box_size = _dec(profile.box_size)
+    stop, target, be_trigger = pole_motif_price_levels(direction, entry, box_size)
+    pole_idx = int(pattern["pole_column_index"])
+    reversal_idx = int(pattern["reversal_column_index"])
+    return PoleMotifSignal(
+        symbol=symbol,
+        direction=direction,
+        entry=entry,
+        stop=stop,
+        target=target,
+        be_trigger=be_trigger,
+        trigger_ts=int(entry_candle.close_time),
+        pattern_name=pattern_name,
+        pole_column_index=pole_idx,
+        reversal_column_index=reversal_idx,
+        confirmation_column_index=confirmation_idx,
+        setup_key=pole_motif_setup_key(symbol, profile, pattern_name, pole_idx, reversal_idx, confirmation_idx),
+    )
+
+
+def detect_latest_pole_motif_demo_signal(symbol: str, profile: PnFProfile, candles: list[Candle]) -> TriangleSignal | None:
+    engine, _latest_ts = _replay_close_confirmed_pnf(profile, candles)
+    if len(engine.columns) < 3:
+        return None
+    patterns = detect_pole_patterns(engine.columns, box_size=float(profile.box_size))
+    core = [
+        pattern
+        for pattern in patterns
+        if pattern.get("opposing_pole_distance_columns") == 3
+        and pattern.get("enhanced_by_opposing_pole") is False
+        and pattern.get("reversal_column_index") is not None
+    ]
+    if not core:
+        return None
+
+    by_idx = {int(getattr(col, "idx")): col for col in engine.columns}
+    latest: PoleMotifSignal | None = None
+    for pattern in core:
+        reversal_idx = int(pattern["reversal_column_index"])
+        confirmation_idx = reversal_idx + 1
+        confirmation = by_idx.get(confirmation_idx)
+        if confirmation is None or getattr(confirmation, "start_ts", None) is None:
+            continue
+        entry_after_ts = int(getattr(confirmation, "start_ts"))
+        entry_candle = next((c for c in candles if c.close_time > entry_after_ts), None)
+        if entry_candle is None:
+            continue
+        candidate = build_pole_motif_signal(
+            symbol=symbol,
+            profile=profile,
+            pattern=pattern,
+            entry_candle=entry_candle,
+            confirmation_idx=confirmation_idx,
+        )
+        if latest is None or candidate.reversal_column_index > latest.reversal_column_index:
+            latest = candidate
+    return latest.to_triangle_signal() if latest is not None else None
+
+
+def is_demo_pole_motif_signal(signal: TriangleSignal) -> bool:
+    return signal.pattern in DEMO_POLE_MOTIF_PATTERNS
+
+
+def be_trigger_price_for_signal(signal: TriangleSignal) -> Decimal | None:
+    if is_demo_pole_motif_signal(signal):
+        return signal.tp1_price
+    return None
+
+
 def is_demo_double_signal(signal: TriangleSignal) -> bool:
     return signal.pattern in DEMO_DOUBLE_PATTERNS
 
@@ -940,8 +1104,9 @@ def record_trade(
         INSERT INTO live_trades_binance(
             created_at, symbol, pattern, side, trigger_timestamp, entry_price,
             stop_price, tp1_price, tp2_price, notional_usdt, decision, status,
-            block_reason, dry_run, exchange_order_id, raw_order_response, notes
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            block_reason, dry_run, exchange_order_id, raw_order_response, notes,
+            break_even_armed, break_even_trigger_price, active_stop_price
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             now_iso(),
@@ -961,6 +1126,9 @@ def record_trade(
             exchange_order_id,
             json.dumps(raw_order_response or {}, sort_keys=True, default=str),
             notes,
+            0,
+            float(be_trigger_price_for_signal(signal)) if be_trigger_price_for_signal(signal) is not None else None,
+            float(signal.stop_price),
         ),
     )
     conn.commit()
@@ -1087,8 +1255,10 @@ def apply_entry_lifecycle(
         ),
     )
     conn.commit()
-    if verbose_market_logs and entry_status == "FILLED":
-        log_position_open_detail(signal, lifecycle)
+    if entry_status == "FILLED":
+        console("ORDER_FILLED", f"{signal.symbol} {signal.pattern}", lifecycle)
+        if verbose_market_logs:
+            log_position_open_detail(signal, lifecycle)
 
 
 def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool, verbose_market_logs: bool = False) -> None:
@@ -1150,6 +1320,7 @@ def record_submitted_entry_order(
     verbose_market_logs: bool = False,
 ) -> dict[str, Any]:
     raw_response = client.submit_order(order)
+    console("ORDER_SUBMITTED", f"{signal.symbol} {signal.pattern}", {"order": order, "response": raw_response})
     order_id, client_order_id = extract_order_ids(order, raw_response)
     exchange_order_id = order_id or client_order_id
     record_signal(
@@ -1718,13 +1889,19 @@ def validate_guards(
     live_enabled: bool,
     demo: bool = False,
     allow_demo_doubles: bool = False,
+    allow_demo_pole_motif: bool = False,
     demo_max_notional_usdt: Decimal = MAX_NOTIONAL_USDT,
     allow_demo_cap_override: bool = False,
 ) -> tuple[SymbolSpec | None, dict[str, Any] | None, str | None]:
     if signal.symbol not in ALLOWED_SYMBOLS:
         return None, None, "symbol outside live allowlist"
     demo_doubles_enabled = bool(demo and live_enabled and allow_demo_doubles)
-    if signal.pattern not in ALLOWED_PATTERNS and not (demo_doubles_enabled and signal.pattern in DEMO_DOUBLE_PATTERNS):
+    demo_pole_motif_enabled = bool(demo and live_enabled and allow_demo_pole_motif)
+    if (
+        signal.pattern not in ALLOWED_PATTERNS
+        and not (demo_doubles_enabled and signal.pattern in DEMO_DOUBLE_PATTERNS)
+        and not (demo_pole_motif_enabled and signal.pattern in DEMO_POLE_MOTIF_PATTERNS)
+    ):
         return None, None, "pattern outside live allowlist"
     if signal.pattern in CATAPULT_SIGNAL_NAMES:
         return None, None, "catapult patterns are log-only"
@@ -1848,6 +2025,14 @@ def build_forced_demo_signal(symbol: str, side: str, candle: Candle) -> Triangle
     )
 
 
+def hit_target_price(high: Any, low: Any, target: Decimal, side: str) -> bool:
+    return _dec(high) >= target if side == "LONG" else _dec(low) <= target
+
+
+def hit_stop_price(high: Any, low: Any, stop: Decimal, side: str) -> bool:
+    return _dec(low) <= stop if side == "LONG" else _dec(high) >= stop
+
+
 def update_open_trade_exits(
     state_conn: sqlite3.Connection,
     candle_conn_or_client: sqlite3.Connection | BinanceFuturesClient,
@@ -1861,13 +2046,29 @@ def update_open_trade_exits(
     active_client = candle_conn_or_client if client is None else client
     rows = state_conn.execute(
         """
-        SELECT id, symbol, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price, raw_order_response, executed_qty
+        SELECT id, symbol, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price,
+               raw_order_response, executed_qty, pattern, break_even_armed, break_even_trigger_price, active_stop_price
         FROM live_trades_binance
         WHERE status IN ('POSITION_OPEN','EXIT_PENDING')
         """
     ).fetchall()
     for row in rows:
-        trade_id, symbol, side, entry_time, entry, stop, _tp1, tp2, raw_order_response, executed_qty = row
+        (
+            trade_id,
+            symbol,
+            side,
+            entry_time,
+            entry,
+            stop,
+            _tp1,
+            tp2,
+            raw_order_response,
+            executed_qty,
+            pattern,
+            break_even_armed,
+            break_even_trigger,
+            active_stop,
+        ) = row
         candles = candle_conn.execute(
             """
             SELECT close_time, high, low
@@ -1877,38 +2078,69 @@ def update_open_trade_exits(
             """,
             (binance_symbol(symbol), symbol, int(entry_time)),
         ).fetchall()
+        entry_dec = _dec(entry)
+        initial_stop = _dec(stop)
+        current_stop = _dec(active_stop) if active_stop not in (None, "") else initial_stop
+        target = _dec(tp2)
+        is_pole_motif = str(pattern) in DEMO_POLE_MOTIF_PATTERNS
+        armed = bool(break_even_armed)
+        be_trigger = _dec(break_even_trigger) if break_even_trigger not in (None, "") else None
         for close_time, high, low in candles:
             exit_price = None
             exit_reason = None
-            if side == "LONG":
-                if float(low) <= float(stop):
-                    exit_price = Decimal(str(stop))
+
+            target_hit = hit_target_price(high, low, target, side)
+            stop_hit = hit_stop_price(high, low, current_stop, side)
+            trigger_hit = bool(is_pole_motif and not armed and be_trigger is not None and hit_target_price(high, low, be_trigger, side))
+
+            if target_hit and stop_hit:
+                exit_price = current_stop
+                exit_reason = "STOP"
+            elif target_hit:
+                exit_price = target
+                exit_reason = "TARGET"
+            elif stop_hit:
+                exit_price = current_stop
+                exit_reason = "STOP"
+            elif trigger_hit:
+                armed = True
+                current_stop = entry_dec
+                state_conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET break_even_armed = 1, active_stop_price = ?, notes = ?
+                    WHERE id = ? AND status IN ('POSITION_OPEN','EXIT_PENDING')
+                    """,
+                    (float(entry_dec), "break-even armed after +2R; active stop moved to entry", int(trade_id)),
+                )
+                state_conn.commit()
+                console("BE_ARMED", f"{symbol} trade_id={trade_id}", {"be_trigger": float(be_trigger), "active_stop": float(entry_dec)})
+                if hit_stop_price(high, low, current_stop, side):
+                    exit_price = current_stop
                     exit_reason = "STOP"
-                elif float(high) >= float(tp2):
-                    exit_price = Decimal(str(tp2))
-                    exit_reason = "TP2"
-            else:
-                if float(high) >= float(stop):
-                    exit_price = Decimal(str(stop))
-                    exit_reason = "STOP"
-                elif float(low) <= float(tp2):
-                    exit_price = Decimal(str(tp2))
-                    exit_reason = "TP2"
+                else:
+                    continue
+
             if exit_price is None:
                 continue
 
-            denom = abs(float(entry) - float(stop))
+            denom = abs(float(entry_dec) - float(initial_stop))
             realized_r = 0.0 if denom == 0 else (
-                (float(exit_price) - float(entry)) / denom if side == "LONG" else (float(entry) - float(exit_price)) / denom
+                (float(exit_price) - float(entry_dec)) / denom if side == "LONG" else (float(entry_dec) - float(exit_price)) / denom
             )
+            if exit_reason == "TARGET":
+                console("TARGET_HIT", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r})
+            else:
+                console("STOP_HIT", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r, "break_even_armed": armed})
+
             if not live_enabled:
                 state_conn.execute(
                     """
                     UPDATE live_trades_binance
-                    SET status = 'POSITION_CLOSED', exit_time = ?, exit_price = ?, realized_r = ?
+                    SET status = 'POSITION_CLOSED', exit_time = ?, exit_price = ?, realized_r = ?, active_stop_price = ?
                     WHERE id = ?
                     """,
-                    (int(close_time), float(exit_price), realized_r, int(trade_id)),
+                    (int(close_time), float(exit_price), realized_r, float(current_stop), int(trade_id)),
                 )
                 state_conn.commit()
                 console("POSITION_CLOSED", f"{symbol} trade_id={trade_id}", {"exit_price": float(exit_price), "realized_r": realized_r})
@@ -1957,13 +2189,14 @@ def update_open_trade_exits(
             state_conn.execute(
                 """
                 UPDATE live_trades_binance
-                SET status = 'POSITION_CLOSED', exit_time = ?, exit_price = ?, realized_r = ?, notes = ?
+                SET status = 'POSITION_CLOSED', exit_time = ?, exit_price = ?, realized_r = ?, active_stop_price = ?, notes = ?
                 WHERE id = ?
                 """,
                 (
                     int(close_time),
                     float(exit_price),
                     realized_r,
+                    float(current_stop),
                     f"local closed-candle exit; reduce-only close response={json.dumps(raw_close_response, sort_keys=True)}",
                     int(trade_id),
                 ),
@@ -2007,6 +2240,7 @@ def log_startup(args: argparse.Namespace) -> None:
             "dry_run": dry_run,
             "api_key_env": binance_env_names(bool(getattr(args, 'demo', False)))[0],
             "enable_demo_doubles": bool(getattr(args, "enable_demo_doubles", False)),
+            "enable_demo_pole_motif": bool(getattr(args, "enable_demo_pole_motif", False)),
             "state_db_path": resolve_state_db_path(args),
             "demo_max_notional_usdt": getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)),
         },
@@ -2018,6 +2252,7 @@ def log_startup(args: argparse.Namespace) -> None:
 def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
     demo = bool(getattr(args, "demo", False))
     enable_demo_doubles = bool(getattr(args, "enable_demo_doubles", False))
+    enable_demo_pole_motif = bool(getattr(args, "enable_demo_pole_motif", False))
     verbose_market_logs = bool(getattr(args, "verbose_market_logs", False))
     live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
     dry_run = not live_enabled
@@ -2036,6 +2271,8 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
 
     if research_rule is not None and not (demo or args.dry_run):
         raise RuntimeError("--research-rule-json requires --demo or --dry-run (forward testing only)")
+    if enable_demo_pole_motif and not demo:
+        raise RuntimeError("--enable-demo-pole-motif requires --demo; pole motif execution is demo-only")
 
     if bool(getattr(args, "reconcile_positions", False)):
         raise RuntimeError("--reconcile-positions must be handled by main() before process_once()")
@@ -2117,18 +2354,30 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 continue
             signal = detect_latest_strict_triangle(symbol, profile, candles)
             allow_demo_doubles = bool(enable_demo_doubles and demo and live_enabled)
+            allow_demo_pole_motif = bool(enable_demo_pole_motif and demo and live_enabled)
             if signal is None and allow_demo_doubles:
                 signal = detect_latest_strict_double(symbol, profile, candles)
+            if signal is None and allow_demo_pole_motif:
+                signal = detect_latest_pole_motif_demo_signal(symbol, profile, candles)
             set_last_processed_close_time(state_conn, symbol, latest_close_time)
             if signal is None:
                 console("NO_SIGNAL", symbol)
                 continue
 
+            if is_demo_pole_motif_signal(signal):
+                console("SETUP_DETECTED", f"{signal.symbol} {signal.pattern} {signal.side}", {
+                    "entry_model": POLE_MOTIF_ENTRY_MODEL,
+                    "entry": float(signal.entry_price),
+                    "stop": float(signal.stop_price),
+                    "target": float(signal.tp2_price),
+                    "be_trigger": float(signal.tp1_price),
+                    "pattern_quality": signal.pattern_quality,
+                })
             console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side}", signal.__dict__)
             if verbose_market_logs:
                 log_signal_detail(signal, profile, candles[-1].close if candles else None)
             _spec, order, block_reason = validate_guards(
-                state_conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles, demo_max_notional_usdt=demo_max_notional_usdt
+                state_conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles, allow_demo_pole_motif=allow_demo_pole_motif, demo_max_notional_usdt=demo_max_notional_usdt
             )
             if verbose_market_logs and order is not None:
                 log_order_detail(signal.symbol, order)
@@ -2228,6 +2477,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode even if LIVE_TRADING_ENABLED=1")
     parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
     parser.add_argument("--enable-demo-doubles", action="store_true", help="Enable strict double top/bottom smoke-test execution only for DEMO LIVE mode")
+    parser.add_argument("--enable-demo-pole-motif", action="store_true", help="Enable validated Pole Motif forward execution only for Binance DEMO LIVE mode")
     parser.add_argument("--notional-usdt", default=str(DEFAULT_NOTIONAL_USDT), help="Fixed order notional; capped by the effective notional limit")
     parser.add_argument("--demo-max-notional-usdt", default=str(MAX_NOTIONAL_USDT), help="Demo-live-only cap; requested notional above 1 USDT is allowed only in --demo with LIVE_TRADING_ENABLED=1 when this value is >= --notional-usdt")
     parser.add_argument("--history-bars", type=int, default=5000, help="Number of recent 1m candles used to reconstruct close-confirmed PnF state")
