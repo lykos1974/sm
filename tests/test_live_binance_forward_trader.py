@@ -1541,6 +1541,121 @@ class BinanceForwardTraderTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(original_env)
 
+
+    def test_build_pole_motif_signal_uses_next_column_open_fixed_risk_chain(self):
+        pattern = {
+            "pattern_name": "LOW_POLE",
+            "pole_column_index": 5,
+            "reversal_column_index": 6,
+        }
+        profile = trader.PnFProfile("POLE_DEMO_bs0.25_rev3", 0.25, 3)
+        signal = trader.build_pole_motif_signal(
+            symbol="BINANCE_FUT:SOLUSDT",
+            profile=profile,
+            pattern=pattern,
+            entry_candle=trader.Candle(close_time=1700000000000, close=100.5, high=101.0, low=99.0, open=100.0),
+            confirmation_idx=7,
+        ).to_triangle_signal()
+
+        self.assertEqual(signal.pattern, "pole_motif_low")
+        self.assertEqual(signal.side, "LONG")
+        self.assertEqual(signal.entry_price, Decimal("100.0"))
+        self.assertEqual(signal.stop_price, Decimal("99.25"))
+        self.assertEqual(signal.tp2_price, Decimal("101.875"))
+        self.assertEqual(signal.tp1_price, Decimal("101.50"))
+        self.assertIn("NEXT_COLUMN_OPEN_ENTRY", signal.pattern_quality)
+
+    def test_pole_motif_guard_is_demo_live_only(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        signal = trader.TriangleSignal(
+            symbol="BINANCE_FUT:SOLUSDT",
+            pattern="pole_motif_low",
+            side="LONG",
+            trigger_ts=123,
+            entry_price=Decimal("100"),
+            stop_price=Decimal("99"),
+            tp1_price=Decimal("102"),
+            tp2_price=Decimal("102.5"),
+            trigger_column_idx=7,
+            support_level=Decimal("99"),
+            resistance_level=Decimal("100"),
+            break_distance_boxes=Decimal("3"),
+            pattern_quality="POLE_MOTIF_DEMO_FORWARD",
+        )
+
+        _spec, order, reason = trader.validate_guards(
+            conn,
+            LiveClient(),
+            signal,
+            notional_usdt=Decimal("1"),
+            live_enabled=True,
+            demo=True,
+            allow_demo_pole_motif=True,
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(order)
+
+        _spec2, order2, reason2 = trader.validate_guards(
+            conn,
+            LiveClient(),
+            replace_signal(signal, trigger_ts=124),
+            notional_usdt=Decimal("1"),
+            live_enabled=True,
+            demo=False,
+            allow_demo_pole_motif=True,
+        )
+        self.assertIsNone(order2)
+        self.assertIn("pattern outside live allowlist", reason2)
+
+    def test_pole_motif_break_even_lifecycle_logs_and_closes_at_be_stop(self):
+        state_conn = sqlite3.connect(":memory:")
+        candle_conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(state_conn)
+            signal = trader.TriangleSignal(
+                symbol="BINANCE_FUT:SOLUSDT",
+                pattern="pole_motif_low",
+                side="LONG",
+                trigger_ts=1,
+                entry_price=Decimal("100"),
+                stop_price=Decimal("99"),
+                tp1_price=Decimal("102"),
+                tp2_price=Decimal("102.5"),
+                trigger_column_idx=7,
+                support_level=Decimal("99"),
+                resistance_level=Decimal("100"),
+                break_distance_boxes=Decimal("3"),
+                pattern_quality="POLE_MOTIF_DEMO_FORWARD",
+            )
+            trader.record_trade(
+                state_conn,
+                signal,
+                notional_usdt=Decimal("1"),
+                exchange_order_id=None,
+                status="POSITION_OPEN",
+                dry_run=True,
+                decision="DRY_RUN",
+            )
+            candle_conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, high REAL, low REAL)")
+            candle_conn.execute("INSERT INTO candles VALUES(?,?,?,?,?)", ("SOLUSDT", "1m", 2, 102.1, 100.1))
+            candle_conn.execute("INSERT INTO candles VALUES(?,?,?,?,?)", ("SOLUSDT", "1m", 3, 101.0, 99.9))
+            candle_conn.commit()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.update_open_trade_exits(state_conn, candle_conn, LifecycleClient("FILLED"), live_enabled=False)
+            row = state_conn.execute("SELECT status, break_even_armed, active_stop_price, exit_price, realized_r FROM live_trades_binance").fetchone()
+        finally:
+            state_conn.close()
+            candle_conn.close()
+
+        self.assertEqual(row, ("POSITION_CLOSED", 1, 100.0, 100.0, 0.0))
+        text = output.getvalue()
+        self.assertIn("BE_ARMED", text)
+        self.assertIn("STOP_HIT", text)
+        self.assertIn("POSITION_CLOSED", text)
+
     def test_reduce_only_close_order_remains_reduce_only_true(self):
         spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
         close, reason = trader.build_reduce_only_close_order(
