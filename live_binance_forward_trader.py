@@ -410,28 +410,69 @@ def log_market_snapshot(symbol: str, profile: PnFProfile, candles: list[Candle])
     )
 
 
-def log_signal_detail(signal: TriangleSignal, profile: PnFProfile, last_close: float | None) -> None:
+def pole_motif_staleness_diagnostics(
+    signal: TriangleSignal,
+    *,
+    current_price: Decimal | float | None,
+    latest_candle_close_time: int | None,
+) -> dict[str, Any]:
+    if not is_demo_pole_motif_signal(signal):
+        return {}
+
+    current_price_dec = _dec(current_price) if current_price is not None else None
+    entry_distance_percent = None
+    if current_price_dec is not None and current_price_dec != 0:
+        entry_distance_percent = ((signal.entry_price - current_price_dec) / current_price_dec) * Decimal("100")
+
+    trigger_age_seconds = None
+    if latest_candle_close_time is not None:
+        trigger_age_seconds = (Decimal(int(latest_candle_close_time)) - Decimal(int(signal.trigger_ts))) / Decimal("1000")
+
+    return {
+        "CURRENT_PRICE": current_price_dec,
+        "ENTRY_PRICE": signal.entry_price,
+        "ENTRY_DISTANCE_PERCENT": entry_distance_percent,
+        "TRIGGER_TIMESTAMP": signal.trigger_ts,
+        "LATEST_CANDLE_CLOSE_TIME": latest_candle_close_time,
+        "TRIGGER_AGE_SECONDS": trigger_age_seconds,
+        "ENTRY_MODEL": POLE_MOTIF_ENTRY_MODEL,
+    }
+
+
+def log_signal_detail(
+    signal: TriangleSignal,
+    profile: PnFProfile,
+    last_close: float | None,
+    *,
+    latest_candle_close_time: int | None = None,
+) -> None:
+    payload = {
+        "pattern": signal.pattern,
+        "side": signal.side,
+        "entry": signal.entry_price,
+        "stop": signal.stop_price,
+        "tp1": signal.tp1_price,
+        "tp2": signal.tp2_price,
+        "breakout_level": signal.entry_price,
+        "support": signal.support_level,
+        "resistance": signal.resistance_level,
+        "box_size": _dec(profile.box_size),
+        "reversal": int(profile.reversal_boxes),
+        "trigger_column": signal.trigger_column_idx,
+        "last_close": last_close,
+        "trigger_timestamp": signal.trigger_ts,
+    }
+    payload.update(
+        pole_motif_staleness_diagnostics(
+            signal,
+            current_price=last_close,
+            latest_candle_close_time=latest_candle_close_time,
+        )
+    )
     console(
         "SIGNAL_DETAIL",
         signal.symbol,
-        compact_visibility_payload(
-            {
-                "pattern": signal.pattern,
-                "side": signal.side,
-                "entry": signal.entry_price,
-                "stop": signal.stop_price,
-                "tp1": signal.tp1_price,
-                "tp2": signal.tp2_price,
-                "breakout_level": signal.entry_price,
-                "support": signal.support_level,
-                "resistance": signal.resistance_level,
-                "box_size": _dec(profile.box_size),
-                "reversal": int(profile.reversal_boxes),
-                "trigger_column": signal.trigger_column_idx,
-                "last_close": last_close,
-                "trigger_timestamp": signal.trigger_ts,
-            }
-        ),
+        compact_visibility_payload(payload),
     )
 
 
@@ -2365,17 +2406,34 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 continue
 
             if is_demo_pole_motif_signal(signal):
-                console("SETUP_DETECTED", f"{signal.symbol} {signal.pattern} {signal.side}", {
-                    "entry_model": POLE_MOTIF_ENTRY_MODEL,
-                    "entry": float(signal.entry_price),
-                    "stop": float(signal.stop_price),
-                    "target": float(signal.tp2_price),
-                    "be_trigger": float(signal.tp1_price),
-                    "pattern_quality": signal.pattern_quality,
-                })
+                pole_motif_diagnostics = pole_motif_staleness_diagnostics(
+                    signal,
+                    current_price=candles[-1].close if candles else None,
+                    latest_candle_close_time=latest_close_time,
+                )
+                console(
+                    "SETUP_DETECTED",
+                    f"{signal.symbol} {signal.pattern} {signal.side}",
+                    compact_visibility_payload(
+                        {
+                            "entry_model": POLE_MOTIF_ENTRY_MODEL,
+                            "entry": signal.entry_price,
+                            "stop": signal.stop_price,
+                            "target": signal.tp2_price,
+                            "be_trigger": signal.tp1_price,
+                            "pattern_quality": signal.pattern_quality,
+                            **pole_motif_diagnostics,
+                        }
+                    ),
+                )
             console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side}", signal.__dict__)
-            if verbose_market_logs:
-                log_signal_detail(signal, profile, candles[-1].close if candles else None)
+            if verbose_market_logs or is_demo_pole_motif_signal(signal):
+                log_signal_detail(
+                    signal,
+                    profile,
+                    candles[-1].close if candles else None,
+                    latest_candle_close_time=latest_close_time,
+                )
             _spec, order, block_reason = validate_guards(
                 state_conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles, allow_demo_pole_motif=allow_demo_pole_motif, demo_max_notional_usdt=demo_max_notional_usdt
             )

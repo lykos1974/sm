@@ -46,6 +46,24 @@ def sample_signal(trigger_ts=123456):
     )
 
 
+def sample_pole_motif_signal(trigger_ts=123456):
+    return trader.TriangleSignal(
+        symbol="BINANCE_FUT:SOLUSDT",
+        pattern="pole_motif_low",
+        side="LONG",
+        trigger_ts=trigger_ts,
+        entry_price=Decimal("105"),
+        stop_price=Decimal("102"),
+        tp1_price=Decimal("111"),
+        tp2_price=Decimal("112.5"),
+        trigger_column_idx=7,
+        support_level=Decimal("102"),
+        resistance_level=Decimal("105"),
+        break_distance_boxes=Decimal("3"),
+        pattern_quality="POLE_MOTIF_DEMO_FORWARD|NEXT_COLUMN_OPEN_ENTRY",
+    )
+
+
 def replace_signal(signal, **overrides):
     values = dict(signal.__dict__)
     values.update(overrides)
@@ -315,7 +333,6 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertTrue(any('"primary_query_symbol": "BINANCE_FUT:BTCUSDT"' in line for line in lines))
         self.assertTrue(any('"fallback_query_symbol": "BTCUSDT"' in line for line in lines))
         self.assertTrue(any("CANDLE_RESULT" in line and '"symbol": "BTCUSDT"' in line and '"rows": 1' in line for line in lines))
-
     def test_process_once_logs_runtime_compare_with_normalized_db_candles(self):
         original_triangle = trader.detect_latest_strict_triangle
         try:
@@ -434,6 +451,92 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertTrue(any(" SIGNAL_DETAIL BINANCE_FUT:SOLUSDT " in line and '"tp2": 103.0' in line for line in lines))
         self.assertTrue(any(" ORDER_DETAIL BINANCE_FUT:SOLUSDT " in line and '"reduce_only": false' in line for line in lines))
 
+    def test_pole_motif_signal_detail_includes_staleness_diagnostics(self):
+        profile = trader.PnFProfile("POLE_DEMO_bs1_rev3", 1.0, 3)
+        signal = sample_pole_motif_signal(trigger_ts=1700000000000)
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            trader.log_signal_detail(signal, profile, 100.0, latest_candle_close_time=1700000120000)
+
+        line = output.getvalue()
+        self.assertIn(" SIGNAL_DETAIL BINANCE_FUT:SOLUSDT ", line)
+        self.assertIn('"CURRENT_PRICE": 100.0', line)
+        self.assertIn('"ENTRY_PRICE": 105.0', line)
+        self.assertIn('"ENTRY_DISTANCE_PERCENT": 5.0', line)
+        self.assertIn('"TRIGGER_TIMESTAMP": 1700000000000', line)
+        self.assertIn('"LATEST_CANDLE_CLOSE_TIME": 1700000120000', line)
+        self.assertIn('"TRIGGER_AGE_SECONDS": 120.0', line)
+        self.assertIn(f'"ENTRY_MODEL": "{trader.POLE_MOTIF_ENTRY_MODEL}"', line)
+
+    def test_pole_motif_setup_detected_and_signal_detail_emit_diagnostics_without_verbose(self):
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        original_pole = trader.detect_latest_pole_motif_demo_signal
+        original_env = os.environ.copy()
+        try:
+            trader.BinanceFuturesClient = DemoInitClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: None
+            trader.detect_latest_pole_motif_demo_signal = lambda symbol, profile, candles: sample_pole_motif_signal(
+                trigger_ts=1700000000000
+            )
+            os.environ["LIVE_TRADING_ENABLED"] = "1"
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "binance.sqlite3")
+                state_db_path = os.path.join(temp_dir, "state.sqlite3")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "symbols": ["BINANCE_FUT:SOLUSDT"],
+                            "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}},
+                        },
+                        fh,
+                    )
+                with closing(sqlite3.connect(db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1700000120000, 100, 100, 100))
+                    conn.commit()
+
+                args = argparse.Namespace(
+                    db_path=db_path,
+                    state_db_path=state_db_path,
+                    settings=settings_path,
+                    dry_run=False,
+                    demo=True,
+                    enable_demo_doubles=False,
+                    enable_demo_pole_motif=True,
+                    notional_usdt="1",
+                    demo_max_notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    force_demo_order=False,
+                    reconcile_positions=False,
+                    verbose_market_logs=False,
+                    research_rule_json=None,
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.process_once(args)
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+            trader.detect_latest_pole_motif_demo_signal = original_pole
+            os.environ.clear()
+            os.environ.update(original_env)
+
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any(" SETUP_DETECTED BINANCE_FUT:SOLUSDT pole_motif_low LONG " in line for line in lines))
+        self.assertTrue(any(" SIGNAL_DETAIL BINANCE_FUT:SOLUSDT " in line for line in lines))
+        for event in ("SETUP_DETECTED", "SIGNAL_DETAIL"):
+            line = next(line for line in lines if f" {event} " in line)
+            self.assertIn('"CURRENT_PRICE": 100.0', line)
+            self.assertIn('"ENTRY_PRICE": 105.0', line)
+            self.assertIn('"ENTRY_DISTANCE_PERCENT": 5.0', line)
+            self.assertIn('"TRIGGER_TIMESTAMP": 1700000000000', line)
+            self.assertIn('"LATEST_CANDLE_CLOSE_TIME": 1700000120000', line)
+            self.assertIn('"TRIGGER_AGE_SECONDS": 120.0', line)
+            self.assertIn(f'"ENTRY_MODEL": "{trader.POLE_MOTIF_ENTRY_MODEL}"', line)
 
     def test_process_once_keeps_candle_db_read_only_and_writes_state_db(self):
         original_client = trader.BinanceFuturesClient
@@ -569,7 +672,6 @@ class BinanceForwardTraderTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         self.assertTrue(any(" POSITION_OPEN_DETAIL " in line and '"avg_fill_price": 100.5' in line for line in lines))
         self.assertTrue(any('"requested_entry": 100.0' in line and '"position_side": "LONG"' in line for line in lines))
-
     def test_process_once_logs_loop_scan_no_signal_without_startup(self):
         original_triangle = trader.detect_latest_strict_triangle
         try:
@@ -894,7 +996,6 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(long_order["side"], "BUY")
         self.assertIsNone(short_reason)
         self.assertEqual(short_order["side"], "SELL")
-
     def test_process_once_records_invalid_risk_levels_and_submits_no_order(self):
         original_client = trader.BinanceFuturesClient
         original_triangle = trader.detect_latest_strict_triangle
