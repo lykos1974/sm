@@ -73,7 +73,7 @@ class ForwardOutcome:
 
 
 def _write_csv(path: Path, fields: list[str], rows: Iterable[dict[str, Any]]) -> None:
-    with path.open("x", newline="") as handle:
+    with path.open("x", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
@@ -250,7 +250,7 @@ def _aggregate_metrics(window_rows: list[dict[str, Any]], selected: list[Forward
 
 
 def _write_summary(path: Path, window_rows: list[dict[str, Any]], metrics: dict[str, Any], verdict: str, quarters: list[str]) -> None:
-    with path.open("x") as handle:
+    with path.open("x", encoding="utf-8") as handle:
         handle.write("# CAND-000053 shadow forward validation\n\n")
         handle.write("Research only. No optimization, parameter search, GA, candidate modification, new filter, detector change, strategy change, production change, live trader change, or promotion was performed.\n\n")
         handle.write(f"## Verdict: **{verdict}**\n\n")
@@ -375,7 +375,7 @@ def run(
         staging_root.mkdir(parents=False, exist_ok=False)
         _write_csv(staging_root / OUTPUT_NAMES[1], WINDOW_FIELDS, windows)
         _write_csv(staging_root / OUTPUT_NAMES[2], METRIC_FIELDS, metric_rows)
-        with (staging_root / OUTPUT_NAMES[3]).open("x") as handle:
+        with (staging_root / OUTPUT_NAMES[3]).open("x", encoding="utf-8") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
             handle.write("\n")
         _write_summary(staging_root / OUTPUT_NAMES[0], windows, metrics, verdict, selected_quarters)

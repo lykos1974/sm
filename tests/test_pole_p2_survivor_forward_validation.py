@@ -131,6 +131,52 @@ def test_cli_emits_shadow_forward_outputs(tmp_path: Path) -> None:
     assert manifest["complete_artifact_set"] == list(OUTPUT_NAMES)
 
 
+def test_artifact_writers_use_utf8_for_windows_unicode_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original_open = Path.open
+
+    def windows_cp1252_default_open(
+        self: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> object:
+        if "b" not in mode and any(flag in mode for flag in ("w", "a", "x")) and encoding is None:
+            encoding = "cp1252"
+        return original_open(self, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", windows_cp1252_default_open)
+
+    summary = tmp_path / "summary.md"
+    forward_validation._write_summary(
+        summary,
+        [
+            {
+                "window_id": "WF-001",
+                "train_start_quarter": "2024-Q1",
+                "train_end_quarter": "2024-Q2",
+                "forward_quarter": "2024-Q3",
+                "trades": 1,
+                "wins": 1,
+                "losses": 0,
+                "break_even_exits": 0,
+                "win_rate": 1.0,
+                "expectancy": 1.0,
+                "total_R": 1.0,
+            }
+        ],
+        {},
+        "FORWARD_EDGE_SURVIVES",
+        ["2024-Q1", "2024-Q2", "2024-Q3"],
+    )
+    assert "→" in summary.read_bytes().decode("utf-8")
+
+    csv_path = tmp_path / "unicode.csv"
+    forward_validation._write_csv(csv_path, ["label"], [{"label": "train → forward"}])
+    assert "train → forward" in csv_path.read_bytes().decode("utf-8")
+
+
 def test_failed_staged_write_leaves_no_summary_only_partial_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     labels, columns, candles = _write_forward_fixture(tmp_path)
     output = tmp_path / "forward_failure"
