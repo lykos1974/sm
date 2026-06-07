@@ -7,6 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+import research_v2.patterns.pole_p2_survivor_forward_validation as forward_validation
 from research_v2.patterns.pole_p2_survivor_forward_validation import (
     FROZEN_RULE_DEFINITION,
     OUTPUT_NAMES,
@@ -100,6 +103,7 @@ def test_cli_emits_shadow_forward_outputs(tmp_path: Path) -> None:
     assert metrics["negative_window_count"] == "1"
     assert "expectancy_dispersion" in metrics
     assert "max_drawdown_R" in metrics
+    assert {row["forward_quarter"] for row in windows} == {"2024-Q3", "2024-Q4"}
 
     summary = (output / "p2_survivor_forward_validation_summary.md").read_text()
     assert "CAND-000053 shadow forward validation" in summary
@@ -122,6 +126,32 @@ def test_cli_emits_shadow_forward_outputs(tmp_path: Path) -> None:
     assert manifest["parameter_search"] is False
     assert manifest["chronological_evaluation_only"] is True
     assert manifest["initial_train_quarters"] == 2
+    assert manifest["artifact_write_completed"] is True
+    assert manifest["artifact_publish_mode"] == "staged_directory_replace"
+    assert manifest["complete_artifact_set"] == list(OUTPUT_NAMES)
+
+
+def test_failed_staged_write_leaves_no_summary_only_partial_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    labels, columns, candles = _write_forward_fixture(tmp_path)
+    output = tmp_path / "forward_failure"
+
+    def fail_summary(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated summary write failure")
+
+    monkeypatch.setattr(forward_validation, "_write_summary", fail_summary)
+
+    with pytest.raises(RuntimeError, match="simulated summary write failure"):
+        forward_validation.run(
+            {"ENA": labels},
+            {"ENA": columns},
+            {"ENA": candles},
+            output,
+            require_full_universe=False,
+        )
+
+    assert not (output / "p2_survivor_forward_validation_summary.md").exists()
+    assert not output.exists()
+    assert not list(tmp_path.glob(".forward_failure.tmp-*"))
 
 
 def test_no_production_changes_and_no_live_trader_imports() -> None:

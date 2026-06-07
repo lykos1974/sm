@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import statistics
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -75,6 +77,25 @@ def _write_csv(path: Path, fields: list[str], rows: Iterable[dict[str, Any]]) ->
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _staging_root(output_root: Path) -> Path:
+    return output_root.parent / f".{output_root.name}.tmp-{uuid.uuid4().hex}"
+
+
+def _ensure_complete_artifact_set(root: Path) -> None:
+    missing = [name for name in OUTPUT_NAMES if not (root / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"staged CAND-000053 forward validation output is incomplete: {', '.join(missing)}")
+
+
+def _publish_staged_outputs(staging_root: Path, output_root: Path) -> None:
+    _ensure_complete_artifact_set(staging_root)
+    if output_root.exists():
+        if any(output_root.iterdir()):
+            raise FileExistsError(f"refusing to publish into non-empty output root: {output_root}")
+        output_root.rmdir()
+    staging_root.replace(output_root)
 
 
 def _quarter_sort_key(quarter: str) -> tuple[int, int, str]:
@@ -282,7 +303,8 @@ def run(
     require_full_universe: bool = True,
     min_forward_windows: int = DEFAULT_MIN_FORWARD_WINDOWS,
 ) -> dict[str, Any]:
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = output_root.resolve()
+    output_root.parent.mkdir(parents=True, exist_ok=True)
     existing = [name for name in OUTPUT_NAMES if (output_root / name).exists()]
     if existing:
         raise FileExistsError(f"refusing to overwrite existing CAND-000053 forward validation output(s): {', '.join(existing)}")
@@ -308,10 +330,6 @@ def run(
     metrics = _aggregate_metrics(windows, selected)
     verdict = _verdict(windows, metrics, min_forward_windows)
     metric_rows = [{"metric": key, "value": value} for key, value in {"verdict": verdict, **metrics}.items()]
-
-    _write_summary(output_root / OUTPUT_NAMES[0], windows, metrics, verdict, selected_quarters)
-    _write_csv(output_root / OUTPUT_NAMES[1], WINDOW_FIELDS, windows)
-    _write_csv(output_root / OUTPUT_NAMES[2], METRIC_FIELDS, metric_rows)
 
     manifest = {
         "created_at_utc": datetime.now(UTC).isoformat(),
@@ -346,11 +364,25 @@ def run(
         "allowed_verdicts": list(ALLOWED_VERDICTS),
         "verdict": verdict,
         "artifacts": list(OUTPUT_NAMES[:-1]),
+        "complete_artifact_set": list(OUTPUT_NAMES),
+        "artifact_publish_mode": "staged_directory_replace",
+        "artifact_write_completed": True,
         "load_flags": load_flags,
     }
-    with (output_root / OUTPUT_NAMES[3]).open("x") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+
+    staging_root = _staging_root(output_root)
+    try:
+        staging_root.mkdir(parents=False, exist_ok=False)
+        _write_csv(staging_root / OUTPUT_NAMES[1], WINDOW_FIELDS, windows)
+        _write_csv(staging_root / OUTPUT_NAMES[2], METRIC_FIELDS, metric_rows)
+        with (staging_root / OUTPUT_NAMES[3]).open("x") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        _write_summary(staging_root / OUTPUT_NAMES[0], windows, metrics, verdict, selected_quarters)
+        _publish_staged_outputs(staging_root, output_root)
+    except Exception:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
     return manifest
 
 
