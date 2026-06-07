@@ -1666,6 +1666,141 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(signal.tp1_price, Decimal("101.50"))
         self.assertIn("NEXT_COLUMN_OPEN_ENTRY", signal.pattern_quality)
 
+    def test_without_p2_flag_process_once_does_not_call_p2_detector(self):
+        original_client = trader.BinanceFuturesClient
+        original_triangle = trader.detect_latest_strict_triangle
+        original_p2 = trader.detect_latest_p2_survivor_demo_signal
+        try:
+            trader.BinanceFuturesClient = DemoInitClient
+            trader.detect_latest_strict_triangle = lambda symbol, profile, candles: None
+
+            def fail_p2(*args, **kwargs):
+                raise AssertionError("P2 detector must not be called without --enable-demo-p2-survivor-v1")
+
+            trader.detect_latest_p2_survivor_demo_signal = fail_p2
+            with tempfile.TemporaryDirectory() as temp_dir:
+                candle_db_path = os.path.join(temp_dir, "market_data.db")
+                state_db_path = os.path.join(temp_dir, "binance_state.db")
+                settings_path = os.path.join(temp_dir, "settings.json")
+                with open(settings_path, "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "symbols": ["BINANCE_FUT:SOLUSDT"],
+                        "profiles": {"BINANCE_FUT:SOLUSDT": {"name": "t", "box_size": 1.0, "reversal_boxes": 3}},
+                    }, fh)
+                with closing(sqlite3.connect(candle_db_path)) as conn:
+                    conn.execute("CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, close REAL, high REAL, low REAL)")
+                    conn.execute("INSERT INTO candles VALUES(?,?,?,?,?,?)", ("SOLUSDT", "1m", 1, 101, 101, 101))
+                    conn.commit()
+
+                args = argparse.Namespace(
+                    db_path=candle_db_path,
+                    state_db_path=state_db_path,
+                    settings=settings_path,
+                    dry_run=True,
+                    demo=True,
+                    enable_demo_doubles=False,
+                    enable_demo_pole_motif=False,
+                    enable_demo_p2_survivor_v1=False,
+                    notional_usdt="1",
+                    demo_max_notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    force_demo_order=False,
+                    verbose_market_logs=False,
+                    reconcile_positions=False,
+                    research_rule_json=None,
+                )
+                trader.process_once(args)
+        finally:
+            trader.BinanceFuturesClient = original_client
+            trader.detect_latest_strict_triangle = original_triangle
+            trader.detect_latest_p2_survivor_demo_signal = original_p2
+
+    def test_existing_order_sizing_exact_output_unchanged(self):
+        spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
+        order, reason = trader.build_entry_order(sample_signal(trigger_ts=123456), spec, Decimal("1"))
+
+        self.assertIsNone(reason)
+        self.assertEqual(order, {
+            "symbol": "SOLUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": "0.010",
+            "price": "100.00",
+            "newClientOrderId": "pnf-bull-123456-L",
+        })
+
+    def test_existing_duplicate_guard_remains_symbol_pattern_timestamp(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(conn)
+            signal = sample_signal(trigger_ts=654321)
+            trader.record_signal(conn, signal, decision="ORDER_SENT", block_reason=None, dry_run=False, notional_usdt=Decimal("1"))
+            _spec, _order, reason = trader.validate_guards(
+                conn,
+                LiveClient(),
+                signal,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+            )
+            different_pattern = replace_signal(signal, pattern="bearish_triangle", side="SHORT", stop_price=Decimal("101"), tp1_price=Decimal("98"), tp2_price=Decimal("97"))
+            _spec2, _order2, reason2 = trader.validate_guards(
+                conn,
+                LiveClient(),
+                different_pattern,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(reason, "duplicate signal for same symbol/pattern/trigger timestamp")
+        self.assertNotEqual(reason2, "duplicate signal for same symbol/pattern/trigger timestamp")
+
+    def test_strategy_candidate_metadata_only_for_p2_signals(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(conn)
+            regular = sample_signal(trigger_ts=2001)
+            p2 = replace_signal(sample_pole_motif_signal(trigger_ts=2002), pattern=trader.P2_SURVIVOR_PATTERN)
+            trader.record_signal(conn, regular, decision="DRY_RUN", block_reason=None, dry_run=True, notional_usdt=Decimal("1"))
+            trader.record_trade(conn, regular, notional_usdt=Decimal("1"), exchange_order_id=None, status="DRY_RUN", dry_run=True)
+            trader.record_signal(conn, p2, decision="DRY_RUN", block_reason=None, dry_run=True, notional_usdt=Decimal("1"))
+            trader.record_trade(conn, p2, notional_usdt=Decimal("1"), exchange_order_id=None, status="DRY_RUN", dry_run=True)
+            signal_rows = conn.execute("SELECT pattern, strategy_id, candidate_id FROM live_signals_binance ORDER BY trigger_timestamp").fetchall()
+            trade_rows = conn.execute("SELECT pattern, strategy_id, candidate_id FROM live_trades_binance ORDER BY trigger_timestamp").fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(signal_rows[0], ("bullish_triangle", None, None))
+        self.assertEqual(trade_rows[0], ("bullish_triangle", None, None))
+        self.assertEqual(signal_rows[1], (trader.P2_SURVIVOR_PATTERN, trader.P2_SURVIVOR_STRATEGY_ID, trader.P2_SURVIVOR_CANDIDATE_ID))
+        self.assertEqual(trade_rows[1], (trader.P2_SURVIVOR_PATTERN, trader.P2_SURVIVOR_STRATEGY_ID, trader.P2_SURVIVOR_CANDIDATE_ID))
+
+    def test_p2_flag_requires_demo_in_process_once(self):
+        args = argparse.Namespace(
+            db_path="unused.sqlite3",
+            state_db_path="unused-state.sqlite3",
+            settings="unused-settings.json",
+            dry_run=True,
+            demo=False,
+            enable_demo_doubles=False,
+            enable_demo_pole_motif=False,
+            enable_demo_p2_survivor_v1=True,
+            notional_usdt="1",
+            demo_max_notional_usdt="1",
+            history_bars=5000,
+            self_test_signal=False,
+            force_demo_order=False,
+            verbose_market_logs=False,
+            reconcile_positions=False,
+            research_rule_json=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "--enable-demo-p2-survivor-v1 requires --demo"):
+            trader.process_once(args)
+
     def test_pole_motif_guard_is_demo_live_only(self):
         conn = sqlite3.connect(":memory:")
         trader.init_live_tables(conn)
@@ -1769,6 +1904,117 @@ class BinanceForwardTraderTests(unittest.TestCase):
         )
         self.assertIsNone(reason)
         self.assertEqual(close["reduceOnly"], "true")
+
+
+    def test_p2_survivor_guard_requires_demo_flag_and_records_ids(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(conn)
+            signal = replace_signal(
+                sample_pole_motif_signal(),
+                pattern=trader.P2_SURVIVOR_PATTERN,
+                pattern_quality="P2_SURVIVOR_V1|candidate_id=CAND-000053",
+            )
+            _spec, blocked_order, blocked_reason = trader.validate_guards(
+                conn,
+                LiveClient(),
+                signal,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+                demo=False,
+                allow_demo_p2_survivor_v1=True,
+            )
+            _spec_flag, flag_order, flag_reason = trader.validate_guards(
+                conn,
+                LiveClient(),
+                signal,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+                demo=True,
+                allow_demo_p2_survivor_v1=False,
+            )
+            _spec2, order, reason = trader.validate_guards(
+                conn,
+                LiveClient(),
+                signal,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+                demo=True,
+                allow_demo_p2_survivor_v1=True,
+            )
+            trader.record_signal(conn, signal, decision="DRY_RUN", block_reason=None, dry_run=True, notional_usdt=Decimal("1"))
+            trader.record_trade(conn, signal, notional_usdt=Decimal("1"), exchange_order_id=None, status="DRY_RUN", dry_run=True)
+            signal_row = conn.execute("SELECT pattern, strategy_id, candidate_id FROM live_signals_binance").fetchone()
+            trade_row = conn.execute("SELECT pattern, strategy_id, candidate_id FROM live_trades_binance").fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNone(blocked_order)
+        self.assertEqual(blocked_reason, "pattern outside live allowlist")
+        self.assertIsNone(flag_order)
+        self.assertEqual(flag_reason, "pattern outside live allowlist")
+        self.assertIsNone(reason)
+        self.assertEqual(order["type"], "LIMIT")
+        self.assertEqual(signal_row, (trader.P2_SURVIVOR_PATTERN, trader.P2_SURVIVOR_STRATEGY_ID, trader.P2_SURVIVOR_CANDIDATE_ID))
+        self.assertEqual(trade_row, (trader.P2_SURVIVOR_PATTERN, trader.P2_SURVIVOR_STRATEGY_ID, trader.P2_SURVIVOR_CANDIDATE_ID))
+
+    def test_detect_latest_p2_survivor_uses_causal_p2_buckets_not_rejected_core_fields(self):
+        class P2Column:
+            def __init__(self, idx, kind, top, bottom, start_ts=None):
+                self.idx = idx
+                self.kind = kind
+                self.top = top
+                self.bottom = bottom
+                self.start_ts = start_ts
+
+        columns = [
+            P2Column(0, "X", 4, 0),
+            P2Column(1, "O", 4, 0),
+            P2Column(2, "X", 4, 0),
+            P2Column(3, "O", 4, 0),
+            P2Column(4, "X", 4, 0),
+            P2Column(5, "O", 4, 0),
+            P2Column(6, "O", 14, 10),
+            P2Column(7, "X", 18, 14),
+            P2Column(8, "O", 18, 16, start_ts=1_000),
+        ]
+
+        class P2Engine:
+            def __init__(self, profile):
+                self.columns = columns
+
+            def update_from_price(self, close_time, close):
+                return None
+
+        original_engine = trader.PnFEngine
+        original_detect = trader.detect_pole_patterns
+        try:
+            trader.PnFEngine = P2Engine
+            trader.detect_pole_patterns = lambda engine_columns, box_size: [
+                {
+                    "pattern_name": "LOW_POLE",
+                    "pole_column_index": 6,
+                    "reversal_column_index": 7,
+                    "opposing_pole_distance_columns": 3,
+                    "enhanced_by_opposing_pole": True,
+                }
+            ]
+            signal = trader.detect_latest_p2_survivor_demo_signal(
+                "BINANCE_FUT:SOLUSDT",
+                trader.PnFProfile("t", 1.0, 3),
+                [trader.Candle(500, 100, 100, 100), trader.Candle(1_500, 101, 101, 101, 101)],
+            )
+        finally:
+            trader.PnFEngine = original_engine
+            trader.detect_pole_patterns = original_detect
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.pattern, trader.P2_SURVIVOR_PATTERN)
+        self.assertEqual(signal.side, "LONG")
+        self.assertIn(trader.P2_SURVIVOR_STRATEGY_ID, signal.pattern_quality)
+        self.assertIn(f"candidate_id={trader.P2_SURVIVOR_CANDIDATE_ID}", signal.pattern_quality)
+        self.assertIn(f"relative_pole_size={trader.P2_SURVIVOR_RELATIVE_POLE_SIZE}", signal.pattern_quality)
+        self.assertIn(f"reversal_boxes={trader.P2_SURVIVOR_REVERSAL_BOXES}", signal.pattern_quality)
 
 
 if __name__ == "__main__":
