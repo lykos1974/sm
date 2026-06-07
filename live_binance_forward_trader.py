@@ -48,6 +48,13 @@ ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:BN
 ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
 DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
 DEMO_POLE_MOTIF_PATTERNS = {"pole_motif_low", "pole_motif_high"}
+P2_SURVIVOR_STRATEGY_ID = "P2_SURVIVOR_V1"
+P2_SURVIVOR_CANDIDATE_ID = "CAND-000053"
+P2_SURVIVOR_PATTERN = "p2_survivor_v1"
+P2_SURVIVOR_RELATIVE_POLE_SIZE = "NEAR_RECENT_AVG_0_75X_1_25X"
+P2_SURVIVOR_REVERSAL_BOXES = "NORMAL_REVERSAL_4_6_BOXES"
+P2_SURVIVOR_STATUS = "VALIDATED_RESEARCH_EDGE|FORWARD_EDGE_SURVIVES|NOT_PRODUCTION|NOT_LIVE_APPROVED"
+RECENT_COLUMN_LOOKBACK = 6
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
 OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "EXIT_PENDING"}
 RECONCILE_PRICE_MISMATCH_BPS = Decimal("1")
@@ -462,6 +469,8 @@ def log_signal_detail(
         "last_close": last_close,
         "trigger_timestamp": signal.trigger_ts,
     }
+    if is_p2_survivor_signal(signal):
+        payload.update({"strategy_id": P2_SURVIVOR_STRATEGY_ID, "candidate_id": P2_SURVIVOR_CANDIDATE_ID})
     payload.update(
         pole_motif_staleness_diagnostics(
             signal,
@@ -627,6 +636,16 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             "break_even_armed": "INTEGER NOT NULL DEFAULT 0",
             "break_even_trigger_price": "REAL",
             "active_stop_price": "REAL",
+            "strategy_id": "TEXT",
+            "candidate_id": "TEXT",
+        },
+    )
+    ensure_columns(
+        conn,
+        "live_signals_binance",
+        {
+            "strategy_id": "TEXT",
+            "candidate_id": "TEXT",
         },
     )
     conn.commit()
@@ -1009,6 +1028,128 @@ def build_pole_motif_signal(
     )
 
 
+def _column_boxes(col: Any, box_size: Decimal) -> Decimal | None:
+    if box_size <= 0:
+        return None
+    return (abs(_column_top(col) - _column_bottom(col)) / box_size) + Decimal("1")
+
+
+def _bucket_relative_pole_size(value: Decimal | None) -> str:
+    if value is None:
+        return "MISSING_RELATIVE_SIZE"
+    if value < Decimal("0.75"):
+        return "BELOW_RECENT_AVG_<0_75X"
+    if value <= Decimal("1.25"):
+        return P2_SURVIVOR_RELATIVE_POLE_SIZE
+    return "ABOVE_RECENT_AVG_>1_25X"
+
+
+def _bucket_p2_reversal_boxes(value: Decimal | None) -> str:
+    if value is None:
+        return "MISSING_REVERSAL_BOXES"
+    if value <= Decimal("3"):
+        return "SMALL_REVERSAL_<=3_BOXES"
+    if value <= Decimal("6"):
+        return P2_SURVIVOR_REVERSAL_BOXES
+    return "LARGE_REVERSAL_>=7_BOXES"
+
+
+def _relative_pole_size_bucket(columns_by_idx: dict[int, Any], pole_idx: int, pole_boxes: Decimal | None, box_size: Decimal) -> tuple[Decimal | None, str]:
+    if pole_boxes is None:
+        return None, _bucket_relative_pole_size(None)
+    recent = [
+        _column_boxes(columns_by_idx[idx], box_size)
+        for idx in range(max(0, pole_idx - RECENT_COLUMN_LOOKBACK), pole_idx)
+        if idx in columns_by_idx
+    ]
+    usable = [value for value in recent if value is not None]
+    if not usable:
+        return None, _bucket_relative_pole_size(None)
+    relative = pole_boxes / (sum(usable, Decimal("0")) / Decimal(len(usable)))
+    return relative, _bucket_relative_pole_size(relative)
+
+
+def p2_survivor_setup_key(symbol: str, profile: PnFProfile, pole_idx: int, reversal_idx: int, confirmation_idx: int) -> str:
+    return f"{symbol}|{profile.name}|{P2_SURVIVOR_STRATEGY_ID}|{P2_SURVIVOR_CANDIDATE_ID}|{pole_idx}|{reversal_idx}|{confirmation_idx}"
+
+
+def detect_latest_p2_survivor_demo_signal(symbol: str, profile: PnFProfile, candles: list[Candle]) -> TriangleSignal | None:
+    """Detect frozen causal P+2 survivor CAND-000053 for demo-only forwarding.
+
+    This intentionally does not use the rejected historical core-motif filters
+    (`opposing_pole_distance_columns` / `enhanced_by_opposing_pole`).  The setup
+    exists when a LOW_POLE has a reversal column and the next confirmation
+    column exists; only P+2-knowable survivor buckets are checked.
+    """
+    engine, _latest_ts = _replay_close_confirmed_pnf(profile, candles)
+    if len(engine.columns) < 3:
+        return None
+    box_size = _dec(profile.box_size)
+    if box_size <= 0:
+        return None
+    patterns = detect_pole_patterns(engine.columns, box_size=float(profile.box_size))
+    by_idx = {int(getattr(col, "idx")): col for col in engine.columns}
+    latest: TriangleSignal | None = None
+    for pattern in patterns:
+        if str(pattern.get("pattern_name", "")).upper() != "LOW_POLE":
+            continue
+        pole_idx_raw = pattern.get("pole_column_index")
+        reversal_idx_raw = pattern.get("reversal_column_index")
+        if pole_idx_raw is None or reversal_idx_raw is None:
+            continue
+        pole_idx = int(pole_idx_raw)
+        reversal_idx = int(reversal_idx_raw)
+        confirmation_idx = reversal_idx + 1
+        pole = by_idx.get(pole_idx)
+        reversal = by_idx.get(reversal_idx)
+        confirmation = by_idx.get(confirmation_idx)
+        if pole is None or reversal is None or confirmation is None:
+            continue
+        if (_column_kind(pole), _column_kind(reversal)) != ("O", "X"):
+            continue
+        pole_boxes = _column_boxes(pole, box_size)
+        reversal_boxes = _column_boxes(reversal, box_size)
+        relative_size, relative_bucket = _relative_pole_size_bucket(by_idx, pole_idx, pole_boxes, box_size)
+        reversal_bucket = _bucket_p2_reversal_boxes(reversal_boxes)
+        if relative_bucket != P2_SURVIVOR_RELATIVE_POLE_SIZE or reversal_bucket != P2_SURVIVOR_REVERSAL_BOXES:
+            continue
+        if getattr(confirmation, "start_ts", None) is None:
+            continue
+        entry_after_ts = int(getattr(confirmation, "start_ts"))
+        entry_candle = next((c for c in candles if c.close_time > entry_after_ts), None)
+        if entry_candle is None:
+            continue
+        entry_source = entry_candle.open if entry_candle.open is not None else entry_candle.close
+        entry = _dec(entry_source)
+        stop = entry - (POLE_MOTIF_STOP_BOXES * box_size)
+        target = entry + ((POLE_MOTIF_STOP_BOXES * box_size) * POLE_MOTIF_TARGET_R)
+        be_trigger = entry + ((POLE_MOTIF_STOP_BOXES * box_size) * POLE_MOTIF_BREAK_EVEN_TRIGGER_R)
+        setup_key = p2_survivor_setup_key(symbol, profile, pole_idx, reversal_idx, confirmation_idx)
+        candidate = TriangleSignal(
+            symbol=symbol,
+            pattern=P2_SURVIVOR_PATTERN,
+            side="LONG",
+            trigger_ts=int(entry_candle.close_time),
+            entry_price=entry,
+            stop_price=stop,
+            tp1_price=be_trigger,
+            tp2_price=target,
+            trigger_column_idx=confirmation_idx,
+            support_level=min(entry, stop),
+            resistance_level=max(entry, stop),
+            break_distance_boxes=POLE_MOTIF_STOP_BOXES,
+            pattern_quality=(
+                f"{P2_SURVIVOR_STRATEGY_ID}|candidate_id={P2_SURVIVOR_CANDIDATE_ID}|"
+                f"status={P2_SURVIVOR_STATUS}|relative_pole_size={relative_bucket}|"
+                f"reversal_boxes={reversal_bucket}|relative_pole_size_value={relative_size}|"
+                f"pole_boxes={pole_boxes}|reversal_box_count={reversal_boxes}|setup={setup_key}"
+            ),
+        )
+        if latest is None or candidate.trigger_column_idx > latest.trigger_column_idx:
+            latest = candidate
+    return latest
+
+
 def detect_latest_pole_motif_demo_signal(symbol: str, profile: PnFProfile, candles: list[Candle]) -> TriangleSignal | None:
     engine, _latest_ts = _replay_close_confirmed_pnf(profile, candles)
     if len(engine.columns) < 3:
@@ -1052,8 +1193,28 @@ def is_demo_pole_motif_signal(signal: TriangleSignal) -> bool:
     return signal.pattern in DEMO_POLE_MOTIF_PATTERNS
 
 
+def is_p2_survivor_signal(signal: TriangleSignal) -> bool:
+    return signal.pattern == P2_SURVIVOR_PATTERN
+
+
+def is_break_even_managed_signal(signal: TriangleSignal) -> bool:
+    return is_demo_pole_motif_signal(signal) or is_p2_survivor_signal(signal)
+
+
+def strategy_id_for_signal(signal: TriangleSignal) -> str | None:
+    if is_p2_survivor_signal(signal):
+        return P2_SURVIVOR_STRATEGY_ID
+    return None
+
+
+def candidate_id_for_signal(signal: TriangleSignal) -> str | None:
+    if is_p2_survivor_signal(signal):
+        return P2_SURVIVOR_CANDIDATE_ID
+    return None
+
+
 def be_trigger_price_for_signal(signal: TriangleSignal) -> Decimal | None:
-    if is_demo_pole_motif_signal(signal):
+    if is_break_even_managed_signal(signal):
         return signal.tp1_price
     return None
 
@@ -1062,10 +1223,20 @@ def is_demo_double_signal(signal: TriangleSignal) -> bool:
     return signal.pattern in DEMO_DOUBLE_PATTERNS
 
 
-def append_demo_double_note(signal: TriangleSignal, notes: str | None) -> str | None:
-    if not is_demo_double_signal(signal):
+def append_demo_signal_note(signal: TriangleSignal, notes: str | None) -> str | None:
+    prefix = None
+    if is_demo_double_signal(signal):
+        prefix = "DEMO_DOUBLE_SMOKE_TEST"
+    elif is_p2_survivor_signal(signal):
+        prefix = f"strategy_id={P2_SURVIVOR_STRATEGY_ID}; candidate_id={P2_SURVIVOR_CANDIDATE_ID}; {P2_SURVIVOR_STATUS}"
+    if prefix is None:
         return notes
-    return "DEMO_DOUBLE_SMOKE_TEST" if not notes else f"DEMO_DOUBLE_SMOKE_TEST; {notes}"
+    return prefix if not notes else f"{prefix}; {notes}"
+
+
+# Backward-compatible name retained for existing call sites/tests.
+def append_demo_double_note(signal: TriangleSignal, notes: str | None) -> str | None:
+    return append_demo_signal_note(signal, notes)
 
 
 def has_existing_open_trade(conn: sqlite3.Connection, symbol: str) -> bool:
@@ -1100,15 +1271,17 @@ def record_signal(
     conn.execute(
         """
         INSERT OR IGNORE INTO live_signals_binance(
-            created_at, symbol, pattern, side, trigger_timestamp, entry_price,
+            created_at, symbol, pattern, strategy_id, candidate_id, side, trigger_timestamp, entry_price,
             stop_price, tp1_price, tp2_price, notional_usdt, decision,
             block_reason, dry_run, exchange_order_id, raw_order_response, notes
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             now_iso(),
             signal.symbol,
             signal.pattern,
+            strategy_id_for_signal(signal),
+            candidate_id_for_signal(signal),
             signal.side,
             signal.trigger_ts,
             float(signal.entry_price),
@@ -1143,16 +1316,18 @@ def record_trade(
     conn.execute(
         """
         INSERT INTO live_trades_binance(
-            created_at, symbol, pattern, side, trigger_timestamp, entry_price,
+            created_at, symbol, pattern, strategy_id, candidate_id, side, trigger_timestamp, entry_price,
             stop_price, tp1_price, tp2_price, notional_usdt, decision, status,
             block_reason, dry_run, exchange_order_id, raw_order_response, notes,
             break_even_armed, break_even_trigger_price, active_stop_price
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             now_iso(),
             signal.symbol,
             signal.pattern,
+            strategy_id_for_signal(signal),
+            candidate_id_for_signal(signal),
             signal.side,
             signal.trigger_ts,
             float(signal.entry_price),
@@ -1298,6 +1473,12 @@ def apply_entry_lifecycle(
     conn.commit()
     if entry_status == "FILLED":
         console("ORDER_FILLED", f"{signal.symbol} {signal.pattern}", lifecycle)
+        if is_p2_survivor_signal(signal):
+            console(
+                "POSITION_OPEN",
+                f"{signal.symbol} {signal.pattern}",
+                {"strategy_id": P2_SURVIVOR_STRATEGY_ID, "candidate_id": P2_SURVIVOR_CANDIDATE_ID, **lifecycle},
+            )
         if verbose_market_logs:
             log_position_open_detail(signal, lifecycle)
 
@@ -1931,6 +2112,7 @@ def validate_guards(
     demo: bool = False,
     allow_demo_doubles: bool = False,
     allow_demo_pole_motif: bool = False,
+    allow_demo_p2_survivor_v1: bool = False,
     demo_max_notional_usdt: Decimal = MAX_NOTIONAL_USDT,
     allow_demo_cap_override: bool = False,
 ) -> tuple[SymbolSpec | None, dict[str, Any] | None, str | None]:
@@ -1938,10 +2120,12 @@ def validate_guards(
         return None, None, "symbol outside live allowlist"
     demo_doubles_enabled = bool(demo and live_enabled and allow_demo_doubles)
     demo_pole_motif_enabled = bool(demo and live_enabled and allow_demo_pole_motif)
+    demo_p2_survivor_enabled = bool(demo and allow_demo_p2_survivor_v1)
     if (
         signal.pattern not in ALLOWED_PATTERNS
         and not (demo_doubles_enabled and signal.pattern in DEMO_DOUBLE_PATTERNS)
         and not (demo_pole_motif_enabled and signal.pattern in DEMO_POLE_MOTIF_PATTERNS)
+        and not (demo_p2_survivor_enabled and is_p2_survivor_signal(signal))
     ):
         return None, None, "pattern outside live allowlist"
     if signal.pattern in CATAPULT_SIGNAL_NAMES:
@@ -2124,6 +2308,7 @@ def update_open_trade_exits(
         current_stop = _dec(active_stop) if active_stop not in (None, "") else initial_stop
         target = _dec(tp2)
         is_pole_motif = str(pattern) in DEMO_POLE_MOTIF_PATTERNS
+        is_p2_survivor = str(pattern) == P2_SURVIVOR_PATTERN
         armed = bool(break_even_armed)
         be_trigger = _dec(break_even_trigger) if break_even_trigger not in (None, "") else None
         for close_time, high, low in candles:
@@ -2132,7 +2317,7 @@ def update_open_trade_exits(
 
             target_hit = hit_target_price(high, low, target, side)
             stop_hit = hit_stop_price(high, low, current_stop, side)
-            trigger_hit = bool(is_pole_motif and not armed and be_trigger is not None and hit_target_price(high, low, be_trigger, side))
+            trigger_hit = bool((is_pole_motif or is_p2_survivor) and not armed and be_trigger is not None and hit_target_price(high, low, be_trigger, side))
 
             if target_hit and stop_hit:
                 exit_price = current_stop
@@ -2294,6 +2479,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
     demo = bool(getattr(args, "demo", False))
     enable_demo_doubles = bool(getattr(args, "enable_demo_doubles", False))
     enable_demo_pole_motif = bool(getattr(args, "enable_demo_pole_motif", False))
+    enable_demo_p2_survivor_v1 = bool(getattr(args, "enable_demo_p2_survivor_v1", False))
     verbose_market_logs = bool(getattr(args, "verbose_market_logs", False))
     live_enabled = bool(os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
     dry_run = not live_enabled
@@ -2314,6 +2500,8 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
         raise RuntimeError("--research-rule-json requires --demo or --dry-run (forward testing only)")
     if enable_demo_pole_motif and not demo:
         raise RuntimeError("--enable-demo-pole-motif requires --demo; pole motif execution is demo-only")
+    if enable_demo_p2_survivor_v1 and not demo:
+        raise RuntimeError("--enable-demo-p2-survivor-v1 requires --demo; P2 survivor execution is demo-only")
 
     if bool(getattr(args, "reconcile_positions", False)):
         raise RuntimeError("--reconcile-positions must be handled by main() before process_once()")
@@ -2396,16 +2584,19 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             signal = detect_latest_strict_triangle(symbol, profile, candles)
             allow_demo_doubles = bool(enable_demo_doubles and demo and live_enabled)
             allow_demo_pole_motif = bool(enable_demo_pole_motif and demo and live_enabled)
+            allow_demo_p2_survivor_v1 = bool(enable_demo_p2_survivor_v1 and demo)
             if signal is None and allow_demo_doubles:
                 signal = detect_latest_strict_double(symbol, profile, candles)
             if signal is None and allow_demo_pole_motif:
                 signal = detect_latest_pole_motif_demo_signal(symbol, profile, candles)
+            if signal is None and allow_demo_p2_survivor_v1:
+                signal = detect_latest_p2_survivor_demo_signal(symbol, profile, candles)
             set_last_processed_close_time(state_conn, symbol, latest_close_time)
             if signal is None:
                 console("NO_SIGNAL", symbol)
                 continue
 
-            if is_demo_pole_motif_signal(signal):
+            if is_demo_pole_motif_signal(signal) or is_p2_survivor_signal(signal):
                 pole_motif_diagnostics = pole_motif_staleness_diagnostics(
                     signal,
                     current_price=candles[-1].close if candles else None,
@@ -2416,6 +2607,9 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                     f"{signal.symbol} {signal.pattern} {signal.side}",
                     compact_visibility_payload(
                         {
+                            "strategy_id": strategy_id_for_signal(signal),
+                            "candidate_id": candidate_id_for_signal(signal),
+                            "status": P2_SURVIVOR_STATUS if is_p2_survivor_signal(signal) else None,
                             "entry_model": POLE_MOTIF_ENTRY_MODEL,
                             "entry": signal.entry_price,
                             "stop": signal.stop_price,
@@ -2427,7 +2621,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                     ),
                 )
             console("SIGNAL", f"{signal.symbol} {signal.pattern} {signal.side}", signal.__dict__)
-            if verbose_market_logs or is_demo_pole_motif_signal(signal):
+            if verbose_market_logs or is_demo_pole_motif_signal(signal) or is_p2_survivor_signal(signal):
                 log_signal_detail(
                     signal,
                     profile,
@@ -2435,7 +2629,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                     latest_candle_close_time=latest_close_time,
                 )
             _spec, order, block_reason = validate_guards(
-                state_conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles, allow_demo_pole_motif=allow_demo_pole_motif, demo_max_notional_usdt=demo_max_notional_usdt
+                state_conn, client, signal, notional_usdt=notional_usdt, live_enabled=live_enabled, demo=demo, allow_demo_doubles=allow_demo_doubles, allow_demo_pole_motif=allow_demo_pole_motif, allow_demo_p2_survivor_v1=allow_demo_p2_survivor_v1, demo_max_notional_usdt=demo_max_notional_usdt
             )
             if verbose_market_logs and order is not None:
                 log_order_detail(signal.symbol, order)
@@ -2536,6 +2730,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
     parser.add_argument("--enable-demo-doubles", action="store_true", help="Enable strict double top/bottom smoke-test execution only for DEMO LIVE mode")
     parser.add_argument("--enable-demo-pole-motif", action="store_true", help="Enable validated Pole Motif forward execution only for Binance DEMO LIVE mode")
+    parser.add_argument("--enable-demo-p2-survivor-v1", action="store_true", help="Enable frozen P2_SURVIVOR_V1 / CAND-000053 path only in --demo mode")
     parser.add_argument("--notional-usdt", default=str(DEFAULT_NOTIONAL_USDT), help="Fixed order notional; capped by the effective notional limit")
     parser.add_argument("--demo-max-notional-usdt", default=str(MAX_NOTIONAL_USDT), help="Demo-live-only cap; requested notional above 1 USDT is allowed only in --demo with LIVE_TRADING_ENABLED=1 when this value is >= --notional-usdt")
     parser.add_argument("--history-bars", type=int, default=5000, help="Number of recent 1m candles used to reconstruct close-confirmed PnF state")
