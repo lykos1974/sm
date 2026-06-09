@@ -1,0 +1,4 @@
+threshold_name,min_pivot_boxes,min_pivot_ratio,symbols,input_columns,confirmed_pivot_count,confirmed_leg_count,avg_leg_boxes,median_leg_boxes,min_leg_boxes,max_leg_boxes,avg_leg_price_distance,internal_reaction_count,avg_internal_reaction_ratio,median_internal_reaction_ratio,confirming_reaction_count,avg_confirming_reaction_ratio,median_confirming_reaction_ratio
+FAST,2,0.146,3,26,26,23,7.26086956522,5,2,16,400.402173913,0,,,23,1.52089450405,1.4
+BASE,3,0.236,3,26,26,23,7.26086956522,5,2,16,400.402173913,0,,,23,1.52089450405,1.4
+SLOW,5,0.382,3,26,10,7,10.7142857143,12,5,18,737.571428571,8,0.637824675325,0.345238095238,7,1.32349773243,1.16666666667
