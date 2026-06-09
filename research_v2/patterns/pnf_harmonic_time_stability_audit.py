@@ -188,9 +188,10 @@ def _period_has_data(columns: Sequence[Any], period: PeriodSpec) -> bool:
 
 
 def _symbol_name(symbol: str) -> str:
-    text = symbol.upper()
+    text = symbol.upper().strip()
+    token = text.rsplit(":", 1)[-1]
     for prefix in SYMBOL_ORDER:
-        if text == prefix or text.startswith(prefix):
+        if text == prefix or token == prefix or token.startswith(f"{prefix}USDT"):
             return prefix
     return text
 
