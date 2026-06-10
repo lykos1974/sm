@@ -27,6 +27,7 @@ OUTPUT_KNOWLEDGE = "harmonic_knowledge_time_summary.csv"
 OUTPUT_PIVOT_COUNTS = "harmonic_pivot_counts.csv"
 OUTPUT_LEG_STATS = "harmonic_leg_statistics.csv"
 OUTPUT_REACTION_DISTRIBUTION = "harmonic_reaction_ratio_distribution.csv"
+OUTPUT_BOX_SIZE_MANIFEST = "harmonic_box_size_manifest.csv"
 OUTPUT_NAMES = (
     OUTPUT_SWINGS,
     OUTPUT_REACTIONS,
@@ -35,6 +36,7 @@ OUTPUT_NAMES = (
     OUTPUT_PIVOT_COUNTS,
     OUTPUT_LEG_STATS,
     OUTPUT_REACTION_DISTRIBUTION,
+    OUTPUT_BOX_SIZE_MANIFEST,
 )
 
 DEFAULT_THRESHOLD_SETS = (
@@ -148,6 +150,13 @@ REACTION_DISTRIBUTION_FIELDS = [
     "bucket",
     "count",
     "percentage",
+]
+BOX_SIZE_MANIFEST_FIELDS = [
+    "symbol",
+    "resolved_box_size",
+    "box_size_source",
+    "profile_name",
+    "warning_if_inferred",
 ]
 REACTION_RATIO_BUCKETS = (
     ("0-10%", 0.0, 0.10),
@@ -264,6 +273,9 @@ class RawColumn:
     completion_time: str
     completion_time_source: str
     box_size: float
+    profile_name: str = ""
+    box_size_source: str = ""
+    warning_if_inferred: str = ""
 
     @property
     def direction(self) -> str:
@@ -340,34 +352,93 @@ def _infer_symbol_box_sizes(rows: list[dict[str, Any]]) -> dict[str, float]:
     return out
 
 
+def _parse_symbol_box_size_specs(specs: Sequence[str] | None) -> dict[str, float]:
+    mapping: dict[str, float] = {}
+    for raw in specs or []:
+        if "=" not in raw:
+            raise ValueError(f"symbol box size must use SYMBOL=BOX_SIZE, got {raw!r}")
+        symbol, value = raw.split("=", 1)
+        symbol = symbol.strip()
+        if not symbol:
+            raise ValueError(f"symbol box size has empty symbol: {raw!r}")
+        try:
+            parsed = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"invalid box size in symbol mapping {raw!r}") from exc
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise ValueError(f"symbol box size must be positive and finite: {raw!r}")
+        mapping[symbol] = parsed
+    return mapping
+
+
+def _symbol_aliases(symbol: str) -> set[str]:
+    text = str(symbol or "").strip()
+    aliases = {text}
+    if ":" in text:
+        aliases.add(text.split(":", 1)[1])
+    return {alias for alias in aliases if alias}
+
+
+def _lookup_symbol_box_size(symbol: str, mapping: dict[str, float]) -> float | None:
+    aliases = _symbol_aliases(symbol)
+    for key, value in mapping.items():
+        if key in aliases or _symbol_aliases(key) & aliases:
+            return value
+    return None
+
+
 def _row_box_size(
     row: dict[str, Any],
     *,
     row_number: int,
     cli_box_size: float | None,
+    symbol_box_sizes: dict[str, float],
     inferred_box_sizes: dict[str, float],
     symbol: str,
-) -> float:
+    allow_infer_box_size: bool,
+) -> tuple[float, str, str]:
     explicit = _first_value(row, ("box_size", "pnf_box_size", "profile_box_size"))
     if explicit is not None:
         parsed = _to_float(explicit, label="box_size", row_number=row_number)
         if parsed <= 0:
             raise ValueError(f"row {row_number}: box_size must be positive")
-        return parsed
+        return parsed, "explicit_csv", ""
+
+    from_symbol = _lookup_symbol_box_size(symbol, symbol_box_sizes)
+    if from_symbol is not None:
+        return from_symbol, "symbol_box_size", ""
+
     from_profile = _parse_box_size_from_profile(row.get("profile_name"))
     if from_profile is not None:
-        return from_profile
+        return from_profile, "profile_name", ""
+
     if cli_box_size is not None:
-        return cli_box_size
+        return cli_box_size, "cli_box_size", ""
+
     inferred = inferred_box_sizes.get(symbol)
     if inferred is not None and inferred > 0:
-        return inferred
+        if not allow_infer_box_size:
+            raise ValueError(
+                f"row {row_number}: missing explicit box_size for {symbol!r}; "
+                f"profile_name={row.get('profile_name')!r} does not contain parseable _bs..._; "
+                "provide box_size/profile_box_size, --symbol-box-size, --box-size, "
+                "or rerun with --allow-infer-box-size"
+            )
+        return inferred, "inferred", "WARNING: inferred from minimum observed price spacing"
+
     raise ValueError(
-        f"row {row_number}: missing box_size; provide box_size/profile_name or --box-size"
+        f"row {row_number}: missing box_size; provide box_size/profile_name, "
+        "--symbol-box-size, --box-size, or --allow-infer-box-size"
     )
 
 
-def load_columns(paths: Sequence[Path], *, box_size: float | None = None) -> list[RawColumn]:
+def load_columns(
+    paths: Sequence[Path],
+    *,
+    box_size: float | None = None,
+    symbol_box_sizes: dict[str, float] | None = None,
+    allow_infer_box_size: bool = False,
+) -> list[RawColumn]:
     raw_rows: list[dict[str, Any]] = []
     for path in paths:
         with path.open("r", newline="", encoding="utf-8") as handle:
@@ -377,6 +448,7 @@ def load_columns(paths: Sequence[Path], *, box_size: float | None = None) -> lis
             raw_rows.extend(dict(row) for row in reader)
 
     inferred_box_sizes = _infer_symbol_box_sizes(raw_rows)
+    explicit_symbol_box_sizes = symbol_box_sizes or {}
     columns: list[RawColumn] = []
     for row_number, row in enumerate(raw_rows, start=1):
         symbol = _to_str(_first_value(row, ("symbol",)) or "")
@@ -415,12 +487,14 @@ def load_columns(paths: Sequence[Path], *, box_size: float | None = None) -> lis
         if completion_time is None:
             completion_time = end_ts
             completion_source = "end_ts_fallback"
-        parsed_box_size = _row_box_size(
+        parsed_box_size, box_size_source, warning_if_inferred = _row_box_size(
             row,
             row_number=row_number,
             cli_box_size=box_size,
+            symbol_box_sizes=explicit_symbol_box_sizes,
             inferred_box_sizes=inferred_box_sizes,
             symbol=symbol,
+            allow_infer_box_size=allow_infer_box_size,
         )
         columns.append(
             RawColumn(
@@ -435,6 +509,9 @@ def load_columns(paths: Sequence[Path], *, box_size: float | None = None) -> lis
                 completion_time=_to_str(completion_time),
                 completion_time_source=completion_source,
                 box_size=parsed_box_size,
+                profile_name=_to_str(row.get("profile_name") or ""),
+                box_size_source=box_size_source,
+                warning_if_inferred=warning_if_inferred,
             )
         )
     return sorted(
@@ -930,6 +1007,41 @@ def _knowledge_rows(
     return rows
 
 
+def _box_size_manifest_rows(columns: Sequence[RawColumn]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, float, str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for column in sorted(
+        columns,
+        key=lambda item: (
+            item.symbol,
+            item.profile_name,
+            item.box_size_source,
+            item.box_size,
+            item.warning_if_inferred,
+        ),
+    ):
+        key = (
+            column.symbol,
+            column.profile_name,
+            column.box_size,
+            column.box_size_source,
+            column.warning_if_inferred,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "symbol": column.symbol,
+                "resolved_box_size": _format_number(column.box_size),
+                "box_size_source": column.box_size_source,
+                "profile_name": column.profile_name,
+                "warning_if_inferred": column.warning_if_inferred,
+            }
+        )
+    return rows
+
+
 def _write_csv(path: Path, fields: Sequence[str], rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(fields))
@@ -943,10 +1055,17 @@ def run_audit(
     output_root: str | Path,
     threshold_set_specs: Sequence[str] | None = None,
     box_size: float | None = None,
+    symbol_box_sizes: dict[str, float] | None = None,
+    allow_infer_box_size: bool = False,
 ) -> dict[str, Any]:
     threshold_specs = list(threshold_set_specs or DEFAULT_THRESHOLD_SETS)
     thresholds = [ThresholdSet.parse(spec) for spec in threshold_specs]
-    columns = load_columns([Path(path) for path in columns_input], box_size=box_size)
+    columns = load_columns(
+        [Path(path) for path in columns_input],
+        box_size=box_size,
+        symbol_box_sizes=symbol_box_sizes,
+        allow_infer_box_size=allow_infer_box_size,
+    )
     output_path = Path(output_root)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -965,6 +1084,11 @@ def run_audit(
         output_path / OUTPUT_REACTION_DISTRIBUTION,
         REACTION_DISTRIBUTION_FIELDS,
         results["reaction_distribution"],
+    )
+    _write_csv(
+        output_path / OUTPUT_BOX_SIZE_MANIFEST,
+        BOX_SIZE_MANIFEST_FIELDS,
+        _box_size_manifest_rows(columns),
     )
 
     return {
@@ -1003,6 +1127,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Fallback box size when input rows do not include box_size/profile_name.",
     )
+    parser.add_argument(
+        "--symbol-box-size",
+        action="append",
+        help="Explicit symbol-specific box size as SYMBOL=BOX_SIZE. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--allow-infer-box-size",
+        action="store_true",
+        help="Allow fallback inference from minimum observed price spacing when no explicit box size is available.",
+    )
     return parser
 
 
@@ -1013,6 +1147,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         output_root=args.output_root,
         threshold_set_specs=args.threshold_set,
         box_size=args.box_size,
+        symbol_box_sizes=_parse_symbol_box_size_specs(args.symbol_box_size),
+        allow_infer_box_size=args.allow_infer_box_size,
     )
     print(
         "harmonic swing threshold audit complete: "
