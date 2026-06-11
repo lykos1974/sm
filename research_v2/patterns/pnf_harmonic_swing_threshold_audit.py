@@ -82,6 +82,8 @@ REACTION_FIELDS = [
     "required_boxes",
     "column_id",
     "completion_time",
+    "knowledge_time",
+    "knowledge_time_source",
     "active_start_ts",
     "active_end_ts",
 ]
@@ -157,6 +159,8 @@ BOX_SIZE_MANIFEST_FIELDS = [
     "box_size_source",
     "profile_name",
     "warning_if_inferred",
+    "knowledge_time_source",
+    "knowledge_time_contract",
 ]
 REACTION_RATIO_BUCKETS = (
     ("0-10%", 0.0, 0.10),
@@ -273,6 +277,7 @@ class RawColumn:
     completion_time: str
     completion_time_source: str
     box_size: float
+    knowledge_time_contract: str = ""
     profile_name: str = ""
     box_size_source: str = ""
     warning_if_inferred: str = ""
@@ -387,6 +392,54 @@ def _lookup_symbol_box_size(symbol: str, mapping: dict[str, float]) -> float | N
     return None
 
 
+def _column_knowledge_time(row: dict[str, Any], *, row_number: int) -> tuple[str, str, str]:
+    """Return the causal timestamp at which a completed PnF column is knowable.
+
+    The input to this audit is a stream of completed PnF columns. An explicit
+    ``completion_time`` is therefore accepted only under the documented source
+    contract that it is the first timestamp at which the completed PnF column is
+    confirmed and available to downstream research. This is not a consumer-side
+    fallback: the exported ``knowledge_time`` is populated from a source field
+    whose meaning is recorded in the manifest.
+    """
+    source_contracts = (
+        (
+            "knowledge_time",
+            "explicit_input_knowledge_time",
+            "Input row supplied an explicit knowledge_time; this is the causal availability timestamp for the completed PnF column.",
+        ),
+        (
+            "completion_time",
+            "explicit_completion_time",
+            "Input contract: completion_time is the first timestamp at which the completed PnF column/reaction is confirmed and available to downstream research; exported knowledge_time is copied from that confirmed-column timestamp.",
+        ),
+        (
+            "column_completion_time",
+            "explicit_column_completion_time",
+            "Input contract: column_completion_time is the first timestamp at which the completed PnF column is confirmed and available to downstream research; exported knowledge_time is copied from that confirmed-column timestamp.",
+        ),
+        (
+            "completed_at",
+            "explicit_completed_at",
+            "Input contract: completed_at is the first timestamp at which the completed PnF column is confirmed and available to downstream research; exported knowledge_time is copied from that confirmed-column timestamp.",
+        ),
+    )
+    for field_name, source_name, contract in source_contracts:
+        value = row.get(field_name)
+        if value is not None and str(value).strip() != "":
+            return _to_str(value), source_name, contract
+
+    end_ts = row.get("end_ts") or row.get("end_time")
+    if end_ts is not None and str(end_ts).strip() != "":
+        return (
+            _to_str(end_ts),
+            "end_ts_fallback",
+            "Fallback only: source did not provide a confirmed-column knowledge timestamp, so end_ts was used for legacy harmonic-threshold diagnostics; do not treat as design_v2-validated causal input.",
+        )
+
+    raise ValueError(f"row {row_number}: missing completion_time/knowledge_time and end_ts")
+
+
 def _row_box_size(
     row: dict[str, Any],
     *,
@@ -474,19 +527,9 @@ def load_columns(
         end_ts = _to_str(_first_value(row, ("end_ts", "end_time")) or "")
         if not start_ts or not end_ts:
             raise ValueError(f"row {row_number}: missing start_ts/end_ts")
-        completion_source = "explicit"
-        completion_time = _first_value(
-            row,
-            (
-                "completion_time",
-                "completed_at",
-                "knowledge_time",
-                "column_completion_time",
-            ),
+        completion_time, completion_source, knowledge_time_contract = _column_knowledge_time(
+            row, row_number=row_number
         )
-        if completion_time is None:
-            completion_time = end_ts
-            completion_source = "end_ts_fallback"
         parsed_box_size, box_size_source, warning_if_inferred = _row_box_size(
             row,
             row_number=row_number,
@@ -508,6 +551,7 @@ def load_columns(
                 end_ts=end_ts,
                 completion_time=_to_str(completion_time),
                 completion_time_source=completion_source,
+                knowledge_time_contract=knowledge_time_contract,
                 box_size=parsed_box_size,
                 profile_name=_to_str(row.get("profile_name") or ""),
                 box_size_source=box_size_source,
@@ -625,6 +669,8 @@ def _reaction_row(
         "required_boxes": _format_number(required_boxes),
         "column_id": column.column_id,
         "completion_time": column.completion_time,
+        "knowledge_time": column.completion_time,
+        "knowledge_time_source": column.completion_time_source,
         "active_start_ts": active.start_ts,
         "active_end_ts": active.end_ts,
     }
@@ -989,7 +1035,9 @@ def _knowledge_rows(
             if row.get("knowledge_time_source") == "end_ts_fallback"
         )
         explicit_count = sum(
-            1 for row in threshold_swings if row.get("knowledge_time_source") == "explicit"
+            1
+            for row in threshold_swings
+            if str(row.get("knowledge_time_source") or "").startswith("explicit_")
         )
         rows.append(
             {
@@ -1008,7 +1056,7 @@ def _knowledge_rows(
 
 
 def _box_size_manifest_rows(columns: Sequence[RawColumn]) -> list[dict[str, Any]]:
-    seen: set[tuple[str, str, float, str, str]] = set()
+    seen: set[tuple[str, str, float, str, str, str, str]] = set()
     rows: list[dict[str, Any]] = []
     for column in sorted(
         columns,
@@ -1018,6 +1066,8 @@ def _box_size_manifest_rows(columns: Sequence[RawColumn]) -> list[dict[str, Any]
             item.box_size_source,
             item.box_size,
             item.warning_if_inferred,
+            item.completion_time_source,
+            item.knowledge_time_contract,
         ),
     ):
         key = (
@@ -1026,6 +1076,8 @@ def _box_size_manifest_rows(columns: Sequence[RawColumn]) -> list[dict[str, Any]
             column.box_size,
             column.box_size_source,
             column.warning_if_inferred,
+            column.completion_time_source,
+            column.knowledge_time_contract,
         )
         if key in seen:
             continue
@@ -1037,6 +1089,8 @@ def _box_size_manifest_rows(columns: Sequence[RawColumn]) -> list[dict[str, Any]
                 "box_size_source": column.box_size_source,
                 "profile_name": column.profile_name,
                 "warning_if_inferred": column.warning_if_inferred,
+                "knowledge_time_source": column.completion_time_source,
+                "knowledge_time_contract": column.knowledge_time_contract,
             }
         )
     return rows

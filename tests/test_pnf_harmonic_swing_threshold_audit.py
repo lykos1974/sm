@@ -3,9 +3,15 @@ from pathlib import Path
 
 import pytest
 
+from research_v2.patterns.pnf_abcd_population_audit import (
+    load_validated_pivots,
+    run_audit as run_abcd_population_audit,
+)
 from research_v2.patterns.pnf_harmonic_swing_threshold_audit import (
     BOX_SIZE_MANIFEST_FIELDS,
     OUTPUT_BOX_SIZE_MANIFEST,
+    OUTPUT_REACTIONS,
+    OUTPUT_SWINGS,
     load_columns,
     run_audit,
 )
@@ -136,6 +142,101 @@ def test_run_audit_writes_box_size_manifest(tmp_path: Path) -> None:
             "box_size_source": "profile_name",
             "profile_name": "BTCUSDT_bs100_rev3",
             "warning_if_inferred": "",
+            "knowledge_time_source": "end_ts_fallback",
+            "knowledge_time_contract": "Fallback only: source did not provide a confirmed-column knowledge timestamp, so end_ts was used for legacy harmonic-threshold diagnostics; do not treat as design_v2-validated causal input.",
         }
     ]
     assert str(manifest_path) in result["output_files"]
+
+
+def _alternating_confirmed_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for idx, kind in enumerate(["X", "O", "X", "O", "X", "O"], start=1):
+        rows.append(
+            _base_row(
+                idx=idx,
+                kind=kind,
+                top=110,
+                bottom=100,
+                start_ts=1_704_067_200 + idx * 100,
+                end_ts=1_704_067_250 + idx * 100,
+                completion_time=1_704_067_260 + idx * 100,
+                profile_name="BTCUSDT_bs1_rev3",
+            )
+        )
+    return rows
+
+
+def test_run_audit_writes_causal_knowledge_time_to_swings_and_reactions(tmp_path: Path) -> None:
+    columns_csv = tmp_path / "columns.csv"
+    output_root = tmp_path / "audit"
+    _write_columns(columns_csv, _alternating_confirmed_rows())
+
+    run_audit(columns_input=[columns_csv], output_root=output_root)
+
+    for filename in (OUTPUT_SWINGS, OUTPUT_REACTIONS):
+        with (output_root / filename).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            assert "knowledge_time" in (reader.fieldnames or [])
+            assert "knowledge_time_source" in (reader.fieldnames or [])
+            rows = list(reader)
+        assert rows
+        assert {row["knowledge_time_source"] for row in rows} == {"explicit_completion_time"}
+        assert all(row["knowledge_time"] for row in rows)
+
+    with (output_root / OUTPUT_BOX_SIZE_MANIFEST).open(newline="", encoding="utf-8") as handle:
+        manifest_rows = list(csv.DictReader(handle))
+    assert manifest_rows[0]["knowledge_time_source"] == "explicit_completion_time"
+    assert "first timestamp" in manifest_rows[0]["knowledge_time_contract"]
+
+
+def test_abcd_population_audit_accepts_regenerated_harmonic_artifact(tmp_path: Path) -> None:
+    columns_csv = tmp_path / "columns.csv"
+    harmonic_root = tmp_path / "VALIDATED_harmonic_swing_threshold_local_v3"
+    abcd_root = tmp_path / "abcd"
+    _write_columns(columns_csv, _alternating_confirmed_rows())
+
+    run_audit(columns_input=[columns_csv], output_root=harmonic_root)
+
+    assert run_abcd_population_audit(input_root=harmonic_root, output_root=abcd_root) is True
+    pivots, rejects, _ = load_validated_pivots(harmonic_root)
+    assert pivots
+    assert rejects["missing_or_invalid_knowledge_time"] == 0
+    report = (abcd_root / "abcd_population_report.md").read_text(encoding="utf-8")
+    assert "Explicit `knowledge_time` required; no `completion_time` fallback is allowed or used." in report
+
+
+def test_abcd_population_audit_still_rejects_missing_knowledge_time(tmp_path: Path) -> None:
+    input_root = tmp_path / "artifact"
+    output_root = tmp_path / "abcd"
+    input_root.mkdir()
+    reactions_path = input_root / OUTPUT_REACTIONS
+    with reactions_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "threshold_name",
+                "symbol",
+                "candidate_direction",
+                "reaction_kind",
+                "candidate_boxes",
+                "completion_time",
+                "column_id",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "threshold_name": "SLOW",
+                "symbol": "BTCUSDT",
+                "candidate_direction": "UP",
+                "reaction_kind": "CONFIRMING",
+                "candidate_boxes": "10",
+                "completion_time": "1704067200",
+                "column_id": "1",
+            }
+        )
+
+    assert run_abcd_population_audit(input_root=input_root, output_root=output_root) is False
+    report = (output_root / "abcd_population_report.md").read_text(encoding="utf-8")
+    assert "missing required knowledge_time column; completion_time fallback is forbidden" in report
