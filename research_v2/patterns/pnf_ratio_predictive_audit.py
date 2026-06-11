@@ -173,6 +173,19 @@ def _completion_sort_key(reaction: Reaction) -> tuple[float, int]:
     return reaction.completion_time, column_id
 
 
+def normalize_symbol(symbol: str) -> str:
+    """Return the canonical market symbol used by stability outputs.
+
+    Reaction exports may carry exchange-qualified symbols such as
+    ``BINANCE_FUT:BTCUSDT`` while the by-symbol stability output is keyed by
+    bare symbols such as ``BTCUSDT``.  Keep the normalization intentionally
+    narrow: strip only an exchange/venue prefix separated by ``:`` and preserve
+    the market symbol itself.
+    """
+
+    return str(symbol or "").strip().split(":")[-1]
+
+
 def load_reactions(
     path: str | Path,
     *,
@@ -328,7 +341,12 @@ def build_symbol_rows(
 ) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for symbol in symbols:
-        symbol_rows = [row for row in rows if row.reaction.symbol == symbol]
+        normalized_symbol = normalize_symbol(symbol)
+        symbol_rows = [
+            row
+            for row in rows
+            if normalize_symbol(row.reaction.symbol) == normalized_symbol
+        ]
         for bucket, lower, upper in RATIO_BUCKETS:
             metrics = _bucket_metrics(_bucket_rows(symbol_rows, lower, upper))
             output.append(
@@ -487,7 +505,10 @@ def _frequency(row: dict[str, Any], key: str) -> float | None:
 
 def _bucket_lookup(
     rows: Sequence[dict[str, Any]], *keys: str
-) -> dict[tuple[Any, ...], dict[str, Any]]:
+) -> dict[Any, dict[str, Any]]:
+    if len(keys) == 1:
+        key = keys[0]
+        return {row[key]: row for row in rows}
     return {tuple(row[key] for key in keys): row for row in rows}
 
 
