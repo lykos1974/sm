@@ -1,0 +1,10 @@
+threshold_name,min_pivot_boxes,min_pivot_ratio,symbol,confirmed_pivot_count,confirmed_leg_count,up_leg_count,down_leg_count
+FAST,2,0.146,BTCUSDT,14,13,6,7
+FAST,2,0.146,ETHUSDT,6,5,2,3
+FAST,2,0.146,SOLUSDT,6,5,2,3
+BASE,3,0.236,BTCUSDT,14,13,6,7
+BASE,3,0.236,ETHUSDT,6,5,2,3
+BASE,3,0.236,SOLUSDT,6,5,2,3
+SLOW,5,0.382,BTCUSDT,6,5,2,3
+SLOW,5,0.382,ETHUSDT,2,1,0,1
+SLOW,5,0.382,SOLUSDT,2,1,0,1

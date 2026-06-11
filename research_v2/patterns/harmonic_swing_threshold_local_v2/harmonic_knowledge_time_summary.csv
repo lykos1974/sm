@@ -1,0 +1,4 @@
+threshold_name,knowledge_rows,knowledge_after_endpoint_count,knowledge_equal_endpoint_count,avg_knowledge_lag,median_knowledge_lag,max_knowledge_lag,fallback_completion_time_count,explicit_completion_time_count
+FAST,23,23,0,8577391.30435,6000000,26640000,23,0
+BASE,23,23,0,8577391.30435,6000000,26640000,23,0
+SLOW,7,7,0,5854285.71429,5460000,10680000,7,0

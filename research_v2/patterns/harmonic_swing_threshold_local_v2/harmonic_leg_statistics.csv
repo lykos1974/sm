@@ -1,0 +1,10 @@
+threshold_name,min_pivot_boxes,min_pivot_ratio,symbol,leg_count,avg_leg_boxes,median_leg_boxes,p25_leg_boxes,p75_leg_boxes,min_leg_boxes,max_leg_boxes,avg_leg_price_distance,median_leg_price_distance
+FAST,2,0.146,BTCUSDT,13,6.92307692308,7,4,10,2,16,692.307692308,700
+FAST,2,0.146,ETHUSDT,5,8,5,4,12,4,15,40,25
+FAST,2,0.146,SOLUSDT,5,7.4,5,5,10,3,14,1.85,1.25
+BASE,3,0.236,BTCUSDT,13,6.92307692308,7,4,10,2,16,692.307692308,700
+BASE,3,0.236,ETHUSDT,5,8,5,4,12,4,15,40,25
+BASE,3,0.236,SOLUSDT,5,7.4,5,5,10,3,14,1.85,1.25
+SLOW,5,0.382,BTCUSDT,5,10.2,7,5,16,5,18,1020,700
+SLOW,5,0.382,ETHUSDT,1,12,12,12,12,12,12,60,60
+SLOW,5,0.382,SOLUSDT,1,12,12,12,12,12,12,3,3

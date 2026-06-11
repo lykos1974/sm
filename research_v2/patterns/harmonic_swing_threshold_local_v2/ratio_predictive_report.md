@@ -2,7 +2,7 @@
 
 ## Scope
 - Research only: no detector, no strategy, no expectancy, and no production changes.
-- Input: `research_v2/patterns/harmonic_swing_threshold_audit_btc_eth_sol/audit/harmonic_reactions_by_threshold.csv`.
+- Input: `research_v2/patterns/harmonic_swing_threshold_local_v2/harmonic_reactions_by_threshold.csv`.
 - Threshold: `SLOW` only.
 - Buckets are lower-inclusive and upper-exclusive.
 - Next confirmed swing is the first later same-symbol SLOW `CONFIRMING` reaction; rows without a later confirmed swing are counted as unresolved and excluded from average/median/frequency denominators.

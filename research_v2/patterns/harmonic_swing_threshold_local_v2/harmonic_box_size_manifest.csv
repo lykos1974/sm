@@ -1,0 +1,4 @@
+symbol,resolved_box_size,box_size_source,profile_name,warning_if_inferred
+BTCUSDT,100,symbol_box_size,BTCUSDT_bs100_rev3,
+ETHUSDT,5,symbol_box_size,ETHUSDT_bs5_rev3,
+SOLUSDT,0.25,symbol_box_size,SOLUSDT_bs0.25_rev3,
