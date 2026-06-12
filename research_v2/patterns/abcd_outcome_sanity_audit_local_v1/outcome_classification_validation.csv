@@ -1,0 +1,6 @@
+scope,cohort,total_measured_rows,continuation_count,reversal_count,continuation_plus_reversal,identity_holds,validation_note
+current_workspace_summary,SYM_0_90_1_10,0,0,0,0,TRUE,Local abcd_outcome_local_v1 is BLOCKED and contains zero rows; this is not the nonzero validated output described in the request.
+current_workspace_summary,EXT_1_20_1_35,0,0,0,0,TRUE,Local abcd_outcome_local_v1 is BLOCKED and contains zero rows; this is not the nonzero validated output described in the request.
+current_workspace_summary,EXT_1_55_1_70,0,0,0,0,TRUE,Local abcd_outcome_local_v1 is BLOCKED and contains zero rows; this is not the nonzero validated output described in the request.
+current_workspace_summary,OTHER,0,0,0,0,TRUE,Local abcd_outcome_local_v1 is BLOCKED and contains zero rows; this is not the nonzero validated output described in the request.
+code_path_invariant,ALL_RESOLVED_ROWS,N/A,N/A,N/A,N/A,TRUE,For every resolved Outcome row exactly one of same_direction_as_cd/opposite_direction_to_cd is true because opposite_direction_to_cd is implemented as next_direction != cd_direction.

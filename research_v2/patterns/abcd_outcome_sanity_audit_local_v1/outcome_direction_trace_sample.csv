@@ -1,0 +1,4 @@
+sample_status,requested_symbol,requested_examples,available_examples,candidate_id,symbol,ab_direction,bc_direction,cd_direction,d_direction_used_by_outcome_audit,next_confirmed_swing_direction,classification,source_note
+BLOCKED_VALIDATED_INPUT_MISSING,BTCUSDT,25,0,,,,,,,,Current workspace lacks the trusted Phase 3 pivot/geometry artifacts required by pnf_abcd_outcome_audit.py, so no non-fabricated BTC sample can be produced from the current code path.
+BLOCKED_VALIDATED_INPUT_MISSING,ETHUSDT,25,0,,,,,,,,Current workspace lacks the trusted Phase 3 pivot/geometry artifacts required by pnf_abcd_outcome_audit.py, so no non-fabricated ETH sample can be produced from the current code path.
+BLOCKED_VALIDATED_INPUT_MISSING,SOLUSDT,25,0,,,,,,,,Current workspace lacks the trusted Phase 3 pivot/geometry artifacts required by pnf_abcd_outcome_audit.py, so no non-fabricated SOL sample can be produced from the current code path.
