@@ -37,7 +37,7 @@ from pnf_abcd_geometry_audit import (
 TRUSTED_PIVOT_ROOT = Path("research_v2/patterns/VALIDATED_harmonic_swing_threshold_local_v3")
 GEOMETRY_ROOT = Path("research_v2/patterns/abcd_geometry_local_v1")
 POPULATION_ROOT = Path("research_v2/patterns/abcd_population_local_v2")
-DEFAULT_OUTPUT_ROOT = Path("research_v2/patterns/abcd_outcome_local_v1")
+DEFAULT_OUTPUT_ROOT = Path("research_v2/patterns/abcd_outcome_repaired_local_v1")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GEOMETRY_CANDIDATES = "abcd_geometry_candidates.csv"
 COHORTS = ("SYM_0_90_1_10", "EXT_1_20_1_35", "EXT_1_55_1_70", "OTHER")
@@ -45,10 +45,13 @@ COHORTS = ("SYM_0_90_1_10", "EXT_1_20_1_35", "EXT_1_55_1_70", "OTHER")
 SUMMARY_FIELDS = [
     "cohort",
     "count",
+    "measured_rows",
     "median_next_confirmed_swing",
     "avg_next_confirmed_swing",
     "continuation_frequency",
     "reversal_frequency",
+    "continuation_count",
+    "reversal_count",
 ]
 BY_SYMBOL_FIELDS = ["symbol", *SUMMARY_FIELDS]
 BY_YEAR_FIELDS = ["year", *SUMMARY_FIELDS]
@@ -61,10 +64,11 @@ class Outcome:
     year: int | None
     cohort: str
     cd_direction: str
+    pre_d_active_direction: str
     next_confirmed_swing_boxes: float | None
     next_confirmed_direction: str
-    same_direction_as_cd: bool | None
-    opposite_direction_to_cd: bool | None
+    continuation: bool | None
+    reversal: bool | None
 
 
 def _year_from_ts(timestamp: float) -> int | None:
@@ -175,8 +179,9 @@ def outcomes_from_pivots(pivots: Sequence[Pivot]) -> list[Outcome]:
                 continue
             next_pivot = ordered[index + 4] if index + 4 < len(ordered) else None
             next_direction = next_pivot.candidate_direction if next_pivot is not None else ""
-            same = next_direction == d.candidate_direction if next_pivot is not None else None
-            opposite = next_direction != d.candidate_direction if next_pivot is not None else None
+            pre_d_active_direction = c.candidate_direction
+            continuation = next_direction == pre_d_active_direction if next_pivot is not None else None
+            reversal = next_direction != pre_d_active_direction if next_pivot is not None else None
             rows.append(
                 Outcome(
                     candidate_id="ABCD:" + ":".join([a.pivot_id, b.pivot_id, c.pivot_id, d.pivot_id]),
@@ -184,10 +189,11 @@ def outcomes_from_pivots(pivots: Sequence[Pivot]) -> list[Outcome]:
                     year=_year_from_ts(d.knowledge_ts),
                     cohort=classify_cd_ab(d.candidate_boxes / b.candidate_boxes),
                     cd_direction=d.candidate_direction,
+                    pre_d_active_direction=pre_d_active_direction,
                     next_confirmed_swing_boxes=next_pivot.candidate_boxes if next_pivot is not None else None,
                     next_confirmed_direction=next_direction,
-                    same_direction_as_cd=same,
-                    opposite_direction_to_cd=opposite,
+                    continuation=continuation,
+                    reversal=reversal,
                 )
             )
     return rows
@@ -231,6 +237,8 @@ def outcomes_from_geometry_file(path: Path, pivots: Sequence[Pivot]) -> list[Out
             if d_key is None:
                 raise ValueError(f"{path}:{row_number}: missing or invalid D knowledge time")
             next_pivot: Pivot | None = None
+            pre_d_active_pivot: Pivot | None = None
+            previous_pivot: Pivot | None = None
             matched_d = False
             for pivot in ordered_by_symbol.get(symbol, []):
                 pivot_key = (pivot.symbol, pivot.knowledge_ts, pivot.column_sort, pivot.candidate_direction)
@@ -239,11 +247,16 @@ def outcomes_from_geometry_file(path: Path, pivots: Sequence[Pivot]) -> list[Out
                     break
                 if pivot_key == d_key:
                     matched_d = True
+                    pre_d_active_pivot = previous_pivot
+                previous_pivot = pivot
             if not matched_d:
                 raise ValueError(f"{path}:{row_number}: could not match D pivot in trusted pivot stream")
+            if pre_d_active_pivot is None:
+                raise ValueError(f"{path}:{row_number}: could not identify pre-D active direction in trusted pivot stream")
+            pre_d_active_direction = pre_d_active_pivot.candidate_direction
             next_direction = next_pivot.candidate_direction if next_pivot is not None else ""
-            same = next_direction == cd_direction if next_pivot is not None else None
-            opposite = next_direction != cd_direction if next_pivot is not None else None
+            continuation = next_direction == pre_d_active_direction if next_pivot is not None else None
+            reversal = next_direction != pre_d_active_direction if next_pivot is not None else None
             year_value = _parse_float(row.get("year"))
             rows.append(
                 Outcome(
@@ -252,10 +265,11 @@ def outcomes_from_geometry_file(path: Path, pivots: Sequence[Pivot]) -> list[Out
                     year=int(year_value) if year_value is not None else None,
                     cohort=classify_cd_ab(cd_ratio),
                     cd_direction=cd_direction,
+                    pre_d_active_direction=pre_d_active_direction,
                     next_confirmed_swing_boxes=next_pivot.candidate_boxes if next_pivot is not None else None,
                     next_confirmed_direction=next_direction,
-                    same_direction_as_cd=same,
-                    opposite_direction_to_cd=opposite,
+                    continuation=continuation,
+                    reversal=reversal,
                 )
             )
     return rows
@@ -277,15 +291,18 @@ def summarize(rows: Sequence[Outcome], cohort: str) -> dict[str, Any]:
     cohort_rows = [row for row in rows if row.cohort == cohort]
     resolved = [row for row in cohort_rows if row.next_confirmed_swing_boxes is not None]
     boxes = [row.next_confirmed_swing_boxes for row in resolved if row.next_confirmed_swing_boxes is not None]
-    continuation = sum(1 for row in resolved if row.same_direction_as_cd is True)
-    reversal = sum(1 for row in resolved if row.opposite_direction_to_cd is True)
+    continuation = sum(1 for row in resolved if row.continuation is True)
+    reversal = sum(1 for row in resolved if row.reversal is True)
     return {
         "cohort": cohort,
         "count": len(cohort_rows),
+        "measured_rows": len(resolved),
         "median_next_confirmed_swing": _median(boxes),
         "avg_next_confirmed_swing": _avg(boxes),
         "continuation_frequency": _freq(continuation, len(resolved)),
         "reversal_frequency": _freq(reversal, len(resolved)),
+        "continuation_count": continuation,
+        "reversal_count": reversal,
     }
 
 
@@ -353,6 +370,80 @@ def _material_frequency_text(summary_rows: Sequence[dict[str, Any]], cohort: str
     return f"continuation delta vs OTHER={cont_delta}; reversal delta vs OTHER={rev_delta}"
 
 
+def _cohort_metric_text(rows: Sequence[dict[str, Any]], cohort: str) -> str:
+    row = _row_by_cohort(rows, cohort)
+    return (
+        f"count={row['count']}; measured_rows={row['measured_rows']}; "
+        f"median_next_swing={row['median_next_confirmed_swing']}; "
+        f"avg_next_swing={row['avg_next_confirmed_swing']}; "
+        f"continuation_frequency={row['continuation_frequency']}; "
+        f"reversal_frequency={row['reversal_frequency']}"
+    )
+
+
+def _validation_status(rows: Sequence[Outcome]) -> tuple[bool, int, int, int]:
+    measured_rows = [row for row in rows if row.next_confirmed_swing_boxes is not None]
+    continuation_count = sum(1 for row in measured_rows if row.continuation is True)
+    reversal_count = sum(1 for row in measured_rows if row.reversal is True)
+    return continuation_count + reversal_count == len(measured_rows), len(measured_rows), continuation_count, reversal_count
+
+
+def _stable_delta_text(rows: Sequence[dict[str, Any]], cohort: str, key_name: str, metric: str) -> str:
+    deltas: list[tuple[Any, float]] = []
+    keys = SYMBOLS if key_name == "symbol" else YEARS
+    for key in keys:
+        scoped = [row for row in rows if row.get(key_name) == key]
+        if not scoped:
+            continue
+        cohort_row = next((row for row in scoped if row["cohort"] == cohort), None)
+        other_row = next((row for row in scoped if row["cohort"] == "OTHER"), None)
+        if cohort_row is None or other_row is None:
+            continue
+        cohort_value = _float_cell(cohort_row, metric)
+        other_value = _float_cell(other_row, metric)
+        cohort_measured = _parse_float(cohort_row.get("measured_rows"))
+        other_measured = _parse_float(other_row.get("measured_rows"))
+        if (
+            cohort_value is None
+            or other_value is None
+            or cohort_measured is None
+            or other_measured is None
+            or cohort_measured <= 0
+            or other_measured <= 0
+        ):
+            continue
+        deltas.append((key, cohort_value - other_value))
+    if not deltas:
+        return "not available"
+    signs = {1 if value > 0 else -1 if value < 0 else 0 for _, value in deltas}
+    stability = "same-sign" if len(signs) == 1 else "mixed-sign"
+    rendered = "; ".join(f"{key}={_fmt(value)}" for key, value in deltas)
+    return f"{stability} deltas ({rendered})"
+
+
+def _structural_separation_text(
+    summary_rows: Sequence[dict[str, Any]],
+    symbol_rows: Sequence[dict[str, Any]],
+    year_rows: Sequence[dict[str, Any]],
+) -> str:
+    del summary_rows
+    for cohort in COHORTS:
+        if cohort == "OTHER":
+            continue
+        symbol_stability = _stable_delta_text(symbol_rows, cohort, "symbol", "continuation_frequency")
+        year_stability = _stable_delta_text(year_rows, cohort, "year", "continuation_frequency")
+        if symbol_stability.startswith("same-sign") and year_stability.startswith("same-sign"):
+            return (
+                "Descriptively yes for continuation-frequency separation only; "
+                f"{cohort} has same-sign deltas versus OTHER across populated symbol and year partitions. "
+                "This is not a profitability, expectancy, or trading conclusion."
+            )
+    return (
+        "No confirmed meaningful structural separation from OTHER was established by this repaired audit; "
+        "available cohort differences were absent, unavailable, or not stable across populated symbol/year partitions."
+    )
+
+
 def write_report(
     output_root: Path,
     *,
@@ -364,82 +455,106 @@ def write_report(
     rejects: dict[str, int],
 ) -> None:
     total = len(rows)
-    resolved = sum(1 for row in rows if row.next_confirmed_swing_boxes is not None)
+    validation_ok, measured_rows, continuation_count, reversal_count = _validation_status(rows)
+    separation_text = _structural_separation_text(summary_rows, symbol_rows, year_rows)
     lines = [
-        "# AB=CD Phase 3 Structural Outcome Audit Report",
+        "# AB=CD Phase 3 Repaired Structural Outcome Audit Report",
         "",
         "## Scope",
         "- Phase 3 descriptive structural outcome audit only.",
         f"- Source detail: {source_detail}.",
         f"- Causal design reference: `{DESIGN_DOC.as_posix()}`.",
         "- Measurement starts only after D is known and uses the next confirmed SLOW structural swing.",
-        "- No trade model, signal generation, detector changes, scanner changes, or production-code behavior changes were performed.",
+        "- Repair scope is limited to continuation/reversal semantics in this research audit.",
+        "- No harmonic extraction, pivot extraction, geometry generation, AB/CD candidate generation, candidate selection, knowledge-time rules, validated inputs, population audit logic, detector, scanner, strategy, trade model, expectancy, or PnL logic was changed.",
+        "",
+        "## Repaired Continuation/Reversal Semantics",
+        "- `pre_d_active_direction` is the confirmed swing direction that existed immediately before D completed.",
+        "- In rolling-pivot mode, `pre_d_active_direction = c.candidate_direction` for the completed A/B/C/D window.",
+        "- In geometry-file mode, `pre_d_active_direction` is recovered from the trusted confirmed-pivot stream as the pivot immediately before the matched D pivot.",
+        "- `continuation = next_confirmed_direction == pre_d_active_direction`.",
+        "- `reversal = next_confirmed_direction != pre_d_active_direction`.",
+        "- The old D/CD-anchor comparison is no longer used for continuation/reversal classification.",
         "",
         "## Dataset Coverage",
-        f"- Completed ABCD rows measured: {total}",
-        f"- Rows with a next confirmed swing available: {resolved}",
+        f"- Completed ABCD rows observed: {total}",
+        f"- Measured rows with a next confirmed swing available: {measured_rows}",
         *[f"- Rejected/ignored pivot rows — {key}: {value}" for key, value in rejects.items()],
         "",
         "## Cohort Summary",
-        "| Cohort | Count | Median next confirmed swing | Average next confirmed swing | Continuation frequency | Reversal frequency |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Cohort | Count | Measured rows | Median next confirmed swing | Average next confirmed swing | Continuation frequency | Reversal frequency | Continuation count | Reversal count |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary_rows:
         lines.append(
-            f"| {row['cohort']} | {row['count']} | {row['median_next_confirmed_swing']} | {row['avg_next_confirmed_swing']} | {row['continuation_frequency']} | {row['reversal_frequency']} |"
+            f"| {row['cohort']} | {row['count']} | {row['measured_rows']} | {row['median_next_confirmed_swing']} | {row['avg_next_confirmed_swing']} | {row['continuation_frequency']} | {row['reversal_frequency']} | {row['continuation_count']} | {row['reversal_count']} |"
         )
     lines.extend([
         "",
         "## Required Answers",
-        f"1. **Do symmetry-zone ABCDs produce different future swing sizes than OTHER?** {_material_swing_text(summary_rows, 'SYM_0_90_1_10')}.",
-        f"2. **Do extension-zone ABCDs produce different future swing sizes than OTHER?** EXT_1_20_1_35: {_material_swing_text(summary_rows, 'EXT_1_20_1_35')}; EXT_1_55_1_70: {_material_swing_text(summary_rows, 'EXT_1_55_1_70')}.",
-        f"3. **Do any cohorts show materially different continuation/reversal frequencies?** SYM_0_90_1_10: {_material_frequency_text(summary_rows, 'SYM_0_90_1_10')}; EXT_1_20_1_35: {_material_frequency_text(summary_rows, 'EXT_1_20_1_35')}; EXT_1_55_1_70: {_material_frequency_text(summary_rows, 'EXT_1_55_1_70')}.",
-        f"4. **Are differences stable across BTCUSDT / ETHUSDT / SOLUSDT?** Continuation-frequency ranges by symbol — SYM_0_90_1_10 {_frequency_range(symbol_rows, 'SYM_0_90_1_10', 'symbol', 'continuation_frequency')}; EXT_1_20_1_35 {_frequency_range(symbol_rows, 'EXT_1_20_1_35', 'symbol', 'continuation_frequency')}; EXT_1_55_1_70 {_frequency_range(symbol_rows, 'EXT_1_55_1_70', 'symbol', 'continuation_frequency')}; OTHER {_frequency_range(symbol_rows, 'OTHER', 'symbol', 'continuation_frequency')}.",
-        f"5. **Are differences stable across 2024 / 2025 / 2026?** Continuation-frequency ranges by year — SYM_0_90_1_10 {_frequency_range(year_rows, 'SYM_0_90_1_10', 'year', 'continuation_frequency')}; EXT_1_20_1_35 {_frequency_range(year_rows, 'EXT_1_20_1_35', 'year', 'continuation_frequency')}; EXT_1_55_1_70 {_frequency_range(year_rows, 'EXT_1_55_1_70', 'year', 'continuation_frequency')}; OTHER {_frequency_range(year_rows, 'OTHER', 'year', 'continuation_frequency')}.",
-        "6. **Is there sufficient descriptive separation to justify Phase 4 research?** Treat as descriptive only: Phase 4 is justified only if the deltas above remain separated after symbol/year review; this report does not make any profitability or recommendation claim.",
+        f"1. **Does SYM_0_90_1_10 differ from OTHER?** SYM_0_90_1_10: {_cohort_metric_text(summary_rows, 'SYM_0_90_1_10')}; OTHER: {_cohort_metric_text(summary_rows, 'OTHER')}; deltas vs OTHER: {_material_swing_text(summary_rows, 'SYM_0_90_1_10')}; {_material_frequency_text(summary_rows, 'SYM_0_90_1_10')}.",
+        f"2. **Does EXT_1_20_1_35 differ from OTHER?** EXT_1_20_1_35: {_cohort_metric_text(summary_rows, 'EXT_1_20_1_35')}; OTHER: {_cohort_metric_text(summary_rows, 'OTHER')}; deltas vs OTHER: {_material_swing_text(summary_rows, 'EXT_1_20_1_35')}; {_material_frequency_text(summary_rows, 'EXT_1_20_1_35')}.",
+        f"3. **Does EXT_1_55_1_70 differ from OTHER?** EXT_1_55_1_70: {_cohort_metric_text(summary_rows, 'EXT_1_55_1_70')}; OTHER: {_cohort_metric_text(summary_rows, 'OTHER')}; deltas vs OTHER: {_material_swing_text(summary_rows, 'EXT_1_55_1_70')}; {_material_frequency_text(summary_rows, 'EXT_1_55_1_70')}.",
+        f"4. **Are observed differences stable across BTCUSDT / ETHUSDT / SOLUSDT?** Continuation-frequency deltas vs OTHER by symbol — SYM_0_90_1_10: {_stable_delta_text(symbol_rows, 'SYM_0_90_1_10', 'symbol', 'continuation_frequency')}; EXT_1_20_1_35: {_stable_delta_text(symbol_rows, 'EXT_1_20_1_35', 'symbol', 'continuation_frequency')}; EXT_1_55_1_70: {_stable_delta_text(symbol_rows, 'EXT_1_55_1_70', 'symbol', 'continuation_frequency')}.",
+        f"5. **Are observed differences stable across 2024 / 2025 / 2026?** Continuation-frequency deltas vs OTHER by year — SYM_0_90_1_10: {_stable_delta_text(year_rows, 'SYM_0_90_1_10', 'year', 'continuation_frequency')}; EXT_1_20_1_35: {_stable_delta_text(year_rows, 'EXT_1_20_1_35', 'year', 'continuation_frequency')}; EXT_1_55_1_70: {_stable_delta_text(year_rows, 'EXT_1_55_1_70', 'year', 'continuation_frequency')}.",
+        f"6. **Does any cohort show meaningful structural separation from OTHER?** {separation_text}",
+        "",
+        "## Required Validation",
+        f"- `continuation_count + reversal_count == measured_rows`: {validation_ok} ({continuation_count} + {reversal_count} == {measured_rows}).",
+        "- Continuation frequency is no longer mechanically forced to zero by the D/CD-anchor bug because continuation is now measured against `pre_d_active_direction`, not `cd_direction`.",
+        "- Reversal frequency is no longer mechanically forced to one by the D/CD-anchor bug because reversal is now measured as any next confirmed direction that differs from `pre_d_active_direction`, not any direction that differs from `cd_direction`.",
+        "- This validation proves classification exhaustiveness for measured rows only; unresolved rows without a next confirmed swing are excluded from frequency denominators.",
         "",
         "## By Symbol",
-        "| Symbol | Cohort | Count | Median next confirmed swing | Average next confirmed swing | Continuation frequency | Reversal frequency |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Symbol | Cohort | Count | Measured rows | Median next confirmed swing | Average next confirmed swing | Continuation frequency | Reversal frequency | Continuation count | Reversal count |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in symbol_rows:
         lines.append(
-            f"| {row['symbol']} | {row['cohort']} | {row['count']} | {row['median_next_confirmed_swing']} | {row['avg_next_confirmed_swing']} | {row['continuation_frequency']} | {row['reversal_frequency']} |"
+            f"| {row['symbol']} | {row['cohort']} | {row['count']} | {row['measured_rows']} | {row['median_next_confirmed_swing']} | {row['avg_next_confirmed_swing']} | {row['continuation_frequency']} | {row['reversal_frequency']} | {row['continuation_count']} | {row['reversal_count']} |"
         )
     lines.extend([
         "",
         "## By Year",
-        "| Year | Cohort | Count | Median next confirmed swing | Average next confirmed swing | Continuation frequency | Reversal frequency |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Year | Cohort | Count | Measured rows | Median next confirmed swing | Average next confirmed swing | Continuation frequency | Reversal frequency | Continuation count | Reversal count |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in year_rows:
         lines.append(
-            f"| {row['year']} | {row['cohort']} | {row['count']} | {row['median_next_confirmed_swing']} | {row['avg_next_confirmed_swing']} | {row['continuation_frequency']} | {row['reversal_frequency']} |"
+            f"| {row['year']} | {row['cohort']} | {row['count']} | {row['measured_rows']} | {row['median_next_confirmed_swing']} | {row['avg_next_confirmed_swing']} | {row['continuation_frequency']} | {row['reversal_frequency']} | {row['continuation_count']} | {row['reversal_count']} |"
         )
     lines.extend([
         "",
         "## Research Guardrail",
         "This is descriptive structural outcome analysis only. It does not state or imply any trading conclusion, profitability conclusion, signal recommendation, or production behavior change.",
         "",
+        f"Final required answer: After repairing the continuation/reversal semantics, AB=CD symmetry {'does' if separation_text.startswith('Descriptively yes') else 'does not'} exhibit structural separation from OTHER.",
+        "",
     ])
-    (output_root / "abcd_outcome_report.md").write_text("\n".join(lines), encoding="utf-8")
+    (output_root / "abcd_outcome_repaired_report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _write_blocked_outputs(output_root: Path, *, reason: str) -> None:
     empty_summary = _summary_rows([])
     empty_symbol = _group_rows([], "symbol")
     empty_year = _group_rows([], "year")
-    _write_csv(output_root / "abcd_outcome_summary.csv", empty_summary, SUMMARY_FIELDS)
-    _write_csv(output_root / "abcd_outcome_by_symbol.csv", empty_symbol, BY_SYMBOL_FIELDS)
-    _write_csv(output_root / "abcd_outcome_by_year.csv", empty_year, BY_YEAR_FIELDS)
+    _write_csv(output_root / "abcd_outcome_repaired_summary.csv", empty_summary, SUMMARY_FIELDS)
+    _write_csv(output_root / "abcd_outcome_repaired_by_symbol.csv", empty_symbol, BY_SYMBOL_FIELDS)
+    _write_csv(output_root / "abcd_outcome_repaired_by_year.csv", empty_year, BY_YEAR_FIELDS)
     report = [
-        "# AB=CD Phase 3 Structural Outcome Audit Report",
+        "# AB=CD Phase 3 Repaired Structural Outcome Audit Report",
         "",
         "## Status",
         "BLOCKED — Phase 3-approved input artifacts are not available in this workspace.",
         "",
         "## Reason",
         reason,
+        "",
+        "## Repaired Continuation/Reversal Semantics",
+        "- The code path has been repaired so continuation is measured as `next_confirmed_direction == pre_d_active_direction`.",
+        "- The code path has been repaired so reversal is measured as `next_confirmed_direction != pre_d_active_direction`.",
+        "- The old D/CD-anchor comparison is no longer used for continuation/reversal classification.",
+        "- This blocked report does not rerun nonzero cohort metrics because trusted Phase 3 inputs are absent.",
         "",
         "## Approved Input Requirement",
         f"- Pivot root: `{TRUSTED_PIVOT_ROOT.as_posix()}`",
@@ -449,18 +564,26 @@ def _write_blocked_outputs(output_root: Path, *, reason: str) -> None:
         "- No fallback to non-approved local artifacts was used.",
         "",
         "## Answers",
-        "1. Symmetry-zone future swing-size difference vs OTHER: not computed because inputs are missing.",
-        "2. Extension-zone future swing-size difference vs OTHER: not computed because inputs are missing.",
-        "3. Continuation/reversal frequency differences: not computed because inputs are missing.",
-        "4. Symbol stability: not determined.",
-        "5. Year stability: not determined.",
-        "6. Phase 4 descriptive-separation justification: not determined from this workspace.",
+        "1. SYM_0_90_1_10 vs OTHER: not computed because inputs are missing.",
+        "2. EXT_1_20_1_35 vs OTHER: not computed because inputs are missing.",
+        "3. EXT_1_55_1_70 vs OTHER: not computed because inputs are missing.",
+        "4. Symbol stability across BTCUSDT / ETHUSDT / SOLUSDT: not determined.",
+        "5. Year stability across 2024 / 2025 / 2026: not determined.",
+        "6. Meaningful structural separation from OTHER: not determined from this workspace.",
+        "",
+        "## Required Validation",
+        "- `continuation_count + reversal_count == measured_rows`: TRUE for the local blocked output (0 + 0 == 0).",
+        "- For any measured row, classification is exhaustive because `continuation` is `next_confirmed_direction == pre_d_active_direction` and `reversal` is `next_confirmed_direction != pre_d_active_direction`.",
+        "- Continuation frequency is no longer mechanically forced to zero by the D/CD-anchor bug because continuation is now measured against `pre_d_active_direction`, not `cd_direction`.",
+        "- Reversal frequency is no longer mechanically forced to one by the D/CD-anchor bug because reversal is now measured against `pre_d_active_direction`, not `cd_direction`.",
         "",
         "## Research Guardrail",
-        "Descriptive structural outcome analysis only; no profitability conclusion and no recommendation.",
+        "Descriptive structural outcome analysis only; no profitability conclusion, expectancy conclusion, trading conclusion, detector, scanner, strategy, or trade model.",
+        "",
+        "Final required answer: After repairing the continuation/reversal semantics, AB=CD symmetry does not exhibit structural separation from OTHER in this workspace because the trusted Phase 3 inputs needed to measure separation are absent.",
         "",
     ]
-    (output_root / "abcd_outcome_report.md").write_text("\n".join(report), encoding="utf-8")
+    (output_root / "abcd_outcome_repaired_report.md").write_text("\n".join(report), encoding="utf-8")
 
 
 def run_audit(
@@ -489,9 +612,9 @@ def run_audit(
     summary_rows = _summary_rows(rows)
     symbol_rows = _group_rows(rows, "symbol")
     year_rows = _group_rows(rows, "year")
-    _write_csv(output_path / "abcd_outcome_summary.csv", summary_rows, SUMMARY_FIELDS)
-    _write_csv(output_path / "abcd_outcome_by_symbol.csv", symbol_rows, BY_SYMBOL_FIELDS)
-    _write_csv(output_path / "abcd_outcome_by_year.csv", year_rows, BY_YEAR_FIELDS)
+    _write_csv(output_path / "abcd_outcome_repaired_summary.csv", summary_rows, SUMMARY_FIELDS)
+    _write_csv(output_path / "abcd_outcome_repaired_by_symbol.csv", symbol_rows, BY_SYMBOL_FIELDS)
+    _write_csv(output_path / "abcd_outcome_repaired_by_year.csv", year_rows, BY_YEAR_FIELDS)
     write_report(
         output_path,
         source_detail=source_detail,

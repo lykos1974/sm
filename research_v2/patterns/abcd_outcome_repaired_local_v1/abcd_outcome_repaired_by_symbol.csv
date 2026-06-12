@@ -1,0 +1,13 @@
+symbol,cohort,count,measured_rows,median_next_confirmed_swing,avg_next_confirmed_swing,continuation_frequency,reversal_frequency,continuation_count,reversal_count
+BTCUSDT,SYM_0_90_1_10,0,0,,,,,0,0
+BTCUSDT,EXT_1_20_1_35,0,0,,,,,0,0
+BTCUSDT,EXT_1_55_1_70,0,0,,,,,0,0
+BTCUSDT,OTHER,0,0,,,,,0,0
+ETHUSDT,SYM_0_90_1_10,0,0,,,,,0,0
+ETHUSDT,EXT_1_20_1_35,0,0,,,,,0,0
+ETHUSDT,EXT_1_55_1_70,0,0,,,,,0,0
+ETHUSDT,OTHER,0,0,,,,,0,0
+SOLUSDT,SYM_0_90_1_10,0,0,,,,,0,0
+SOLUSDT,EXT_1_20_1_35,0,0,,,,,0,0
+SOLUSDT,EXT_1_55_1_70,0,0,,,,,0,0
+SOLUSDT,OTHER,0,0,,,,,0,0
