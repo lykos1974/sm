@@ -55,6 +55,29 @@ SUMMARY_FIELDS = [
 ]
 BY_SYMBOL_FIELDS = ["symbol", *SUMMARY_FIELDS]
 BY_YEAR_FIELDS = ["year", *SUMMARY_FIELDS]
+TRACE_FIELDS = [
+    "candidate_id",
+    "symbol",
+    "cohort",
+    "a_pivot_id",
+    "b_pivot_id",
+    "c_pivot_id",
+    "d_pivot_id",
+    "next_pivot_id",
+    "a_direction",
+    "b_direction",
+    "c_direction",
+    "d_direction",
+    "pre_d_active_direction",
+    "next_confirmed_direction",
+    "continuation",
+    "reversal",
+    "a_knowledge_time",
+    "b_knowledge_time",
+    "c_knowledge_time",
+    "d_knowledge_time",
+    "next_knowledge_time",
+]
 
 
 @dataclass(frozen=True)
@@ -69,6 +92,20 @@ class Outcome:
     next_confirmed_direction: str
     continuation: bool | None
     reversal: bool | None
+    a_pivot_id: str = ""
+    b_pivot_id: str = ""
+    c_pivot_id: str = ""
+    d_pivot_id: str = ""
+    next_pivot_id: str = ""
+    a_direction: str = ""
+    b_direction: str = ""
+    c_direction: str = ""
+    d_direction: str = ""
+    a_knowledge_time: str = ""
+    b_knowledge_time: str = ""
+    c_knowledge_time: str = ""
+    d_knowledge_time: str = ""
+    next_knowledge_time: str = ""
 
 
 def _year_from_ts(timestamp: float) -> int | None:
@@ -194,6 +231,20 @@ def outcomes_from_pivots(pivots: Sequence[Pivot]) -> list[Outcome]:
                     next_confirmed_direction=next_direction,
                     continuation=continuation,
                     reversal=reversal,
+                    a_pivot_id=a.pivot_id,
+                    b_pivot_id=b.pivot_id,
+                    c_pivot_id=c.pivot_id,
+                    d_pivot_id=d.pivot_id,
+                    next_pivot_id=next_pivot.pivot_id if next_pivot is not None else "",
+                    a_direction=a.candidate_direction,
+                    b_direction=b.candidate_direction,
+                    c_direction=c.candidate_direction,
+                    d_direction=d.candidate_direction,
+                    a_knowledge_time=a.knowledge_time,
+                    b_knowledge_time=b.knowledge_time,
+                    c_knowledge_time=c.knowledge_time,
+                    d_knowledge_time=d.knowledge_time,
+                    next_knowledge_time=next_pivot.knowledge_time if next_pivot is not None else "",
                 )
             )
     return rows
@@ -240,13 +291,16 @@ def outcomes_from_geometry_file(path: Path, pivots: Sequence[Pivot]) -> list[Out
             pre_d_active_pivot: Pivot | None = None
             previous_pivot: Pivot | None = None
             matched_d = False
-            for pivot in ordered_by_symbol.get(symbol, []):
+            matched_d_index: int | None = None
+            ordered = ordered_by_symbol.get(symbol, [])
+            for pivot_index, pivot in enumerate(ordered):
                 pivot_key = (pivot.symbol, pivot.knowledge_ts, pivot.column_sort, pivot.candidate_direction)
                 if matched_d:
                     next_pivot = pivot
                     break
                 if pivot_key == d_key:
                     matched_d = True
+                    matched_d_index = pivot_index
                     pre_d_active_pivot = previous_pivot
                 previous_pivot = pivot
             if not matched_d:
@@ -258,6 +312,10 @@ def outcomes_from_geometry_file(path: Path, pivots: Sequence[Pivot]) -> list[Out
             continuation = next_direction == pre_d_active_direction if next_pivot is not None else None
             reversal = next_direction != pre_d_active_direction if next_pivot is not None else None
             year_value = _parse_float(row.get("year"))
+            a_pivot = ordered[matched_d_index - 3] if matched_d_index is not None and matched_d_index >= 3 else None
+            b_pivot = ordered[matched_d_index - 2] if matched_d_index is not None and matched_d_index >= 2 else None
+            c_pivot = ordered[matched_d_index - 1] if matched_d_index is not None and matched_d_index >= 1 else None
+            d_pivot = ordered[matched_d_index] if matched_d_index is not None else None
             rows.append(
                 Outcome(
                     candidate_id=str(row.get("candidate_id") or f"geometry_row_{row_number}"),
@@ -270,9 +328,60 @@ def outcomes_from_geometry_file(path: Path, pivots: Sequence[Pivot]) -> list[Out
                     next_confirmed_direction=next_direction,
                     continuation=continuation,
                     reversal=reversal,
+                    a_pivot_id=a_pivot.pivot_id if a_pivot is not None else "",
+                    b_pivot_id=b_pivot.pivot_id if b_pivot is not None else "",
+                    c_pivot_id=c_pivot.pivot_id if c_pivot is not None else "",
+                    d_pivot_id=d_pivot.pivot_id if d_pivot is not None else "",
+                    next_pivot_id=next_pivot.pivot_id if next_pivot is not None else "",
+                    a_direction=a_pivot.candidate_direction if a_pivot is not None else "",
+                    b_direction=b_pivot.candidate_direction if b_pivot is not None else "",
+                    c_direction=c_pivot.candidate_direction if c_pivot is not None else "",
+                    d_direction=d_pivot.candidate_direction if d_pivot is not None else "",
+                    a_knowledge_time=a_pivot.knowledge_time if a_pivot is not None else "",
+                    b_knowledge_time=b_pivot.knowledge_time if b_pivot is not None else "",
+                    c_knowledge_time=c_pivot.knowledge_time if c_pivot is not None else "",
+                    d_knowledge_time=d_pivot.knowledge_time if d_pivot is not None else "",
+                    next_knowledge_time=next_pivot.knowledge_time if next_pivot is not None else "",
                 )
             )
     return rows
+
+
+def _trace_row_from_outcome(row: Outcome) -> dict[str, Any]:
+    """Return trace fields copied from an already-built outcome row.
+
+    Continuation and reversal are intentionally read from ``row`` instead of
+    recomputing comparisons, so trace export cannot drift from outcome logic.
+    """
+
+    return {
+        "candidate_id": row.candidate_id,
+        "symbol": row.symbol,
+        "cohort": row.cohort,
+        "a_pivot_id": row.a_pivot_id,
+        "b_pivot_id": row.b_pivot_id,
+        "c_pivot_id": row.c_pivot_id,
+        "d_pivot_id": row.d_pivot_id,
+        "next_pivot_id": row.next_pivot_id,
+        "a_direction": row.a_direction,
+        "b_direction": row.b_direction,
+        "c_direction": row.c_direction,
+        "d_direction": row.d_direction,
+        "pre_d_active_direction": row.pre_d_active_direction,
+        "next_confirmed_direction": row.next_confirmed_direction,
+        "continuation": row.continuation,
+        "reversal": row.reversal,
+        "a_knowledge_time": row.a_knowledge_time,
+        "b_knowledge_time": row.b_knowledge_time,
+        "c_knowledge_time": row.c_knowledge_time,
+        "d_knowledge_time": row.d_knowledge_time,
+        "next_knowledge_time": row.next_knowledge_time,
+    }
+
+
+def _write_trace_csv(path: Path, rows: Sequence[Outcome], sample_size: int) -> None:
+    measured = [row for row in rows if row.next_confirmed_swing_boxes is not None]
+    _write_csv(path, [_trace_row_from_outcome(row) for row in measured[:sample_size]], TRACE_FIELDS)
 
 
 def _median(values: Sequence[float]) -> str:
@@ -591,10 +700,17 @@ def run_audit(
     pivot_root: str | Path = TRUSTED_PIVOT_ROOT,
     geometry_root: str | Path = GEOMETRY_ROOT,
     output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    trace_sample_size: int | None = None,
+    trace_output: str | Path | None = None,
 ) -> bool:
+    if trace_sample_size is not None and trace_sample_size < 0:
+        raise ValueError("trace_sample_size must be non-negative")
+    if trace_sample_size is not None and trace_output is None:
+        raise ValueError("trace_output is required when trace_sample_size is set")
     pivot_path = _resolve_repo_path(pivot_root)
     geometry_path = _resolve_repo_path(geometry_root)
     output_path = _resolve_repo_path(output_root)
+    trace_path = _resolve_repo_path(trace_output) if trace_output is not None else None
     output_path.mkdir(parents=True, exist_ok=True)
     try:
         pivots, rejects, reactions_path = load_validated_pivots(pivot_path)
@@ -624,6 +740,8 @@ def run_audit(
         year_rows=year_rows,
         rejects=rejects,
     )
+    if trace_sample_size is not None and trace_path is not None:
+        _write_trace_csv(trace_path, rows, trace_sample_size)
     return True
 
 
@@ -637,7 +755,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="exit non-zero when Phase 3-approved inputs are missing or invalid",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--trace-sample-size",
+        type=int,
+        default=None,
+        help="write the first N measured outcome rows to a trace CSV; disabled when omitted",
+    )
+    parser.add_argument(
+        "--trace-output",
+        type=Path,
+        default=None,
+        help="CSV output path for --trace-sample-size",
+    )
+    args = parser.parse_args(argv)
+    if args.trace_sample_size is not None and args.trace_sample_size < 0:
+        parser.error("--trace-sample-size must be non-negative")
+    if args.trace_sample_size is not None and args.trace_output is None:
+        parser.error("--trace-output is required when --trace-sample-size is set")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -646,6 +781,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         pivot_root=args.pivot_root,
         geometry_root=args.geometry_root,
         output_root=args.output_root,
+        trace_sample_size=args.trace_sample_size,
+        trace_output=args.trace_output,
     )
     if args.strict and not ok:
         raise SystemExit(1)
