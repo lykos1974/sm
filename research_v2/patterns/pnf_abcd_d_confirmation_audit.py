@@ -60,6 +60,9 @@ CANDIDATE_FIELDS = [
 ]
 
 SUMMARY_FIELDS = [
+    "total_candidates_loaded",
+    "measured_candidates",
+    "unmeasured_candidates",
     "total_candidates_measured",
     "strong_count",
     "strong_pct",
@@ -87,6 +90,9 @@ SUMMARY_FIELDS = [
 
 GROUP_FIELDS = [
     "group",
+    "total_candidates_loaded",
+    "measured_candidates",
+    "unmeasured_candidates",
     "total_candidates_measured",
     "strong_count",
     "strong_pct",
@@ -151,7 +157,7 @@ def _read_csv_exact(path: Path, expected_rows: int, label: str) -> list[dict[str
 
 def _classify_quality(max_favorable: float | None) -> str:
     if max_favorable is None:
-        raise ValueError("missing max_favorable_before_first_adverse_pivot")
+        return "UNMEASURED"
     if max_favorable >= 13:
         return "STRONG"
     if max_favorable >= 8:
@@ -248,20 +254,26 @@ def _separates(rows: Sequence[dict[str, Any]]) -> str:
 
 
 def summarize(rows: Sequence[dict[str, Any]], include_stability: bool = False) -> dict[str, Any]:
-    total = len(rows)
+    total_loaded = len(rows)
+    measured_rows = [row for row in rows if row.get("bounded_reaction_quality") in QUALITY_ORDER]
+    measured_total = len(measured_rows)
+    unmeasured_total = total_loaded - measured_total
     counts = {
-        quality: sum(1 for row in rows if row.get("bounded_reaction_quality") == quality)
+        quality: sum(1 for row in measured_rows if row.get("bounded_reaction_quality") == quality)
         for quality in QUALITY_ORDER
     }
     summary: dict[str, Any] = {
-        "total_candidates_measured": total,
+        "total_candidates_loaded": total_loaded,
+        "measured_candidates": measured_total,
+        "unmeasured_candidates": unmeasured_total,
+        "total_candidates_measured": measured_total,
         "strong_count": counts["STRONG"],
-        "strong_pct": _pct(counts["STRONG"], total),
+        "strong_pct": _pct(counts["STRONG"], measured_total),
         "medium_count": counts["MEDIUM"],
-        "medium_pct": _pct(counts["MEDIUM"], total),
+        "medium_pct": _pct(counts["MEDIUM"], measured_total),
         "weak_count": counts["WEAK"],
-        "weak_pct": _pct(counts["WEAK"], total),
-        "early_post_d_confirmation_separates_strong_from_weak": _separates(rows),
+        "weak_pct": _pct(counts["WEAK"], measured_total),
+        "early_post_d_confirmation_separates_strong_from_weak": _separates(measured_rows),
     }
     for field in (
         "first_post_d_reaction_boxes",
@@ -269,19 +281,19 @@ def summarize(rows: Sequence[dict[str, Any]], include_stability: bool = False) -
         "first_post_d_reaction_pct_of_CD",
     ):
         for quality in QUALITY_ORDER:
-            summary[f"median_{field}_{quality.lower()}"] = _fmt(_quality_median(rows, quality, field))
+            summary[f"median_{field}_{quality.lower()}"] = _fmt(_quality_median(measured_rows, quality, field))
     summary["strong_minus_weak_median_first_post_d_reaction_boxes"] = _fmt(
-        _diff_medians(rows, "first_post_d_reaction_boxes")
+        _diff_medians(measured_rows, "first_post_d_reaction_boxes")
     )
     summary["strong_minus_weak_median_first_post_d_reaction_pct_of_AB"] = _fmt(
-        _diff_medians(rows, "first_post_d_reaction_pct_of_AB")
+        _diff_medians(measured_rows, "first_post_d_reaction_pct_of_AB")
     )
     summary["strong_minus_weak_median_first_post_d_reaction_pct_of_CD"] = _fmt(
-        _diff_medians(rows, "first_post_d_reaction_pct_of_CD")
+        _diff_medians(measured_rows, "first_post_d_reaction_pct_of_CD")
     )
     if include_stability:
-        by_symbol = _group_rows(rows, "symbol")
-        by_year = _group_rows(rows, "year")
+        by_symbol = _group_rows(measured_rows, "symbol")
+        by_year = _group_rows(measured_rows, "year")
         summary["stable_across_symbols"] = _stable_across_groups(by_symbol)
         summary["stable_across_years"] = _stable_across_groups(by_year)
         summary["final_research_only_decision"] = (
@@ -348,7 +360,7 @@ def _quality_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _report(summary: dict[str, Any]) -> str:
-    return f"""# AB=CD D-Confirmation Audit\n\nResearch-only audit using bounded D-reaction candidate fields joined to existing geometry candidates. No raw datasets were inspected, no ABCDs were reconstructed, and no strategy, entries, exits, stops, targets, PnL, expectancy, profitability, or trading rules were created.\n\n## Required answers\n\n1. Total candidates measured: {summary['total_candidates_measured']}\n2. Count and % STRONG: {summary['strong_count']} ({summary['strong_pct']})\n3. Count and % MEDIUM: {summary['medium_count']} ({summary['medium_pct']})\n4. Count and % WEAK: {summary['weak_count']} ({summary['weak_pct']})\n5. Median first_post_d_reaction_boxes by quality: STRONG={summary['median_first_post_d_reaction_boxes_strong']}, MEDIUM={summary['median_first_post_d_reaction_boxes_medium']}, WEAK={summary['median_first_post_d_reaction_boxes_weak']}\n6. Median first_post_d_reaction_pct_of_AB by quality: STRONG={summary['median_first_post_d_reaction_pct_of_AB_strong']}, MEDIUM={summary['median_first_post_d_reaction_pct_of_AB_medium']}, WEAK={summary['median_first_post_d_reaction_pct_of_AB_weak']}\n7. Median first_post_d_reaction_pct_of_CD by quality: STRONG={summary['median_first_post_d_reaction_pct_of_CD_strong']}, MEDIUM={summary['median_first_post_d_reaction_pct_of_CD_medium']}, WEAK={summary['median_first_post_d_reaction_pct_of_CD_weak']}\n8. Does early post-D confirmation separate STRONG from WEAK? {summary['early_post_d_confirmation_separates_strong_from_weak']}\n9. Stable across symbols? {summary['stable_across_symbols']}\n10. Stable across years? {summary['stable_across_years']}\n11. Final research-only decision: {summary['final_research_only_decision']}\n\n## Validation\n\n- Geometry rows required: {EXPECTED_ROWS}\n- Bounded D-reaction candidate rows required: {EXPECTED_ROWS}\n"""
+    return f"""# AB=CD D-Confirmation Audit\n\nResearch-only audit using bounded D-reaction candidate fields joined to existing geometry candidates. No raw datasets were inspected, no ABCDs were reconstructed, and no strategy, entries, exits, stops, targets, PnL, expectancy, profitability, or trading rules were created.\n\n## Required answers\n\n1. Total candidates loaded: {summary['total_candidates_loaded']}\n2. Measured candidates: {summary['measured_candidates']}\n3. Unmeasured candidates: {summary['unmeasured_candidates']}\n4. Count and % STRONG: {summary['strong_count']} ({summary['strong_pct']})\n5. Count and % MEDIUM: {summary['medium_count']} ({summary['medium_pct']})\n6. Count and % WEAK: {summary['weak_count']} ({summary['weak_pct']})\n7. Median first_post_d_reaction_boxes by quality: STRONG={summary['median_first_post_d_reaction_boxes_strong']}, MEDIUM={summary['median_first_post_d_reaction_boxes_medium']}, WEAK={summary['median_first_post_d_reaction_boxes_weak']}\n8. Median first_post_d_reaction_pct_of_AB by quality: STRONG={summary['median_first_post_d_reaction_pct_of_AB_strong']}, MEDIUM={summary['median_first_post_d_reaction_pct_of_AB_medium']}, WEAK={summary['median_first_post_d_reaction_pct_of_AB_weak']}\n9. Median first_post_d_reaction_pct_of_CD by quality: STRONG={summary['median_first_post_d_reaction_pct_of_CD_strong']}, MEDIUM={summary['median_first_post_d_reaction_pct_of_CD_medium']}, WEAK={summary['median_first_post_d_reaction_pct_of_CD_weak']}\n10. Does early post-D confirmation separate STRONG from WEAK? {summary['early_post_d_confirmation_separates_strong_from_weak']}\n11. Stable across symbols? {summary['stable_across_symbols']}\n12. Stable across years? {summary['stable_across_years']}\n13. Final research-only decision: {summary['final_research_only_decision']}\n\n## Validation\n\n- Geometry rows required: {EXPECTED_ROWS}\n- Bounded D-reaction candidate rows required: {EXPECTED_ROWS}\n"""
 
 
 def run(
