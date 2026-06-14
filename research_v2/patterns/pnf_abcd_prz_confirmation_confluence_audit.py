@@ -67,6 +67,18 @@ BY_COHORT_FIELDS = [
     "median_columns_to_first_adverse_pivot",
     "avg_columns_to_first_adverse_pivot",
 ]
+CANDIDATE_FIELDS = [
+    "candidate_id",
+    "symbol",
+    "year",
+    "prz_class",
+    *REACTION_METRICS,
+    "PRZ_TIGHT",
+    "PRZ_ACCEPTABLE",
+    "PRZ_VALID",
+    "CONFIRMED_13",
+    "PRZ_VALID_AND_CONFIRMED_13",
+]
 SAMPLE_FIELDS = [
     "candidate_id",
     "symbol",
@@ -158,6 +170,11 @@ def _load_joined_rows(prz_input: Path, d_mfe_input: Path) -> list[dict[str, Any]
                 "in_prz_valid": "YES" if in_prz_valid else "NO",
                 "in_confirmed_13": "YES" if in_confirmed else "NO",
                 "in_prz_valid_and_confirmed_13": "YES" if in_prz_valid and in_confirmed else "NO",
+                "PRZ_TIGHT": "YES" if prz_class == "PRZ_TIGHT" else "NO",
+                "PRZ_ACCEPTABLE": "YES" if prz_class == "PRZ_ACCEPTABLE" else "NO",
+                "PRZ_VALID": "YES" if in_prz_valid else "NO",
+                "CONFIRMED_13": "YES" if in_confirmed else "NO",
+                "PRZ_VALID_AND_CONFIRMED_13": "YES" if in_prz_valid and in_confirmed else "NO",
             }
         )
     return joined
@@ -262,7 +279,7 @@ def _stability_answer(rows: Sequence[dict[str, Any]], scope_prefix: str, summary
     return "; ".join(parts) + f". Overall decision: {summary['decision']}."
 
 
-def write_report(output_root: Path, by_cohort: Sequence[dict[str, Any]], summary: dict[str, Any]) -> None:
+def write_report(output_root: Path, by_cohort: Sequence[dict[str, Any]], summary: dict[str, Any], candidate_export_count: int) -> None:
     overall = [row for row in by_cohort if row["scope"] == "ALL_SYMBOLS_ALL_YEARS"]
     lines = [
         "# AB=CD PRZ + Confirmation Confluence Audit",
@@ -273,6 +290,7 @@ def write_report(output_root: Path, by_cohort: Sequence[dict[str, Any]], summary
         f"- PRZ convergence candidates: `{PRZ_INPUT.as_posix()}`.",
         f"- Bounded D-reaction candidates: `{D_MFE_INPUT.as_posix()}`.",
         "- Candidate populations must match exactly by unique `candidate_id`; otherwise the audit fails hard.",
+        f"- Candidate-level export rows: {candidate_export_count} (`abcd_prz_confirmation_confluence_candidates.csv`).",
         "",
         "## Required answers",
         f"1. Total measured candidates: {summary['baseline_count']}",
@@ -310,9 +328,11 @@ def run_audit(prz_input: Path, d_mfe_input: Path, output_root: Path) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     _write_csv(output_root / "abcd_prz_confirmation_confluence_summary.csv", [summary], SUMMARY_FIELDS)
     _write_csv(output_root / "abcd_prz_confirmation_confluence_by_cohort.csv", by_cohort, BY_COHORT_FIELDS)
-    sample_rows = sorted(rows, key=lambda row: (row.get("symbol", ""), row.get("year", ""), row.get("candidate_id", "")))[:SAMPLE_SIZE]
+    candidate_rows = sorted(rows, key=lambda row: (row.get("symbol", ""), row.get("year", ""), row.get("candidate_id", "")))
+    _write_csv(output_root / "abcd_prz_confirmation_confluence_candidates.csv", candidate_rows, CANDIDATE_FIELDS)
+    sample_rows = candidate_rows[:SAMPLE_SIZE]
     _write_csv(output_root / "abcd_prz_confirmation_confluence_sample.csv", sample_rows, SAMPLE_FIELDS)
-    write_report(output_root, by_cohort, summary)
+    write_report(output_root, by_cohort, summary, len(candidate_rows))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
