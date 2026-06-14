@@ -59,7 +59,7 @@ SUMMARY_FIELDS = [
 ]
 GROUP_FIELDS = ["symbol", *SUMMARY_FIELDS]
 BY_YEAR_FIELDS = ["year", *SUMMARY_FIELDS]
-SAMPLE_FIELDS = [
+WINDOW_ROW_FIELDS = [
     "candidate_id",
     "symbol",
     "year",
@@ -469,12 +469,18 @@ def run_audit(geometry_candidates_path: Path, reactions_path: Path, output_root:
     summary = summarize(outcomes, len(candidates))
     by_symbol = _group_rows(outcomes, "symbol")
     by_year = _group_rows(outcomes, "year")
+    valid_windows = [
+        _sample_row(outcome)
+        for outcome in outcomes
+        if outcome.classification == "VALID_BAMM_WINDOW"
+    ]
     sample = [_sample_row(outcome) for outcome in outcomes[:100]]
 
     _write_csv(output_root / "abcd_bamm_window_summary.csv", [summary], SUMMARY_FIELDS)
     _write_csv(output_root / "abcd_bamm_window_by_symbol.csv", by_symbol, GROUP_FIELDS)
     _write_csv(output_root / "abcd_bamm_window_by_year.csv", by_year, BY_YEAR_FIELDS)
-    _write_csv(output_root / "abcd_bamm_window_sample.csv", sample, SAMPLE_FIELDS)
+    _write_csv(output_root / "abcd_bamm_window_candidates.csv", valid_windows, WINDOW_ROW_FIELDS)
+    _write_csv(output_root / "abcd_bamm_window_sample.csv", sample, WINDOW_ROW_FIELDS)
     _write_report(output_root / "abcd_bamm_window_report.md", summary=summary, by_symbol=by_symbol, by_year=by_year)
 
 
