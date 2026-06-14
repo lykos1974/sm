@@ -145,18 +145,21 @@ def _validate_reaction_input(path: Path) -> int:
     return count
 
 
-def _d_reaction_path(root: Path) -> Path | None:
-    for name in ("abcd_d_mfe_candidates.csv", "abcd_d_mfe_full.csv", "abcd_d_mfe_rows.csv", "abcd_d_mfe_sample.csv"):
-        candidate = root / name
-        if candidate.exists():
-            return candidate
+def _d_reaction_path(root: Path) -> tuple[Path, str] | None:
+    full_candidate = root / "abcd_d_mfe_candidates.csv"
+    if full_candidate.exists():
+        return full_candidate, "FULL"
+    sample_candidate = root / "abcd_d_mfe_sample.csv"
+    if sample_candidate.exists():
+        return sample_candidate, "SAMPLE"
     return None
 
 
 def _load_d_reactions(root: Path) -> tuple[dict[str, dict[str, str]], str]:
-    path = _d_reaction_path(root)
-    if path is None:
-        return {}, "unavailable: no full or sample bounded D-reaction output found"
+    path_detail = _d_reaction_path(root)
+    if path_detail is None:
+        return {}, "unavailable: no full or sample bounded D-reaction output found; reaction join type NONE; joined row count 0"
+    path, join_type = path_detail
     rows: dict[str, dict[str, str]] = {}
     with path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -166,7 +169,7 @@ def _load_d_reactions(root: Path) -> tuple[dict[str, dict[str, str]], str]:
             candidate_id = str(row.get("candidate_id") or "").strip()
             if candidate_id:
                 rows[candidate_id] = {field: str(row.get(field) or "") for field in D_REACTION_FIELDS}
-    return rows, f"available: joined {len(rows)} rows from {path.as_posix()}"
+    return rows, f"available: reaction join {join_type}; joined row count {len(rows)} from {path.as_posix()}"
 
 
 def load_candidates(geometry_path: Path, d_reactions: dict[str, dict[str, str]]) -> list[PrzCandidate]:
