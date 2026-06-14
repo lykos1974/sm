@@ -31,6 +31,7 @@ DEFAULT_REACTIONS = Path(
 )
 DEFAULT_OUTPUT_ROOT = Path("research_v2/patterns/abcd_bamm_window_local_v1")
 EXPECTED_GEOMETRY_ROWS = 7823
+EXPECTED_VALID_BAMM_WINDOWS = 1999
 
 CLASSIFICATIONS = (
     "VALID_BAMM_WINDOW",
@@ -462,7 +463,26 @@ def _write_report(path: Path, *, summary: dict[str, Any], by_symbol: Sequence[di
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_audit(geometry_candidates_path: Path, reactions_path: Path, output_root: Path, expected_geometry_rows: int) -> None:
+def _validate_valid_bamm_window_population(rows: Sequence[dict[str, Any]], expected_valid_windows: int) -> None:
+    valid_count = sum(
+        1
+        for row in rows
+        if _normalize_direction(row.get("classification")) == "VALID_BAMM_WINDOW"
+    )
+    if valid_count != expected_valid_windows:
+        raise SystemExit(
+            "Valid BAMM window row validation failed: "
+            f"exported {valid_count}, expected {expected_valid_windows}"
+        )
+
+
+def run_audit(
+    geometry_candidates_path: Path,
+    reactions_path: Path,
+    output_root: Path,
+    expected_geometry_rows: int,
+    expected_valid_bamm_windows: int,
+) -> None:
     candidates = load_geometry_candidates(geometry_candidates_path, expected_geometry_rows)
     reactions_by_symbol = load_validated_reactions(reactions_path)
     outcomes = [classify_window(candidate, reactions_by_symbol.get(candidate.symbol, ())) for candidate in candidates]
@@ -474,6 +494,7 @@ def run_audit(geometry_candidates_path: Path, reactions_path: Path, output_root:
         for outcome in outcomes
         if outcome.classification == "VALID_BAMM_WINDOW"
     ]
+    _validate_valid_bamm_window_population(valid_windows, expected_valid_bamm_windows)
     sample = [_sample_row(outcome) for outcome in outcomes[:100]]
 
     _write_csv(output_root / "abcd_bamm_window_summary.csv", [summary], SUMMARY_FIELDS)
@@ -490,12 +511,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reactions", type=Path, default=DEFAULT_REACTIONS)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--expected-geometry-rows", type=int, default=EXPECTED_GEOMETRY_ROWS)
+    parser.add_argument("--expected-valid-bamm-windows", type=int, default=EXPECTED_VALID_BAMM_WINDOWS)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_audit(args.geometry_candidates, args.reactions, args.output_root, args.expected_geometry_rows)
+    run_audit(
+        args.geometry_candidates,
+        args.reactions,
+        args.output_root,
+        args.expected_geometry_rows,
+        args.expected_valid_bamm_windows,
+    )
 
 
 if __name__ == "__main__":
