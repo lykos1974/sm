@@ -380,6 +380,7 @@ def _write_blocked_outputs(output_root: Path, *, reason: str) -> None:
     _write_csv(output_root / "abcd_d_mfe_by_symbol.csv", _group_rows([], "symbol"), BY_SYMBOL_FIELDS)
     _write_csv(output_root / "abcd_d_mfe_by_year.csv", _group_rows([], "year"), BY_YEAR_FIELDS)
     _write_csv(output_root / "abcd_d_mfe_by_cohort.csv", empty_summary, BY_COHORT_FIELDS)
+    _write_csv(output_root / "abcd_d_mfe_candidates.csv", [], SAMPLE_FIELDS)
     _write_csv(output_root / "abcd_d_mfe_sample.csv", [], SAMPLE_FIELDS)
     report = [
         "# AB=CD D-Completion Bounded Reaction Audit Report",
@@ -421,7 +422,9 @@ def run_audit(*, pivot_root: str | Path = TRUSTED_PIVOT_ROOT, geometry_root: str
     _write_csv(output_path / "abcd_d_mfe_by_symbol.csv", symbol_rows, BY_SYMBOL_FIELDS)
     _write_csv(output_path / "abcd_d_mfe_by_year.csv", year_rows, BY_YEAR_FIELDS)
     _write_csv(output_path / "abcd_d_mfe_by_cohort.csv", summaries, BY_COHORT_FIELDS)
+    candidate_rows = [_sample_row(row) for row in rows]
     measured = [row for row in rows if row.columns_to_first_adverse_pivot is not None]
+    _write_csv(output_path / "abcd_d_mfe_candidates.csv", candidate_rows, SAMPLE_FIELDS)
     _write_csv(output_path / "abcd_d_mfe_sample.csv", [_sample_row(row) for row in measured[:SAMPLE_SIZE]], SAMPLE_FIELDS)
     write_report(output_path, source_detail=source_detail, summary_rows=summaries, symbol_rows=symbol_rows, year_rows=year_rows)
     return True
