@@ -32,18 +32,22 @@ FINAL_DECISION_YES = "CANDLE_REALITY_JUSTIFIES_STRATEGY_RESEARCH"
 FINAL_DECISION_NO = "CANDLE_REALITY_REJECTS_PROXY_EDGE"
 UNKNOWN_MISSING_ENTRY_CONTEXT = "UNKNOWN_MISSING_ENTRY_CONTEXT"
 UNKNOWN_MISSING_CANDLES = "UNKNOWN_MISSING_CANDLES"
-CLASSIFICATIONS = ("TARGET_FIRST", "STOP_FIRST", "SAME_CANDLE_AMBIGUOUS", "NOT_REACHED", UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES)
+UNKNOWN_ORDERING = "UNKNOWN_ORDERING"
+PRICE_MODE = "PRICE_MODE"
+STRUCTURAL_BOX_MODE = "STRUCTURAL_BOX_MODE"
+NO_TRADE_RECOMMENDATION = "RESEARCH_ONLY_NO_PROFITABILITY_OR_TRADE_RECOMMENDATION"
+CLASSIFICATIONS = ("TARGET_FIRST", "STOP_FIRST", "SAME_CANDLE_AMBIGUOUS", "NOT_REACHED", UNKNOWN_ORDERING, UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES)
 
 CANDIDATE_FIELDS = [
     "candidate_id", "symbol", "year", "post_d_reaction_direction", "first_post_d_reaction_boxes",
-    "retest_event_time", "entry_model", "entry_price", "box_size", "risk_boxes", "risk_price",
+    "retest_event_time", "entry_model", "simulation_mode", "entry_box", "entry_price", "box_size", "risk_boxes", "risk_price",
     "target_1R_price", "target_1R_classification", "target_1R_first_event_time",
     "target_2R_price", "target_2R_classification", "target_2R_first_event_time",
     "target_3R_price", "target_3R_classification", "target_3R_first_event_time", "details",
 ]
 SUMMARY_FIELDS = [
     "total_candidates_loaded", "measured_candidates", "candidates_with_candle_coverage",
-    "unknown_missing_entry_context_count", "unknown_missing_candle_count",
+    "simulation_mode", "unknown_missing_entry_context_count", "unknown_missing_candle_count", "unknown_ordering_count",
     "same_candle_ambiguity_count", "target_1R_target_first_count", "target_1R_target_first_pct",
     "target_1R_stop_first_count", "target_1R_stop_first_pct", "target_2R_target_first_count",
     "target_2R_target_first_pct", "target_2R_stop_first_count", "target_2R_stop_first_pct",
@@ -191,6 +195,40 @@ def _classify(candles: Sequence[Candle], event_ts: int | None, direction: str, e
     return "NOT_REACHED", "", "neither target nor stop reached in available candles"
 
 
+def _structural_boxes(row: dict[str, Any], aliases: Sequence[str]) -> float | None:
+    return _parse_float(_first(row, aliases))
+
+
+def _classify_structural(row: dict[str, Any], risk_boxes: float, target_r: int) -> tuple[str, str, str]:
+    continuation_boxes = _structural_boxes(
+        row,
+        (
+            "continuation_boxes_after_retrace",
+            "favorable_after_entry_boxes",
+            "favorable_boxes_after_entry",
+            "post_entry_continuation_boxes",
+        ),
+    )
+    adverse_boxes = _structural_boxes(
+        row,
+        (
+            "adverse_after_entry_boxes",
+            "adverse_boxes_after_entry",
+            "adverse_boxes_after_retrace",
+            "max_adverse_after_entry_boxes",
+        ),
+    )
+    if continuation_boxes is None:
+        return UNKNOWN_MISSING_ENTRY_CONTEXT, "", "missing structural continuation_boxes_after_retrace"
+    if continuation_boxes >= target_r * risk_boxes:
+        return "TARGET_FIRST", "", "structural target threshold reached; no candle-ordering claim"
+    if adverse_boxes is None:
+        return UNKNOWN_ORDERING, "", "structural adverse_after_entry_boxes unavailable; no candle-ordering claim"
+    if adverse_boxes >= risk_boxes:
+        return "STOP_FIRST", "", "structural adverse threshold reached; no candle-ordering claim"
+    return "NOT_REACHED", "", "structural target and adverse thresholds not reached; no candle-ordering claim"
+
+
 def _pct(count: int, total: int) -> str:
     return _fmt(count / total) if total else ""
 
@@ -213,13 +251,17 @@ def _summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     covered = measured
     unknown_entry_context = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == UNKNOWN_MISSING_ENTRY_CONTEXT for r in TARGETS))
     unknown = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == UNKNOWN_MISSING_CANDLES for r in TARGETS))
+    unknown_ordering = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == UNKNOWN_ORDERING for r in TARGETS))
     ambiguous = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == "SAME_CANDLE_AMBIGUOUS" for r in TARGETS))
+    modes = {row.get("simulation_mode") for row in rows if row.get("simulation_mode")}
     out: dict[str, Any] = {
         "total_candidates_loaded": total,
         "measured_candidates": measured,
         "candidates_with_candle_coverage": covered,
+        "simulation_mode": PRICE_MODE if modes == {PRICE_MODE} else STRUCTURAL_BOX_MODE,
         "unknown_missing_entry_context_count": unknown_entry_context,
         "unknown_missing_candle_count": unknown,
+        "unknown_ordering_count": unknown_ordering,
         "same_candle_ambiguity_count": ambiguous,
     }
     for r in TARGETS:
@@ -230,7 +272,11 @@ def _summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         out[f"target_{r}R_target_first_pct"] = _pct(target_first, denom)
         out[f"target_{r}R_stop_first_count"] = stop_first
         out[f"target_{r}R_stop_first_pct"] = _pct(stop_first, denom)
-    out["final_decision"] = FINAL_DECISION_YES if (_parse_float(out.get("target_1R_target_first_pct")) or 0) > (_parse_float(out.get("target_1R_stop_first_pct")) or 0) else FINAL_DECISION_NO
+    out["final_decision"] = (
+        FINAL_DECISION_YES
+        if out["simulation_mode"] == PRICE_MODE and (_parse_float(out.get("target_1R_target_first_pct")) or 0) > (_parse_float(out.get("target_1R_stop_first_pct")) or 0)
+        else (FINAL_DECISION_NO if out["simulation_mode"] == PRICE_MODE else NO_TRADE_RECOMMENDATION)
+    )
     return out
 
 
@@ -256,6 +302,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         "# AB=CD Candle Reality Simulation — Model C ENTRY_RETRACE_382", "",
         "Research-only candle ordering check using existing local artifacts only. No ABCD reconstruction, FAST artifacts, optimization, fees/slippage, leverage, production strategy, live trading logic, or trade recommendation is included.", "",
         "## Required Answers",
+        f"Mode: {summary['simulation_mode']}",
         f"1. Total candidates loaded: {summary['total_candidates_loaded']}",
         f"2. Measured candidates: {summary['measured_candidates']}",
         f"3. Unknown/missing entry context count: {summary['unknown_missing_entry_context_count']}",
@@ -267,8 +314,12 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         f"9. 3R target-first count and % among measured candidates: {summary['target_3R_target_first_count']} ({summary['target_3R_target_first_pct']})",
         f"10. 3R stop-first count and % among measured candidates: {summary['target_3R_stop_first_count']} ({summary['target_3R_stop_first_pct']})",
         f"11. Same-candle ambiguity count: {summary['same_candle_ambiguity_count']}",
-        "12. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_candle_reality_by_symbol.csv.",
-        "13. Stability across 2024 / 2025 / 2026: see abcd_candle_reality_by_year.csv.", "",
+        f"12. Unknown structural ordering count: {summary['unknown_ordering_count']}",
+        "13. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_candle_reality_by_symbol.csv.",
+        "14. Stability across 2024 / 2025 / 2026: see abcd_candle_reality_by_year.csv.", "",
+        "## Mode Caveat",
+        "STRUCTURAL_BOX_MODE uses continuation/retrace box chronology from existing artifacts only and does not claim real candle ordering.",
+        "",
         "## Final Decision", str(summary["final_decision"]),
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -288,13 +339,14 @@ def run(confluence_input: Path, feasibility_input: Path, entry_input: Path, cand
         risk_boxes = ENTRY_THRESHOLD * first_boxes
         risk_price = risk_boxes * box_size if box_size is not None and math.isfinite(risk_boxes) else None
         entry = _entry_price(row, candles, event_ts)
-        item = {"candidate_id": row["candidate_id"], "symbol": symbol, "year": row.get("year", ""), "post_d_reaction_direction": direction, "first_post_d_reaction_boxes": _fmt_optional(first_boxes), "retest_event_time": event_ts or "", "entry_model": ENTRY_MODEL, "entry_price": _fmt_optional(entry), "box_size": _fmt_optional(box_size), "risk_boxes": _fmt_optional(risk_boxes), "risk_price": _fmt_optional(risk_price), "details": ""}
+        price_context_available = entry is not None and risk_price is not None and box_size is not None
+        simulation_mode = PRICE_MODE if price_context_available else STRUCTURAL_BOX_MODE
+        item = {"candidate_id": row["candidate_id"], "symbol": symbol, "year": row.get("year", ""), "post_d_reaction_direction": direction, "first_post_d_reaction_boxes": _fmt_optional(first_boxes), "retest_event_time": event_ts or "", "entry_model": ENTRY_MODEL, "simulation_mode": simulation_mode, "entry_box": "0" if simulation_mode == STRUCTURAL_BOX_MODE else "", "entry_price": _fmt_optional(entry), "box_size": _fmt_optional(box_size), "risk_boxes": _fmt_optional(risk_boxes), "risk_price": _fmt_optional(risk_price), "details": ""}
         details = []
-        missing_entry_context = entry is None or risk_price is None or box_size is None
         for r in TARGETS:
-            target_price = None if missing_entry_context else (entry + r * risk_price if direction == "UP" else entry - r * risk_price)
-            if missing_entry_context:
-                classification, first_event, detail = UNKNOWN_MISSING_ENTRY_CONTEXT, "", "missing entry_price, risk_price, or box_size"
+            target_price = None if simulation_mode == STRUCTURAL_BOX_MODE else (entry + r * risk_price if direction == "UP" else entry - r * risk_price)
+            if simulation_mode == STRUCTURAL_BOX_MODE:
+                classification, first_event, detail = _classify_structural(row, risk_boxes, r)
             else:
                 classification, first_event, detail = _classify(candles, event_ts, direction, entry, risk_price, r)
             item[f"target_{r}R_price"] = _fmt_optional(target_price)
