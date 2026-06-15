@@ -33,7 +33,7 @@ NOT_READY = "STRUCTURAL_INVALIDATION_NOT_READY_FOR_PNL_PHASE"
 STOP_MODELS = ("STOP_RETRACE_LOW_HIGH", "STOP_D_LEVEL", "STOP_FIRST_ADVERSE_PIVOT")
 
 MEASURE_FIELDS = [
-    "measured_candidates", "with_retrace_count", "with_retrace_pct", "with_first_adverse_pivot_count",
+    "total_candidates", "measured_candidates", "unmatched_d_pivot_count", "unmeasured_count", "with_retrace_count", "with_retrace_pct", "with_first_adverse_pivot_count",
     "with_first_adverse_pivot_pct", "median_adverse_boxes_after_retest", "p75_adverse_boxes_after_retest",
     "p90_adverse_boxes_after_retest", "p95_adverse_boxes_after_retest", "median_adverse_pct_of_first_reaction",
     "median_adverse_pct_of_continuation", "median_columns_to_adverse_pivot", "median_time_to_adverse_pivot",
@@ -48,6 +48,7 @@ CANDIDATE_FIELDS = [
     "first_adverse_pivot_boxes", "adverse_boxes_from_retrace_point", "adverse_pct_of_first_reaction",
     "adverse_pct_of_continuation", "columns_to_adverse_pivot", "time_to_adverse_pivot",
     "STOP_RETRACE_LOW_HIGH_structurally_available", "STOP_D_LEVEL_structurally_available", "STOP_FIRST_ADVERSE_PIVOT_structurally_available",
+    "d_pivot_match_status", "structural_invalidation_status",
 ]
 
 
@@ -172,15 +173,39 @@ def _load_reactions(path: Path) -> list[ReactionRow]:
     return sorted(rows, key=lambda row: (row.symbol, row.knowledge_ts, row.column_sort, row.direction, row.boxes))
 
 
-def _match_d_index(row: dict[str, Any], ordered: Sequence[ReactionRow]) -> int:
+def _match_d_index(row: dict[str, Any], ordered: Sequence[ReactionRow]) -> int | None:
     post_direction = str(row.get("post_d_reaction_direction") or "").strip().upper()
     d_ts = _parse_time(_first(row, ("d_knowledge_time", "d_time", "candidate_knowledge_time")))
     d_col = _column_sort(_first(row, ("d_column_id", "column_id")))
     cd_direction = _opposite(post_direction)
     match = next((i for i, reaction in enumerate(ordered) if (reaction.knowledge_ts, reaction.column_sort, reaction.direction) == (d_ts, d_col, cd_direction)), None)
-    if match is None:
-        raise ValueError(f"could not match D pivot for candidate_id={row['candidate_id']}")
     return match
+
+
+def _candidate_level_measurement(row: dict[str, Any], *, d_match_status: str, status: str) -> dict[str, Any]:
+    post_direction = str(row.get("post_d_reaction_direction") or "").strip().upper()
+    first_boxes = _parse_float(row.get("first_post_d_reaction_boxes"))
+    retrace_boxes = _parse_float(row.get("retrace_boxes"))
+    continuation_boxes = _parse_float(row.get("continuation_boxes_after_retrace"))
+    return {
+        "candidate_id": row["candidate_id"], "symbol": row["symbol"], "year": row.get("year", ""),
+        "post_d_reaction_direction": post_direction, "first_post_d_reaction_boxes": _fmt(first_boxes) if first_boxes is not None else str(row.get("first_post_d_reaction_boxes") or ""),
+        "retrace_boxes": _fmt(retrace_boxes) if retrace_boxes is not None else str(row.get("retrace_boxes") or ""),
+        "retrace_pct_of_first_reaction": row.get("retrace_pct_of_first_reaction", ""),
+        "continuation_boxes_after_retrace": _fmt(continuation_boxes) if continuation_boxes is not None else str(row.get("continuation_boxes_after_retrace") or ""),
+        "first_adverse_pivot_direction": row.get("first_adverse_pivot_direction", ""),
+        "first_adverse_pivot_boxes": row.get("first_adverse_pivot_boxes", ""),
+        "adverse_boxes_from_retrace_point": row.get("adverse_boxes_from_retrace_point", ""),
+        "adverse_pct_of_first_reaction": row.get("adverse_pct_of_first_reaction", ""),
+        "adverse_pct_of_continuation": row.get("adverse_pct_of_continuation", ""),
+        "columns_to_adverse_pivot": row.get("columns_to_adverse_pivot", ""),
+        "time_to_adverse_pivot": row.get("time_to_adverse_pivot", ""),
+        "STOP_RETRACE_LOW_HIGH_structurally_available": "",
+        "STOP_D_LEVEL_structurally_available": "",
+        "STOP_FIRST_ADVERSE_PIVOT_structurally_available": "",
+        "d_pivot_match_status": d_match_status,
+        "structural_invalidation_status": status,
+    }
 
 
 def _measure_candidate(row: dict[str, Any], ordered: Sequence[ReactionRow]) -> dict[str, Any]:
@@ -189,6 +214,8 @@ def _measure_candidate(row: dict[str, Any], ordered: Sequence[ReactionRow]) -> d
     retrace_boxes = _parse_float(row.get("retrace_boxes"))
     continuation_boxes = _parse_float(row.get("continuation_boxes_after_retrace"))
     d_index = _match_d_index(row, ordered)
+    if d_index is None:
+        return _candidate_level_measurement(row, d_match_status="UNMATCHED", status="UNMEASURED_D_MATCH")
     confirmation_index = next((i for i, reaction in enumerate(ordered[d_index + 1 :], start=d_index + 1) if reaction.direction == post_direction and reaction.boxes >= CONFIRMATION_THRESHOLD_BOXES), None)
     if confirmation_index is None:
         raise ValueError(f"could not match confirmation event for candidate_id={row['candidate_id']}")
@@ -212,6 +239,8 @@ def _measure_candidate(row: dict[str, Any], ordered: Sequence[ReactionRow]) -> d
         "STOP_RETRACE_LOW_HIGH_structurally_available": "YES" if retrace is not None else "NO",
         "STOP_D_LEVEL_structurally_available": "YES",
         "STOP_FIRST_ADVERSE_PIVOT_structurally_available": "YES" if adverse is not None else "NO",
+        "d_pivot_match_status": "MATCHED",
+        "structural_invalidation_status": "MEASURED",
     }
 
 
@@ -228,13 +257,21 @@ def measure(confluence: dict[str, dict[str, Any]], feasibility: dict[str, dict[s
     return out
 
 
+def _measured_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get("structural_invalidation_status") == "MEASURED"]
+
+
 def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    total_candidates = len(rows)
+    unmatched = sum(1 for row in rows if row.get("d_pivot_match_status") == "UNMATCHED")
+    unmeasured = sum(1 for row in rows if str(row.get("structural_invalidation_status") or "").startswith("UNMEASURED"))
+    rows = _measured_rows(rows)
     total = len(rows)
     retraced = sum(1 for row in rows if row["STOP_RETRACE_LOW_HIGH_structurally_available"] == "YES")
     adverse = sum(1 for row in rows if row["STOP_FIRST_ADVERSE_PIVOT_structurally_available"] == "YES")
     adverse_boxes = [v for row in rows if (v := _parse_float(row.get("adverse_boxes_from_retrace_point"))) is not None]
     return {
-        "measured_candidates": total, "with_retrace_count": retraced, "with_retrace_pct": _pct(retraced, total),
+        "total_candidates": total_candidates, "measured_candidates": total, "unmatched_d_pivot_count": unmatched, "unmeasured_count": unmeasured, "with_retrace_count": retraced, "with_retrace_pct": _pct(retraced, total),
         "with_first_adverse_pivot_count": adverse, "with_first_adverse_pivot_pct": _pct(adverse, total),
         "median_adverse_boxes_after_retest": _median(adverse_boxes), "p75_adverse_boxes_after_retest": _quantile(adverse_boxes, 0.75),
         "p90_adverse_boxes_after_retest": _quantile(adverse_boxes, 0.90), "p95_adverse_boxes_after_retest": _quantile(adverse_boxes, 0.95),
@@ -246,6 +283,7 @@ def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def stop_model_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = _measured_rows(rows)
     total = len(rows)
     out = []
     for model in STOP_MODELS:
@@ -260,7 +298,7 @@ def _scoped_summary(rows: Sequence[dict[str, Any]], field: str, values: Sequence
 
 
 def _decision(summary: dict[str, Any], stops: Sequence[dict[str, Any]]) -> str:
-    if summary["measured_candidates"] != EXPECTED_COHORT_COUNT:
+    if summary["total_candidates"] != EXPECTED_COHORT_COUNT or summary["unmeasured_count"]:
         return NOT_READY
     if not summary["median_adverse_boxes_after_retest"]:
         return NOT_READY
@@ -275,16 +313,19 @@ def write_report(path: Path, summary: dict[str, Any], stops: Sequence[dict[str, 
         "Research-only structural audit. No raw dataset inspection, ABCD reconstruction, FAST artifacts, executable entries, targets, RR, expectancy, profitability, PnL, or trade recommendation is included.",
         "",
         "## Required Answers",
-        f"1. Candidates measured: {summary['measured_candidates']}",
-        f"2. Median adverse boxes after retest: {summary['median_adverse_boxes_after_retest']}",
-        f"3. p75 adverse boxes: {summary['p75_adverse_boxes_after_retest']}",
-        f"4. p90 adverse boxes: {summary['p90_adverse_boxes_after_retest']}",
-        f"5. p95 adverse boxes: {summary['p95_adverse_boxes_after_retest']}",
-        f"6. Structural feasibility of STOP_RETRACE_LOW_HIGH: {stop_by_name['STOP_RETRACE_LOW_HIGH']['structural_feasibility']} ({stop_by_name['STOP_RETRACE_LOW_HIGH']['structurally_available_count']}, {stop_by_name['STOP_RETRACE_LOW_HIGH']['structurally_available_pct']})",
-        f"7. Structural feasibility of STOP_D_LEVEL: {stop_by_name['STOP_D_LEVEL']['structural_feasibility']} ({stop_by_name['STOP_D_LEVEL']['structurally_available_count']}, {stop_by_name['STOP_D_LEVEL']['structurally_available_pct']})",
-        f"8. Structural feasibility of STOP_FIRST_ADVERSE_PIVOT: {stop_by_name['STOP_FIRST_ADVERSE_PIVOT']['structural_feasibility']} ({stop_by_name['STOP_FIRST_ADVERSE_PIVOT']['structurally_available_count']}, {stop_by_name['STOP_FIRST_ADVERSE_PIVOT']['structurally_available_pct']})",
-        "9. Stability across symbols: see abcd_structural_invalidation_by_symbol.csv.",
-        "10. Stability across years: see abcd_structural_invalidation_by_year.csv.",
+        f"1. Total candidates: {summary['total_candidates']}",
+        f"2. Candidates measured: {summary['measured_candidates']}",
+        f"3. Unmatched D pivots: {summary['unmatched_d_pivot_count']}",
+        f"4. Unmeasured candidates: {summary['unmeasured_count']}",
+        f"5. Median adverse boxes after retest: {summary['median_adverse_boxes_after_retest']}",
+        f"6. p75 adverse boxes: {summary['p75_adverse_boxes_after_retest']}",
+        f"7. p90 adverse boxes: {summary['p90_adverse_boxes_after_retest']}",
+        f"8. p95 adverse boxes: {summary['p95_adverse_boxes_after_retest']}",
+        f"9. Structural feasibility of STOP_RETRACE_LOW_HIGH: {stop_by_name['STOP_RETRACE_LOW_HIGH']['structural_feasibility']} ({stop_by_name['STOP_RETRACE_LOW_HIGH']['structurally_available_count']}, {stop_by_name['STOP_RETRACE_LOW_HIGH']['structurally_available_pct']})",
+        f"10. Structural feasibility of STOP_D_LEVEL: {stop_by_name['STOP_D_LEVEL']['structural_feasibility']} ({stop_by_name['STOP_D_LEVEL']['structurally_available_count']}, {stop_by_name['STOP_D_LEVEL']['structurally_available_pct']})",
+        f"11. Structural feasibility of STOP_FIRST_ADVERSE_PIVOT: {stop_by_name['STOP_FIRST_ADVERSE_PIVOT']['structural_feasibility']} ({stop_by_name['STOP_FIRST_ADVERSE_PIVOT']['structurally_available_count']}, {stop_by_name['STOP_FIRST_ADVERSE_PIVOT']['structurally_available_pct']})",
+        "12. Stability across symbols: see abcd_structural_invalidation_by_symbol.csv.",
+        "13. Stability across years: see abcd_structural_invalidation_by_year.csv.",
         "",
         "## Final Decision",
         str(summary["decision"]),
