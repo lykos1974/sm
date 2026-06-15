@@ -54,12 +54,21 @@ CANDIDATE_FIELDS = [
     "stop_price",
     "target_1R_price",
     "target_1R_classification",
+    "target_1R_decision_event_time",
+    "target_1R_target_hit_time",
+    "target_1R_stop_hit_time",
     "target_1R_first_event_time",
     "target_2R_price",
     "target_2R_classification",
+    "target_2R_decision_event_time",
+    "target_2R_target_hit_time",
+    "target_2R_stop_hit_time",
     "target_2R_first_event_time",
     "target_3R_price",
     "target_3R_classification",
+    "target_3R_decision_event_time",
+    "target_3R_target_hit_time",
+    "target_3R_stop_hit_time",
     "target_3R_first_event_time",
     "has_candle_coverage",
     "details",
@@ -70,6 +79,7 @@ SUMMARY_FIELDS = [
     "missing_candle_count",
     "same_candle_ambiguity_count",
     "not_reached_count",
+    "decision_event_time_validation_failure_count",
     "target_1R_target_first_count",
     "target_1R_target_first_pct",
     "target_1R_stop_first_count",
@@ -229,22 +239,45 @@ def _classify(
     direction: str,
     stop_price: float,
     target_price: float,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str, str]:
     if retest_ts is None:
-        return UNKNOWN_MISSING_CANDLES, "", "missing retest_time"
+        return UNKNOWN_MISSING_CANDLES, "", "", "", "missing retest_time"
     replay = [candle for candle in candles if candle.ts > retest_ts]
     if not replay:
-        return UNKNOWN_MISSING_CANDLES, "", "no candles after retest_time"
+        return UNKNOWN_MISSING_CANDLES, "", "", "", "no candles after retest_time"
     for candle in replay:
         hit_target = candle.high >= target_price if direction == "UP" else candle.low <= target_price
         hit_stop = candle.low <= stop_price if direction == "UP" else candle.high >= stop_price
         if hit_target and hit_stop:
-            return SAME_CANDLE_AMBIGUOUS, _fmt(candle.ts), "target and stop both inside same OHLC candle"
+            event_time = _fmt(candle.ts)
+            return SAME_CANDLE_AMBIGUOUS, event_time, event_time, event_time, "target and stop both inside same OHLC candle"
         if hit_target:
-            return TARGET_FIRST, _fmt(candle.ts), "target reached before stop"
+            event_time = _fmt(candle.ts)
+            return TARGET_FIRST, event_time, event_time, "", "target reached before stop"
         if hit_stop:
-            return STOP_FIRST, _fmt(candle.ts), "stop reached before target"
-    return NOT_REACHED, "", "neither target nor stop reached in available candles"
+            event_time = _fmt(candle.ts)
+            return STOP_FIRST, event_time, "", event_time, "stop reached before target"
+    return NOT_REACHED, "", "", "", "neither target nor stop reached in available candles"
+
+
+def _decision_event_time_validation_failure_count(rows: Sequence[dict[str, Any]]) -> int:
+    failures = 0
+    for row in rows:
+        for r in TARGETS:
+            classification = row.get(f"target_{r}R_classification")
+            decision_event_time = row.get(f"target_{r}R_decision_event_time")
+            target_hit_time = row.get(f"target_{r}R_target_hit_time")
+            stop_hit_time = row.get(f"target_{r}R_stop_hit_time")
+            if classification == TARGET_FIRST and decision_event_time != target_hit_time:
+                failures += 1
+            elif classification == STOP_FIRST and decision_event_time != stop_hit_time:
+                failures += 1
+            elif (
+                classification == SAME_CANDLE_AMBIGUOUS
+                and not (target_hit_time == stop_hit_time == decision_event_time and decision_event_time)
+            ):
+                failures += 1
+    return failures
 
 
 def _summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -258,6 +291,7 @@ def _summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             1 for row in rows for r in TARGETS if row.get(f"target_{r}R_classification") == SAME_CANDLE_AMBIGUOUS
         ),
         "not_reached_count": sum(1 for row in rows for r in TARGETS if row.get(f"target_{r}R_classification") == NOT_REACHED),
+        "decision_event_time_validation_failure_count": _decision_event_time_validation_failure_count(rows),
     }
     for r in TARGETS:
         denom = sum(1 for row in rows if row.get(f"target_{r}R_classification") != UNKNOWN_MISSING_CANDLES)
@@ -311,9 +345,11 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         f"9. 3R stop-first count and %: {summary['target_3R_stop_first_count']} ({summary['target_3R_stop_first_pct']})",
         f"10. Same-candle ambiguity count: {summary['same_candle_ambiguity_count']}",
         f"11. Not reached count: {summary['not_reached_count']}",
-        "12. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_price_mode_reality_by_symbol.csv.",
-        "13. Candle coverage by candle_symbol_used: see abcd_price_mode_reality_by_candle_symbol_used.csv.",
-        "14. Stability across 2024 / 2025 / 2026: see abcd_price_mode_reality_by_year.csv.",
+        f"12. Decision event time validation failure count: {summary['decision_event_time_validation_failure_count']}",
+        "13. Deprecated compatibility fields: target_1R_first_event_time, target_2R_first_event_time, and target_3R_first_event_time are retained as aliases of the corresponding decision_event_time fields; use the explicit decision_event_time, target_hit_time, and stop_hit_time fields for new analysis.",
+        "14. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_price_mode_reality_by_symbol.csv.",
+        "15. Candle coverage by candle_symbol_used: see abcd_price_mode_reality_by_candle_symbol_used.csv.",
+        "16. Stability across 2024 / 2025 / 2026: see abcd_price_mode_reality_by_year.csv.",
         "",
         "## Final Decision",
         str(summary["final_decision"]),
@@ -351,10 +387,15 @@ def run(context_input: Path, candles_input: Path, output_root: Path) -> dict[str
         }
         details = []
         for r in TARGETS:
-            classification, first_event_time, detail = _classify(candles, retest_ts, direction, stop, targets[r] or 0.0)
+            classification, decision_event_time, target_hit_time, stop_hit_time, detail = _classify(
+                candles, retest_ts, direction, stop, targets[r] or 0.0
+            )
             item[f"target_{r}R_price"] = _fmt_optional(targets[r])
             item[f"target_{r}R_classification"] = classification
-            item[f"target_{r}R_first_event_time"] = first_event_time
+            item[f"target_{r}R_decision_event_time"] = decision_event_time
+            item[f"target_{r}R_target_hit_time"] = target_hit_time
+            item[f"target_{r}R_stop_hit_time"] = stop_hit_time
+            item[f"target_{r}R_first_event_time"] = decision_event_time
             details.append(f"{r}R={detail}")
         item["details"] = "; ".join(details)
         candidates.append(item)
