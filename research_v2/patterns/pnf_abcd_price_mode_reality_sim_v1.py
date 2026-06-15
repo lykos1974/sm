@@ -45,6 +45,7 @@ FINAL_DECISION_NO = "PRICE_MODE_REALITY_REJECTS_MODEL_C"
 CANDIDATE_FIELDS = [
     "candidate_id",
     "symbol",
+    "candle_symbol_used",
     "year",
     "post_d_reaction_direction",
     "retest_time",
@@ -183,6 +184,32 @@ def _load_candles(path: Path, symbol: str) -> list[Candle]:
     return sorted((row for row in rows if row.ts), key=lambda candle: candle.ts)
 
 
+def _candle_symbol_fallbacks(symbol: str) -> tuple[str, ...]:
+    return (symbol, f"BINANCE_FUT:{symbol}", f"BINANCE:{symbol}")
+
+
+def _load_candle_fallbacks(path: Path, symbols: Iterable[str]) -> dict[str, list[Candle]]:
+    candle_symbols = dict.fromkeys(candidate for symbol in symbols for candidate in _candle_symbol_fallbacks(symbol))
+    return {symbol: _load_candles(path, symbol) for symbol in candle_symbols}
+
+
+def _select_candles(
+    candles_by_symbol: dict[str, list[Candle]],
+    symbol: str,
+    retest_ts: float | None,
+) -> tuple[str, list[Candle]]:
+    loaded_symbol = ""
+    loaded_candles: list[Candle] = []
+    for candle_symbol in _candle_symbol_fallbacks(symbol):
+        candles = candles_by_symbol.get(candle_symbol, [])
+        if retest_ts is not None and any(candle.ts > retest_ts for candle in candles):
+            return candle_symbol, candles
+        if candles and not loaded_symbol:
+            loaded_symbol = candle_symbol
+            loaded_candles = candles
+    return loaded_symbol, loaded_candles
+
+
 def _direction(value: Any) -> str:
     direction = _text(value).upper()
     if direction in {"UP", "LONG", "BULL", "BULLISH"}:
@@ -285,7 +312,8 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         f"10. Same-candle ambiguity count: {summary['same_candle_ambiguity_count']}",
         f"11. Not reached count: {summary['not_reached_count']}",
         "12. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_price_mode_reality_by_symbol.csv.",
-        "13. Stability across 2024 / 2025 / 2026: see abcd_price_mode_reality_by_year.csv.",
+        "13. Candle coverage by candle_symbol_used: see abcd_price_mode_reality_by_candle_symbol_used.csv.",
+        "14. Stability across 2024 / 2025 / 2026: see abcd_price_mode_reality_by_year.csv.",
         "",
         "## Final Decision",
         str(summary["final_decision"]),
@@ -295,13 +323,13 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
 
 def run(context_input: Path, candles_input: Path, output_root: Path) -> dict[str, Any]:
     rows = _load_candidates(context_input)
-    candles_by_symbol = {symbol: _load_candles(candles_input, symbol) for symbol in SYMBOLS}
+    candles_by_symbol = _load_candle_fallbacks(candles_input, SYMBOLS)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         direction = _direction(row["post_d_reaction_direction"])
         symbol = row["symbol"]
-        candles = candles_by_symbol.get(symbol, [])
         retest_ts = _normalize_ts(row["retest_time"])
+        candle_symbol_used, candles = _select_candles(candles_by_symbol, symbol, retest_ts)
         entry_price = _parse_float(row["entry_price"])
         risk_price = _parse_float(row["risk_price"])
         targets = {r: _parse_float(row[f"target_{r}R_price"]) for r in TARGETS}
@@ -312,6 +340,7 @@ def run(context_input: Path, candles_input: Path, output_root: Path) -> dict[str
         item: dict[str, Any] = {
             "candidate_id": row["candidate_id"],
             "symbol": symbol,
+            "candle_symbol_used": candle_symbol_used,
             "year": row["year"],
             "post_d_reaction_direction": direction,
             "retest_time": row["retest_time"],
@@ -334,6 +363,13 @@ def run(context_input: Path, candles_input: Path, output_root: Path) -> dict[str
     _write_csv(output_root / "abcd_price_mode_reality_summary.csv", [summary], SUMMARY_FIELDS)
     _write_csv(output_root / "abcd_price_mode_reality_by_target.csv", _by_target(candidates), BY_TARGET_FIELDS)
     _write_csv(output_root / "abcd_price_mode_reality_by_symbol.csv", _scope(candidates, "symbol", SYMBOLS), BY_SCOPE_FIELDS)
+    candle_symbol_values = [symbol for symbol in candles_by_symbol if any(row.get("candle_symbol_used") == symbol for row in candidates)]
+    candle_symbol_values.extend([""] if any(not row.get("candle_symbol_used") for row in candidates) else [])
+    _write_csv(
+        output_root / "abcd_price_mode_reality_by_candle_symbol_used.csv",
+        _scope(candidates, "candle_symbol_used", candle_symbol_values),
+        BY_SCOPE_FIELDS,
+    )
     _write_csv(output_root / "abcd_price_mode_reality_by_year.csv", _scope(candidates, "year", [str(year) for year in YEARS]), BY_SCOPE_FIELDS)
     _write_csv(output_root / "abcd_price_mode_reality_candidates.csv", candidates, CANDIDATE_FIELDS)
     _write_report(output_root / "abcd_price_mode_reality_report.md", summary)
