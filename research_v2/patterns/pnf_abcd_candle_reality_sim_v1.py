@@ -30,7 +30,9 @@ ENTRY_THRESHOLD = 0.382
 TARGETS = (1, 2, 3)
 FINAL_DECISION_YES = "CANDLE_REALITY_JUSTIFIES_STRATEGY_RESEARCH"
 FINAL_DECISION_NO = "CANDLE_REALITY_REJECTS_PROXY_EDGE"
-CLASSIFICATIONS = ("TARGET_FIRST", "STOP_FIRST", "SAME_CANDLE_AMBIGUOUS", "NOT_REACHED", "UNKNOWN_MISSING_CANDLES")
+UNKNOWN_MISSING_ENTRY_CONTEXT = "UNKNOWN_MISSING_ENTRY_CONTEXT"
+UNKNOWN_MISSING_CANDLES = "UNKNOWN_MISSING_CANDLES"
+CLASSIFICATIONS = ("TARGET_FIRST", "STOP_FIRST", "SAME_CANDLE_AMBIGUOUS", "NOT_REACHED", UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES)
 
 CANDIDATE_FIELDS = [
     "candidate_id", "symbol", "year", "post_d_reaction_direction", "first_post_d_reaction_boxes",
@@ -40,7 +42,8 @@ CANDIDATE_FIELDS = [
     "target_3R_price", "target_3R_classification", "target_3R_first_event_time", "details",
 ]
 SUMMARY_FIELDS = [
-    "total_candidates_loaded", "candidates_with_candle_coverage", "unknown_missing_candle_count",
+    "total_candidates_loaded", "measured_candidates", "candidates_with_candle_coverage",
+    "unknown_missing_entry_context_count", "unknown_missing_candle_count",
     "same_candle_ambiguity_count", "target_1R_target_first_count", "target_1R_target_first_pct",
     "target_1R_stop_first_count", "target_1R_stop_first_pct", "target_2R_target_first_count",
     "target_2R_target_first_pct", "target_2R_stop_first_count", "target_2R_stop_first_pct",
@@ -192,14 +195,35 @@ def _pct(count: int, total: int) -> str:
     return _fmt(count / total) if total else ""
 
 
+def _fmt_optional(value: float | None) -> str:
+    if value is None:
+        return ""
+    if not math.isfinite(value):
+        return ""
+    return _fmt(value)
+
+
+def _is_measured(row: dict[str, Any]) -> bool:
+    return all(row.get(f"target_{r}R_classification") not in {UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES} for r in TARGETS)
+
+
 def _summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     total = len(rows)
-    covered = sum(1 for row in rows if all(row.get(f"target_{r}R_classification") != "UNKNOWN_MISSING_CANDLES" for r in TARGETS))
-    unknown = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == "UNKNOWN_MISSING_CANDLES" for r in TARGETS))
+    measured = sum(1 for row in rows if _is_measured(row))
+    covered = measured
+    unknown_entry_context = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == UNKNOWN_MISSING_ENTRY_CONTEXT for r in TARGETS))
+    unknown = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == UNKNOWN_MISSING_CANDLES for r in TARGETS))
     ambiguous = sum(1 for row in rows if any(row.get(f"target_{r}R_classification") == "SAME_CANDLE_AMBIGUOUS" for r in TARGETS))
-    out: dict[str, Any] = {"total_candidates_loaded": total, "candidates_with_candle_coverage": covered, "unknown_missing_candle_count": unknown, "same_candle_ambiguity_count": ambiguous}
+    out: dict[str, Any] = {
+        "total_candidates_loaded": total,
+        "measured_candidates": measured,
+        "candidates_with_candle_coverage": covered,
+        "unknown_missing_entry_context_count": unknown_entry_context,
+        "unknown_missing_candle_count": unknown,
+        "same_candle_ambiguity_count": ambiguous,
+    }
     for r in TARGETS:
-        denom = total - sum(1 for row in rows if row.get(f"target_{r}R_classification") == "UNKNOWN_MISSING_CANDLES")
+        denom = sum(1 for row in rows if row.get(f"target_{r}R_classification") not in {UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES})
         target_first = sum(1 for row in rows if row.get(f"target_{r}R_classification") == "TARGET_FIRST")
         stop_first = sum(1 for row in rows if row.get(f"target_{r}R_classification") == "STOP_FIRST")
         out[f"target_{r}R_target_first_count"] = target_first
@@ -214,10 +238,11 @@ def _by_target(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for r in TARGETS:
         counts = {name: sum(1 for row in rows if row.get(f"target_{r}R_classification") == name) for name in CLASSIFICATIONS}
-        item = {"target_r": r, "candidates": len(rows)}
+        candidates = sum(1 for row in rows if row.get(f"target_{r}R_classification") not in {UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES})
+        item = {"target_r": r, "candidates": candidates}
         for name in CLASSIFICATIONS:
             item[f"{name.lower()}_count"] = counts[name]
-            item[f"{name.lower()}_pct"] = _pct(counts[name], len(rows))
+            item[f"{name.lower()}_pct"] = "" if name in {UNKNOWN_MISSING_ENTRY_CONTEXT, UNKNOWN_MISSING_CANDLES} else _pct(counts[name], candidates)
         out.append(item)
     return out
 
@@ -232,17 +257,18 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         "Research-only candle ordering check using existing local artifacts only. No ABCD reconstruction, FAST artifacts, optimization, fees/slippage, leverage, production strategy, live trading logic, or trade recommendation is included.", "",
         "## Required Answers",
         f"1. Total candidates loaded: {summary['total_candidates_loaded']}",
-        f"2. Candidates with candle coverage: {summary['candidates_with_candle_coverage']}",
-        f"3. Unknown/missing candle count: {summary['unknown_missing_candle_count']}",
-        f"4. 1R target-first count and %: {summary['target_1R_target_first_count']} ({summary['target_1R_target_first_pct']})",
-        f"5. 1R stop-first count and %: {summary['target_1R_stop_first_count']} ({summary['target_1R_stop_first_pct']})",
-        f"6. 2R target-first count and %: {summary['target_2R_target_first_count']} ({summary['target_2R_target_first_pct']})",
-        f"7. 2R stop-first count and %: {summary['target_2R_stop_first_count']} ({summary['target_2R_stop_first_pct']})",
-        f"8. 3R target-first count and %: {summary['target_3R_target_first_count']} ({summary['target_3R_target_first_pct']})",
-        f"9. 3R stop-first count and %: {summary['target_3R_stop_first_count']} ({summary['target_3R_stop_first_pct']})",
-        f"10. Same-candle ambiguity count: {summary['same_candle_ambiguity_count']}",
-        "11. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_candle_reality_by_symbol.csv.",
-        "12. Stability across 2024 / 2025 / 2026: see abcd_candle_reality_by_year.csv.", "",
+        f"2. Measured candidates: {summary['measured_candidates']}",
+        f"3. Unknown/missing entry context count: {summary['unknown_missing_entry_context_count']}",
+        f"4. Unknown/missing candle count: {summary['unknown_missing_candle_count']}",
+        f"5. 1R target-first count and % among measured candidates: {summary['target_1R_target_first_count']} ({summary['target_1R_target_first_pct']})",
+        f"6. 1R stop-first count and % among measured candidates: {summary['target_1R_stop_first_count']} ({summary['target_1R_stop_first_pct']})",
+        f"7. 2R target-first count and % among measured candidates: {summary['target_2R_target_first_count']} ({summary['target_2R_target_first_pct']})",
+        f"8. 2R stop-first count and % among measured candidates: {summary['target_2R_stop_first_count']} ({summary['target_2R_stop_first_pct']})",
+        f"9. 3R target-first count and % among measured candidates: {summary['target_3R_target_first_count']} ({summary['target_3R_target_first_pct']})",
+        f"10. 3R stop-first count and % among measured candidates: {summary['target_3R_stop_first_count']} ({summary['target_3R_stop_first_pct']})",
+        f"11. Same-candle ambiguity count: {summary['same_candle_ambiguity_count']}",
+        "12. Stability across BTCUSDT / ETHUSDT / SOLUSDT: see abcd_candle_reality_by_symbol.csv.",
+        "13. Stability across 2024 / 2025 / 2026: see abcd_candle_reality_by_year.csv.", "",
         "## Final Decision", str(summary["final_decision"]),
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -258,16 +284,20 @@ def run(confluence_input: Path, feasibility_input: Path, entry_input: Path, cand
         direction = _direction(row)
         event_ts = _event_ts(row)
         first_boxes = _parse_float(row.get("first_post_d_reaction_boxes")) or math.nan
-        box_size = _parse_float(_first(row, ("box_size", "pnf_box_size", "box"))) or 1.0
+        box_size = _parse_float(_first(row, ("box_size", "pnf_box_size", "box")))
         risk_boxes = ENTRY_THRESHOLD * first_boxes
-        risk_price = risk_boxes * box_size if math.isfinite(risk_boxes) else math.nan
+        risk_price = risk_boxes * box_size if box_size is not None and math.isfinite(risk_boxes) else None
         entry = _entry_price(row, candles, event_ts)
-        item = {"candidate_id": row["candidate_id"], "symbol": symbol, "year": row.get("year", ""), "post_d_reaction_direction": direction, "first_post_d_reaction_boxes": _fmt(first_boxes), "retest_event_time": event_ts or "", "entry_model": ENTRY_MODEL, "entry_price": _fmt(entry), "box_size": _fmt(box_size), "risk_boxes": _fmt(risk_boxes), "risk_price": _fmt(risk_price), "details": ""}
+        item = {"candidate_id": row["candidate_id"], "symbol": symbol, "year": row.get("year", ""), "post_d_reaction_direction": direction, "first_post_d_reaction_boxes": _fmt_optional(first_boxes), "retest_event_time": event_ts or "", "entry_model": ENTRY_MODEL, "entry_price": _fmt_optional(entry), "box_size": _fmt_optional(box_size), "risk_boxes": _fmt_optional(risk_boxes), "risk_price": _fmt_optional(risk_price), "details": ""}
         details = []
+        missing_entry_context = entry is None or risk_price is None or box_size is None
         for r in TARGETS:
-            target_price = None if entry is None or not math.isfinite(risk_price) else (entry + r * risk_price if direction == "UP" else entry - r * risk_price)
-            classification, first_event, detail = _classify(candles, event_ts, direction, entry, risk_price, r)
-            item[f"target_{r}R_price"] = _fmt(target_price)
+            target_price = None if missing_entry_context else (entry + r * risk_price if direction == "UP" else entry - r * risk_price)
+            if missing_entry_context:
+                classification, first_event, detail = UNKNOWN_MISSING_ENTRY_CONTEXT, "", "missing entry_price, risk_price, or box_size"
+            else:
+                classification, first_event, detail = _classify(candles, event_ts, direction, entry, risk_price, r)
+            item[f"target_{r}R_price"] = _fmt_optional(target_price)
             item[f"target_{r}R_classification"] = classification
             item[f"target_{r}R_first_event_time"] = first_event
             details.append(f"{r}R={detail}")
