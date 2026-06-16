@@ -212,6 +212,9 @@ class BinanceFuturesClient:
     def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
         return self._request_json("POST", "/fapi/v1/order", params=order, signed=True)
 
+    def submit_algo_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("POST", "/fapi/v1/algoOrder", params=order, signed=True)
+
     def get_order(self, symbol: str, *, order_id: str | None = None, client_order_id: str | None = None) -> dict[str, Any]:
         return self._request_json(
             "GET",
@@ -638,6 +641,11 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             "active_stop_price": "REAL",
             "strategy_id": "TEXT",
             "candidate_id": "TEXT",
+            "stop_algo_id": "TEXT",
+            "tp_algo_id": "TEXT",
+            "protective_orders_status": "TEXT",
+            "protective_orders_raw_response": "TEXT",
+            "protective_orders_error": "TEXT",
         },
     )
     ensure_columns(
@@ -1350,6 +1358,182 @@ def record_trade(
     conn.commit()
 
 
+def extract_algo_order_id(response: dict[str, Any] | None) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    for key in ("algoId", "orderId", "clientAlgoId", "clientOrderId"):
+        raw = response.get(key)
+        if raw not in (None, ""):
+            return str(raw)
+    return None
+
+
+def build_protective_algo_orders(
+    *,
+    trade_id: int,
+    signal: TriangleSignal,
+    active_stop_price: Decimal | None = None,
+    working_type: str = "MARK_PRICE",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    exit_side = "SELL" if signal.side == "LONG" else "BUY"
+    position_side = "LONG" if signal.side == "LONG" else "SHORT"
+    stop_price = active_stop_price if active_stop_price is not None else signal.stop_price
+    base = {
+        "algoType": "CONDITIONAL",
+        "symbol": binance_symbol(signal.symbol),
+        "side": exit_side,
+        "positionSide": position_side,
+        "closePosition": "true",
+        "workingType": working_type,
+    }
+    stop_order = {
+        **base,
+        "type": "STOP_MARKET",
+        "triggerPrice": str(stop_price),
+        "clientAlgoId": f"pnf-sl-{trade_id}"[:36],
+    }
+    tp_order = {
+        **base,
+        "type": "TAKE_PROFIT_MARKET",
+        "triggerPrice": str(signal.tp2_price),
+        "clientAlgoId": f"pnf-tp-{trade_id}"[:36],
+    }
+    return stop_order, tp_order
+
+
+def attach_protective_algo_orders(
+    conn: sqlite3.Connection,
+    client: BinanceFuturesClient,
+    trade_id: int,
+    signal: TriangleSignal,
+    *,
+    dry_run: bool = False,
+) -> None:
+    row = conn.execute(
+        """
+        SELECT stop_algo_id, tp_algo_id, protective_orders_status, active_stop_price
+        FROM live_trades_binance
+        WHERE id = ?
+        """,
+        (int(trade_id),),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"trade_id={trade_id} not found for protective order attach")
+    stop_algo_id, tp_algo_id, protective_status, active_stop = row
+    if stop_algo_id and tp_algo_id:
+        if protective_status != "ATTACHED":
+            conn.execute(
+                """
+                UPDATE live_trades_binance
+                SET protective_orders_status = ?, protective_orders_error = NULL
+                WHERE id = ?
+                """,
+                ("ATTACHED", int(trade_id)),
+            )
+            conn.commit()
+        console("PROTECTIVE_ATTACH_ATTEMPT", f"{signal.symbol} trade_id={trade_id} skipped; already attached")
+        return
+    if protective_status == "ATTACHED":
+        console("PROTECTIVE_ATTACH_ATTEMPT", f"{signal.symbol} trade_id={trade_id} skipped; already attached")
+        return
+
+    active_stop_dec = _dec(active_stop) if active_stop not in (None, "") else None
+    stop_order, tp_order = build_protective_algo_orders(
+        trade_id=int(trade_id),
+        signal=signal,
+        active_stop_price=active_stop_dec,
+    )
+    console(
+        "PROTECTIVE_ATTACH_ATTEMPT",
+        f"{signal.symbol} trade_id={trade_id}",
+        {"stop_order": stop_order, "tp_order": tp_order, "dry_run": dry_run},
+    )
+
+    if dry_run:
+        conn.execute(
+            """
+            UPDATE live_trades_binance
+            SET protective_orders_status = ?, protective_orders_raw_response = ?, protective_orders_error = NULL
+            WHERE id = ?
+            """,
+            (
+                "DRY_RUN",
+                json.dumps({"stop_order": stop_order, "tp_order": tp_order}, sort_keys=True, default=str),
+                int(trade_id),
+            ),
+        )
+        conn.commit()
+        return
+
+    stop_response: dict[str, Any] | None = None
+    tp_response: dict[str, Any] | None = None
+    stop_id = str(stop_algo_id) if stop_algo_id not in (None, "") else None
+    tp_id = str(tp_algo_id) if tp_algo_id not in (None, "") else None
+    try:
+        if stop_id is None:
+            stop_response = client.submit_algo_order(stop_order)
+            stop_id = extract_algo_order_id(stop_response) or stop_order["clientAlgoId"]
+        if tp_id is None:
+            tp_response = client.submit_algo_order(tp_order)
+            tp_id = extract_algo_order_id(tp_response) or tp_order["clientAlgoId"]
+        conn.execute(
+            """
+            UPDATE live_trades_binance
+            SET stop_algo_id = ?, tp_algo_id = ?, protective_orders_status = ?,
+                protective_orders_raw_response = ?, protective_orders_error = NULL
+            WHERE id = ?
+            """,
+            (
+                stop_id,
+                tp_id,
+                "ATTACHED",
+                json.dumps(
+                    {
+                        "stop_order": stop_order,
+                        "stop_response": stop_response,
+                        "tp_order": tp_order,
+                        "tp_response": tp_response,
+                    },
+                    sort_keys=True,
+                    default=str,
+                ),
+                int(trade_id),
+            ),
+        )
+        conn.commit()
+        console("PROTECTIVE_ATTACH_SUCCESS", f"{signal.symbol} trade_id={trade_id}", {"stop_algo_id": stop_id, "tp_algo_id": tp_id})
+    except Exception as exc:
+        conn.execute(
+            """
+            UPDATE live_trades_binance
+            SET stop_algo_id = COALESCE(?, stop_algo_id),
+                tp_algo_id = COALESCE(?, tp_algo_id),
+                protective_orders_status = ?, protective_orders_raw_response = ?,
+                protective_orders_error = ?
+            WHERE id = ?
+            """,
+            (
+                stop_id,
+                tp_id,
+                "ATTACH_FAILED",
+                json.dumps(
+                    {
+                        "stop_order": stop_order,
+                        "stop_response": stop_response,
+                        "tp_order": tp_order,
+                        "tp_response": tp_response,
+                    },
+                    sort_keys=True,
+                    default=str,
+                ),
+                str(exc),
+                int(trade_id),
+            ),
+        )
+        conn.commit()
+        console("PROTECTIVE_ATTACH_FAILED", f"{signal.symbol} trade_id={trade_id} UNPROTECTED", {"error": str(exc)})
+
+
 
 def extract_order_ids(order_request: dict[str, Any] | None, order_response: dict[str, Any] | None) -> tuple[str | None, str | None]:
     order_id = None
@@ -1428,12 +1612,14 @@ def apply_entry_lifecycle(
     conn: sqlite3.Connection,
     trade_id: int,
     *,
+    client: BinanceFuturesClient | None = None,
     signal: TriangleSignal,
     order_request: dict[str, Any] | None,
     order_response: dict[str, Any] | None,
     status_response: dict[str, Any],
     trades_response: Any,
     lifecycle: dict[str, Any],
+    live_enabled: bool = True,
     verbose_market_logs: bool = False,
 ) -> None:
     entry_status = str(lifecycle.get("entry_order_status") or "")
@@ -1472,6 +1658,8 @@ def apply_entry_lifecycle(
     )
     conn.commit()
     if entry_status == "FILLED":
+        if live_enabled and client is not None:
+            attach_protective_algo_orders(conn, client, int(trade_id), signal, dry_run=False)
         console("ORDER_FILLED", f"{signal.symbol} {signal.pattern}", lifecycle)
         if is_p2_survivor_signal(signal):
             console(
@@ -1519,12 +1707,14 @@ def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesCl
             apply_entry_lifecycle(
                 conn,
                 int(trade_id),
+                client=client,
                 signal=signal,
                 order_request=order_request,
                 order_response=order_response,
                 status_response=status_response,
                 trades_response=trades_response,
                 lifecycle=lifecycle,
+                live_enabled=live_enabled,
                 verbose_market_logs=verbose_market_logs,
             )
             console("ORDER_STATUS", f"{symbol} trade_id={trade_id}", lifecycle)
@@ -1581,12 +1771,14 @@ def record_submitted_entry_order(
     apply_entry_lifecycle(
         conn,
         trade_id,
+        client=client,
         signal=signal,
         order_request=order,
         order_response=raw_response,
         status_response=status_response,
         trades_response=trades_response,
         lifecycle=lifecycle,
+        live_enabled=True,
         verbose_market_logs=verbose_market_logs,
     )
     return {"order_response": raw_response, "order_status": status_response, "user_trades": trades_response, "lifecycle": lifecycle}
@@ -2555,7 +2747,7 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
                 raw_response = client.submit_order(order)
                 record_signal(state_conn, signal, decision="FORCE_DEMO_SENT", block_reason=None, dry_run=False, notional_usdt=force_notional, raw_order_response={"order_request": order, "order_response": raw_response}, notes="forced demo self-test")
                 console("FORCE_DEMO_ORDER_SENT", force_symbol, {"order": order, "response": raw_response})
-                console("FORCE_DEMO_ORDER_SENT", "protective TP/SL attach/cancel path not implemented in forced mode; entry-only self-test")
+                console("FORCE_DEMO_ORDER_SENT", "protective algo TP/SL attach is not part of forced self-test; entry-only self-test")
             console("FORCE_DEMO_ORDER_DONE", force_symbol)
             return
 
