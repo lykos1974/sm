@@ -1642,6 +1642,108 @@ class BinanceForwardTraderTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(original_env)
 
+    def test_export_trade_journal_writes_human_readable_csv(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "state.db")
+            export_path = os.path.join(temp_dir, "journal", "trades.csv")
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                trader.init_live_tables(conn)
+                conn.execute(
+                    """
+                    INSERT INTO live_trades_binance(
+                        created_at, symbol, pattern, strategy_id, candidate_id, side,
+                        trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price,
+                        notional_usdt, decision, status, block_reason, dry_run,
+                        exchange_order_id, entry_order_status, avg_fill_price, executed_qty,
+                        stop_algo_id, tp_algo_id, protective_orders_status, exit_time,
+                        exit_price, realized_r, fees, raw_order_response, notes
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        "2026-06-16T00:00:00+00:00",
+                        "BINANCE_FUT:SOLUSDT",
+                        "bullish_triangle",
+                        "P2_SURVIVOR_V1",
+                        "CAND-000053",
+                        "LONG",
+                        123456,
+                        100.0,
+                        99.0,
+                        102.0,
+                        103.0,
+                        1.0,
+                        "ORDER_SENT",
+                        "POSITION_OPEN",
+                        None,
+                        0,
+                        "abc123",
+                        "FILLED",
+                        100.1,
+                        0.01,
+                        "sl-1",
+                        "tp-1",
+                        "ATTACHED",
+                        123999,
+                        103.0,
+                        3.0,
+                        0.001,
+                        "{}",
+                        "entry order filled; POSITION_OPEN",
+                    ),
+                )
+                conn.commit()
+
+            with closing(trader.connect_state_db_readonly(state_db_path)) as conn:
+                row_count = trader.export_trade_journal(conn, export_path)
+
+            self.assertEqual(row_count, 1)
+            with open(export_path, "r", encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            self.assertEqual(lines[0].split(","), list(trader.TRADE_JOURNAL_COLUMNS))
+            self.assertIn("BINANCE_FUT:SOLUSDT", lines[1])
+            self.assertIn("P2_SURVIVOR_V1", lines[1])
+            self.assertIn("ATTACHED", lines[1])
+
+    def test_main_export_trade_journal_is_read_only_and_skips_runtime(self):
+        original_parse_args = trader.parse_args
+        original_process_once = trader.process_once
+        original_reconcile = trader.run_reconciliation_once
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state_db_path = os.path.join(temp_dir, "state.db")
+                export_path = os.path.join(temp_dir, "journal.csv")
+                with closing(sqlite3.connect(state_db_path)) as conn:
+                    trader.init_live_tables(conn)
+                trader.parse_args = lambda: argparse.Namespace(
+                    db_path=os.path.join(temp_dir, "missing-market-data.db"),
+                    state_db_path=state_db_path,
+                    settings=os.path.join(temp_dir, "missing-settings.json"),
+                    dry_run=True,
+                    demo=True,
+                    enable_demo_doubles=False,
+                    notional_usdt="1",
+                    demo_max_notional_usdt="1",
+                    history_bars=5000,
+                    self_test_signal=False,
+                    verbose_market_logs=False,
+                    reconcile_positions=False,
+                    export_trade_journal=export_path,
+                    loop=False,
+                    poll_seconds=0,
+                )
+                trader.process_once = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("process_once called"))
+                trader.run_reconciliation_once = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("reconcile called"))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.main()
+                self.assertTrue(os.path.exists(export_path))
+        finally:
+            trader.parse_args = original_parse_args
+            trader.process_once = original_process_once
+            trader.run_reconciliation_once = original_reconcile
+
+        self.assertIn("TRADE_JOURNAL_EXPORT", output.getvalue())
+
 
     def test_build_pole_motif_signal_uses_next_column_open_fixed_risk_chain(self):
         pattern = {
