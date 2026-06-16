@@ -143,6 +143,7 @@ class LiveClient(StaticClient):
 class LifecycleClient(LiveClient):
     def __init__(self, status="FILLED"):
         self.submitted_orders = []
+        self.cancelled_orders = []
         self.status = status
 
     def submit_order(self, order):
@@ -162,6 +163,16 @@ class LifecycleClient(LiveClient):
 
     def get_user_trades(self, symbol, *, order_id=None):
         return [{"orderId": int(order_id), "commission": "0.00001", "commissionAsset": "USDT"}]
+
+    def cancel_order(self, symbol, *, order_id=None, orig_client_order_id=None):
+        response = {
+            "symbol": symbol,
+            "orderId": int(order_id),
+            "clientOrderId": orig_client_order_id,
+            "status": "CANCELED",
+        }
+        self.cancelled_orders.append(response)
+        return response
 
 
 class SubmittingClient(LifecycleClient):
@@ -1333,6 +1344,88 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(row[4], 0.00001)
         self.assertEqual(row[5], 0.5)
         self.assertEqual(result["lifecycle"]["entry_order_status"], "FILLED")
+
+    def _record_pending_order(self, conn, *, created_at, status="NEW"):
+        signal = sample_signal()
+        order = {"newClientOrderId": "entry-test-1"}
+        raw_response = {"orderId": 42, "clientOrderId": "entry-test-1", "status": "NEW"}
+        trader.record_trade(
+            conn,
+            signal,
+            notional_usdt=Decimal("1"),
+            exchange_order_id="42",
+            status="ORDER_SENT",
+            dry_run=False,
+            decision="ORDER_SENT",
+            raw_order_response={"order_request": order, "order_response": raw_response},
+            notes="pending entry",
+        )
+        conn.execute("UPDATE live_trades_binance SET created_at = ?", (created_at,))
+        conn.commit()
+        return LifecycleClient(status)
+
+    def test_stale_pending_new_order_is_cancelled_and_marked_entry_expired(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        client = self._record_pending_order(conn, created_at="2000-01-01T00:00:00Z", status="NEW")
+
+        trader.poll_pending_entry_orders(conn, client, live_enabled=True, max_pending_entry_minutes=1)
+
+        row = conn.execute("SELECT status, block_reason, notes, raw_order_response FROM live_trades_binance").fetchone()
+        self.assertEqual(row[0], "ENTRY_EXPIRED")
+        self.assertEqual(row[1], "MAX_PENDING_ENTRY_AGE_EXCEEDED")
+        self.assertIn("MAX_PENDING_ENTRY_AGE_EXCEEDED", row[2])
+        self.assertIn("cancel_response", row[3])
+        self.assertEqual(len(client.cancelled_orders), 1)
+
+    def test_young_pending_new_order_is_not_cancelled(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        client = self._record_pending_order(conn, created_at=trader.now_iso(), status="NEW")
+
+        trader.poll_pending_entry_orders(conn, client, live_enabled=True, max_pending_entry_minutes=60)
+
+        row = conn.execute("SELECT status, entry_order_status FROM live_trades_binance").fetchone()
+        self.assertEqual(row[0], "ORDER_SENT")
+        self.assertEqual(row[1], "NEW")
+        self.assertEqual(client.cancelled_orders, [])
+
+    def test_stale_filled_order_is_not_cancelled_and_opens_position(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        client = self._record_pending_order(conn, created_at="2000-01-01T00:00:00Z", status="FILLED")
+
+        trader.poll_pending_entry_orders(conn, client, live_enabled=True, max_pending_entry_minutes=1)
+
+        row = conn.execute("SELECT status, entry_order_status FROM live_trades_binance").fetchone()
+        self.assertEqual(row[0], "POSITION_OPEN")
+        self.assertEqual(row[1], "FILLED")
+        self.assertEqual(client.cancelled_orders, [])
+
+    def test_stale_exchange_canceled_order_updates_local_terminal_status(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        client = self._record_pending_order(conn, created_at="2000-01-01T00:00:00Z", status="CANCELED")
+
+        trader.poll_pending_entry_orders(conn, client, live_enabled=True, max_pending_entry_minutes=1)
+
+        row = conn.execute("SELECT status, entry_order_status, notes FROM live_trades_binance").fetchone()
+        self.assertEqual(row[0], "CANCELED")
+        self.assertEqual(row[1], "CANCELED")
+        self.assertIn("terminal on exchange", row[2])
+        self.assertEqual(client.cancelled_orders, [])
+
+    def test_disabled_max_pending_option_preserves_current_pending_behavior(self):
+        conn = sqlite3.connect(":memory:")
+        trader.init_live_tables(conn)
+        client = self._record_pending_order(conn, created_at="2000-01-01T00:00:00Z", status="NEW")
+
+        trader.poll_pending_entry_orders(conn, client, live_enabled=True)
+
+        row = conn.execute("SELECT status, entry_order_status FROM live_trades_binance").fetchone()
+        self.assertEqual(row[0], "ORDER_SENT")
+        self.assertEqual(row[1], "NEW")
+        self.assertEqual(client.cancelled_orders, [])
 
     def test_new_or_partially_filled_entry_does_not_trigger_exits(self):
         for status in ("NEW", "PARTIALLY_FILLED"):
