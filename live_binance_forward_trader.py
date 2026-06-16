@@ -9,6 +9,7 @@ MEXC validator.  Live exchange writes are fail-closed and require
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import closing
 import hashlib
 import hmac
@@ -63,6 +64,36 @@ POLE_MOTIF_ENTRY_MODEL = "NEXT_COLUMN_OPEN_ENTRY"
 POLE_MOTIF_STOP_BOXES = Decimal("3")
 POLE_MOTIF_TARGET_R = Decimal("2.5")
 POLE_MOTIF_BREAK_EVEN_TRIGGER_R = Decimal("2")
+
+TRADE_JOURNAL_COLUMNS = (
+    "trade_id",
+    "created_at",
+    "symbol",
+    "pattern",
+    "strategy_id",
+    "candidate_id",
+    "side",
+    "trigger_timestamp",
+    "entry_price",
+    "stop_price",
+    "tp1_price",
+    "tp2_price",
+    "decision",
+    "status",
+    "block_reason",
+    "exchange_order_id",
+    "entry_order_status",
+    "avg_fill_price",
+    "executed_qty",
+    "stop_algo_id",
+    "tp_algo_id",
+    "protective_orders_status",
+    "exit_time",
+    "exit_price",
+    "realized_r",
+    "fees",
+    "notes",
+)
 
 
 @dataclass(frozen=True)
@@ -2272,6 +2303,52 @@ def run_reconciliation_once(args: argparse.Namespace) -> None:
         run_position_reconciliation_report(state_conn, client)
 
 
+def export_trade_journal(conn: sqlite3.Connection, csv_path: str | os.PathLike[str]) -> int:
+    """Export persisted Binance live trade rows as a human-readable CSV."""
+    if not table_exists(conn, "live_trades_binance"):
+        raise RuntimeError("live_trades_binance table does not exist in state DB")
+
+    existing_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(live_trades_binance)").fetchall()}
+    source_columns = ["id" if column == "trade_id" else column for column in TRADE_JOURNAL_COLUMNS]
+    selected_columns = [column for column in source_columns if column in existing_columns]
+    select_clause = ", ".join(selected_columns) if selected_columns else "id"
+    rows = conn.execute(
+        f"""
+        SELECT {select_clause}
+        FROM live_trades_binance
+        ORDER BY id ASC
+        """
+    ).fetchall()
+
+    output_path = Path(csv_path)
+    if output_path.parent and str(output_path.parent) != ".":
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(TRADE_JOURNAL_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            raw = dict(row)
+            journal_row: dict[str, Any] = {}
+            for column in TRADE_JOURNAL_COLUMNS:
+                source_column = "id" if column == "trade_id" else column
+                journal_row[column] = raw.get(source_column, "")
+            writer.writerow(journal_row)
+    return len(rows)
+
+
+def run_trade_journal_export_once(args: argparse.Namespace) -> None:
+    state_db_path = resolve_state_db_path(args)
+    with closing(connect_state_db_readonly(state_db_path)) as state_conn:
+        log_db_info(state_db_path, state_conn)
+        row_count = export_trade_journal(state_conn, args.export_trade_journal)
+    console(
+        "TRADE_JOURNAL_EXPORT",
+        str(args.export_trade_journal),
+        {"rows": row_count, "state_db_path": str(Path(state_db_path).expanduser().absolute())},
+    )
+
+
 def has_exchange_position(position_response: dict[str, Any]) -> bool:
     rows: Any = position_response if isinstance(position_response, list) else position_response.get("positions", position_response.get("data"))
     if isinstance(rows, dict):
@@ -2936,12 +3013,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-demo-max-notional-usdt", help="Override notional cap only for --force-demo-order validation (demo mode only)")
     parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
     parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
+    parser.add_argument("--export-trade-journal", help="Read-only CSV export path for all rows in live_trades_binance; exits before scanning or submitting orders")
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if getattr(args, "export_trade_journal", None):
+        run_trade_journal_export_once(args)
+        return
+
     log_startup(args)
 
     if bool(getattr(args, "reconcile_positions", False)):
