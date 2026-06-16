@@ -254,6 +254,24 @@ class BinanceFuturesClient:
             signed=True,
         )
 
+    def cancel_order(
+        self,
+        symbol: str,
+        *,
+        order_id: str | None = None,
+        orig_client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not symbol:
+            raise ValueError("symbol is required to cancel a Binance USD-M futures order")
+        if order_id in (None, "") and orig_client_order_id in (None, ""):
+            raise ValueError("order_id or orig_client_order_id is required to cancel a Binance USD-M futures order")
+        return self._request_json(
+            "DELETE",
+            "/fapi/v1/order",
+            params={"symbol": symbol, "orderId": order_id, "origClientOrderId": orig_client_order_id},
+            signed=True,
+        )
+
     def get_user_trades(self, symbol: str, *, order_id: str | None = None) -> Any:
         return self._request_json("GET", "/fapi/v1/userTrades", params={"symbol": symbol, "orderId": order_id}, signed=True)
 
@@ -1702,19 +1720,77 @@ def apply_entry_lifecycle(
             log_position_open_detail(signal, lifecycle)
 
 
-def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesClient, *, live_enabled: bool, verbose_market_logs: bool = False) -> None:
+def parse_utc_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def pending_age_minutes(created_at: str | None) -> float | None:
+    created = parse_utc_timestamp(created_at)
+    if created is None:
+        return None
+    return (datetime.now(timezone.utc) - created).total_seconds() / 60
+
+
+def mark_entry_order_terminal(
+    conn: sqlite3.Connection,
+    trade_id: int,
+    *,
+    status: str,
+    status_response: dict[str, Any],
+    trades_response: Any,
+    raw_order_response: dict[str, Any],
+    notes: str,
+    block_reason: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE live_trades_binance
+        SET status = ?, entry_order_status = ?, block_reason = COALESCE(?, block_reason),
+            order_status_response = ?, user_trades_response = ?, raw_order_response = ?, notes = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            status,
+            block_reason,
+            json.dumps(status_response, sort_keys=True, default=str),
+            json.dumps(trades_response, sort_keys=True, default=str),
+            json.dumps(raw_order_response, sort_keys=True, default=str),
+            notes,
+            int(trade_id),
+        ),
+    )
+    conn.commit()
+
+
+def poll_pending_entry_orders(
+    conn: sqlite3.Connection,
+    client: BinanceFuturesClient,
+    *,
+    live_enabled: bool,
+    verbose_market_logs: bool = False,
+    max_pending_entry_minutes: int | None = None,
+) -> None:
     if not live_enabled:
         return
     rows = conn.execute(
         """
-        SELECT id, symbol, pattern, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price,
+        SELECT id, created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price, tp1_price, tp2_price,
                raw_order_response
         FROM live_trades_binance
         WHERE status = 'ORDER_SENT'
         """
     ).fetchall()
     for row in rows:
-        trade_id, symbol, pattern, side, trigger_ts, entry, stop, tp1, tp2, raw_order_response = row
+        trade_id, created_at, symbol, pattern, side, trigger_ts, entry, stop, tp1, tp2, raw_order_response = row
         signal = TriangleSignal(
             symbol=symbol,
             pattern=pattern,
@@ -1735,6 +1811,74 @@ def poll_pending_entry_orders(conn: sqlite3.Connection, client: BinanceFuturesCl
             order_request = raw.get("order_request") if isinstance(raw, dict) else None
             order_response = raw.get("order_response") if isinstance(raw, dict) else None
             status_response, trades_response, lifecycle = poll_entry_order_status(client, signal, order_request, order_response)
+            entry_status = str(lifecycle.get("entry_order_status") or "")
+            age_minutes = pending_age_minutes(str(created_at))
+            is_expired = (
+                max_pending_entry_minutes is not None
+                and age_minutes is not None
+                and age_minutes > max_pending_entry_minutes
+            )
+            if is_expired and entry_status in {"CANCELED", "EXPIRED", "REJECTED"}:
+                merged_raw = {
+                    "order_request": order_request,
+                    "order_response": order_response,
+                    "order_status": status_response,
+                    "user_trades": trades_response,
+                }
+                mark_entry_order_terminal(
+                    conn,
+                    int(trade_id),
+                    status=entry_status,
+                    status_response=status_response,
+                    trades_response=trades_response,
+                    raw_order_response=merged_raw,
+                    notes=f"entry order terminal on exchange before stale cancellation; status={entry_status}",
+                )
+                console("ORDER_STATUS", f"{symbol} trade_id={trade_id}", lifecycle)
+                continue
+            if is_expired and entry_status == "PARTIALLY_FILLED":
+                console(
+                    "ORDER_EXPIRED_MANUAL_REVIEW",
+                    f"{symbol} trade_id={trade_id}",
+                    {"reason": "MAX_PENDING_ENTRY_AGE_EXCEEDED", "age_minutes": age_minutes, **lifecycle},
+                )
+                continue
+            if is_expired and entry_status == "NEW":
+                order_id, client_order_id = extract_order_ids(order_request, order_response)
+                cancel_response = client.cancel_order(
+                    binance_symbol(signal.symbol),
+                    order_id=order_id,
+                    orig_client_order_id=client_order_id,
+                )
+                merged_raw = {
+                    "order_request": order_request,
+                    "order_response": order_response,
+                    "order_status": status_response,
+                    "user_trades": trades_response,
+                    "cancel_response": cancel_response,
+                    "cancel_reason": "MAX_PENDING_ENTRY_AGE_EXCEEDED",
+                }
+                mark_entry_order_terminal(
+                    conn,
+                    int(trade_id),
+                    status="ENTRY_EXPIRED",
+                    status_response=status_response,
+                    trades_response=trades_response,
+                    raw_order_response=merged_raw,
+                    notes=json.dumps(
+                        {
+                            "reason": "MAX_PENDING_ENTRY_AGE_EXCEEDED",
+                            "age_minutes": age_minutes,
+                            "cancel_response": cancel_response,
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                    block_reason="MAX_PENDING_ENTRY_AGE_EXCEEDED",
+                )
+                console("ORDER_CANCELLED", f"{symbol} trade_id={trade_id}", {"reason": "MAX_PENDING_ENTRY_AGE_EXCEEDED", "cancel_response": cancel_response})
+                console("ORDER_EXPIRED", f"{symbol} trade_id={trade_id}", {"age_minutes": age_minutes})
+                continue
             apply_entry_lifecycle(
                 conn,
                 int(trade_id),
@@ -2829,7 +2973,13 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             return
 
         settings = load_settings(Path(args.settings))
-        poll_pending_entry_orders(state_conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
+        poll_pending_entry_orders(
+            state_conn,
+            client,
+            live_enabled=live_enabled,
+            verbose_market_logs=verbose_market_logs,
+            max_pending_entry_minutes=getattr(args, "max_pending_entry_minutes", None),
+        )
         update_open_trade_exits(state_conn, candle_conn, client, live_enabled=live_enabled, verbose_market_logs=verbose_market_logs)
         configured_symbols = [s for s in settings.get("symbols", []) if s in ALLOWED_SYMBOLS]
         for symbol in configured_symbols:
@@ -3012,6 +3162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-demo-notional-usdt", default="1.0", help="Notional USDT for forced demo self-test order")
     parser.add_argument("--force-demo-max-notional-usdt", help="Override notional cap only for --force-demo-order validation (demo mode only)")
     parser.add_argument("--verbose-market-logs", action="store_true", help="Emit compact per-symbol market, signal, order, fill, and exit visibility logs")
+    parser.add_argument("--max-pending-entry-minutes", type=int, help="Cancel live entry orders that remain pending longer than this many minutes; disabled by default")
     parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
     parser.add_argument("--export-trade-journal", help="Read-only CSV export path for all rows in live_trades_binance; exits before scanning or submitting orders")
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
