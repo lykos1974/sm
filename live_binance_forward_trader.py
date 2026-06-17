@@ -58,6 +58,9 @@ P2_SURVIVOR_STATUS = "VALIDATED_RESEARCH_EDGE|FORWARD_EDGE_SURVIVES|NOT_PRODUCTI
 RECENT_COLUMN_LOOKBACK = 6
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
 OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "EXIT_PENDING"}
+DUPLICATE_SETUP_COOLDOWN_HOURS = 12
+DUPLICATE_SETUP_COOLDOWN_SECONDS = DUPLICATE_SETUP_COOLDOWN_HOURS * 60 * 60
+DUPLICATE_SETUP_PRICE_TOLERANCE = Decimal("0.00000001")
 RECONCILE_PRICE_MISMATCH_BPS = Decimal("1")
 RECONCILE_MIN_PRICE_MISMATCH = Decimal("0.00000001")
 POLE_MOTIF_ENTRY_MODEL = "NEXT_COLUMN_OPEN_ENTRY"
@@ -1304,6 +1307,36 @@ def has_existing_open_trade(conn: sqlite3.Connection, symbol: str) -> bool:
     return row is not None
 
 
+def _prices_match_for_duplicate_setup(left: Any, right: Decimal) -> bool:
+    try:
+        left_dec = _dec(left)
+    except ValueError:
+        return False
+    return abs(left_dec - right) <= DUPLICATE_SETUP_PRICE_TOLERANCE
+
+
+def has_recent_duplicate_setup_trade(conn: sqlite3.Connection, signal: TriangleSignal) -> bool:
+    cutoff = datetime.now(timezone.utc).timestamp() - DUPLICATE_SETUP_COOLDOWN_SECONDS
+    rows = conn.execute(
+        """
+        SELECT created_at, entry_price, stop_price
+        FROM live_trades_binance
+        WHERE symbol = ? AND pattern = ? AND side = ? AND dry_run = 0
+        ORDER BY id DESC
+        """,
+        (signal.symbol, signal.pattern, signal.side),
+    ).fetchall()
+    for created_at, entry_price, stop_price in rows:
+        created = parse_utc_timestamp(str(created_at))
+        if created is None or created.timestamp() < cutoff:
+            continue
+        entry_matches = _prices_match_for_duplicate_setup(entry_price, signal.entry_price)
+        stop_matches = _prices_match_for_duplicate_setup(stop_price, signal.stop_price)
+        if entry_matches and stop_matches:
+            return True
+    return False
+
+
 def signal_exists(conn: sqlite3.Connection, signal: TriangleSignal) -> bool:
     row = conn.execute(
         "SELECT 1 FROM live_signals_binance WHERE symbol = ? AND pattern = ? AND trigger_timestamp = ? LIMIT 1",
@@ -2548,6 +2581,8 @@ def validate_guards(
         return None, None, risk_reason
     if signal_exists(conn, signal):
         return None, None, "duplicate signal for same symbol/pattern/trigger timestamp"
+    if has_recent_duplicate_setup_trade(conn, signal):
+        return None, None, "DUPLICATE_SETUP_COOLDOWN"
     if has_existing_open_trade(conn, signal.symbol):
         return None, None, "existing open live trade on symbol"
     max_notional_usdt = effective_notional_cap(

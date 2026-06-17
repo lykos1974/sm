@@ -1,6 +1,7 @@
 import argparse
 import io
 from contextlib import closing, redirect_stdout
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import sqlite3
@@ -1952,6 +1953,63 @@ class BinanceForwardTraderTests(unittest.TestCase):
 
         self.assertEqual(reason, "duplicate signal for same symbol/pattern/trigger timestamp")
         self.assertNotEqual(reason2, "duplicate signal for same symbol/pattern/trigger timestamp")
+
+    def test_duplicate_setup_cooldown_blocks_same_entry_stop_after_close(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(conn)
+            original = sample_signal(trigger_ts=1001)
+            trader.record_trade(
+                conn,
+                original,
+                notional_usdt=Decimal("1"),
+                exchange_order_id="closed-1",
+                status="POSITION_CLOSED",
+                dry_run=False,
+            )
+            repeat = replace_signal(original, trigger_ts=1002)
+            _spec, order, reason = trader.validate_guards(
+                conn,
+                LiveClient(),
+                repeat,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+            )
+        finally:
+            conn.close()
+
+        self.assertIsNone(order)
+        self.assertEqual(reason, "DUPLICATE_SETUP_COOLDOWN")
+
+    def test_duplicate_setup_cooldown_allows_after_twelve_hours(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            trader.init_live_tables(conn)
+            original = sample_signal(trigger_ts=1001)
+            trader.record_trade(
+                conn,
+                original,
+                notional_usdt=Decimal("1"),
+                exchange_order_id="closed-1",
+                status="POSITION_CLOSED",
+                dry_run=False,
+            )
+            old_created_at = (datetime.now(timezone.utc) - timedelta(hours=13)).isoformat(timespec="seconds")
+            conn.execute("UPDATE live_trades_binance SET created_at = ?", (old_created_at,))
+            conn.commit()
+            repeat = replace_signal(original, trigger_ts=1002)
+            _spec, order, reason = trader.validate_guards(
+                conn,
+                LiveClient(),
+                repeat,
+                notional_usdt=Decimal("1"),
+                live_enabled=True,
+            )
+        finally:
+            conn.close()
+
+        self.assertIsNone(reason)
+        self.assertIsNotNone(order)
 
     def test_strategy_candidate_metadata_only_for_p2_signals(self):
         conn = sqlite3.connect(":memory:")
