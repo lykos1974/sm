@@ -47,7 +47,7 @@ VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE", "WATCH", "REJECT"}
 BOX_W = 18
 BOX_H = 18
 LEFT_AXIS_W = 70
-RIGHT_AXIS_W = 70
+RIGHT_AXIS_W = 130
 
 EXTRA_ROWS_ABOVE = 8
 EXTRA_ROWS_BELOW = 8
@@ -929,23 +929,29 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"Structure panel reset failed: {e}")
 
+    def _build_current_structure_state(self, symbol: str):
+        engine = self.engines.get(symbol)
+        if engine is None or not getattr(engine, "columns", None):
+            return None
+
+        profile = self._get_profile(symbol)
+        return build_structure_state(
+            symbol=symbol,
+            profile=profile,
+            columns=engine.columns,
+            latest_signal_name=engine.latest_signal_name(),
+            market_state=engine.market_state(),
+            last_price=getattr(engine, "last_price", None),
+        )
+
     def _update_structure_panel(self, symbol: str):
         try:
-            engine = self.engines.get(symbol)
-            if engine is None or not getattr(engine, "columns", None):
+            structure = self._build_current_structure_state(symbol)
+            if structure is None:
                 self._set_structure_panel_na()
                 return
 
             profile = self._get_profile(symbol)
-            structure = build_structure_state(
-                symbol=symbol,
-                profile=profile,
-                columns=engine.columns,
-                latest_signal_name=engine.latest_signal_name(),
-                market_state=engine.market_state(),
-                last_price=getattr(engine, "last_price", None),
-            )
-
             for field, var in self.structure_panel_vars.items():
                 var.set(self._structure_panel_field_value(field, structure.get(field), profile))
         except Exception as e:
@@ -1072,6 +1078,7 @@ class App(tk.Tk):
             "profile": profile,
             "cols": cols,
             "display_bottom": display_bottom,
+            "display_top": display_top,
             "plot_w": max(scroll_cols * BOX_W, 1),
             "plot_h": max(scroll_rows * BOX_H, 1),
             "scroll_rows": scroll_rows,
@@ -1149,6 +1156,8 @@ class App(tk.Tk):
                     r = min(BOX_W, BOX_H) * 0.32
                     self.chart_canvas.create_oval(x_center - r, y_center - r, x_center + r, y_center + r, outline="#ff7b72", width=2)
 
+        self._draw_support_resistance_overlay(symbol, surface)
+
         snapshot = self.latest_scanner.get(symbol, {})
         self.meta_label.config(
             text=(
@@ -1162,6 +1171,67 @@ class App(tk.Tk):
         self._update_profile_info()
         self._update_structure_panel(symbol)
         self._sync_axes_to_chart_yview()
+
+    def _draw_support_resistance_overlay(self, symbol: str, surface: dict):
+        try:
+            structure = self._build_current_structure_state(symbol)
+            if structure is None:
+                return
+
+            profile = surface["profile"]
+            display_bottom = surface["display_bottom"]
+            display_top = surface["display_top"]
+            plot_w = surface["plot_w"]
+            plot_h = surface["plot_h"]
+            scroll_rows = surface["scroll_rows"]
+            row_offset = surface["row_offset"]
+
+            overlay_specs = (
+                ("support_level", "SUPPORT", "#0b6b2b"),
+                ("resistance_level", "RESISTANCE", "#8b1a1a"),
+            )
+            for field, label, color in overlay_specs:
+                value = structure.get(field)
+                if value is None:
+                    continue
+
+                try:
+                    level = float(value)
+                except Exception:
+                    continue
+
+                if level < display_bottom or level > display_top:
+                    continue
+
+                local_row_idx = int(round((level - display_bottom) / profile.box_size))
+                global_row_idx = local_row_idx + row_offset
+                if global_row_idx < 0 or global_row_idx >= scroll_rows:
+                    continue
+
+                y_top = plot_h - (global_row_idx + 1) * BOX_H
+                y_bottom = plot_h - global_row_idx * BOX_H
+                y_center = (y_top + y_bottom) / 2
+                price_text = self._format_price(level, profile.box_size)
+
+                self.chart_canvas.create_line(
+                    0,
+                    y_center,
+                    plot_w,
+                    y_center,
+                    fill=color,
+                    dash=(6, 4),
+                    width=2,
+                )
+                self.right_axis.create_text(
+                    RIGHT_AXIS_W - 6,
+                    y_center,
+                    text=f"{label} {price_text}",
+                    fill=color,
+                    anchor="e",
+                    font=("Consolas", 8, "bold"),
+                )
+        except Exception as e:
+            self._log(f"Support/resistance overlay failed for {symbol}: {e}")
 
     def _draw_empty_canvases(self):
         cw = max(self.chart_canvas.winfo_width(), 500)
