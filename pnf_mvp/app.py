@@ -1137,6 +1137,8 @@ class App(tk.Tk):
             self.left_axis.create_text(LEFT_AXIS_W - 6, y_center, text=f"{price:.{decimals}f}", fill="#95a3ad", anchor="e", font=("Consolas", 9))
             self.right_axis.create_text(6, y_center, text=f"{price:.{decimals}f}", fill="#95a3ad", anchor="w", font=("Consolas", 9))
 
+        self._draw_trendline_overlay(symbol, surface)
+
         for i, col in enumerate(cols):
             global_col_idx = i + col_offset
             x_left = global_col_idx * BOX_W
@@ -1171,6 +1173,138 @@ class App(tk.Tk):
         self._update_profile_info()
         self._update_structure_panel(symbol)
         self._sync_axes_to_chart_yview()
+
+
+    def _column_center_x(self, column_index: int, surface: dict) -> float:
+        global_col_idx = column_index + surface["col_offset"]
+        return global_col_idx * BOX_W + BOX_W / 2
+
+    def _price_center_y(self, price: float, surface: dict) -> float:
+        profile = surface["profile"]
+        local_row_idx = int(round((price - surface["display_bottom"]) / profile.box_size))
+        global_row_idx = local_row_idx + surface["row_offset"]
+        return surface["plot_h"] - (global_row_idx + 0.5) * BOX_H
+
+    def _completed_trendline_columns(self, cols: list) -> list:
+        if len(cols) < 3:
+            return []
+        return cols[:-1]
+
+    def _find_bullish_support_anchor(self, surface: dict):
+        profile = surface["profile"]
+        anchors = [
+            (idx, col.bottom)
+            for idx, col in enumerate(self._completed_trendline_columns(surface["cols"]))
+            if col.kind == "O"
+        ]
+        if len(anchors) < 2:
+            return None
+
+        for right_pos in range(len(anchors) - 1, 0, -1):
+            right_idx, right_low = anchors[right_pos]
+            for left_pos in range(right_pos - 1, -1, -1):
+                left_idx, left_low = anchors[left_pos]
+                if right_low <= left_low:
+                    continue
+                expected_right = left_low + (right_idx - left_idx) * profile.box_size
+                if expected_right <= right_low + 1e-9:
+                    return left_idx, left_low
+        return None
+
+    def _find_bearish_resistance_anchor(self, surface: dict):
+        profile = surface["profile"]
+        anchors = [
+            (idx, col.top)
+            for idx, col in enumerate(self._completed_trendline_columns(surface["cols"]))
+            if col.kind == "X"
+        ]
+        if len(anchors) < 2:
+            return None
+
+        for right_pos in range(len(anchors) - 1, 0, -1):
+            right_idx, right_high = anchors[right_pos]
+            for left_pos in range(right_pos - 1, -1, -1):
+                left_idx, left_high = anchors[left_pos]
+                if right_high >= left_high:
+                    continue
+                expected_right = left_high - (right_idx - left_idx) * profile.box_size
+                if expected_right >= right_high - 1e-9:
+                    return left_idx, left_high
+        return None
+
+    def _trendline_visible_segment(self, anchor_idx: int, anchor_price: float, box_step: float, surface: dict):
+        cols = surface["cols"]
+        profile = surface["profile"]
+        display_bottom = surface["display_bottom"]
+        display_top = surface["display_top"]
+        max_idx = len(cols) - 1 + EXTRA_COLS_RIGHT
+        points = []
+
+        for idx in range(anchor_idx, max_idx + 1):
+            price = anchor_price + (idx - anchor_idx) * box_step * profile.box_size
+            if display_bottom <= price <= display_top:
+                points.append((idx, price))
+
+        if len(points) < 2:
+            return None
+        return points[0], points[-1]
+
+    def _draw_single_trendline(self, anchor: tuple, box_step: float, label: str, color: str, surface: dict):
+        segment = self._trendline_visible_segment(anchor[0], anchor[1], box_step, surface)
+        if segment is None:
+            return
+
+        (start_idx, start_price), (end_idx, end_price) = segment
+        x1 = self._column_center_x(start_idx, surface)
+        y1 = self._price_center_y(start_price, surface)
+        x2 = self._column_center_x(end_idx, surface)
+        y2 = self._price_center_y(end_price, surface)
+
+        self.chart_canvas.create_line(
+            x1,
+            y1,
+            x2,
+            y2,
+            fill=color,
+            dash=(4, 6),
+            width=2,
+            stipple="gray50",
+        )
+
+        label_x = min(max(x1 + 8, 4), max(surface["plot_w"] - 8, 4))
+        label_y = y1 - 10 if box_step > 0 else y1 + 10
+        self.chart_canvas.create_text(
+            label_x,
+            label_y,
+            text=label,
+            fill=color,
+            anchor="w",
+            font=("Consolas", 8, "bold"),
+        )
+
+    def _draw_trendline_overlay(self, symbol: str, surface: dict):
+        try:
+            bullish_anchor = self._find_bullish_support_anchor(surface)
+            if bullish_anchor is not None:
+                self._draw_single_trendline(
+                    bullish_anchor,
+                    1.0,
+                    "BULLISH SUPPORT",
+                    "#2aa84a",
+                    surface,
+                )
+
+            bearish_anchor = self._find_bearish_resistance_anchor(surface)
+            if bearish_anchor is not None:
+                self._draw_single_trendline(
+                    bearish_anchor,
+                    -1.0,
+                    "BEARISH RESISTANCE",
+                    "#c65a5a",
+                    surface,
+                )
+        except Exception as e:
+            self._log(f"Trendline overlay failed for {symbol}: {e}")
 
     def _draw_support_resistance_overlay(self, symbol: str, surface: dict):
         try:
