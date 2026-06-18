@@ -140,7 +140,7 @@ class App(tk.Tk):
 
         main = ttk.Frame(self, padding=10)
         main.grid(row=0, column=1, sticky="nsew")
-        main.rowconfigure(1, weight=1)
+        main.rowconfigure(2, weight=1)
         main.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="Scanner", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
@@ -208,8 +208,37 @@ class App(tk.Tk):
         self.meta_label.grid(row=1, column=0, sticky="w")
         ttk.Label(header, textvariable=self.status_var).grid(row=0, column=1, sticky="e")
 
+        self.structure_panel_vars = {}
+        structure_panel = ttk.LabelFrame(main, text="STRUCTURE", padding=(8, 6))
+        structure_panel.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        structure_fields = [
+            "trend_state",
+            "trend_regime",
+            "immediate_slope",
+            "swing_direction",
+            "support_level",
+            "resistance_level",
+            "breakout_context",
+            "is_extended_move",
+            "active_leg_boxes",
+            "latest_signal_name",
+            "market_state",
+            "last_price",
+        ]
+        for idx, field in enumerate(structure_fields):
+            col = idx % 4
+            row = idx // 4
+            cell = ttk.Frame(structure_panel)
+            cell.grid(row=row, column=col, sticky="w", padx=(0, 18), pady=2)
+            ttk.Label(cell, text=f"{field}:", font=("Segoe UI", 9, "bold")).pack(side="left")
+            var = tk.StringVar(value="N/A")
+            ttk.Label(cell, textvariable=var).pack(side="left", padx=(4, 0))
+            self.structure_panel_vars[field] = var
+        for col in range(4):
+            structure_panel.columnconfigure(col, weight=1)
+
         chart_frame = ttk.Frame(main)
-        chart_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+        chart_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 8))
         chart_frame.rowconfigure(0, weight=1)
         chart_frame.columnconfigure(1, weight=1)
 
@@ -232,7 +261,7 @@ class App(tk.Tk):
         self.chart_canvas.bind("<Shift-MouseWheel>", self._on_mousewheel_horizontal)
 
         bottom = ttk.Notebook(main)
-        bottom.grid(row=2, column=0, sticky="nsew")
+        bottom.grid(row=3, column=0, sticky="nsew")
         signals_tab = ttk.Frame(bottom, padding=8)
         log_tab = ttk.Frame(bottom, padding=8)
         bottom.add(signals_tab, text="Signals")
@@ -881,6 +910,48 @@ class App(tk.Tk):
                 reference_ts=int(reference_ts),
             )
 
+    def _structure_panel_field_value(self, field: str, value, profile: PnFProfile) -> str:
+        if value is None:
+            return "N/A"
+        if isinstance(value, bool):
+            return "YES" if value else "NO"
+        if field in {"support_level", "resistance_level", "last_price"}:
+            try:
+                return self._format_price(float(value), profile.box_size)
+            except Exception:
+                return "N/A"
+        return str(value) if str(value) else "N/A"
+
+    def _set_structure_panel_na(self):
+        try:
+            for var in getattr(self, "structure_panel_vars", {}).values():
+                var.set("N/A")
+        except Exception as e:
+            self._log(f"Structure panel reset failed: {e}")
+
+    def _update_structure_panel(self, symbol: str):
+        try:
+            engine = self.engines.get(symbol)
+            if engine is None or not getattr(engine, "columns", None):
+                self._set_structure_panel_na()
+                return
+
+            profile = self._get_profile(symbol)
+            structure = build_structure_state(
+                symbol=symbol,
+                profile=profile,
+                columns=engine.columns,
+                latest_signal_name=engine.latest_signal_name(),
+                market_state=engine.market_state(),
+                last_price=getattr(engine, "last_price", None),
+            )
+
+            for field, var in self.structure_panel_vars.items():
+                var.set(self._structure_panel_field_value(field, structure.get(field), profile))
+        except Exception as e:
+            self._log(f"Structure panel update failed for {symbol}: {e}")
+            self._set_structure_panel_na()
+
     def _split_storage_symbol(self, storage_symbol: str):
         if ":" in storage_symbol:
             exchange, native_symbol = storage_symbol.split(":", 1)
@@ -1020,6 +1091,7 @@ class App(tk.Tk):
         if not surface:
             self._draw_empty_canvases()
             self.meta_label.config(text="State: N/A | Signal: N/A | Last: N/A | Score: N/A | Priority: N/A")
+            self._set_structure_panel_na()
             return
 
         self.chart_surface = surface
@@ -1088,6 +1160,7 @@ class App(tk.Tk):
             )
         )
         self._update_profile_info()
+        self._update_structure_panel(symbol)
         self._sync_axes_to_chart_yview()
 
     def _draw_empty_canvases(self):
