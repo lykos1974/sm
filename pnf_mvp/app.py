@@ -1289,7 +1289,7 @@ class App(tk.Tk):
                 self._draw_single_trendline(
                     bullish_anchor,
                     1.0,
-                    "BULLISH SUPPORT",
+                    "BULLISH SLOPE GUIDE",
                     "#2aa84a",
                     surface,
                 )
@@ -1299,12 +1299,12 @@ class App(tk.Tk):
                 self._draw_single_trendline(
                     bearish_anchor,
                     -1.0,
-                    "BEARISH RESISTANCE",
+                    "BEARISH SLOPE GUIDE",
                     "#c65a5a",
                     surface,
                 )
         except Exception as e:
-            self._log(f"Trendline overlay failed for {symbol}: {e}")
+            self._log(f"Slope guide overlay failed for {symbol}: {e}")
 
     def _draw_support_resistance_overlay(self, symbol: str, surface: dict):
         try:
