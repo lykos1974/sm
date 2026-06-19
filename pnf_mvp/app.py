@@ -142,7 +142,7 @@ class App(tk.Tk):
 
         left = ttk.Frame(self, padding=10)
         left.grid(row=0, column=0, sticky="nsew")
-        left.rowconfigure(3, weight=1)
+        left.rowconfigure(4, weight=1)
         left.columnconfigure(0, weight=1)
 
         main = ttk.Frame(self, padding=10)
@@ -166,7 +166,45 @@ class App(tk.Tk):
                 command=self._update_top_opportunities,
             ).grid(row=0, column=idx, sticky="w", padx=(0, 8))
         self.top_opportunity_widgets = []
+        self.current_top_opportunities = []
+        self.selected_opportunity_symbol = None
         self._render_top_opportunities([])
+
+        self.opportunity_details_panel = ttk.LabelFrame(left, text="OPPORTUNITY DETAILS", padding=(8, 6))
+        self.opportunity_details_panel.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self.opportunity_details_panel.columnconfigure(1, weight=1)
+        self.opportunity_details_empty_var = tk.StringVar(value="No opportunity selected.")
+        self.opportunity_details_empty_label = ttk.Label(
+            self.opportunity_details_panel,
+            textvariable=self.opportunity_details_empty_var,
+        )
+        self.opportunity_details_empty_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.opportunity_details_vars = {}
+        opportunity_detail_fields = [
+            ("Rank", "rank"),
+            ("Symbol", "symbol"),
+            ("Status", "status"),
+            ("Quality", "quality"),
+            ("Quality Score", "quality_score"),
+            ("RR", "rr"),
+            ("Compared Against", "compared_against"),
+            ("Ranking Reason", "ranking_reason"),
+        ]
+        for row, (label_text, field) in enumerate(opportunity_detail_fields, start=1):
+            ttk.Label(
+                self.opportunity_details_panel,
+                text=f"{label_text}:",
+                font=("Segoe UI", 9, "bold"),
+            ).grid(row=row, column=0, sticky="nw", pady=1)
+            var = tk.StringVar(value="N/A")
+            ttk.Label(
+                self.opportunity_details_panel,
+                textvariable=var,
+                wraplength=260,
+                justify="left",
+            ).grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=1)
+            self.opportunity_details_vars[field] = var
+        self._set_opportunity_details_empty()
 
         columns = ("exchange", "native_symbol", "setup_status", "state", "signal", "priority", "last", "score", "updated")
         self.tree = ttk.Treeview(left, columns=columns, show="headings", height=16)
@@ -183,12 +221,12 @@ class App(tk.Tk):
         ]:
             self.tree.heading(col, text=col.upper())
             self.tree.column(col, width=width, anchor="center")
-        self.tree.grid(row=3, column=0, sticky="nsew")
+        self.tree.grid(row=4, column=0, sticky="nsew")
         self._setup_scanner_status_tags()
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         controls = ttk.Frame(left)
-        controls.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        controls.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         controls.columnconfigure(0, weight=1)
 
         ttk.Checkbutton(controls, text="Auto-follow first active symbol", variable=self.auto_follow).grid(row=0, column=0, sticky="w")
@@ -885,7 +923,75 @@ class App(tk.Tk):
         ranked.sort(key=lambda x: (-status_rank.get(x["status"], 0), -x["score"], -x["quality_rank"], -x["rr"], x["symbol"]))
         return ranked[:5]
 
+
+    def _set_opportunity_details_empty(self):
+        self.opportunity_details_empty_label.grid()
+        self.opportunity_details_empty_var.set("No opportunity selected.")
+        for var in getattr(self, "opportunity_details_vars", {}).values():
+            var.set("")
+
+    def _ranking_reason_for_opportunity(self, opportunity: dict, next_opportunity: dict | None) -> str:
+        if next_opportunity is None:
+            return "Top ranked visible opportunity."
+
+        status_rank = {"ACTIVE": 5, "CANDIDATE": 4, "WATCH": 3, "REJECT": 2, "NONE": 1}
+        selected_status = str(opportunity.get("status") or "NONE").upper()
+        next_status = str(next_opportunity.get("status") or "NONE").upper()
+        if status_rank.get(selected_status, 0) > status_rank.get(next_status, 0):
+            return f"{selected_status} outranks {next_status}."
+
+        selected_score = float(opportunity.get("score") or 0.0)
+        next_score = float(next_opportunity.get("score") or 0.0)
+        if selected_score > next_score:
+            return "Higher quality score than the next ranked opportunity."
+
+        selected_quality = int(opportunity.get("quality_rank") or 0)
+        next_quality = int(next_opportunity.get("quality_rank") or 0)
+        if selected_quality == next_quality and float(opportunity.get("rr") or 0.0) > float(next_opportunity.get("rr") or 0.0):
+            return "Same status and quality. Higher RR used as tie-breaker."
+
+        return "Same status, quality, and RR. Existing ranking order preserved."
+
+    def _update_opportunity_details(self, symbol: str | None = None):
+        selected_symbol = symbol or self.selected_opportunity_symbol
+        opportunities = getattr(self, "current_top_opportunities", [])
+        if not selected_symbol:
+            self.selected_opportunity_symbol = None
+            self._set_opportunity_details_empty()
+            return
+
+        selected_index = next((idx for idx, item in enumerate(opportunities) if item.get("symbol") == selected_symbol), None)
+        if selected_index is None:
+            self.selected_opportunity_symbol = None
+            self._set_opportunity_details_empty()
+            return
+
+        self.selected_opportunity_symbol = selected_symbol
+        opportunity = opportunities[selected_index]
+        next_opportunity = opportunities[selected_index + 1] if selected_index + 1 < len(opportunities) else None
+        _exchange, native_symbol = self._split_storage_symbol(selected_symbol)
+        quality = self._quality_grade_from_score((opportunity.get("setup") or {}).get("quality_score"))
+        next_text = "None"
+        if next_opportunity is not None:
+            _next_exchange, next_native_symbol = self._split_storage_symbol(next_opportunity["symbol"])
+            next_text = f"#{selected_index + 2} {next_native_symbol}"
+
+        self.opportunity_details_empty_label.grid_remove()
+        values = {
+            "rank": f"#{selected_index + 1}",
+            "symbol": native_symbol,
+            "status": opportunity.get("status", "NONE"),
+            "quality": quality,
+            "quality_score": f"{float(opportunity.get('score') or 0.0):.0f}",
+            "rr": f"{float(opportunity.get('rr') or 0.0):.1f}",
+            "compared_against": next_text,
+            "ranking_reason": self._ranking_reason_for_opportunity(opportunity, next_opportunity),
+        }
+        for field, var in self.opportunity_details_vars.items():
+            var.set(values.get(field, "N/A"))
+
     def _render_top_opportunities(self, opportunities: list[dict]):
+        self.current_top_opportunities = opportunities
         for widget in getattr(self, "top_opportunity_widgets", []):
             widget.destroy()
         self.top_opportunity_widgets = []
@@ -927,10 +1033,13 @@ class App(tk.Tk):
                 if selected_filter == "ALL" or exchange == selected_filter:
                     visible_items.append(item)
         self._render_top_opportunities(self._rank_visible_opportunities(visible_items))
+        self._update_opportunity_details(self.selected_opportunity_symbol)
 
     def _select_symbol_from_opportunity(self, symbol: str):
         if symbol not in self.tree.get_children():
             return
+        self.selected_opportunity_symbol = symbol
+        self._update_opportunity_details(symbol)
         self.tree.selection_set(symbol)
         self.tree.focus(symbol)
         self.tree.see(symbol)
@@ -1456,6 +1565,7 @@ class App(tk.Tk):
             self._update_profile_info()
             self.user_panned = False
             self._draw_selected(symbol)
+            self.selected_opportunity_symbol = symbol
             self._update_top_opportunities()
             self._focus_active_area(symbol)
             self._save_current_view_for_symbol(symbol)
