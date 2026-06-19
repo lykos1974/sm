@@ -1251,7 +1251,10 @@ class App(tk.Tk):
             self.left_axis.create_text(LEFT_AXIS_W - 6, y_center, text=f"{price:.{decimals}f}", fill="#95a3ad", anchor="e", font=("Consolas", 9))
             self.right_axis.create_text(6, y_center, text=f"{price:.{decimals}f}", fill="#95a3ad", anchor="w", font=("Consolas", 9))
 
+        self._draw_trade_zone_overlay(symbol, surface)
+        self._draw_trade_column_highlight_overlay(symbol, surface)
         self._draw_trendline_overlay(symbol, surface)
+        self._draw_support_resistance_overlay(symbol, surface)
 
         for i, col in enumerate(cols):
             global_col_idx = i + col_offset
@@ -1272,7 +1275,6 @@ class App(tk.Tk):
                     r = min(BOX_W, BOX_H) * 0.32
                     self.chart_canvas.create_oval(x_center - r, y_center - r, x_center + r, y_center + r, outline="#ff7b72", width=2)
 
-        self._draw_support_resistance_overlay(symbol, surface)
         self._draw_trade_visualization_overlay(symbol, surface)
 
         snapshot = self.latest_scanner.get(symbol, {})
@@ -1422,6 +1424,151 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"Slope guide overlay failed for {symbol}: {e}")
 
+    def _price_band_y_bounds(self, level_a: float, level_b: float, surface: dict):
+        display_bottom = surface["display_bottom"]
+        display_top = surface["display_top"]
+        low = max(min(level_a, level_b), display_bottom)
+        high = min(max(level_a, level_b), display_top)
+        if high < display_bottom or low > display_top or high <= low:
+            return None
+
+        y_high = self._price_center_y(high, surface)
+        y_low = self._price_center_y(low, surface)
+        return min(y_high, y_low), max(y_high, y_low)
+
+    def _setup_column_index(self, setup: dict, surface: dict):
+        for field in ("setup_column_idx", "setup_column_index", "signal_column_idx", "signal_column_index", "column_idx", "column_index"):
+            value = setup.get(field)
+            if value is not None:
+                try:
+                    return int(value)
+                except Exception:
+                    pass
+
+        engine = self.engines.get(setup.get("symbol"))
+        for sig in reversed(getattr(engine, "signals", []) if engine is not None else []):
+            try:
+                return int(sig.get("column_idx"))
+            except Exception:
+                continue
+
+        columns = surface["cols"]
+        return len(columns) - 1 if columns else None
+
+    def _entry_column_index(self, setup: dict, surface: dict):
+        for field in ("entry_column_idx", "entry_column_index", "entry_col_idx", "entry_col", "entry_column"):
+            value = setup.get(field)
+            if value is not None:
+                try:
+                    return int(value)
+                except Exception:
+                    pass
+        return None
+
+    def _draw_column_highlight(self, column_index: int, fill: str, surface: dict):
+        if column_index is None:
+            return
+        if column_index < 0 or column_index >= len(surface["cols"]):
+            return
+
+        global_col_idx = column_index + surface["col_offset"]
+        x_left = global_col_idx * BOX_W
+        x_right = x_left + BOX_W
+        self.chart_canvas.create_rectangle(
+            x_left,
+            0,
+            x_right,
+            surface["plot_h"],
+            fill=fill,
+            outline="",
+            stipple="gray25",
+        )
+
+
+    def _draw_column_highlight_label(self, column_index: int, label: str, text_fill: str, surface: dict):
+        if column_index is None:
+            return
+        if column_index < 0 or column_index >= len(surface["cols"]):
+            return
+        x_center = self._column_center_x(column_index, surface)
+        self.chart_canvas.create_text(
+            x_center,
+            14,
+            text=label,
+            fill=text_fill,
+            anchor="n",
+            angle=90,
+            font=("Consolas", 8, "bold"),
+        )
+
+    def _draw_trade_column_highlight_labels(self, symbol: str, surface: dict):
+        try:
+            setup = self._get_active_trade_visual_setup(symbol)
+            if setup is None:
+                return
+            setup_col = self._setup_column_index(setup, surface)
+            entry_col = self._entry_column_index(setup, surface)
+            self._draw_column_highlight_label(setup_col, "SETUP COLUMN", "#d6bd66", surface)
+            if entry_col is not None and entry_col != setup_col:
+                self._draw_column_highlight_label(entry_col, "ENTRY COLUMN", "#68bfd6", surface)
+        except Exception as e:
+            self._log(f"Trade column label overlay failed for {symbol}: {e}")
+
+    def _draw_trade_zone_overlay(self, symbol: str, surface: dict):
+        try:
+            setup = self._get_active_trade_visual_setup(symbol)
+            if setup is None:
+                return
+
+            bands = (
+                ("ideal_entry", "invalidation", "RISK ZONE", "#7b3131", "gray12"),
+                ("ideal_entry", "tp1", "TARGET ZONE", "#1f6f3a", "gray12"),
+                ("tp1", "tp2", "EXTENDED TARGET", "#2f8f4f", "gray12"),
+            )
+            for low_field, high_field, label, fill, stipple in bands:
+                try:
+                    level_a = float(setup.get(low_field))
+                    level_b = float(setup.get(high_field))
+                except Exception:
+                    continue
+                bounds = self._price_band_y_bounds(level_a, level_b, surface)
+                if bounds is None:
+                    continue
+                y_top, y_bottom = bounds
+                self.chart_canvas.create_rectangle(
+                    0,
+                    y_top,
+                    surface["plot_w"],
+                    y_bottom,
+                    fill=fill,
+                    outline="",
+                    stipple=stipple,
+                )
+                self.chart_canvas.create_text(
+                    8,
+                    y_top + 4,
+                    text=label,
+                    fill="#7fae8c" if "TARGET" in label else "#b77a7a",
+                    anchor="nw",
+                    font=("Consolas", 8, "bold"),
+                )
+        except Exception as e:
+            self._log(f"Trade zone overlay failed for {symbol}: {e}")
+
+    def _draw_trade_column_highlight_overlay(self, symbol: str, surface: dict):
+        try:
+            setup = self._get_active_trade_visual_setup(symbol)
+            if setup is None:
+                return
+
+            setup_col = self._setup_column_index(setup, surface)
+            entry_col = self._entry_column_index(setup, surface)
+            self._draw_column_highlight(setup_col, "#8a6f1f", surface)
+            if entry_col is not None and entry_col != setup_col:
+                self._draw_column_highlight(entry_col, "#1f5f7a", surface)
+        except Exception as e:
+            self._log(f"Trade column highlight overlay failed for {symbol}: {e}")
+
     def _draw_support_resistance_overlay(self, symbol: str, surface: dict):
         try:
             structure = self._build_current_structure_state(symbol)
@@ -1494,7 +1641,7 @@ class App(tk.Tk):
             active_setups = []
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
-                if status not in {"CANDIDATE", "WATCH"}:
+                if status not in {"ACTIVE", "CANDIDATE", "WATCH"}:
                     continue
                 if any(setup.get(field) is None for field in ("ideal_entry", "invalidation", "tp1", "tp2")):
                     continue
@@ -1503,7 +1650,7 @@ class App(tk.Tk):
             if not active_setups:
                 return None
 
-            status_rank = {"CANDIDATE": 0, "WATCH": 1}
+            status_rank = {"ACTIVE": 0, "CANDIDATE": 1, "WATCH": 2}
             side_rank = {"LONG": 0, "SHORT": 1}
             return sorted(
                 active_setups,
@@ -1584,6 +1731,7 @@ class App(tk.Tk):
                     font=("Consolas", 8, "bold"),
                 )
 
+            self._draw_trade_column_highlight_labels(symbol, surface)
             self.chart_canvas.create_text(
                 8,
                 16,
