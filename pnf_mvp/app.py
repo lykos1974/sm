@@ -1061,6 +1061,23 @@ class App(tk.Tk):
         cols = engine.columns
         actual_top = max(c.top for c in cols)
         actual_bottom = min(c.bottom for c in cols)
+
+        active_setup = self._get_active_trade_visual_setup(symbol)
+        if active_setup is not None:
+            setup_levels = [
+                active_setup.get("ideal_entry"),
+                active_setup.get("invalidation"),
+                active_setup.get("tp1"),
+                active_setup.get("tp2"),
+            ]
+            for setup_level in setup_levels:
+                try:
+                    level = float(setup_level)
+                except Exception:
+                    continue
+                actual_top = max(actual_top, level)
+                actual_bottom = min(actual_bottom, level)
+
         display_top = actual_top + EXTRA_ROWS_ABOVE * profile.box_size
         display_bottom = actual_bottom - EXTRA_ROWS_BELOW * profile.box_size
 
@@ -1159,6 +1176,7 @@ class App(tk.Tk):
                     self.chart_canvas.create_oval(x_center - r, y_center - r, x_center + r, y_center + r, outline="#ff7b72", width=2)
 
         self._draw_support_resistance_overlay(symbol, surface)
+        self._draw_trade_visualization_overlay(symbol, surface)
 
         snapshot = self.latest_scanner.get(symbol, {})
         self.meta_label.config(
@@ -1366,6 +1384,118 @@ class App(tk.Tk):
                 )
         except Exception as e:
             self._log(f"Support/resistance overlay failed for {symbol}: {e}")
+
+
+    def _get_active_trade_visual_setup(self, symbol: str):
+        try:
+            engine = self.engines.get(symbol)
+            if engine is None or not getattr(engine, "columns", None):
+                return None
+
+            _structure, setups = self._evaluate_strategy_setups(symbol, engine)
+            active_setups = []
+            for setup in setups:
+                status = str(setup.get("status") or "").upper()
+                if status not in {"CANDIDATE", "WATCH"}:
+                    continue
+                if any(setup.get(field) is None for field in ("ideal_entry", "invalidation", "tp1", "tp2")):
+                    continue
+                active_setups.append(setup)
+
+            if not active_setups:
+                return None
+
+            status_rank = {"CANDIDATE": 0, "WATCH": 1}
+            side_rank = {"LONG": 0, "SHORT": 1}
+            return sorted(
+                active_setups,
+                key=lambda setup: (
+                    status_rank.get(str(setup.get("status") or "").upper(), 99),
+                    side_rank.get(str(setup.get("side") or "").upper(), 99),
+                    -float(setup.get("quality_score") or 0.0),
+                ),
+            )[0]
+        except Exception as e:
+            self._log(f"Trade visualization setup lookup failed for {symbol}: {e}")
+            return None
+
+    def _draw_trade_visualization_overlay(self, symbol: str, surface: dict):
+        try:
+            setup = self._get_active_trade_visual_setup(symbol)
+            if setup is None:
+                return
+
+            profile = surface["profile"]
+            display_bottom = surface["display_bottom"]
+            display_top = surface["display_top"]
+            plot_w = surface["plot_w"]
+            plot_h = surface["plot_h"]
+            scroll_rows = surface["scroll_rows"]
+            row_offset = surface["row_offset"]
+            right_label_x = RIGHT_AXIS_W - 6
+
+            line_specs = (
+                ("ideal_entry", "ENTRY", "#f2cc60", 3, ()),
+                ("invalidation", "STOP", "#ff4d4d", 3, (2, 3)),
+                ("tp1", "TP1", "#46d369", 2, (8, 4)),
+                ("tp2", "TP2", "#2fbf71", 2, (8, 4)),
+            )
+            side = str(setup.get("side") or "").upper()
+            status = str(setup.get("status") or "").upper()
+
+            for field, label, color, width, dash in line_specs:
+                try:
+                    level = float(setup.get(field))
+                except Exception:
+                    continue
+
+                if level < display_bottom or level > display_top:
+                    continue
+
+                local_row_idx = int(round((level - display_bottom) / profile.box_size))
+                global_row_idx = local_row_idx + row_offset
+                if global_row_idx < 0 or global_row_idx >= scroll_rows:
+                    continue
+
+                y_top = plot_h - (global_row_idx + 1) * BOX_H
+                y_bottom = plot_h - global_row_idx * BOX_H
+                y_center = (y_top + y_bottom) / 2
+                price_text = self._format_price(level, profile.box_size)
+                line_kwargs = {
+                    "fill": color,
+                    "width": width,
+                }
+                if dash:
+                    line_kwargs["dash"] = dash
+
+                self.chart_canvas.create_line(0, y_center, plot_w, y_center, **line_kwargs)
+                self.chart_canvas.create_text(
+                    8,
+                    y_center - 8,
+                    text=f"{label} {price_text}",
+                    fill=color,
+                    anchor="w",
+                    font=("Consolas", 9, "bold"),
+                )
+                self.right_axis.create_text(
+                    right_label_x,
+                    y_center,
+                    text=f"{label} {price_text}",
+                    fill=color,
+                    anchor="e",
+                    font=("Consolas", 8, "bold"),
+                )
+
+            self.chart_canvas.create_text(
+                8,
+                16,
+                text=f"TRADE SETUP {side} {status}",
+                fill="#d7dde2",
+                anchor="w",
+                font=("Consolas", 9, "bold"),
+            )
+        except Exception as e:
+            self._log(f"Trade visualization overlay failed for {symbol}: {e}")
 
     def _draw_empty_canvases(self):
         cw = max(self.chart_canvas.winfo_width(), 500)
