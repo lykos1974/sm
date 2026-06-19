@@ -140,7 +140,7 @@ class App(tk.Tk):
 
         main = ttk.Frame(self, padding=10)
         main.grid(row=0, column=1, sticky="nsew")
-        main.rowconfigure(3, weight=1)
+        main.rowconfigure(4, weight=1)
         main.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="Scanner", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
@@ -278,8 +278,28 @@ class App(tk.Tk):
         for col in range(5):
             trade_setup_panel.columnconfigure(col, weight=1)
 
+        self.setup_explanation_panel_vars = {}
+        setup_explanation_panel = ttk.LabelFrame(main, text="SETUP EXPLANATION", padding=(8, 6))
+        setup_explanation_panel.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        setup_explanation_fields = [
+            ("Status Reason", "status_reason"),
+            ("Quality Reason", "quality_reason"),
+            ("Risk Notes", "risk_notes"),
+            ("Context", "context"),
+        ]
+        for idx, (label, field) in enumerate(setup_explanation_fields):
+            cell = ttk.Frame(setup_explanation_panel)
+            cell.grid(row=idx, column=0, sticky="ew", pady=2)
+            cell.columnconfigure(1, weight=1)
+            ttk.Label(cell, text=f"{label}:", font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="nw")
+            var = tk.StringVar(value="N/A")
+            value_label = ttk.Label(cell, textvariable=var, wraplength=1200, justify="left")
+            value_label.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+            self.setup_explanation_panel_vars[field] = var
+        setup_explanation_panel.columnconfigure(0, weight=1)
+
         chart_frame = ttk.Frame(main)
-        chart_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 8))
+        chart_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 8))
         chart_frame.rowconfigure(0, weight=1)
         chart_frame.columnconfigure(1, weight=1)
 
@@ -302,7 +322,7 @@ class App(tk.Tk):
         self.chart_canvas.bind("<Shift-MouseWheel>", self._on_mousewheel_horizontal)
 
         bottom = ttk.Notebook(main)
-        bottom.grid(row=4, column=0, sticky="nsew")
+        bottom.grid(row=5, column=0, sticky="nsew")
         signals_tab = ttk.Frame(bottom, padding=8)
         log_tab = ttk.Frame(bottom, padding=8)
         bottom.add(signals_tab, text="Signals")
@@ -1146,6 +1166,74 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"Trade setup panel reset failed: {e}")
 
+    def _first_setup_explanation_value(self, setup: dict, fields: tuple[str, ...]) -> str:
+        for field in fields:
+            try:
+                value = setup.get(field)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                text = " | ".join(str(item).strip() for item in value if str(item).strip())
+            elif isinstance(value, dict):
+                text = " | ".join(f"{key}={val}" for key, val in value.items() if val is not None and str(val).strip())
+            else:
+                text = str(value).strip()
+            if text:
+                return text
+        return "N/A"
+
+    def _format_setup_explanation_field_value(self, field: str, setup: dict) -> str:
+        if field == "status_reason":
+            status = str(setup.get("status") or "").upper()
+            status_fields_by_status = {
+                "ACTIVE": ("promotion_reason", "active_reason", "setup_reason", "status_reason", "reason"),
+                "CANDIDATE": ("candidate_reason", "setup_reason", "status_reason", "reason"),
+                "WATCH": ("watch_reason", "setup_reason", "status_reason", "reason"),
+                "REJECT": ("rejection_reason", "reject_reason", "setup_reason", "status_reason", "reason"),
+            }
+            return self._first_setup_explanation_value(
+                setup,
+                status_fields_by_status.get(status, ("status_reason", "setup_reason", "reason")),
+            )
+        if field == "quality_reason":
+            return self._first_setup_explanation_value(
+                setup,
+                ("quality_reason", "quality_notes", "quality_explanation", "pullback_quality", "setup_maturity", "trigger_quality", "impulse_quality", "continuation_quality"),
+            )
+        if field == "risk_notes":
+            return self._first_setup_explanation_value(
+                setup,
+                ("risk_notes", "risk_reason", "risk_explanation", "risk_quality", "reward_quality", "reject_reason"),
+            )
+        if field == "context":
+            return self._first_setup_explanation_value(
+                setup,
+                ("context_reason", "context", "explanation", "notes", "breakout_context", "decision_path", "decision_version"),
+            )
+        return "N/A"
+
+    def _set_setup_explanation_panel_na(self):
+        try:
+            for var in getattr(self, "setup_explanation_panel_vars", {}).values():
+                var.set("N/A")
+        except Exception as e:
+            self._log(f"Setup explanation panel reset failed: {e}")
+
+    def _update_setup_explanation_panel(self, symbol: str):
+        try:
+            summary = self._get_setup_status_summary(symbol)
+            setup = summary.get("setup")
+            if setup is None or summary.get("status") == "NONE":
+                self._set_setup_explanation_panel_na()
+                return
+            for field, var in self.setup_explanation_panel_vars.items():
+                var.set(self._format_setup_explanation_field_value(field, setup))
+        except Exception as e:
+            self._log(f"Setup explanation panel update failed for {symbol}: {e}")
+            self._set_setup_explanation_panel_na()
+
     def _update_trade_setup_panel(self, symbol: str):
         try:
             setup = self._get_active_trade_visual_setup(symbol)
@@ -1362,6 +1450,7 @@ class App(tk.Tk):
             self._update_chart_header_badges(symbol)
             self._set_structure_panel_na()
             self._set_trade_setup_panel_na()
+            self._set_setup_explanation_panel_na()
             return
 
         self.chart_surface = surface
@@ -1439,6 +1528,7 @@ class App(tk.Tk):
         self._update_profile_info()
         self._update_structure_panel(symbol)
         self._update_trade_setup_panel(symbol)
+        self._update_setup_explanation_panel(symbol)
         self._update_chart_header_badges(symbol)
         self._sync_axes_to_chart_yview()
 
