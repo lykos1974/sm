@@ -97,6 +97,13 @@ class App(tk.Tk):
         self.active_symbol = self.settings["symbols"][0]
         self.auto_follow = tk.BooleanVar(value=True)
         self.exchange_filter = tk.StringVar(value="ALL")
+        self.top_opportunity_status_filters = {
+            "ACTIVE": tk.BooleanVar(value=True),
+            "CANDIDATE": tk.BooleanVar(value=True),
+            "WATCH": tk.BooleanVar(value=True),
+            "REJECT": tk.BooleanVar(value=False),
+            "NONE": tk.BooleanVar(value=False),
+        }
         self.structure_debug_enabled = tk.BooleanVar(value=False)
         self.structure_debug_symbol = tk.StringVar(value="BTCUSDT")
         self.status_var = tk.StringVar(value="Starting...")
@@ -149,6 +156,15 @@ class App(tk.Tk):
         self.top_opportunities_panel = ttk.LabelFrame(left, text="TOP OPPORTUNITIES", padding=(8, 6))
         self.top_opportunities_panel.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.top_opportunities_panel.columnconfigure(0, weight=1)
+        self.top_opportunity_filter_frame = ttk.Frame(self.top_opportunities_panel)
+        self.top_opportunity_filter_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        for idx, status in enumerate(("ACTIVE", "CANDIDATE", "WATCH", "REJECT", "NONE")):
+            ttk.Checkbutton(
+                self.top_opportunity_filter_frame,
+                text=status,
+                variable=self.top_opportunity_status_filters[status],
+                command=self._update_top_opportunities,
+            ).grid(row=0, column=idx, sticky="w", padx=(0, 8))
         self.top_opportunity_widgets = []
         self._render_top_opportunities([])
 
@@ -840,13 +856,23 @@ class App(tk.Tk):
                 continue
         return 0.0
 
+    def _enabled_top_opportunity_statuses(self) -> set[str]:
+        return {
+            status
+            for status, enabled in self.top_opportunity_status_filters.items()
+            if enabled.get()
+        }
+
     def _rank_visible_opportunities(self, visible_items: list[dict]) -> list[dict]:
         status_rank = {"ACTIVE": 5, "CANDIDATE": 4, "WATCH": 3, "REJECT": 2, "NONE": 1}
+        enabled_statuses = self._enabled_top_opportunity_statuses()
         ranked = []
         for item in visible_items:
             symbol = item["symbol"]
             summary = self._get_setup_status_summary(symbol)
             status = str(summary.get("status") or "NONE").upper()
+            if status not in enabled_statuses:
+                continue
             setup = summary.get("setup")
             ranked.append({
                 "symbol": symbol,
@@ -857,7 +883,7 @@ class App(tk.Tk):
                 "rr": self._setup_rr_value(setup),
             })
         ranked.sort(key=lambda x: (-status_rank.get(x["status"], 0), -x["score"], -x["quality_rank"], -x["rr"], x["symbol"]))
-        return [item for item in ranked if item["status"] != "NONE"][:5]
+        return ranked[:5]
 
     def _render_top_opportunities(self, opportunities: list[dict]):
         for widget in getattr(self, "top_opportunity_widgets", []):
@@ -866,7 +892,7 @@ class App(tk.Tk):
 
         if not opportunities:
             empty = ttk.Label(self.top_opportunities_panel, text="No ranked opportunities")
-            empty.grid(row=0, column=0, sticky="w")
+            empty.grid(row=1, column=0, sticky="w")
             self.top_opportunity_widgets.append(empty)
             return
 
@@ -888,7 +914,7 @@ class App(tk.Tk):
                 font=("Segoe UI", 9, "bold"),
                 cursor="hand2",
             )
-            label.grid(row=idx - 1, column=0, sticky="ew", pady=(0, 3))
+            label.grid(row=idx, column=0, sticky="ew", pady=(0, 3))
             label.bind("<Button-1>", lambda _event, selected=symbol: self._select_symbol_from_opportunity(selected))
             self.top_opportunity_widgets.append(label)
 
