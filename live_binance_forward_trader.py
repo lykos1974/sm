@@ -126,6 +126,20 @@ class TriangleSignal:
 
 
 @dataclass(frozen=True)
+class SetupExecutionIntent:
+    setup_id: str
+    symbol: str
+    side: str
+    entry: Decimal
+    stop: Decimal
+    tp1: Decimal
+    tp2: Decimal
+    rr1: Decimal | None
+    rr2: Decimal | None
+    reference_ts: int
+
+
+@dataclass(frozen=True)
 class PoleMotifSignal:
     symbol: str
     direction: str
@@ -324,6 +338,102 @@ def log_db_info(db_path: str | os.PathLike[str], conn: sqlite3.Connection | None
 
 def sqlite_readonly_uri(db_path: str | os.PathLike[str]) -> str:
     return Path(db_path).expanduser().absolute().as_uri() + "?mode=ro"
+
+
+def connect_strategy_setups_db_readonly(db_path: str | os.PathLike[str]) -> sqlite3.Connection:
+    conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_executable_strategy_setups(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            setup_id, symbol, side, ideal_entry, invalidation, tp1, tp2, rr1, rr2,
+            reference_ts, status, breakout_context, pullback_quality,
+            active_leg_boxes, is_extended_move, resolution_status
+        FROM strategy_setups
+        WHERE status = 'CANDIDATE'
+          AND side = 'LONG'
+          AND breakout_context = 'POST_BREAKOUT_PULLBACK'
+          AND pullback_quality = 'HEALTHY'
+          AND active_leg_boxes = 2
+          AND COALESCE(is_extended_move, 0) = 0
+          AND resolution_status = 'PENDING'
+        ORDER BY reference_ts ASC, symbol ASC, setup_id ASC
+        """
+    ).fetchall()
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    return _dec(value)
+
+
+def setup_row_to_execution_intent(row: sqlite3.Row | dict[str, Any]) -> tuple[SetupExecutionIntent | None, str | None]:
+    raw = dict(row)
+    setup_id = str(raw.get("setup_id") or "").strip()
+    if not setup_id:
+        return None, "missing setup_id"
+    symbol = str(raw.get("symbol") or "").strip()
+    if not symbol:
+        return None, "missing symbol"
+    side = str(raw.get("side") or "").upper()
+    if side != "LONG":
+        return None, "unsupported side"
+    required_prices = {
+        "entry": raw.get("ideal_entry"),
+        "stop": raw.get("invalidation"),
+        "tp1": raw.get("tp1"),
+        "tp2": raw.get("tp2"),
+    }
+    missing = [name for name, value in required_prices.items() if value in (None, "")]
+    if missing:
+        return None, f"missing required price fields: {','.join(missing)}"
+    try:
+        entry = _dec(raw.get("ideal_entry"))
+        stop = _dec(raw.get("invalidation"))
+        tp1 = _dec(raw.get("tp1"))
+        tp2 = _dec(raw.get("tp2"))
+        rr1 = _optional_decimal(raw.get("rr1"))
+        rr2 = _optional_decimal(raw.get("rr2"))
+        reference_ts = int(raw.get("reference_ts"))
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        return None, f"invalid setup execution field: {exc}"
+    if not (stop < entry < tp1 < tp2):
+        return None, "invalid LONG risk levels: expected stop < entry < tp1 < tp2"
+    return (
+        SetupExecutionIntent(
+            setup_id=setup_id,
+            symbol=symbol,
+            side=side,
+            entry=entry,
+            stop=stop,
+            tp1=tp1,
+            tp2=tp2,
+            rr1=rr1,
+            rr2=rr2,
+            reference_ts=reference_ts,
+        ),
+        None,
+    )
+
+
+def setup_execution_payload(intent: SetupExecutionIntent) -> dict[str, Any]:
+    return {
+        "setup_id": intent.setup_id,
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "entry": str(intent.entry),
+        "stop": str(intent.stop),
+        "tp1": str(intent.tp1),
+        "tp2": str(intent.tp2),
+        "rr1": str(intent.rr1) if intent.rr1 is not None else None,
+        "rr2": str(intent.rr2) if intent.rr2 is not None else None,
+        "reference_ts": intent.reference_ts,
+    }
 
 
 RESEARCH_RULE_REQUIRED_FIELDS = (
@@ -3175,6 +3285,35 @@ def process_once(args: argparse.Namespace, *, iteration: int | None = None) -> N
             console("ORDER_SENT", f"{signal.symbol} {signal.pattern}", lifecycle_result)
 
 
+def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
+    loop_iteration = 1 if iteration is None else iteration
+    console("LOOP_BEGIN", f"iteration={loop_iteration}")
+    console("SETUP_CONSUMER_MODE", "ENABLED")
+    setup_db_path = getattr(args, "strategy_setups_db", None)
+    if not setup_db_path:
+        raise RuntimeError("--strategy-setups-db is required when --consume-strategy-setups is supplied")
+
+    with closing(connect_strategy_setups_db_readonly(setup_db_path)) as setup_conn:
+        rows = load_executable_strategy_setups(setup_conn)
+
+    console("SETUP_ROWS_FOUND", str(len(rows)))
+    accepted = 0
+    for row in rows:
+        intent, reject_reason = setup_row_to_execution_intent(row)
+        row_payload = {
+            "setup_id": row["setup_id"] if "setup_id" in row.keys() else None,
+            "symbol": row["symbol"] if "symbol" in row.keys() else None,
+            "reject_reason": reject_reason,
+        }
+        if intent is None:
+            console("SETUP_EXECUTION_REJECTED", "", row_payload)
+            continue
+        accepted += 1
+        console("SETUP_EXECUTION_CANDIDATE", "", setup_execution_payload(intent))
+    if accepted == 0:
+        console("NO_EXECUTABLE_SETUPS", "")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forward-validate strict PnF triangles with guarded Binance USD-M futures micro-orders")
     parser.add_argument("--db-path", required=True, help="Path to existing market_data.db; opened read-only and used only as the candle source")
@@ -3201,6 +3340,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconcile-positions", action="store_true", help="Read-only Binance/local open position reconciliation report; exits before scanning or submitting orders")
     parser.add_argument("--export-trade-journal", help="Read-only CSV export path for all rows in live_trades_binance; exits before scanning or submitting orders")
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
+    parser.add_argument("--consume-strategy-setups", action="store_true", help="Read scanner-generated strategy_setups rows and emit setup execution intents; read-only/no orders")
+    parser.add_argument("--strategy-setups-db", help="Path to strategy_validation.db containing strategy_setups for --consume-strategy-setups")
     return parser.parse_args()
 
 
@@ -3219,11 +3360,17 @@ def main() -> None:
     if args.loop:
         iteration = 1
         while True:
-            process_once(args, iteration=iteration)
+            if bool(getattr(args, "consume_strategy_setups", False)):
+                process_setup_execution_once(args, iteration=iteration)
+            else:
+                process_once(args, iteration=iteration)
             iteration += 1
             time.sleep(args.poll_seconds)
     else:
-        process_once(args, iteration=1)
+        if bool(getattr(args, "consume_strategy_setups", False)):
+            process_setup_execution_once(args, iteration=1)
+        else:
+            process_once(args, iteration=1)
 
 
 if __name__ == "__main__":

@@ -71,6 +71,68 @@ def replace_signal(signal, **overrides):
     return trader.TriangleSignal(**values)
 
 
+def create_strategy_setups_db(path, rows):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE strategy_setups (
+            setup_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reference_ts INTEGER NOT NULL,
+            breakout_context TEXT,
+            pullback_quality TEXT,
+            active_leg_boxes INTEGER,
+            is_extended_move INTEGER,
+            resolution_status TEXT NOT NULL,
+            ideal_entry REAL,
+            invalidation REAL,
+            tp1 REAL,
+            tp2 REAL,
+            rr1 REAL,
+            rr2 REAL
+        )
+        """
+    )
+    for row in rows:
+        payload = {
+            "setup_id": "setup-1",
+            "symbol": "BINANCE_FUT:ETHUSDT",
+            "side": "LONG",
+            "status": "CANDIDATE",
+            "reference_ts": 1_700_000_000,
+            "breakout_context": "POST_BREAKOUT_PULLBACK",
+            "pullback_quality": "HEALTHY",
+            "active_leg_boxes": 2,
+            "is_extended_move": 0,
+            "resolution_status": "PENDING",
+            "ideal_entry": 100.0,
+            "invalidation": 95.0,
+            "tp1": 105.0,
+            "tp2": 110.0,
+            "rr1": 1.0,
+            "rr2": 2.0,
+            **row,
+        }
+        conn.execute(
+            """
+            INSERT INTO strategy_setups(
+                setup_id, symbol, side, status, reference_ts, breakout_context,
+                pullback_quality, active_leg_boxes, is_extended_move, resolution_status,
+                ideal_entry, invalidation, tp1, tp2, rr1, rr2
+            ) VALUES(
+                :setup_id, :symbol, :side, :status, :reference_ts, :breakout_context,
+                :pullback_quality, :active_leg_boxes, :is_extended_move, :resolution_status,
+                :ideal_entry, :invalidation, :tp1, :tp2, :rr1, :rr2
+            )
+            """,
+            payload,
+        )
+    conn.commit()
+    conn.close()
+
+
 def sample_double_signal(trigger_ts=123456, pattern="double_top_breakout"):
     if pattern == "double_bottom_breakdown":
         return trader.TriangleSignal(
@@ -214,6 +276,124 @@ class ForceDemoClient(DemoInitClient):
 
 
 class BinanceForwardTraderTests(unittest.TestCase):
+    def test_setup_consumer_baseline_filter_and_candidate_logging(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            create_strategy_setups_db(
+                db_path,
+                [
+                    {"setup_id": "valid-setup"},
+                    {"setup_id": "watch-row", "status": "WATCH"},
+                    {"setup_id": "short-row", "side": "SHORT"},
+                    {"setup_id": "extended-row", "is_extended_move": 1},
+                    {"setup_id": "wrong-leg-row", "active_leg_boxes": 3},
+                    {"setup_id": "resolved-row", "resolution_status": "TP2"},
+                ],
+            )
+            args = argparse.Namespace(strategy_setups_db=db_path)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_setup_execution_once(args, iteration=3)
+
+        logs = output.getvalue()
+        self.assertIn("SETUP_CONSUMER_MODE ENABLED", logs)
+        self.assertIn("SETUP_ROWS_FOUND 1", logs)
+        self.assertIn("SETUP_EXECUTION_CANDIDATE", logs)
+        self.assertIn('"setup_id": "valid-setup"', logs)
+        self.assertIn('"entry": "100.0"', logs)
+        self.assertNotIn("watch-row", logs)
+        self.assertNotIn("short-row", logs)
+
+    def test_setup_consumer_rejects_invalid_long_risk_levels(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            create_strategy_setups_db(
+                db_path,
+                [
+                    {"setup_id": "bad-risk", "ideal_entry": 100.0, "invalidation": 101.0, "tp1": 105.0, "tp2": 110.0},
+                ],
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_setup_execution_once(argparse.Namespace(strategy_setups_db=db_path), iteration=1)
+
+        logs = output.getvalue()
+        self.assertIn("SETUP_ROWS_FOUND 1", logs)
+        self.assertIn("SETUP_EXECUTION_REJECTED", logs)
+        self.assertIn("invalid LONG risk levels", logs)
+        self.assertIn("NO_EXECUTABLE_SETUPS", logs)
+
+    def test_setup_consumer_opens_strategy_setups_db_read_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            create_strategy_setups_db(db_path, [{"setup_id": "valid-setup"}])
+            with closing(trader.connect_strategy_setups_db_readonly(db_path)) as conn:
+                self.assertEqual(len(trader.load_executable_strategy_setups(conn)), 1)
+                with self.assertRaises(sqlite3.OperationalError):
+                    conn.execute("UPDATE strategy_setups SET status = 'WATCH' WHERE setup_id = 'valid-setup'")
+
+    def test_setup_consumer_does_not_submit_orders_or_initialize_binance_client(self):
+        class ForbiddenClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("Binance client must not be initialized in read-only setup consumer mode")
+
+        original_client = trader.BinanceFuturesClient
+        try:
+            trader.BinanceFuturesClient = ForbiddenClient
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = os.path.join(temp_dir, "strategy_validation.db")
+                create_strategy_setups_db(db_path, [{"setup_id": "valid-setup"}])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.process_setup_execution_once(argparse.Namespace(strategy_setups_db=db_path), iteration=1)
+        finally:
+            trader.BinanceFuturesClient = original_client
+
+        self.assertIn("SETUP_EXECUTION_CANDIDATE", output.getvalue())
+
+    def test_main_dispatches_to_setup_consumer_only_when_flag_is_enabled(self):
+        original_parse_args = trader.parse_args
+        original_process_once = trader.process_once
+        original_setup_once = trader.process_setup_execution_once
+        try:
+            calls = []
+            trader.process_once = lambda parsed_args, *, iteration=None: calls.append(("signal", iteration))
+            trader.process_setup_execution_once = lambda parsed_args, *, iteration=None: calls.append(("setup", iteration))
+            trader.parse_args = lambda: argparse.Namespace(
+                db_path="unused-market.db",
+                state_db_path="unused-state.db",
+                settings="unused-settings.json",
+                dry_run=True,
+                demo=True,
+                export_trade_journal=None,
+                reconcile_positions=False,
+                consume_strategy_setups=False,
+                loop=False,
+                poll_seconds=0,
+            )
+            with redirect_stdout(io.StringIO()):
+                trader.main()
+            trader.parse_args = lambda: argparse.Namespace(
+                db_path="unused-market.db",
+                state_db_path="unused-state.db",
+                settings="unused-settings.json",
+                dry_run=True,
+                demo=True,
+                export_trade_journal=None,
+                reconcile_positions=False,
+                consume_strategy_setups=True,
+                loop=False,
+                poll_seconds=0,
+            )
+            with redirect_stdout(io.StringIO()):
+                trader.main()
+        finally:
+            trader.parse_args = original_parse_args
+            trader.process_once = original_process_once
+            trader.process_setup_execution_once = original_setup_once
+
+        self.assertEqual(calls, [("signal", 1), ("setup", 1)])
+
     def test_research_rule_matching_eth_long_watch_setup_passes(self):
         rule = {
             "rule_id": "eth-long-cont-persist-v1",
