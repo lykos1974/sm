@@ -135,7 +135,7 @@ class App(tk.Tk):
 
         left = ttk.Frame(self, padding=10)
         left.grid(row=0, column=0, sticky="nsew")
-        left.rowconfigure(2, weight=1)
+        left.rowconfigure(3, weight=1)
         left.columnconfigure(0, weight=1)
 
         main = ttk.Frame(self, padding=10)
@@ -145,6 +145,12 @@ class App(tk.Tk):
 
         ttk.Label(left, text="Scanner", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(left, textvariable=self.profile_info_var).grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self.top_opportunities_panel = ttk.LabelFrame(left, text="TOP OPPORTUNITIES", padding=(8, 6))
+        self.top_opportunities_panel.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self.top_opportunities_panel.columnconfigure(0, weight=1)
+        self.top_opportunity_widgets = []
+        self._render_top_opportunities([])
 
         columns = ("exchange", "native_symbol", "setup_status", "state", "signal", "priority", "last", "score", "updated")
         self.tree = ttk.Treeview(left, columns=columns, show="headings", height=16)
@@ -161,12 +167,12 @@ class App(tk.Tk):
         ]:
             self.tree.heading(col, text=col.upper())
             self.tree.column(col, width=width, anchor="center")
-        self.tree.grid(row=2, column=0, sticky="nsew")
+        self.tree.grid(row=3, column=0, sticky="nsew")
         self._setup_scanner_status_tags()
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         controls = ttk.Frame(left)
-        controls.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        controls.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         controls.columnconfigure(0, weight=1)
 
         ttk.Checkbutton(controls, text="Auto-follow first active symbol", variable=self.auto_follow).grid(row=0, column=0, sticky="w")
@@ -815,7 +821,94 @@ class App(tk.Tk):
         finally:
             self.suppress_tree_select_handler = False
         self._update_profile_info()
+        self._update_top_opportunities(filtered_items)
 
+    def _setup_quality_rank(self, setup: dict | None) -> int:
+        if setup is None:
+            return 0
+        return {"D": 1, "C": 2, "B": 3, "A": 4, "A+": 5}.get(self._quality_grade_from_score(setup.get("quality_score")), 0)
+
+    def _setup_rr_value(self, setup: dict | None) -> float:
+        if setup is None:
+            return 0.0
+        for field in ("rr2", "rr1"):
+            try:
+                value = setup.get(field)
+                if value is not None:
+                    return float(value)
+            except Exception:
+                continue
+        return 0.0
+
+    def _rank_visible_opportunities(self, visible_items: list[dict]) -> list[dict]:
+        status_rank = {"ACTIVE": 5, "CANDIDATE": 4, "WATCH": 3, "REJECT": 2, "NONE": 1}
+        ranked = []
+        for item in visible_items:
+            symbol = item["symbol"]
+            summary = self._get_setup_status_summary(symbol)
+            status = str(summary.get("status") or "NONE").upper()
+            setup = summary.get("setup")
+            ranked.append({
+                "symbol": symbol,
+                "status": status,
+                "setup": setup,
+                "score": float((setup or {}).get("quality_score") or 0.0),
+                "quality_rank": self._setup_quality_rank(setup),
+                "rr": self._setup_rr_value(setup),
+            })
+        ranked.sort(key=lambda x: (-status_rank.get(x["status"], 0), -x["score"], -x["quality_rank"], -x["rr"], x["symbol"]))
+        return [item for item in ranked if item["status"] != "NONE"][:5]
+
+    def _render_top_opportunities(self, opportunities: list[dict]):
+        for widget in getattr(self, "top_opportunity_widgets", []):
+            widget.destroy()
+        self.top_opportunity_widgets = []
+
+        if not opportunities:
+            empty = ttk.Label(self.top_opportunities_panel, text="No ranked opportunities")
+            empty.grid(row=0, column=0, sticky="w")
+            self.top_opportunity_widgets.append(empty)
+            return
+
+        for idx, opportunity in enumerate(opportunities, start=1):
+            symbol = opportunity["symbol"]
+            _exchange, native_symbol = self._split_storage_symbol(symbol)
+            status = opportunity["status"]
+            quality = self._quality_grade_from_score((opportunity.get("setup") or {}).get("quality_score"))
+            rr = opportunity["rr"]
+            bg, fg = self._setup_status_colors(status)
+            label = tk.Label(
+                self.top_opportunities_panel,
+                text=f"#{idx} {native_symbol}   {status} | {quality} | RR {rr:.1f}",
+                anchor="w",
+                padx=8,
+                pady=3,
+                bg=bg,
+                fg=fg,
+                font=("Segoe UI", 9, "bold"),
+                cursor="hand2",
+            )
+            label.grid(row=idx - 1, column=0, sticky="ew", pady=(0, 3))
+            label.bind("<Button-1>", lambda _event, selected=symbol: self._select_symbol_from_opportunity(selected))
+            self.top_opportunity_widgets.append(label)
+
+    def _update_top_opportunities(self, visible_items: list[dict] | None = None):
+        if visible_items is None:
+            selected_filter = self.exchange_filter.get()
+            visible_items = []
+            for item in self.latest_scanner.values():
+                exchange, _native_symbol = self._split_storage_symbol(item["symbol"])
+                if selected_filter == "ALL" or exchange == selected_filter:
+                    visible_items.append(item)
+        self._render_top_opportunities(self._rank_visible_opportunities(visible_items))
+
+    def _select_symbol_from_opportunity(self, symbol: str):
+        if symbol not in self.tree.get_children():
+            return
+        self.tree.selection_set(symbol)
+        self.tree.focus(symbol)
+        self.tree.see(symbol)
+        self._on_tree_select()
 
     def _update_structure_debug_choices(self):
         try:
@@ -1315,6 +1408,7 @@ class App(tk.Tk):
 
         self._draw_selected(self.active_symbol)
         self._update_profile_info()
+        self._update_top_opportunities()
 
     def _update_profile_info(self):
         symbol = self.selected_symbol.get()
@@ -1336,6 +1430,7 @@ class App(tk.Tk):
             self._update_profile_info()
             self.user_panned = False
             self._draw_selected(symbol)
+            self._update_top_opportunities()
             self._focus_active_area(symbol)
             self._save_current_view_for_symbol(symbol)
 
