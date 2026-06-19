@@ -140,7 +140,7 @@ class App(tk.Tk):
 
         main = ttk.Frame(self, padding=10)
         main.grid(row=0, column=1, sticky="nsew")
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(3, weight=1)
         main.columnconfigure(0, weight=1)
 
         ttk.Label(left, text="Scanner", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
@@ -237,8 +237,35 @@ class App(tk.Tk):
         for col in range(4):
             structure_panel.columnconfigure(col, weight=1)
 
+        self.trade_setup_panel_vars = {}
+        trade_setup_panel = ttk.LabelFrame(main, text="ACTIVE SETUP", padding=(8, 6))
+        trade_setup_panel.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        trade_setup_fields = [
+            ("Strategy", "strategy"),
+            ("Status", "status"),
+            ("Direction", "side"),
+            ("Score", "quality_score"),
+            ("RR", "rr"),
+            ("Entry", "ideal_entry"),
+            ("Stop", "invalidation"),
+            ("TP1", "tp1"),
+            ("TP2", "tp2"),
+            ("Created timestamp", "created_ts"),
+        ]
+        for idx, (label, field) in enumerate(trade_setup_fields):
+            col = idx % 5
+            row = idx // 5
+            cell = ttk.Frame(trade_setup_panel)
+            cell.grid(row=row, column=col, sticky="w", padx=(0, 18), pady=2)
+            ttk.Label(cell, text=f"{label}:", font=("Segoe UI", 9, "bold")).pack(side="left")
+            var = tk.StringVar(value="N/A")
+            ttk.Label(cell, textvariable=var).pack(side="left", padx=(4, 0))
+            self.trade_setup_panel_vars[field] = var
+        for col in range(5):
+            trade_setup_panel.columnconfigure(col, weight=1)
+
         chart_frame = ttk.Frame(main)
-        chart_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 8))
+        chart_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 8))
         chart_frame.rowconfigure(0, weight=1)
         chart_frame.columnconfigure(1, weight=1)
 
@@ -261,7 +288,7 @@ class App(tk.Tk):
         self.chart_canvas.bind("<Shift-MouseWheel>", self._on_mousewheel_horizontal)
 
         bottom = ttk.Notebook(main)
-        bottom.grid(row=3, column=0, sticky="nsew")
+        bottom.grid(row=4, column=0, sticky="nsew")
         signals_tab = ttk.Frame(bottom, padding=8)
         log_tab = ttk.Frame(bottom, padding=8)
         bottom.add(signals_tab, text="Signals")
@@ -958,6 +985,75 @@ class App(tk.Tk):
             self._log(f"Structure panel update failed for {symbol}: {e}")
             self._set_structure_panel_na()
 
+
+    def _format_trade_setup_timestamp(self, value) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            ts = int(value)
+            if ts <= 0:
+                return "N/A"
+            if ts > 10_000_000_000:
+                ts = ts / 1000.0
+            return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            text = str(value).strip()
+            return text if text else "N/A"
+
+    def _format_trade_setup_field_value(self, field: str, setup: dict, profile: PnFProfile) -> str:
+        if field == "rr":
+            rr1 = setup.get("rr1")
+            rr2 = setup.get("rr2")
+            if rr1 is None and rr2 is None:
+                return "N/A"
+            try:
+                rr1_text = "N/A" if rr1 is None else f"{float(rr1):.2f}"
+                rr2_text = "N/A" if rr2 is None else f"{float(rr2):.2f}"
+                return f"{rr1_text} / {rr2_text}"
+            except Exception:
+                return "N/A"
+        if field == "created_ts":
+            for timestamp_field in ("created_ts", "created_timestamp", "reference_ts", "timestamp"):
+                if setup.get(timestamp_field) is not None:
+                    return self._format_trade_setup_timestamp(setup.get(timestamp_field))
+            return "N/A"
+
+        value = setup.get(field)
+        if value is None:
+            return "N/A"
+        if field in {"ideal_entry", "invalidation", "tp1", "tp2"}:
+            try:
+                return self._format_price(float(value), profile.box_size)
+            except Exception:
+                return "N/A"
+        if field == "quality_score":
+            try:
+                return f"{float(value):.2f}"
+            except Exception:
+                return str(value) if str(value) else "N/A"
+        return str(value) if str(value) else "N/A"
+
+    def _set_trade_setup_panel_na(self):
+        try:
+            for var in getattr(self, "trade_setup_panel_vars", {}).values():
+                var.set("N/A")
+        except Exception as e:
+            self._log(f"Trade setup panel reset failed: {e}")
+
+    def _update_trade_setup_panel(self, symbol: str):
+        try:
+            setup = self._get_active_trade_visual_setup(symbol)
+            if setup is None:
+                self._set_trade_setup_panel_na()
+                return
+
+            profile = self._get_profile(symbol)
+            for field, var in self.trade_setup_panel_vars.items():
+                var.set(self._format_trade_setup_field_value(field, setup, profile))
+        except Exception as e:
+            self._log(f"Trade setup panel update failed for {symbol}: {e}")
+            self._set_trade_setup_panel_na()
+
     def _split_storage_symbol(self, storage_symbol: str):
         if ":" in storage_symbol:
             exchange, native_symbol = storage_symbol.split(":", 1)
@@ -1116,6 +1212,7 @@ class App(tk.Tk):
             self._draw_empty_canvases()
             self.meta_label.config(text="State: N/A | Signal: N/A | Last: N/A | Score: N/A | Priority: N/A")
             self._set_structure_panel_na()
+            self._set_trade_setup_panel_na()
             return
 
         self.chart_surface = surface
@@ -1190,6 +1287,7 @@ class App(tk.Tk):
         )
         self._update_profile_info()
         self._update_structure_panel(symbol)
+        self._update_trade_setup_panel(symbol)
         self._sync_axes_to_chart_yview()
 
 
