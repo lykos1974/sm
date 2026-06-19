@@ -1384,9 +1384,9 @@ class App(tk.Tk):
             x2,
             y2,
             fill=color,
-            dash=(4, 6),
-            width=2,
-            stipple="gray50",
+            dash=(4, 8),
+            width=1,
+            stipple="gray25",
         )
 
         label_x = min(max(x1 + 8, 4), max(surface["plot_w"] - 8, 4))
@@ -1397,7 +1397,7 @@ class App(tk.Tk):
             text=label,
             fill=color,
             anchor="w",
-            font=("Consolas", 8, "bold"),
+            font=("Consolas", 7),
         )
 
     def _draw_trendline_overlay(self, symbol: str, surface: dict):
@@ -1408,7 +1408,7 @@ class App(tk.Tk):
                     bullish_anchor,
                     1.0,
                     "BULLISH SLOPE GUIDE",
-                    "#2aa84a",
+                    "#6f9f79",
                     surface,
                 )
 
@@ -1418,7 +1418,7 @@ class App(tk.Tk):
                     bearish_anchor,
                     -1.0,
                     "BEARISH SLOPE GUIDE",
-                    "#c65a5a",
+                    "#a77a7a",
                     surface,
                 )
         except Exception as e:
@@ -1521,8 +1521,8 @@ class App(tk.Tk):
                 return
 
             bands = (
-                ("ideal_entry", "invalidation", "RISK ZONE", "#7b3131", "gray12"),
-                ("ideal_entry", "tp1", "TARGET ZONE", "#1f6f3a", "gray12"),
+                ("ideal_entry", "invalidation", "RISK ZONE", "#7b3131", "gray25"),
+                ("ideal_entry", "tp1", "TARGET ZONE", "#1f6f3a", "gray25"),
                 ("tp1", "tp2", "EXTENDED TARGET", "#2f8f4f", "gray12"),
             )
             for low_field, high_field, label, fill, stipple in bands:
@@ -1616,8 +1616,8 @@ class App(tk.Tk):
                     plot_w,
                     y_center,
                     fill=color,
-                    dash=(6, 4),
-                    width=2,
+                    dash=(6, 6),
+                    width=1,
                 )
                 self.right_axis.create_text(
                     RIGHT_AXIS_W - 6,
@@ -1625,7 +1625,7 @@ class App(tk.Tk):
                     text=f"{label} {price_text}",
                     fill=color,
                     anchor="e",
-                    font=("Consolas", 8, "bold"),
+                    font=("Consolas", 8),
                 )
         except Exception as e:
             self._log(f"Support/resistance overlay failed for {symbol}: {e}")
@@ -1680,15 +1680,15 @@ class App(tk.Tk):
             right_label_x = RIGHT_AXIS_W - 6
 
             line_specs = (
-                ("ideal_entry", "ENTRY", "#f2cc60", 3, ()),
-                ("invalidation", "STOP", "#ff4d4d", 3, (2, 3)),
-                ("tp1", "TP1", "#46d369", 2, (8, 4)),
-                ("tp2", "TP2", "#2fbf71", 2, (8, 4)),
+                ("ideal_entry", "ENTRY", "#f2cc60", 5, (), ("Consolas", 11, "bold"), ("Consolas", 9, "bold")),
+                ("invalidation", "STOP", "#ff4d4d", 4, (2, 3), ("Consolas", 10, "bold"), ("Consolas", 8, "bold")),
+                ("tp1", "TP1", "#46d369", 4, (8, 4), ("Consolas", 10, "bold"), ("Consolas", 8, "bold")),
+                ("tp2", "TP2", "#2fbf71", 1, (10, 6), ("Consolas", 8), ("Consolas", 8)),
             )
             side = str(setup.get("side") or "").upper()
             status = str(setup.get("status") or "").upper()
 
-            for field, label, color, width, dash in line_specs:
+            for field, label, color, width, dash, chart_font, axis_font in line_specs:
                 try:
                     level = float(setup.get(field))
                 except Exception:
@@ -1720,7 +1720,7 @@ class App(tk.Tk):
                     text=f"{label} {price_text}",
                     fill=color,
                     anchor="w",
-                    font=("Consolas", 9, "bold"),
+                    font=chart_font,
                 )
                 self.right_axis.create_text(
                     right_label_x,
@@ -1728,7 +1728,7 @@ class App(tk.Tk):
                     text=f"{label} {price_text}",
                     fill=color,
                     anchor="e",
-                    font=("Consolas", 8, "bold"),
+                    font=axis_font,
                 )
 
             self._draw_trade_column_highlight_labels(symbol, surface)
