@@ -146,11 +146,12 @@ class App(tk.Tk):
         ttk.Label(left, text="Scanner", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(left, textvariable=self.profile_info_var).grid(row=1, column=0, sticky="w", pady=(0, 8))
 
-        columns = ("exchange", "native_symbol", "state", "signal", "priority", "last", "score", "updated")
+        columns = ("exchange", "native_symbol", "setup_status", "state", "signal", "priority", "last", "score", "updated")
         self.tree = ttk.Treeview(left, columns=columns, show="headings", height=16)
         for col, width in [
             ("exchange", 90),
             ("native_symbol", 130),
+            ("setup_status", 115),
             ("state", 150),
             ("signal", 80),
             ("priority", 90),
@@ -161,6 +162,7 @@ class App(tk.Tk):
             self.tree.heading(col, text=col.upper())
             self.tree.column(col, width=width, anchor="center")
         self.tree.grid(row=2, column=0, sticky="nsew")
+        self._setup_scanner_status_tags()
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         controls = ttk.Frame(left)
@@ -204,9 +206,17 @@ class App(tk.Tk):
         header.columnconfigure(0, weight=1)
 
         ttk.Label(header, textvariable=self.selected_symbol, font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
+        badge_frame = ttk.Frame(header)
+        badge_frame.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.chart_status_badge = tk.Label(badge_frame, text="NO SETUP", padx=10, pady=3, font=("Segoe UI", 10, "bold"))
+        self.chart_status_badge.pack(side="left", padx=(0, 6))
+        self.chart_quality_badge = tk.Label(badge_frame, text="QUALITY D", padx=10, pady=3, font=("Segoe UI", 10, "bold"))
+        self.chart_quality_badge.pack(side="left", padx=(0, 6))
+        self.chart_rr_badge = tk.Label(badge_frame, text="RR N/A", padx=10, pady=3, font=("Segoe UI", 10, "bold"), bg="#2b3138", fg="#d7dde2")
+        self.chart_rr_badge.pack(side="left")
         self.meta_label = ttk.Label(header, text="")
         self.meta_label.grid(row=1, column=0, sticky="w")
-        ttk.Label(header, textvariable=self.status_var).grid(row=0, column=1, sticky="e")
+        ttk.Label(header, textvariable=self.status_var).grid(row=1, column=1, sticky="e")
 
         self.structure_panel_vars = {}
         structure_panel = ttk.LabelFrame(main, text="STRUCTURE", padding=(8, 6))
@@ -238,6 +248,7 @@ class App(tk.Tk):
             structure_panel.columnconfigure(col, weight=1)
 
         self.trade_setup_panel_vars = {}
+        self.trade_setup_panel_value_labels = {}
         trade_setup_panel = ttk.LabelFrame(main, text="ACTIVE SETUP", padding=(8, 6))
         trade_setup_panel.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         trade_setup_fields = [
@@ -245,6 +256,7 @@ class App(tk.Tk):
             ("Status", "status"),
             ("Direction", "side"),
             ("Score", "quality_score"),
+            ("Quality", "quality"),
             ("RR", "rr"),
             ("Entry", "ideal_entry"),
             ("Stop", "invalidation"),
@@ -259,8 +271,10 @@ class App(tk.Tk):
             cell.grid(row=row, column=col, sticky="w", padx=(0, 18), pady=2)
             ttk.Label(cell, text=f"{label}:", font=("Segoe UI", 9, "bold")).pack(side="left")
             var = tk.StringVar(value="N/A")
-            ttk.Label(cell, textvariable=var).pack(side="left", padx=(4, 0))
+            value_label = ttk.Label(cell, textvariable=var)
+            value_label.pack(side="left", padx=(4, 0))
             self.trade_setup_panel_vars[field] = var
+            self.trade_setup_panel_value_labels[field] = value_label
         for col in range(5):
             trade_setup_panel.columnconfigure(col, weight=1)
 
@@ -305,6 +319,53 @@ class App(tk.Tk):
     def _setup_signal_tags(self):
         self.signal_text.tag_configure("normal_alert", foreground="#000000")
         self.signal_text.tag_configure("latest_alert", foreground="#cc0000")
+
+    def _setup_scanner_status_tags(self):
+        self.tree.tag_configure("setup_status_active", background="#0b6b2b", foreground="#ffffff")
+        self.tree.tag_configure("setup_status_candidate", background="#16803d", foreground="#ffffff")
+        self.tree.tag_configure("setup_status_watch", background="#d6a800", foreground="#101418")
+        self.tree.tag_configure("setup_status_reject", background="#8b1a1a", foreground="#ffffff")
+        self.tree.tag_configure("setup_status_none", background="", foreground="")
+
+    def _quality_grade_from_score(self, score) -> str:
+        try:
+            numeric_score = float(score)
+        except Exception:
+            numeric_score = 0.0
+
+        if numeric_score >= 90:
+            return "A+"
+        if numeric_score >= 80:
+            return "A"
+        if numeric_score >= 70:
+            return "B"
+        if numeric_score >= 60:
+            return "C"
+        return "D"
+
+    def _quality_colors(self, grade: str) -> tuple[str, str]:
+        grade = str(grade or "D").upper()
+        if grade == "A+":
+            return "#0b6b2b", "#ffffff"
+        if grade == "A":
+            return "#16803d", "#ffffff"
+        if grade == "B":
+            return "#3f8f4f", "#ffffff"
+        if grade == "C":
+            return "#d6a800", "#101418"
+        return "#8b1a1a", "#ffffff"
+
+    def _setup_status_colors(self, status: str) -> tuple[str, str]:
+        status = str(status or "NONE").upper()
+        if status == "ACTIVE":
+            return "#0b6b2b", "#ffffff"
+        if status == "CANDIDATE":
+            return "#16803d", "#ffffff"
+        if status == "WATCH":
+            return "#d6a800", "#101418"
+        if status == "REJECT":
+            return "#8b1a1a", "#ffffff"
+        return "#2b3138", "#d7dde2"
 
     def _schedule_refresh(self):
         if not self._refresh_running and self.bootstrap_completed:
@@ -695,11 +756,14 @@ class App(tk.Tk):
         for item in self.latest_scanner.values():
             exchange, native_symbol = self._split_storage_symbol(item["symbol"])
             if selected_filter == "ALL" or exchange == selected_filter:
+                setup_summary = self._get_setup_status_summary(item["symbol"])
+                item = {**item, "setup_status": setup_summary["status"]}
                 filtered_items.append(item)
 
+        setup_status_rank_map = {"ACTIVE": 0, "CANDIDATE": 1, "WATCH": 2, "REJECT": 3, "NONE": 4}
         ordered = sorted(
             filtered_items,
-            key=lambda x: (priority_rank_map.get(x["priority"], 99), -x["score"], x["symbol"]),
+            key=lambda x: (setup_status_rank_map.get(x.get("setup_status", "NONE"), 99), priority_rank_map.get(x["priority"], 99), -x["score"], x["symbol"]),
         )
 
         chosen = self.active_symbol
@@ -707,12 +771,14 @@ class App(tk.Tk):
         for item in ordered:
             iid = item["symbol"]
             exchange, native_symbol = self._split_storage_symbol(item["symbol"])
-            values = (exchange, native_symbol, item["state"], item["signal"], item["priority"], item["last"], item["score"], item["updated"])
+            setup_status = item.get("setup_status", "NONE")
+            values = (exchange, native_symbol, setup_status, item["state"], item["signal"], item["priority"], item["last"], item["score"], item["updated"])
+            tags = (f"setup_status_{setup_status.lower()}",)
             if iid in existing:
-                self.tree.item(iid, values=values)
+                self.tree.item(iid, values=values, tags=tags)
                 existing.remove(iid)
             else:
-                self.tree.insert("", "end", iid=iid, values=values)
+                self.tree.insert("", "end", iid=iid, values=values, tags=tags)
         for iid in existing:
             self.tree.delete(iid)
 
@@ -904,6 +970,41 @@ class App(tk.Tk):
 
         return structure, [s for s in (setup_long, setup_short) if s]
 
+    def _get_setup_status_summary(self, symbol: str) -> dict:
+        try:
+            engine = self.engines.get(symbol)
+            if engine is None or not getattr(engine, "columns", None):
+                return {"status": "NONE", "setup": None}
+
+            _structure, setups = self._evaluate_strategy_setups(symbol, engine)
+            if not setups:
+                return {"status": "NONE", "setup": None}
+
+            status_rank = {"ACTIVE": 0, "CANDIDATE": 1, "WATCH": 2, "REJECT": 3}
+            side_rank = {"LONG": 0, "SHORT": 1}
+            def quality_score(setup: dict) -> float:
+                try:
+                    return float(setup.get("quality_score") or 0.0)
+                except Exception:
+                    return 0.0
+
+            ranked_setups = sorted(
+                setups,
+                key=lambda setup: (
+                    status_rank.get(str(setup.get("status") or "").upper(), 99),
+                    side_rank.get(str(setup.get("side") or "").upper(), 99),
+                    -quality_score(setup),
+                ),
+            )
+            setup = ranked_setups[0]
+            status = str(setup.get("status") or "NONE").upper()
+            if status not in {"ACTIVE", "CANDIDATE", "WATCH", "REJECT"}:
+                status = "NONE"
+            return {"status": status, "setup": setup}
+        except Exception as e:
+            self._log(f"Setup status summary failed for {symbol}: {e}")
+            return {"status": "NONE", "setup": None}
+
     def _run_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list):
         if engine is None or not engine.columns:
             return
@@ -1001,6 +1102,8 @@ class App(tk.Tk):
             return text if text else "N/A"
 
     def _format_trade_setup_field_value(self, field: str, setup: dict, profile: PnFProfile) -> str:
+        if field == "quality":
+            return self._quality_grade_from_score(setup.get("quality_score"))
         if field == "rr":
             rr1 = setup.get("rr1")
             rr2 = setup.get("rr2")
@@ -1037,6 +1140,9 @@ class App(tk.Tk):
         try:
             for var in getattr(self, "trade_setup_panel_vars", {}).values():
                 var.set("N/A")
+            quality_label = getattr(self, "trade_setup_panel_value_labels", {}).get("quality")
+            if quality_label is not None:
+                quality_label.configure(foreground="")
         except Exception as e:
             self._log(f"Trade setup panel reset failed: {e}")
 
@@ -1050,9 +1156,51 @@ class App(tk.Tk):
             profile = self._get_profile(symbol)
             for field, var in self.trade_setup_panel_vars.items():
                 var.set(self._format_trade_setup_field_value(field, setup, profile))
+            quality = self._quality_grade_from_score(setup.get("quality_score"))
+            bg, _fg = self._quality_colors(quality)
+            quality_label = getattr(self, "trade_setup_panel_value_labels", {}).get("quality")
+            if quality_label is not None:
+                quality_label.configure(foreground=bg)
         except Exception as e:
             self._log(f"Trade setup panel update failed for {symbol}: {e}")
             self._set_trade_setup_panel_na()
+
+    def _format_chart_rr_badge(self, setup: dict | None) -> str:
+        if setup is None:
+            return "RR N/A"
+        for field in ("rr2", "rr1"):
+            try:
+                value = setup.get(field)
+                if value is not None:
+                    return f"RR {float(value):.1f}"
+            except Exception:
+                continue
+        return "RR N/A"
+
+    def _update_chart_header_badges(self, symbol: str):
+        summary = self._get_setup_status_summary(symbol)
+        setup = summary["setup"]
+        status = summary["status"]
+
+        if setup is None or status == "NONE":
+            status_text = "NO SETUP"
+            quality = "D"
+        elif status in {"ACTIVE", "CANDIDATE"}:
+            side = str(setup.get("side") or "").upper()
+            status_text = f"{status} {side}".strip()
+            quality = self._quality_grade_from_score(setup.get("quality_score"))
+        elif status in {"WATCH", "REJECT"}:
+            status_text = status
+            quality = self._quality_grade_from_score(setup.get("quality_score"))
+        else:
+            status_text = "NO SETUP"
+            quality = "D"
+
+        status_bg, status_fg = self._setup_status_colors(status)
+        quality_bg, quality_fg = self._quality_colors(quality)
+        self.chart_status_badge.configure(text=status_text, bg=status_bg, fg=status_fg)
+        self.chart_quality_badge.configure(text=f"QUALITY {quality}", bg=quality_bg, fg=quality_fg)
+        self.chart_rr_badge.configure(text=self._format_chart_rr_badge(setup))
 
     def _split_storage_symbol(self, storage_symbol: str):
         if ":" in storage_symbol:
@@ -1211,6 +1359,7 @@ class App(tk.Tk):
         if not surface:
             self._draw_empty_canvases()
             self.meta_label.config(text="State: N/A | Signal: N/A | Last: N/A | Score: N/A | Priority: N/A")
+            self._update_chart_header_badges(symbol)
             self._set_structure_panel_na()
             self._set_trade_setup_panel_na()
             return
@@ -1290,6 +1439,7 @@ class App(tk.Tk):
         self._update_profile_info()
         self._update_structure_panel(symbol)
         self._update_trade_setup_panel(symbol)
+        self._update_chart_header_badges(symbol)
         self._sync_axes_to_chart_yview()
 
 
