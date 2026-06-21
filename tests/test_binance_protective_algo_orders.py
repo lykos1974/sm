@@ -109,6 +109,38 @@ def test_short_protective_orders_use_buy_short():
     assert tp_order["triggerPrice"] == "97"
 
 
+
+def test_entry_position_side_both_is_reused_for_protective_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    conn.execute(
+        """
+        UPDATE live_trades_binance
+        SET raw_order_response = ?
+        WHERE id = ?
+        """,
+        (
+            '{"order_request":{"quantity":"0.01"},"order_response":{"orderId":42,"positionSide":"BOTH","status":"NEW"}}',
+            trade_id,
+        ),
+    )
+    conn.commit()
+    client = CapturingBinanceClient()
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    submitted = [call["params"] for call in client.calls]
+    assert [order["type"] for order in submitted] == ["STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    assert all(order["side"] == "SELL" for order in submitted)
+    assert all(order["positionSide"] == "BOTH" for order in submitted)
+    assert all(order["positionSide"] != "LONG" for order in submitted)
+    assert all("code" not in order and "-4061" not in str(order) for order in submitted)
+    row = conn.execute(
+        "SELECT protective_orders_status, protective_orders_error FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("ATTACHED", None)
+
 def test_close_position_orders_send_no_quantity_or_reduce_only():
     stop_order, tp_order = trader.build_protective_algo_orders(trade_id=7, signal=sample_signal("LONG"))
 

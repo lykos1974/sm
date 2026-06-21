@@ -1891,9 +1891,11 @@ def build_protective_algo_orders(
     active_stop_price: Decimal | None = None,
     spec: SymbolSpec | None = None,
     working_type: str = "MARK_PRICE",
+    position_side: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     exit_side = "SELL" if signal.side == "LONG" else "BUY"
-    position_side = "LONG" if signal.side == "LONG" else "SHORT"
+    if position_side is None:
+        position_side = "LONG" if signal.side == "LONG" else "SHORT"
     stop_price = active_stop_price if active_stop_price is not None else signal.stop_price
     tp_price = signal.tp2_price
     if spec is not None:
@@ -1903,10 +1905,11 @@ def build_protective_algo_orders(
         "algoType": "CONDITIONAL",
         "symbol": binance_symbol(signal.symbol),
         "side": exit_side,
-        "positionSide": position_side,
         "closePosition": "true",
         "workingType": working_type,
     }
+    if position_side:
+        base["positionSide"] = position_side
     stop_order = {
         **base,
         "type": "STOP_MARKET",
@@ -1922,6 +1925,39 @@ def build_protective_algo_orders(
     return stop_order, tp_order
 
 
+def extract_entry_position_side(raw_order_response: str | dict[str, Any] | None) -> str | None:
+    """Return the accepted entry order positionSide, when Binance supplied one."""
+    if raw_order_response in (None, ""):
+        return None
+    raw: Any = raw_order_response
+    if isinstance(raw_order_response, str):
+        try:
+            raw = json.loads(raw_order_response)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    candidates: list[Any] = [raw]
+    for key in ("order_response", "order_status"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for candidate in candidates:
+        position_side = str(candidate.get("positionSide") or "").upper()
+        if position_side:
+            return position_side
+    return None
+
+
+def protective_position_side_for_trade(signal: TriangleSignal, raw_order_response: str | dict[str, Any] | None) -> str:
+    entry_position_side = extract_entry_position_side(raw_order_response)
+    if entry_position_side == "BOTH":
+        return "BOTH"
+    if entry_position_side in {"LONG", "SHORT"}:
+        return entry_position_side
+    return "LONG" if signal.side == "LONG" else "SHORT"
+
+
 def attach_protective_algo_orders(
     conn: sqlite3.Connection,
     client: BinanceFuturesClient,
@@ -1932,7 +1968,7 @@ def attach_protective_algo_orders(
 ) -> None:
     row = conn.execute(
         """
-        SELECT stop_algo_id, tp_algo_id, protective_orders_status, active_stop_price
+        SELECT stop_algo_id, tp_algo_id, protective_orders_status, active_stop_price, raw_order_response
         FROM live_trades_binance
         WHERE id = ?
         """,
@@ -1940,7 +1976,7 @@ def attach_protective_algo_orders(
     ).fetchone()
     if row is None:
         raise RuntimeError(f"trade_id={trade_id} not found for protective order attach")
-    stop_algo_id, tp_algo_id, protective_status, active_stop = row
+    stop_algo_id, tp_algo_id, protective_status, active_stop, raw_order_response = row
     if stop_algo_id and tp_algo_id:
         if protective_status != "ATTACHED":
             conn.execute(
@@ -1972,6 +2008,7 @@ def attach_protective_algo_orders(
             signal=signal,
             active_stop_price=active_stop_dec,
             spec=spec,
+            position_side=protective_position_side_for_trade(signal, raw_order_response),
         )
         console(
             "PROTECTIVE_TRIGGER_PRICE_QUANTIZED",
