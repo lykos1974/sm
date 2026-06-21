@@ -35,6 +35,21 @@ class CapturingBinanceClient(trader.BinanceFuturesClient):
         self.calls.append({"method": method, "path": path, "params": params, "signed": signed})
         return {"algoId": 123, "clientAlgoId": params.get("clientAlgoId")}
 
+    def get_symbol_spec(self, symbol):
+        return trader.SymbolSpec(
+            symbol=symbol,
+            status="TRADING",
+            base_asset=symbol.removesuffix("USDT"),
+            quote_asset="USDT",
+            tick_size=Decimal("0.01"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("100000"),
+            min_notional=Decimal("1"),
+            price_precision=2,
+            quantity_precision=3,
+        )
+
 
 def setup_trade(signal):
     conn = sqlite3.connect(":memory:")
@@ -256,3 +271,46 @@ def test_retry_missing_tp_failure_preserves_existing_stop_id():
     assert row[1] is None
     assert row[2] == "ATTACH_FAILED"
     assert "tp retry failed" in row[3]
+
+
+def test_xrp_like_floating_trigger_prices_are_quantized_before_submission():
+    signal = trader.TriangleSignal(
+        symbol="BINANCE_FUT:XRPUSDT",
+        pattern="execution_intent",
+        side="LONG",
+        trigger_ts=123456,
+        entry_price=Decimal("1.1500"),
+        stop_price=Decimal("1.1300000000000001"),
+        tp1_price=Decimal("1.1600"),
+        tp2_price=Decimal("1.1699999999999993"),
+        trigger_column_idx=7,
+        support_level=Decimal("1.13"),
+        resistance_level=Decimal("1.15"),
+        break_distance_boxes=Decimal("1"),
+        pattern_quality="TEST",
+    )
+
+    class XrpSpecClient(CapturingBinanceClient):
+        def get_symbol_spec(self, symbol):
+            return trader.SymbolSpec(
+                symbol=symbol,
+                status="TRADING",
+                base_asset="XRP",
+                quote_asset="USDT",
+                tick_size=Decimal("0.0001"),
+                step_size=Decimal("0.1"),
+                min_qty=Decimal("0.1"),
+                max_qty=Decimal("1000000"),
+                min_notional=Decimal("1"),
+                price_precision=4,
+                quantity_precision=1,
+            )
+
+    conn, trade_id = setup_trade(signal)
+    client = XrpSpecClient()
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    submitted = [call["params"] for call in client.calls]
+    assert [order["triggerPrice"] for order in submitted] == ["1.1300", "1.1700"]
+    assert all("000000000000" not in order["triggerPrice"] for order in submitted)

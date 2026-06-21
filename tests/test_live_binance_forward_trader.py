@@ -231,6 +231,21 @@ class LifecycleClient(LiveClient):
         self.submitted_orders.append(order)
         return {"algoId": f"algo-{len(self.submitted_orders)}", "clientAlgoId": order.get("clientAlgoId"), "status": "NEW"}
 
+    def get_symbol_spec(self, symbol):
+        return trader.SymbolSpec(
+            symbol=symbol,
+            status="TRADING",
+            base_asset=symbol.removesuffix("USDT"),
+            quote_asset="USDT",
+            tick_size=Decimal("0.01"),
+            step_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("100000"),
+            min_notional=Decimal("1"),
+            price_precision=2,
+            quantity_precision=3,
+        )
+
     def cancel_order(self, symbol, *, order_id=None, orig_client_order_id=None):
         response = {
             "symbol": symbol,
@@ -3041,6 +3056,37 @@ class BinanceForwardTraderTests(unittest.TestCase):
             logs2, clients2 = self._run_execution_trade_sync(state, status="FILLED")
         self.assertIn("PROTECTIVE_ORDERS_ATTACHED", logs)
         self.assertIn("EXECUTION_TRADES_SYNC_FOUND 0", logs2)
+        self.assertEqual(len(clients[0].submitted_orders), 2)
+        self.assertEqual(len(clients2[0].submitted_orders), 0)
+
+    def test_sync_execution_trades_retries_unprotected_and_does_not_duplicate_after_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET status = 'POSITION_OPEN_UNPROTECTED', entry_order_status = 'FILLED',
+                        protective_orders_status = 'ATTACH_FAILED', notes = 'previous attach failed'
+                    """
+                )
+                conn.commit()
+
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED")
+            logs2, clients2 = self._run_execution_trade_sync(state, status="FILLED")
+
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute(
+                    "SELECT status, protective_orders_status, stop_algo_id, tp_algo_id FROM live_trades_binance"
+                ).fetchone()
+
+        self.assertIn("UNPROTECTED_TRADES_SYNC_FOUND 1", logs)
+        self.assertIn("PROTECTIVE_ORDERS_ATTACHED", logs)
+        self.assertIn("UNPROTECTED_TRADES_SYNC_FOUND 0", logs2)
+        self.assertEqual(row[0:2], ("POSITION_OPEN", "ATTACHED"))
+        self.assertTrue(row[2])
+        self.assertTrue(row[3])
         self.assertEqual(len(clients[0].submitted_orders), 2)
         self.assertEqual(len(clients2[0].submitted_orders), 0)
 

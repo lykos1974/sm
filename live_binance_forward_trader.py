@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -1889,11 +1889,16 @@ def build_protective_algo_orders(
     trade_id: int,
     signal: TriangleSignal,
     active_stop_price: Decimal | None = None,
+    spec: SymbolSpec | None = None,
     working_type: str = "MARK_PRICE",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     exit_side = "SELL" if signal.side == "LONG" else "BUY"
     position_side = "LONG" if signal.side == "LONG" else "SHORT"
     stop_price = active_stop_price if active_stop_price is not None else signal.stop_price
+    tp_price = signal.tp2_price
+    if spec is not None:
+        stop_price = quantize_nearest(stop_price, spec.tick_size).quantize(spec.tick_size.normalize())
+        tp_price = quantize_nearest(tp_price, spec.tick_size).quantize(spec.tick_size.normalize())
     base = {
         "algoType": "CONDITIONAL",
         "symbol": binance_symbol(signal.symbol),
@@ -1905,13 +1910,13 @@ def build_protective_algo_orders(
     stop_order = {
         **base,
         "type": "STOP_MARKET",
-        "triggerPrice": str(stop_price),
+        "triggerPrice": format_decimal_for_step(stop_price, spec.tick_size) if spec is not None else str(stop_price),
         "clientAlgoId": f"pnf-sl-{trade_id}"[:36],
     }
     tp_order = {
         **base,
         "type": "TAKE_PROFIT_MARKET",
-        "triggerPrice": str(signal.tp2_price),
+        "triggerPrice": format_decimal_for_step(tp_price, spec.tick_size) if spec is not None else str(tp_price),
         "clientAlgoId": f"pnf-tp-{trade_id}"[:36],
     }
     return stop_order, tp_order
@@ -1954,38 +1959,51 @@ def attach_protective_algo_orders(
         return
 
     active_stop_dec = _dec(active_stop) if active_stop not in (None, "") else None
-    stop_order, tp_order = build_protective_algo_orders(
-        trade_id=int(trade_id),
-        signal=signal,
-        active_stop_price=active_stop_dec,
-    )
-    console(
-        "PROTECTIVE_ATTACH_ATTEMPT",
-        f"{signal.symbol} trade_id={trade_id}",
-        {"stop_order": stop_order, "tp_order": tp_order, "dry_run": dry_run},
-    )
-
-    if dry_run:
-        conn.execute(
-            """
-            UPDATE live_trades_binance
-            SET protective_orders_status = ?, protective_orders_raw_response = ?, protective_orders_error = NULL
-            WHERE id = ?
-            """,
-            (
-                "DRY_RUN",
-                json.dumps({"stop_order": stop_order, "tp_order": tp_order}, sort_keys=True, default=str),
-                int(trade_id),
-            ),
-        )
-        conn.commit()
-        return
-
+    stop_order: dict[str, Any] | None = None
+    tp_order: dict[str, Any] | None = None
     stop_response: dict[str, Any] | None = None
     tp_response: dict[str, Any] | None = None
     stop_id = str(stop_algo_id) if stop_algo_id not in (None, "") else None
     tp_id = str(tp_algo_id) if tp_algo_id not in (None, "") else None
     try:
+        spec = client.get_symbol_spec(binance_symbol(signal.symbol))
+        stop_order, tp_order = build_protective_algo_orders(
+            trade_id=int(trade_id),
+            signal=signal,
+            active_stop_price=active_stop_dec,
+            spec=spec,
+        )
+        console(
+            "PROTECTIVE_TRIGGER_PRICE_QUANTIZED",
+            f"{signal.symbol} trade_id={trade_id}",
+            {
+                "tick_size": str(spec.tick_size),
+                "stop_trigger_price": stop_order["triggerPrice"],
+                "tp_trigger_price": tp_order["triggerPrice"],
+            },
+        )
+        console(
+            "PROTECTIVE_ATTACH_ATTEMPT",
+            f"{signal.symbol} trade_id={trade_id}",
+            {"stop_order": stop_order, "tp_order": tp_order, "dry_run": dry_run},
+        )
+
+        if dry_run:
+            conn.execute(
+                """
+                UPDATE live_trades_binance
+                SET protective_orders_status = ?, protective_orders_raw_response = ?, protective_orders_error = NULL
+                WHERE id = ?
+                """,
+                (
+                    "DRY_RUN",
+                    json.dumps({"stop_order": stop_order, "tp_order": tp_order}, sort_keys=True, default=str),
+                    int(trade_id),
+                ),
+            )
+            conn.commit()
+            return
+
         if stop_id is None:
             stop_response = client.submit_algo_order(stop_order)
             stop_id = extract_algo_order_id(stop_response) or stop_order["clientAlgoId"]
@@ -2464,6 +2482,16 @@ def quantize_down(value: Decimal, unit: Decimal) -> Decimal:
     if unit <= 0:
         raise ValueError("precision unit must be positive")
     return ((value / unit).to_integral_value(rounding=ROUND_DOWN) * unit).quantize(unit.normalize(), rounding=ROUND_DOWN)
+
+
+def quantize_nearest(value: Decimal, unit: Decimal) -> Decimal:
+    if unit <= 0:
+        raise ValueError("precision unit must be positive")
+    return (value / unit).to_integral_value(rounding=ROUND_HALF_UP) * unit
+
+
+def format_decimal_for_step(value: Decimal, unit: Decimal) -> str:
+    return format(value.quantize(unit.normalize()), "f")
 
 
 def aligned(value: Decimal, unit: Decimal) -> bool:
@@ -3826,6 +3854,42 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
     with closing(sqlite3.connect(state_db_path)) as conn:
         conn.row_factory = sqlite3.Row
         init_live_tables(conn)
+        unprotected_rows = conn.execute(
+            """
+            SELECT id, created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
+                   tp1_price, tp2_price, raw_order_response, entry_order_status, setup_id, intent_id,
+                   stop_algo_id, tp_algo_id, protective_orders_status
+            FROM live_trades_binance
+            WHERE status = 'POSITION_OPEN_UNPROTECTED'
+              AND setup_id IS NOT NULL AND setup_id != ''
+              AND intent_id IS NOT NULL AND intent_id != ''
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        console("UNPROTECTED_TRADES_SYNC_FOUND", str(len(unprotected_rows)))
+        for row in unprotected_rows:
+            trade_id = int(row["id"])
+            signal = trade_row_to_signal(row)
+            attach_protective_algo_orders(conn, client, trade_id, signal, dry_run=False)
+            protected = conn.execute(
+                "SELECT protective_orders_status FROM live_trades_binance WHERE id = ?",
+                (trade_id,),
+            ).fetchone()
+            if protected is not None and protected[0] == "ATTACHED":
+                conn.execute(
+                    "UPDATE live_trades_binance SET status = ?, notes = ? WHERE id = ?",
+                    ("POSITION_OPEN", "execution trade sync: protective orders attached on retry", trade_id),
+                )
+                conn.commit()
+                console("PROTECTIVE_ORDERS_ATTACHED", f"{signal.symbol} trade_id={trade_id} retry")
+            else:
+                conn.execute(
+                    "UPDATE live_trades_binance SET status = ?, notes = ? WHERE id = ?",
+                    ("POSITION_OPEN_UNPROTECTED", "execution trade sync: protective order retry failed; still unprotected", trade_id),
+                )
+                conn.commit()
+                console("PROTECTIVE_ORDER_FAILED", f"{signal.symbol} trade_id={trade_id} still UNPROTECTED")
+
         rows = conn.execute(
             """
             SELECT id, created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
