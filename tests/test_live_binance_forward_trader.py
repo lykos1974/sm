@@ -1449,6 +1449,28 @@ class BinanceForwardTraderTests(unittest.TestCase):
         expected = trader.hmac.new(b"secret", query.encode("utf-8"), trader.hashlib.sha256).hexdigest()
         self.assertEqual(signed["signature"], expected)
 
+    def test_order_signing_syncs_binance_server_time_offset(self):
+        class OffsetClient(trader.BinanceFuturesClient):
+            def get_server_time(self):
+                return 1700000007500
+
+        client = OffsetClient("key", "secret")
+        original_time = trader.time.time
+        output = io.StringIO()
+        try:
+            trader.time.time = lambda: 1700000000.0
+            with redirect_stdout(output):
+                signed = client._signed_params({"symbol": "SOLUSDT", "side": "BUY"})
+        finally:
+            trader.time.time = original_time
+
+        self.assertEqual(signed["timestamp"], 1700000007500)
+        self.assertEqual(signed["recvWindow"], 5000)
+        self.assertIn("BINANCE_TIME_SYNC", output.getvalue())
+        self.assertIn('"server_time": 1700000007500', output.getvalue())
+        self.assertIn('"local_time": 1700000000000', output.getvalue())
+        self.assertIn('"offset_ms": 7500', output.getvalue())
+
     def test_exchange_info_filter_parsing(self):
         spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
         self.assertEqual(spec.tick_size, Decimal("0.0100"))
@@ -2813,6 +2835,25 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertIn("EXECUTION_INTENT_ORDER_SENT", logs)
         self.assertEqual(status, "READY")
         self.assertEqual(trade, ("setup-test", "intent-test", "ORDER_SENT"))
+        self.assertEqual(len(clients[0].submitted_orders), 1)
+
+    def test_execution_intents_timestamp_rejection_leaves_intent_new(self):
+        class TimestampRejectingClient(SubmittingClient):
+            def submit_order(self, order):
+                self.submitted_orders.append(order)
+                raise RuntimeError('Binance HTTP 400: {"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            logs, clients = self._run_intent_executor(state, client_cls=TimestampRejectingClient)
+            with closing(sqlite3.connect(state)) as conn:
+                status = conn.execute("SELECT intent_status FROM execution_intents").fetchone()[0]
+                trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
+        self.assertIn("EXECUTION_INTENT_ORDER_FAILED", logs)
+        self.assertIn("-1021", logs)
+        self.assertEqual(status, "NEW")
+        self.assertEqual(trade_count, 0)
         self.assertEqual(len(clients[0].submitted_orders), 1)
 
     def test_execution_intents_rerun_does_not_duplicate_ready_intent(self):
