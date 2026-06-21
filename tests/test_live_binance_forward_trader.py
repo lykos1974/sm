@@ -2664,6 +2664,231 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertIn(f"relative_pole_size={trader.P2_SURVIVOR_RELATIVE_POLE_SIZE}", signal.pattern_quality)
         self.assertIn(f"reversal_boxes={trader.P2_SURVIVOR_REVERSAL_BOXES}", signal.pattern_quality)
 
+    def _create_intent_state_db(self, path, **overrides):
+        payload = {
+            "intent_id": "intent-test",
+            "setup_id": "setup-test",
+            "symbol": "BINANCE_FUT:SOLUSDT",
+            "side": "LONG",
+            "entry": "100",
+            "stop": "99",
+            "tp1": "102",
+            "tp2": "103",
+            "rr1": "2",
+            "rr2": "3",
+            "reference_ts": 1700000000,
+            "created_ts": 1700000001,
+            "intent_status": "NEW",
+            **overrides,
+        }
+        with closing(sqlite3.connect(path)) as conn:
+            trader.init_live_tables(conn)
+            trader.init_execution_intents_table(conn)
+            conn.execute(
+                """
+                INSERT INTO execution_intents(
+                    intent_id, setup_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2,
+                    reference_ts, created_ts, intent_status
+                ) VALUES(
+                    :intent_id, :setup_id, :symbol, :side, :entry, :stop, :tp1, :tp2, :rr1, :rr2,
+                    :reference_ts, :created_ts, :intent_status
+                )
+                """,
+                payload,
+            )
+            conn.commit()
+
+    def _run_intent_executor(self, state_db_path, *, demo=True, dry_run=False, live_env="1", notional="1", client_cls=SubmittingClient):
+        original_client = trader.BinanceFuturesClient
+        old_live = os.environ.get("LIVE_TRADING_ENABLED")
+        old_key = os.environ.get(trader.BINANCE_DEMO_API_KEY_ENV)
+        old_secret = os.environ.get(trader.BINANCE_DEMO_API_SECRET_ENV)
+        SubmittingClient.instances = []
+        try:
+            trader.BinanceFuturesClient = client_cls
+            if live_env is None:
+                os.environ.pop("LIVE_TRADING_ENABLED", None)
+            else:
+                os.environ["LIVE_TRADING_ENABLED"] = live_env
+            os.environ[trader.BINANCE_DEMO_API_KEY_ENV] = "key"
+            os.environ[trader.BINANCE_DEMO_API_SECRET_ENV] = "secret"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_execution_intents_once(
+                    argparse.Namespace(
+                        state_db_path=state_db_path,
+                        demo=demo,
+                        dry_run=dry_run,
+                        notional_usdt=notional,
+                    ),
+                    iteration=1,
+                )
+            return output.getvalue(), list(SubmittingClient.instances)
+        finally:
+            trader.BinanceFuturesClient = original_client
+            if old_live is None:
+                os.environ.pop("LIVE_TRADING_ENABLED", None)
+            else:
+                os.environ["LIVE_TRADING_ENABLED"] = old_live
+            if old_key is None:
+                os.environ.pop(trader.BINANCE_DEMO_API_KEY_ENV, None)
+            else:
+                os.environ[trader.BINANCE_DEMO_API_KEY_ENV] = old_key
+            if old_secret is None:
+                os.environ.pop(trader.BINANCE_DEMO_API_SECRET_ENV, None)
+            else:
+                os.environ[trader.BINANCE_DEMO_API_SECRET_ENV] = old_secret
+
+    def test_execution_intents_demo_only_enforcement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            logs, clients = self._run_intent_executor(state, demo=False)
+        self.assertIn("EXECUTION_INTENT_REJECTED", logs)
+        self.assertIn("requires --demo", logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_dry_run_blocks_execution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            logs, clients = self._run_intent_executor(state, dry_run=True)
+        self.assertIn("blocked by --dry-run", logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_missing_live_trading_enabled_blocks_execution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            logs, clients = self._run_intent_executor(state, live_env=None)
+        self.assertIn("LIVE_TRADING_ENABLED is not 1", logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_short_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state, side="SHORT", stop="101", tp1="98", tp2="97")
+            logs, clients = self._run_intent_executor(state)
+        self.assertIn("SHORT execution intents are blocked", logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_mexc_fut_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state, symbol="MEXC_FUT:HYPEUSDT")
+            logs, clients = self._run_intent_executor(state)
+        self.assertIn(trader.UNSUPPORTED_EXECUTION_VENUE, logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_invalid_risk_ordering_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state, stop="101")
+            logs, clients = self._run_intent_executor(state)
+        self.assertIn("invalid risk levels", logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_demo_notional_cap_is_100_usdt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            ok_logs, ok_clients = self._run_intent_executor(state, notional="100")
+            self.assertIn("EXECUTION_INTENT_ORDER_SENT", ok_logs)
+            self.assertEqual(len(ok_clients[0].submitted_orders), 1)
+
+            state2 = os.path.join(temp_dir, "state2.db")
+            self._create_intent_state_db(state2, intent_id="intent-test-2", setup_id="setup-test-2")
+            bad_logs, bad_clients = self._run_intent_executor(state2, notional="101")
+        self.assertIn("cap=100", bad_logs)
+        self.assertEqual(bad_clients[0].submitted_orders, [])
+
+    def test_execution_intents_successful_fake_order_marks_ready(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            logs, clients = self._run_intent_executor(state)
+            with closing(sqlite3.connect(state)) as conn:
+                status = conn.execute("SELECT intent_status FROM execution_intents").fetchone()[0]
+                trade = conn.execute("SELECT setup_id, intent_id, status FROM live_trades_binance").fetchone()
+        self.assertIn("EXECUTION_INTENT_ORDER_SENT", logs)
+        self.assertEqual(status, "READY")
+        self.assertEqual(trade, ("setup-test", "intent-test", "ORDER_SENT"))
+        self.assertEqual(len(clients[0].submitted_orders), 1)
+
+    def test_execution_intents_rerun_does_not_duplicate_ready_intent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            self._run_intent_executor(state)
+            logs, clients = self._run_intent_executor(state)
+            with closing(sqlite3.connect(state)) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
+        self.assertIn("intent_status is not NEW: READY", logs)
+        self.assertEqual(count, 1)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_existing_open_trade_blocks_same_symbol(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state)
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO live_trades_binance(
+                        created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
+                        tp1_price, tp2_price, notional_usdt, status, dry_run
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (trader.now_iso(), "BINANCE_FUT:SOLUSDT", "x", "LONG", 1, 100, 99, 102, 103, 1, "ORDER_SENT", 0),
+                )
+                conn.commit()
+            logs, clients = self._run_intent_executor(state)
+        self.assertIn("existing open live trade on symbol", logs)
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_execution_intents_strategy_setups_is_never_mutated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            setup_db = os.path.join(temp_dir, "strategy_validation.db")
+            state = os.path.join(temp_dir, "state.db")
+            create_strategy_setups_db(setup_db, [{"setup_id": "setup-test", "symbol": "BINANCE_FUT:SOLUSDT"}])
+            self._create_intent_state_db(state)
+            with closing(sqlite3.connect(setup_db)) as conn:
+                before = conn.execute("SELECT * FROM strategy_setups").fetchall()
+            self._run_intent_executor(state)
+            with closing(sqlite3.connect(setup_db)) as conn:
+                after = conn.execute("SELECT * FROM strategy_setups").fetchall()
+        self.assertEqual(before, after)
+
+    def test_execution_intents_no_path_runs_unless_flag_supplied(self):
+        original_parse_args = trader.parse_args
+        original_process_once = trader.process_once
+        original_execute_once = trader.process_execution_intents_once
+        try:
+            calls = []
+            trader.process_once = lambda parsed_args, *, iteration=None: calls.append(("signal", iteration))
+            trader.process_execution_intents_once = lambda parsed_args, *, iteration=None: calls.append(("intents", iteration))
+            trader.parse_args = lambda: argparse.Namespace(
+                db_path="unused-market.db",
+                state_db_path="unused-state.db",
+                settings="unused-settings.json",
+                dry_run=True,
+                demo=True,
+                export_trade_journal=None,
+                reconcile_positions=False,
+                consume_strategy_setups=False,
+                execute_execution_intents=False,
+                loop=False,
+                poll_seconds=0,
+                inspect_execution_intents=False,
+            )
+            with redirect_stdout(io.StringIO()):
+                trader.main()
+        finally:
+            trader.parse_args = original_parse_args
+            trader.process_once = original_process_once
+            trader.process_execution_intents_once = original_execute_once
+        self.assertEqual(calls, [("signal", 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

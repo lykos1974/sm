@@ -42,6 +42,7 @@ BINANCE_API_SECRET_ENV = "BINANCE_FUTURES_API_SECRET"
 BINANCE_DEMO_API_KEY_ENV = "BINANCE_DEMO_FUTURES_API_KEY"
 BINANCE_DEMO_API_SECRET_ENV = "BINANCE_DEMO_FUTURES_API_SECRET"
 MAX_NOTIONAL_USDT = Decimal("1")
+EXECUTION_INTENT_DEMO_MAX_NOTIONAL_USDT = Decimal("100")
 DEFAULT_NOTIONAL_USDT = Decimal("1")
 RECV_WINDOW_MS = 5000
 
@@ -794,6 +795,7 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_live_trades_binance_symbol_status
         ON live_trades_binance(symbol, status);
 
+
         CREATE TABLE IF NOT EXISTS live_binance_trader_state (
             symbol TEXT PRIMARY KEY,
             last_processed_close_time INTEGER NOT NULL,
@@ -825,6 +827,8 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             "protective_orders_status": "TEXT",
             "protective_orders_raw_response": "TEXT",
             "protective_orders_error": "TEXT",
+            "setup_id": "TEXT",
+            "intent_id": "TEXT",
         },
     )
     ensure_columns(
@@ -974,6 +978,111 @@ def create_execution_intent(
         return False
     conn.commit()
     return True
+
+
+def execution_intent_to_signal(row: sqlite3.Row | dict[str, Any]) -> TriangleSignal:
+    raw = dict(row)
+    return TriangleSignal(
+        symbol=str(raw["symbol"]),
+        pattern="execution_intent",
+        side=str(raw["side"]).upper(),
+        trigger_ts=int(raw["reference_ts"]),
+        entry_price=_dec(raw["entry"]),
+        stop_price=_dec(raw["stop"]),
+        tp1_price=_dec(raw["tp1"]),
+        tp2_price=_dec(raw["tp2"]),
+        trigger_column_idx=0,
+        support_level=_dec(raw["stop"]),
+        resistance_level=_dec(raw["entry"]),
+        break_distance_boxes=Decimal("0"),
+        pattern_quality=f"EXECUTION_INTENT|setup_id={raw['setup_id']}|intent_id={raw['intent_id']}",
+    )
+
+
+def load_execution_intents(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        f"""
+        SELECT {", ".join(EXECUTION_INTENT_INSPECT_COLUMNS)}
+        FROM execution_intents
+        ORDER BY created_ts, intent_id
+        """
+    ).fetchall()
+
+
+def setup_already_executed(conn: sqlite3.Connection, setup_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM live_trades_binance WHERE setup_id = ? AND dry_run = 0 LIMIT 1",
+        (setup_id,),
+    ).fetchone()
+    return row is not None
+
+
+def reject_execution_intent(row: sqlite3.Row | dict[str, Any], reason: str) -> None:
+    raw = dict(row)
+    console(
+        "EXECUTION_INTENT_REJECTED",
+        "",
+        {"intent_id": raw.get("intent_id"), "setup_id": raw.get("setup_id"), "symbol": raw.get("symbol"), "reason": reason},
+    )
+
+
+def record_execution_intent_trade(
+    conn: sqlite3.Connection,
+    signal: TriangleSignal,
+    *,
+    intent_id: str,
+    setup_id: str,
+    notional_usdt: Decimal,
+    order: dict[str, Any],
+    response: dict[str, Any],
+) -> None:
+    order_id, client_order_id = extract_order_ids(order, response)
+    exchange_order_id = order_id or client_order_id
+    conn.execute(
+        """
+        INSERT INTO live_trades_binance(
+            created_at, symbol, pattern, strategy_id, candidate_id, side, trigger_timestamp, entry_price,
+            stop_price, tp1_price, tp2_price, notional_usdt, decision, status,
+            block_reason, dry_run, exchange_order_id, raw_order_response, notes,
+            break_even_armed, break_even_trigger_price, active_stop_price,
+            entry_order_status, protective_orders_status, setup_id, intent_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            now_iso(),
+            signal.symbol,
+            signal.pattern,
+            None,
+            setup_id,
+            signal.side,
+            signal.trigger_ts,
+            float(signal.entry_price),
+            float(signal.stop_price),
+            float(signal.tp1_price),
+            float(signal.tp2_price),
+            float(notional_usdt),
+            "ORDER_SENT",
+            "ORDER_SENT",
+            None,
+            0,
+            exchange_order_id,
+            json.dumps({"order_request": order, "order_response": response}, sort_keys=True, default=str),
+            "execution intent demo entry order submitted; protective orders pending entry fill/future lifecycle",
+            0,
+            None,
+            float(signal.stop_price),
+            str(response.get("status") or "NEW"),
+            "PENDING_ENTRY_FILL",
+            setup_id,
+            intent_id,
+        ),
+    )
+    conn.execute(
+        "UPDATE execution_intents SET intent_status = ? WHERE intent_id = ? AND intent_status = ?",
+        (EXECUTION_INTENT_STATUS_READY, intent_id, EXECUTION_INTENT_STATUS_NEW),
+    )
+    conn.commit()
 
 
 def init_executed_setup_candidates_table(conn: sqlite3.Connection) -> None:
@@ -3223,7 +3332,8 @@ def log_startup(args: argparse.Namespace) -> None:
             "demo_max_notional_usdt": getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)),
         },
     )
-    log_db_info(args.db_path)
+    if getattr(args, "db_path", None):
+        log_db_info(args.db_path)
     log_db_info(resolve_state_db_path(args))
 
 
@@ -3547,6 +3657,108 @@ def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | N
         console("NO_EXECUTABLE_SETUPS", "")
 
 
+def process_execution_intents_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
+    loop_iteration = 1 if iteration is None else iteration
+    console("LOOP_BEGIN", f"iteration={loop_iteration}")
+    console("EXECUTION_INTENT_EXECUTOR_MODE", "ENABLED")
+    state_db_path = resolve_state_db_path(args)
+    demo = bool(getattr(args, "demo", False))
+    dry_run_flag = bool(getattr(args, "dry_run", False))
+    live_enabled = os.environ.get("LIVE_TRADING_ENABLED") == "1"
+    api_key_env, api_secret_env = binance_env_names(demo)
+    notional_usdt = _dec(getattr(args, "notional_usdt", str(DEFAULT_NOTIONAL_USDT)))
+    client = BinanceFuturesClient(
+        os.environ.get(api_key_env),
+        os.environ.get(api_secret_env),
+        base_url=binance_base_url(demo),
+    )
+    with closing(sqlite3.connect(state_db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        init_live_tables(conn)
+        init_execution_intents_table(conn)
+        rows = load_execution_intents(conn)
+        console("EXECUTION_INTENTS_FOUND", str(len(rows)))
+        sent = 0
+        rejected = 0
+        failed = 0
+        for row in rows:
+            if not demo:
+                rejected += 1
+                reject_execution_intent(row, "requires --demo; mainnet execution-intent path is disabled")
+                continue
+            if dry_run_flag:
+                rejected += 1
+                reject_execution_intent(row, "blocked by --dry-run")
+                continue
+            if not live_enabled:
+                rejected += 1
+                reject_execution_intent(row, "LIVE_TRADING_ENABLED is not 1")
+                continue
+            if row["intent_status"] != EXECUTION_INTENT_STATUS_NEW:
+                rejected += 1
+                reject_execution_intent(row, f"intent_status is not NEW: {row['intent_status']}")
+                continue
+            signal = execution_intent_to_signal(row)
+            if signal.side != "LONG":
+                rejected += 1
+                reject_execution_intent(row, "SHORT execution intents are blocked")
+                continue
+            if not is_setup_symbol_supported_for_execution(signal.symbol, "BINANCE_DEMO"):
+                rejected += 1
+                reject_execution_intent(row, UNSUPPORTED_EXECUTION_VENUE)
+                continue
+            risk_reason = validate_risk_levels(signal)
+            if risk_reason is not None:
+                rejected += 1
+                reject_execution_intent(row, risk_reason)
+                continue
+            if has_existing_open_trade(conn, signal.symbol):
+                rejected += 1
+                reject_execution_intent(row, "existing open live trade on symbol")
+                continue
+            if setup_already_executed(conn, row["setup_id"]):
+                rejected += 1
+                reject_execution_intent(row, "setup_id already executed")
+                continue
+            if not client.has_credentials:
+                rejected += 1
+                reject_execution_intent(row, "API credentials missing")
+                continue
+            try:
+                spec = client.get_symbol_spec(binance_symbol(signal.symbol))
+                order, reason = build_entry_order(
+                    signal,
+                    spec,
+                    notional_usdt,
+                    max_notional_usdt=EXECUTION_INTENT_DEMO_MAX_NOTIONAL_USDT,
+                )
+                if reason is not None or order is None:
+                    rejected += 1
+                    reject_execution_intent(row, reason or "order build failed")
+                    continue
+                order["newClientOrderId"] = f"pnf-intent-{str(row['intent_id']).replace('intent-', '')}"[:36]
+                log_order_detail(signal.symbol, order)
+                response = client.submit_order(order)
+                record_execution_intent_trade(
+                    conn,
+                    signal,
+                    intent_id=row["intent_id"],
+                    setup_id=row["setup_id"],
+                    notional_usdt=notional_usdt,
+                    order=order,
+                    response=response,
+                )
+                sent += 1
+                console("EXECUTION_INTENT_ORDER_SENT", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": signal.symbol, "response": response})
+            except Exception as exc:
+                failed += 1
+                conn.rollback()
+                console("EXECUTION_INTENT_ORDER_FAILED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": row["symbol"], "error": str(exc)})
+        console("EXECUTION_INTENTS_SENT", str(sent))
+        console("EXECUTION_INTENTS_REJECTED", str(rejected))
+        console("EXECUTION_INTENTS_FAILED", str(failed))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forward-validate strict PnF triangles with guarded Binance USD-M futures micro-orders")
     parser.add_argument("--db-path", help="Path to existing market_data.db; opened read-only and used only as the candle source")
@@ -3575,12 +3787,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
     parser.add_argument("--consume-strategy-setups", action="store_true", help="Read scanner-generated strategy_setups rows and emit setup execution intents; read-only/no orders")
     parser.add_argument("--strategy-setups-db", help="Path to strategy_validation.db containing strategy_setups for --consume-strategy-setups")
+    parser.add_argument("--execute-execution-intents", action="store_true", help="Submit NEW execution_intents to Binance Demo under strict guards")
     parser.add_argument("--inspect-execution-intents", action="store_true", help="Read-only summary of execution_intents in --state-db-path; exits before Binance initialization or scanning")
     args = parser.parse_args()
-    if not args.inspect_execution_intents:
+    if not (args.inspect_execution_intents or args.execute_execution_intents):
         missing = [flag for flag, value in (("--db-path", args.db_path), ("--settings", args.settings)) if not value]
         if missing:
-            parser.error(f"the following arguments are required unless --inspect-execution-intents is used: {', '.join(missing)}")
+            parser.error(f"the following arguments are required unless --inspect-execution-intents or --execute-execution-intents is used: {', '.join(missing)}")
     return args
 
 
@@ -3588,6 +3801,10 @@ def main() -> None:
     args = parse_args()
     if bool(getattr(args, "inspect_execution_intents", False)):
         inspect_execution_intents_once(args)
+        return
+    if bool(getattr(args, "execute_execution_intents", False)):
+        log_startup(args)
+        process_execution_intents_once(args, iteration=1)
         return
 
     if getattr(args, "export_trade_journal", None):
