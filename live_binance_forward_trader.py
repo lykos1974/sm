@@ -46,6 +46,19 @@ DEFAULT_NOTIONAL_USDT = Decimal("1")
 RECV_WINDOW_MS = 5000
 
 ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:BNBUSDT", "BINANCE_FUT:SOLUSDT", "BINANCE_FUT:XRPUSDT"}
+BINANCE_DEMO_SETUP_SYMBOLS = {
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "BINANCE_FUT:BTCUSDT",
+    "BINANCE_FUT:ETHUSDT",
+    "BINANCE_FUT:BNBUSDT",
+    "BINANCE_FUT:SOLUSDT",
+    "BINANCE_FUT:XRPUSDT",
+}
+UNSUPPORTED_EXECUTION_VENUE = "UNSUPPORTED_EXECUTION_VENUE"
 ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
 DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
 DEMO_POLE_MOTIF_PATTERNS = {"pole_motif_low", "pole_motif_high"}
@@ -820,6 +833,46 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
+
+
+def init_executed_setup_candidates_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS executed_setup_candidates (
+            setup_id TEXT PRIMARY KEY,
+            first_seen_ts INTEGER NOT NULL,
+            last_seen_ts INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def mark_setup_candidate_seen(conn: sqlite3.Connection, setup_id: str, *, seen_ts: int | None = None) -> bool:
+    observed_ts = int(time.time() if seen_ts is None else seen_ts)
+    existing = conn.execute(
+        "SELECT setup_id FROM executed_setup_candidates WHERE setup_id = ?",
+        (setup_id,),
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO executed_setup_candidates(setup_id, first_seen_ts, last_seen_ts) VALUES (?, ?, ?)",
+            (setup_id, observed_ts, observed_ts),
+        )
+        conn.commit()
+        return True
+    conn.execute(
+        "UPDATE executed_setup_candidates SET last_seen_ts = ? WHERE setup_id = ?",
+        (observed_ts, setup_id),
+    )
+    conn.commit()
+    return False
+
+
+def is_setup_symbol_supported_for_execution(symbol: str, execution_venue: str | None) -> bool:
+    if execution_venue == "BINANCE_DEMO":
+        return symbol in BINANCE_DEMO_SETUP_SYMBOLS
+    return True
 
 def load_settings(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
@@ -3289,27 +3342,49 @@ def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | N
     loop_iteration = 1 if iteration is None else iteration
     console("LOOP_BEGIN", f"iteration={loop_iteration}")
     console("SETUP_CONSUMER_MODE", "ENABLED")
+    execution_venue = "BINANCE_DEMO" if bool(getattr(args, "demo", False)) else None
     setup_db_path = getattr(args, "strategy_setups_db", None)
     if not setup_db_path:
         raise RuntimeError("--strategy-setups-db is required when --consume-strategy-setups is supplied")
+    state_db_path = getattr(args, "state_db_path", None)
+    if not state_db_path:
+        raise RuntimeError("--state-db-path is required when --consume-strategy-setups is supplied")
 
     with closing(connect_strategy_setups_db_readonly(setup_db_path)) as setup_conn:
         rows = load_executable_strategy_setups(setup_conn)
 
     console("SETUP_ROWS_FOUND", str(len(rows)))
     accepted = 0
-    for row in rows:
-        intent, reject_reason = setup_row_to_execution_intent(row)
-        row_payload = {
-            "setup_id": row["setup_id"] if "setup_id" in row.keys() else None,
-            "symbol": row["symbol"] if "symbol" in row.keys() else None,
-            "reject_reason": reject_reason,
-        }
-        if intent is None:
-            console("SETUP_EXECUTION_REJECTED", "", row_payload)
-            continue
-        accepted += 1
-        console("SETUP_EXECUTION_CANDIDATE", "", setup_execution_payload(intent))
+    rejected = 0
+    with closing(sqlite3.connect(state_db_path)) as state_conn:
+        init_executed_setup_candidates_table(state_conn)
+        for row in rows:
+            intent, reject_reason = setup_row_to_execution_intent(row)
+            row_payload = {
+                "setup_id": row["setup_id"] if "setup_id" in row.keys() else None,
+                "symbol": row["symbol"] if "symbol" in row.keys() else None,
+                "reason": reject_reason,
+            }
+            if intent is None:
+                rejected += 1
+                console("SETUP_EXECUTION_REJECTED", "", row_payload)
+                continue
+            if not is_setup_symbol_supported_for_execution(intent.symbol, execution_venue):
+                rejected += 1
+                console(
+                    "SETUP_EXECUTION_REJECTED",
+                    "",
+                    {"setup_id": intent.setup_id, "symbol": intent.symbol, "reason": UNSUPPORTED_EXECUTION_VENUE},
+                )
+                continue
+            accepted += 1
+            is_first_seen = mark_setup_candidate_seen(state_conn, intent.setup_id)
+            if is_first_seen:
+                console("SETUP_EXECUTION_CANDIDATE", "", setup_execution_payload(intent))
+            else:
+                console("SETUP_ALREADY_SEEN", "", {"setup_id": intent.setup_id, "symbol": intent.symbol})
+    console("SETUP_ROWS_ACCEPTED", str(accepted))
+    console("SETUP_ROWS_REJECTED", str(rejected))
     if accepted == 0:
         console("NO_EXECUTABLE_SETUPS", "")
 

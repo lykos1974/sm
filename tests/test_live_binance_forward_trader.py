@@ -290,7 +290,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
                     {"setup_id": "resolved-row", "resolution_status": "TP2"},
                 ],
             )
-            args = argparse.Namespace(strategy_setups_db=db_path)
+            args = argparse.Namespace(strategy_setups_db=db_path, state_db_path=os.path.join(temp_dir, "live_state.db"), demo=True)
             output = io.StringIO()
             with redirect_stdout(output):
                 trader.process_setup_execution_once(args, iteration=3)
@@ -315,7 +315,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
             )
             output = io.StringIO()
             with redirect_stdout(output):
-                trader.process_setup_execution_once(argparse.Namespace(strategy_setups_db=db_path), iteration=1)
+                trader.process_setup_execution_once(argparse.Namespace(strategy_setups_db=db_path, state_db_path=os.path.join(temp_dir, "live_state.db"), demo=True), iteration=1)
 
         logs = output.getvalue()
         self.assertIn("SETUP_ROWS_FOUND 1", logs)
@@ -345,11 +345,92 @@ class BinanceForwardTraderTests(unittest.TestCase):
                 create_strategy_setups_db(db_path, [{"setup_id": "valid-setup"}])
                 output = io.StringIO()
                 with redirect_stdout(output):
-                    trader.process_setup_execution_once(argparse.Namespace(strategy_setups_db=db_path), iteration=1)
+                    trader.process_setup_execution_once(argparse.Namespace(strategy_setups_db=db_path, state_db_path=os.path.join(temp_dir, "live_state.db"), demo=True), iteration=1)
         finally:
             trader.BinanceFuturesClient = original_client
 
         self.assertIn("SETUP_EXECUTION_CANDIDATE", output.getvalue())
+
+    def test_setup_consumer_binance_demo_accepts_binance_symbol_universe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            create_strategy_setups_db(
+                db_path,
+                [
+                    {"setup_id": "btc-raw", "symbol": "BTCUSDT"},
+                    {"setup_id": "eth-raw", "symbol": "ETHUSDT"},
+                    {"setup_id": "btc-prefixed", "symbol": "BINANCE_FUT:BTCUSDT"},
+                ],
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_setup_execution_once(
+                    argparse.Namespace(strategy_setups_db=db_path, state_db_path=state_db_path, demo=True),
+                    iteration=1,
+                )
+
+        logs = output.getvalue()
+        self.assertIn("SETUP_ROWS_FOUND 3", logs)
+        self.assertIn("SETUP_ROWS_ACCEPTED 3", logs)
+        self.assertIn("SETUP_ROWS_REJECTED 0", logs)
+        self.assertEqual(logs.count("SETUP_EXECUTION_CANDIDATE"), 3)
+        self.assertIn('"symbol": "BTCUSDT"', logs)
+        self.assertIn('"symbol": "ETHUSDT"', logs)
+        self.assertIn('"symbol": "BINANCE_FUT:BTCUSDT"', logs)
+
+    def test_setup_consumer_binance_demo_rejects_mexc_symbols_with_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            create_strategy_setups_db(
+                db_path,
+                [
+                    {"setup_id": "mexc-hype", "symbol": "MEXC_FUT:HYPEUSDT"},
+                    {"setup_id": "mexc-eth", "symbol": "MEXC_FUT:ETHUSDT"},
+                    {"setup_id": "raw-btc", "symbol": "BTCUSDT"},
+                ],
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_setup_execution_once(
+                    argparse.Namespace(strategy_setups_db=db_path, state_db_path=state_db_path, demo=True),
+                    iteration=1,
+                )
+
+        logs = output.getvalue()
+        self.assertIn("SETUP_ROWS_FOUND 3", logs)
+        self.assertIn("SETUP_ROWS_ACCEPTED 1", logs)
+        self.assertIn("SETUP_ROWS_REJECTED 2", logs)
+        self.assertEqual(logs.count("SETUP_EXECUTION_CANDIDATE"), 1)
+        self.assertEqual(logs.count("SETUP_EXECUTION_REJECTED"), 2)
+        self.assertIn('"reason": "UNSUPPORTED_EXECUTION_VENUE"', logs)
+        self.assertIn('"setup_id": "mexc-hype"', logs)
+        self.assertIn('"setup_id": "mexc-eth"', logs)
+
+    def test_setup_consumer_tracks_seen_setup_ids_without_duplicate_candidates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            create_strategy_setups_db(db_path, [{"setup_id": "same-setup", "symbol": "BTCUSDT"}])
+            args = argparse.Namespace(strategy_setups_db=db_path, state_db_path=state_db_path, demo=True)
+            first_output = io.StringIO()
+            with redirect_stdout(first_output):
+                trader.process_setup_execution_once(args, iteration=1)
+            second_output = io.StringIO()
+            with redirect_stdout(second_output):
+                trader.process_setup_execution_once(args, iteration=2)
+
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                rows = conn.execute("SELECT setup_id, first_seen_ts, last_seen_ts FROM executed_setup_candidates").fetchall()
+
+        self.assertIn("SETUP_EXECUTION_CANDIDATE", first_output.getvalue())
+        second_logs = second_output.getvalue()
+        self.assertNotIn("SETUP_EXECUTION_CANDIDATE", second_logs)
+        self.assertIn("SETUP_ALREADY_SEEN", second_logs)
+        self.assertIn('"setup_id": "same-setup"', second_logs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "same-setup")
 
     def test_main_dispatches_to_setup_consumer_only_when_flag_is_enabled(self):
         original_parse_args = trader.parse_args
