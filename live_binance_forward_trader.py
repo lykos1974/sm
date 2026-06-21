@@ -59,6 +59,10 @@ BINANCE_DEMO_SETUP_SYMBOLS = {
     "BINANCE_FUT:XRPUSDT",
 }
 UNSUPPORTED_EXECUTION_VENUE = "UNSUPPORTED_EXECUTION_VENUE"
+EXECUTION_INTENT_STATUS_NEW = "NEW"
+EXECUTION_INTENT_STATUS_READY = "READY"
+EXECUTION_INTENT_STATUS_CANCELLED = "CANCELLED"
+EXECUTION_INTENT_STATUSES = {EXECUTION_INTENT_STATUS_NEW, EXECUTION_INTENT_STATUS_READY, EXECUTION_INTENT_STATUS_CANCELLED}
 ALLOWED_PATTERNS = {"bullish_triangle", "bearish_triangle"}
 DEMO_DOUBLE_PATTERNS = {"double_top_breakout", "double_bottom_breakdown"}
 DEMO_POLE_MOTIF_PATTERNS = {"pole_motif_low", "pole_motif_high"}
@@ -833,6 +837,78 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
 
+
+
+def init_execution_intents_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_intents (
+            intent_id TEXT PRIMARY KEY,
+            setup_id TEXT NOT NULL UNIQUE,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry TEXT NOT NULL,
+            stop TEXT NOT NULL,
+            tp1 TEXT NOT NULL,
+            tp2 TEXT NOT NULL,
+            rr1 TEXT,
+            rr2 TEXT,
+            reference_ts INTEGER NOT NULL,
+            created_ts INTEGER NOT NULL,
+            intent_status TEXT NOT NULL CHECK(intent_status IN ('NEW', 'READY', 'CANCELLED'))
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_execution_intents_status_created
+        ON execution_intents(intent_status, created_ts)
+        """
+    )
+    conn.commit()
+
+
+def execution_intent_id(setup_id: str) -> str:
+    digest = hashlib.sha256(setup_id.encode("utf-8")).hexdigest()[:16]
+    return f"intent-{digest}"
+
+
+def create_execution_intent(
+    conn: sqlite3.Connection,
+    intent: SetupExecutionIntent,
+    *,
+    created_ts: int | None = None,
+) -> bool:
+    observed_ts = int(time.time() if created_ts is None else created_ts)
+    try:
+        conn.execute(
+            """
+            INSERT INTO execution_intents(
+                intent_id, setup_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2,
+                reference_ts, created_ts, intent_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                execution_intent_id(intent.setup_id),
+                intent.setup_id,
+                intent.symbol,
+                intent.side,
+                str(intent.entry),
+                str(intent.stop),
+                str(intent.tp1),
+                str(intent.tp2),
+                str(intent.rr1) if intent.rr1 is not None else None,
+                str(intent.rr2) if intent.rr2 is not None else None,
+                intent.reference_ts,
+                observed_ts,
+                EXECUTION_INTENT_STATUS_NEW,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return False
+    conn.commit()
+    return True
 
 
 def init_executed_setup_candidates_table(conn: sqlite3.Connection) -> None:
@@ -3356,8 +3432,11 @@ def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | N
     console("SETUP_ROWS_FOUND", str(len(rows)))
     accepted = 0
     rejected = 0
+    intents_created = 0
+    intents_skipped = 0
     with closing(sqlite3.connect(state_db_path)) as state_conn:
         init_executed_setup_candidates_table(state_conn)
+        init_execution_intents_table(state_conn)
         for row in rows:
             intent, reject_reason = setup_row_to_execution_intent(row)
             row_payload = {
@@ -3383,7 +3462,21 @@ def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | N
                 console("SETUP_EXECUTION_CANDIDATE", "", setup_execution_payload(intent))
             else:
                 console("SETUP_ALREADY_SEEN", "", {"setup_id": intent.setup_id, "symbol": intent.symbol})
+            if create_execution_intent(state_conn, intent):
+                intents_created += 1
+                console("EXECUTION_INTENT_CREATED", "", {
+                    "setup_id": intent.setup_id,
+                    "symbol": intent.symbol,
+                    "side": intent.side,
+                    "entry": str(intent.entry),
+                    "stop": str(intent.stop),
+                })
+            else:
+                intents_skipped += 1
+                console("EXECUTION_INTENT_ALREADY_EXISTS", "", {"setup_id": intent.setup_id, "symbol": intent.symbol})
     console("SETUP_ROWS_ACCEPTED", str(accepted))
+    console("INTENTS_CREATED", str(intents_created))
+    console("INTENTS_SKIPPED", str(intents_skipped))
     console("SETUP_ROWS_REJECTED", str(rejected))
     if accepted == 0:
         console("NO_EXECUTABLE_SETUPS", "")

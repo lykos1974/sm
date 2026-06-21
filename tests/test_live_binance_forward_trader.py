@@ -349,7 +349,9 @@ class BinanceForwardTraderTests(unittest.TestCase):
         finally:
             trader.BinanceFuturesClient = original_client
 
-        self.assertIn("SETUP_EXECUTION_CANDIDATE", output.getvalue())
+        logs = output.getvalue()
+        self.assertIn("SETUP_EXECUTION_CANDIDATE", logs)
+        self.assertIn("EXECUTION_INTENT_CREATED", logs)
 
     def test_setup_consumer_binance_demo_accepts_binance_symbol_universe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -423,14 +425,48 @@ class BinanceForwardTraderTests(unittest.TestCase):
 
             with closing(sqlite3.connect(state_db_path)) as conn:
                 rows = conn.execute("SELECT setup_id, first_seen_ts, last_seen_ts FROM executed_setup_candidates").fetchall()
+                intent_rows = conn.execute(
+                    """
+                    SELECT setup_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2, reference_ts, intent_status
+                    FROM execution_intents
+                    """
+                ).fetchall()
 
-        self.assertIn("SETUP_EXECUTION_CANDIDATE", first_output.getvalue())
+        first_logs = first_output.getvalue()
+        self.assertIn("SETUP_EXECUTION_CANDIDATE", first_logs)
+        self.assertIn("EXECUTION_INTENT_CREATED", first_logs)
+        self.assertIn("INTENTS_CREATED 1", first_logs)
+        self.assertIn("INTENTS_SKIPPED 0", first_logs)
         second_logs = second_output.getvalue()
         self.assertNotIn("SETUP_EXECUTION_CANDIDATE", second_logs)
         self.assertIn("SETUP_ALREADY_SEEN", second_logs)
+        self.assertIn("EXECUTION_INTENT_ALREADY_EXISTS", second_logs)
+        self.assertIn("INTENTS_CREATED 0", second_logs)
+        self.assertIn("INTENTS_SKIPPED 1", second_logs)
         self.assertIn('"setup_id": "same-setup"', second_logs)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], "same-setup")
+        self.assertEqual(len(intent_rows), 1)
+        self.assertEqual(intent_rows[0], ("same-setup", "BTCUSDT", "LONG", "100.0", "95.0", "105.0", "110.0", "1.0", "2.0", 1_700_000_000, "NEW"))
+
+
+    def test_execution_intent_state_db_survives_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "strategy_validation.db")
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            create_strategy_setups_db(db_path, [{"setup_id": "restart-setup", "symbol": "BTCUSDT"}])
+            args = argparse.Namespace(strategy_setups_db=db_path, state_db_path=state_db_path, demo=True)
+
+            with redirect_stdout(io.StringIO()):
+                trader.process_setup_execution_once(args, iteration=1)
+
+            with closing(sqlite3.connect(state_db_path)) as restarted_conn:
+                rows = restarted_conn.execute(
+                    "SELECT setup_id, symbol, intent_status FROM execution_intents WHERE setup_id = ?",
+                    ("restart-setup",),
+                ).fetchall()
+
+        self.assertEqual(rows, [("restart-setup", "BTCUSDT", "NEW")])
 
     def test_main_dispatches_to_setup_consumer_only_when_flag_is_enabled(self):
         original_parse_args = trader.parse_args
