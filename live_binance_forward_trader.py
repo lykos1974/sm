@@ -75,7 +75,7 @@ P2_SURVIVOR_REVERSAL_BOXES = "NORMAL_REVERSAL_4_6_BOXES"
 P2_SURVIVOR_STATUS = "VALIDATED_RESEARCH_EDGE|FORWARD_EDGE_SURVIVES|NOT_PRODUCTION|NOT_LIVE_APPROVED"
 RECENT_COLUMN_LOOKBACK = 6
 CATAPULT_SIGNAL_NAMES = {"bullish_catapult", "bearish_catapult"}
-OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "EXIT_PENDING"}
+OPEN_TRADE_STATUSES = {"OPEN", "ORDER_SENT", "POSITION_OPEN", "POSITION_OPEN_UNPROTECTED", "EXIT_PENDING"}
 DUPLICATE_SETUP_COOLDOWN_HOURS = 12
 DUPLICATE_SETUP_COOLDOWN_SECONDS = DUPLICATE_SETUP_COOLDOWN_HOURS * 60 * 60
 DUPLICATE_SETUP_PRICE_TOLERANCE = Decimal("0.00000001")
@@ -2238,6 +2238,25 @@ def mark_entry_order_terminal(
     conn.commit()
 
 
+def trade_row_to_signal(row: sqlite3.Row | dict[str, Any]) -> TriangleSignal:
+    raw = dict(row)
+    return TriangleSignal(
+        symbol=str(raw["symbol"]),
+        pattern=str(raw["pattern"]),
+        side=str(raw["side"]).upper(),
+        trigger_ts=int(raw["trigger_timestamp"]),
+        entry_price=_dec(raw["entry_price"]),
+        stop_price=_dec(raw["stop_price"]),
+        tp1_price=_dec(raw["tp1_price"]),
+        tp2_price=_dec(raw["tp2_price"]),
+        trigger_column_idx=0,
+        support_level=Decimal("0"),
+        resistance_level=Decimal("0"),
+        break_distance_boxes=Decimal("0"),
+        pattern_quality="PERSISTED_ENTRY_ORDER",
+    )
+
+
 def poll_pending_entry_orders(
     conn: sqlite3.Connection,
     client: BinanceFuturesClient,
@@ -3780,6 +3799,138 @@ def process_execution_intents_once(args: argparse.Namespace, *, iteration: int |
         console("EXECUTION_INTENTS_FAILED", str(failed))
 
 
+def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
+    loop_iteration = 1 if iteration is None else iteration
+    console("LOOP_BEGIN", f"iteration={loop_iteration}")
+    console("EXECUTION_TRADE_SYNC_MODE", "ENABLED")
+    state_db_path = resolve_state_db_path(args)
+    demo = bool(getattr(args, "demo", False))
+    dry_run_flag = bool(getattr(args, "dry_run", False))
+    live_enabled = os.environ.get("LIVE_TRADING_ENABLED") == "1"
+    if not demo:
+        raise RuntimeError("--sync-execution-trades requires --demo; mainnet sync is disabled")
+    if dry_run_flag:
+        raise RuntimeError("--sync-execution-trades is blocked by --dry-run")
+    if not live_enabled:
+        raise RuntimeError("--sync-execution-trades requires LIVE_TRADING_ENABLED=1")
+
+    api_key_env, api_secret_env = binance_env_names(demo)
+    client = BinanceFuturesClient(
+        os.environ.get(api_key_env),
+        os.environ.get(api_secret_env),
+        base_url=binance_base_url(demo),
+    )
+    if not client.has_credentials:
+        raise RuntimeError("--sync-execution-trades requires Binance Demo API credentials")
+
+    with closing(sqlite3.connect(state_db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        init_live_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT id, created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
+                   tp1_price, tp2_price, raw_order_response, entry_order_status, setup_id, intent_id,
+                   stop_algo_id, tp_algo_id, protective_orders_status
+            FROM live_trades_binance
+            WHERE status = 'ORDER_SENT'
+              AND COALESCE(entry_order_status, 'NEW') IN ('NEW', 'PARTIALLY_FILLED', 'FILLED')
+              AND setup_id IS NOT NULL AND setup_id != ''
+              AND intent_id IS NOT NULL AND intent_id != ''
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        console("EXECUTION_TRADES_SYNC_FOUND", str(len(rows)))
+        for row in rows:
+            trade_id = int(row["id"])
+            signal = trade_row_to_signal(row)
+            raw = json.loads(row["raw_order_response"] or "{}") if row["raw_order_response"] else {}
+            order_request = raw.get("order_request") if isinstance(raw, dict) else None
+            order_response = raw.get("order_response") if isinstance(raw, dict) else None
+            try:
+                status_response, trades_response, lifecycle = poll_entry_order_status(client, signal, order_request, order_response)
+                entry_status = str(lifecycle.get("entry_order_status") or "")
+                merged_raw = {
+                    "order_request": order_request,
+                    "order_response": order_response,
+                    "order_status": status_response,
+                    "user_trades": trades_response,
+                }
+                if entry_status != "FILLED":
+                    conn.execute(
+                        """
+                        UPDATE live_trades_binance
+                        SET entry_order_status = ?, executed_qty = ?, avg_fill_price = ?,
+                            entry_order_update_time = ?, order_status_response = ?,
+                            user_trades_response = ?, raw_order_response = ?, notes = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            lifecycle.get("entry_order_status"),
+                            lifecycle.get("executed_qty"),
+                            lifecycle.get("avg_fill_price"),
+                            lifecycle.get("entry_order_update_time"),
+                            json.dumps(status_response, sort_keys=True, default=str),
+                            json.dumps(trades_response, sort_keys=True, default=str),
+                            json.dumps(merged_raw, sort_keys=True, default=str),
+                            f"execution trade sync: entry not filled; status={entry_status}",
+                            trade_id,
+                        ),
+                    )
+                    conn.commit()
+                    console("ENTRY_NOT_FILLED", f"{signal.symbol} trade_id={trade_id}", lifecycle)
+                    continue
+
+                conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET status = 'POSITION_OPEN', entry_order_status = ?, avg_fill_price = ?, executed_qty = ?,
+                        entry_order_update_time = ?, entry_commission = ?, entry_commission_asset = ?,
+                        entry_slippage = ?, entry_slippage_bps = ?, fees = ?, order_status_response = ?,
+                        user_trades_response = ?, raw_order_response = ?, notes = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        lifecycle.get("entry_order_status"),
+                        lifecycle.get("avg_fill_price"),
+                        lifecycle.get("executed_qty"),
+                        lifecycle.get("entry_order_update_time"),
+                        lifecycle.get("entry_commission"),
+                        lifecycle.get("entry_commission_asset"),
+                        lifecycle.get("entry_slippage"),
+                        lifecycle.get("entry_slippage_bps"),
+                        lifecycle.get("entry_commission"),
+                        json.dumps(status_response, sort_keys=True, default=str),
+                        json.dumps(trades_response, sort_keys=True, default=str),
+                        json.dumps(merged_raw, sort_keys=True, default=str),
+                        "execution trade sync: entry filled; attaching protective orders",
+                        trade_id,
+                    ),
+                )
+                conn.commit()
+                attach_protective_algo_orders(conn, client, trade_id, signal, dry_run=False)
+                protected = conn.execute(
+                    "SELECT protective_orders_status FROM live_trades_binance WHERE id = ?",
+                    (trade_id,),
+                ).fetchone()
+                if protected is not None and protected[0] == "ATTACHED":
+                    console("PROTECTIVE_ORDERS_ATTACHED", f"{signal.symbol} trade_id={trade_id}", lifecycle)
+                else:
+                    conn.execute(
+                        "UPDATE live_trades_binance SET status = ?, notes = ? WHERE id = ?",
+                        ("POSITION_OPEN_UNPROTECTED", "execution trade sync: entry filled but protective order attachment failed", trade_id),
+                    )
+                    conn.commit()
+                    console("PROTECTIVE_ORDER_FAILED", f"{signal.symbol} trade_id={trade_id} UNPROTECTED", lifecycle)
+            except Exception as exc:
+                conn.execute(
+                    "UPDATE live_trades_binance SET notes = ? WHERE id = ?",
+                    (f"execution trade sync failed before protective attach decision; will retry: {exc}", trade_id),
+                )
+                conn.commit()
+                console("ENTRY_SYNC_FAILED", f"{signal.symbol} trade_id={trade_id}", {"error": str(exc)})
+
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forward-validate strict PnF triangles with guarded Binance USD-M futures micro-orders")
     parser.add_argument("--db-path", help="Path to existing market_data.db; opened read-only and used only as the candle source")
@@ -3809,9 +3960,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consume-strategy-setups", action="store_true", help="Read scanner-generated strategy_setups rows and emit setup execution intents; read-only/no orders")
     parser.add_argument("--strategy-setups-db", help="Path to strategy_validation.db containing strategy_setups for --consume-strategy-setups")
     parser.add_argument("--execute-execution-intents", action="store_true", help="Submit NEW execution_intents to Binance Demo under strict guards")
+    parser.add_argument("--sync-execution-trades", action="store_true", help="Sync Binance Demo execution-intent entry fills and attach protective TP/SL orders")
     parser.add_argument("--inspect-execution-intents", action="store_true", help="Read-only summary of execution_intents in --state-db-path; exits before Binance initialization or scanning")
     args = parser.parse_args()
-    if not (args.inspect_execution_intents or args.execute_execution_intents):
+    if not (args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades):
         missing = [flag for flag, value in (("--db-path", args.db_path), ("--settings", args.settings)) if not value]
         if missing:
             parser.error(f"the following arguments are required unless --inspect-execution-intents or --execute-execution-intents is used: {', '.join(missing)}")
@@ -3826,6 +3978,10 @@ def main() -> None:
     if bool(getattr(args, "execute_execution_intents", False)):
         log_startup(args)
         process_execution_intents_once(args, iteration=1)
+        return
+    if bool(getattr(args, "sync_execution_trades", False)):
+        log_startup(args)
+        process_sync_execution_trades_once(args, iteration=1)
         return
 
     if getattr(args, "export_trade_journal", None):
