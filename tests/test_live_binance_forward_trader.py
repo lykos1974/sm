@@ -468,6 +468,104 @@ class BinanceForwardTraderTests(unittest.TestCase):
 
         self.assertEqual(rows, [("restart-setup", "BTCUSDT", "NEW")])
 
+    def test_inspect_execution_intents_empty_table_returns_zero_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                trader.init_execution_intents_table(conn)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.inspect_execution_intents_once(argparse.Namespace(state_db_path=state_db_path))
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                table_exists = trader.execution_intents_table_exists(conn)
+
+        logs = output.getvalue()
+        self.assertIn("INTENTS_TOTAL 0", logs)
+        self.assertIn("INTENTS_NEW 0", logs)
+        self.assertIn("INTENTS_READY 0", logs)
+        self.assertIn("INTENTS_CANCELLED 0", logs)
+        self.assertNotIn("INTENT_ROW", logs)
+        self.assertTrue(table_exists)
+
+    def test_inspect_execution_intents_populated_db_prints_expected_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                trader.init_execution_intents_table(conn)
+                conn.executemany(
+                    """
+                    INSERT INTO execution_intents(
+                        intent_id, setup_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2,
+                        reference_ts, created_ts, intent_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("intent-a", "setup-a", "BTCUSDT", "LONG", "100", "95", "105", "110", "1", "2", 1700000000, 1700000001, "NEW"),
+                        ("intent-b", "setup-b", "ETHUSDT", "LONG", "200", "190", "210", "220", "1", "2", 1700000100, 1700000101, "READY"),
+                        ("intent-c", "setup-c", "SOLUSDT", "SHORT", "50", "55", "45", "40", None, None, 1700000200, 1700000201, "CANCELLED"),
+                    ],
+                )
+                conn.commit()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.inspect_execution_intents_once(argparse.Namespace(state_db_path=state_db_path))
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                statuses = conn.execute(
+                    "SELECT setup_id, intent_status FROM execution_intents ORDER BY setup_id"
+                ).fetchall()
+
+        logs = output.getvalue()
+        self.assertIn("INTENTS_TOTAL 3", logs)
+        self.assertIn("INTENTS_NEW 1", logs)
+        self.assertIn("INTENTS_READY 1", logs)
+        self.assertIn("INTENTS_CANCELLED 1", logs)
+        self.assertEqual(logs.count("INTENT_ROW"), 3)
+        self.assertIn('"intent_id": "intent-a"', logs)
+        self.assertIn('"setup_id": "setup-b"', logs)
+        self.assertIn('"intent_status": "CANCELLED"', logs)
+        self.assertIn('"rr1": null', logs)
+        self.assertEqual(statuses, [("setup-a", "NEW"), ("setup-b", "READY"), ("setup-c", "CANCELLED")])
+
+    def test_inspect_execution_intents_missing_table_exits_cleanly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            sqlite3.connect(state_db_path).close()
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.inspect_execution_intents_once(argparse.Namespace(state_db_path=state_db_path))
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                table_exists = trader.execution_intents_table_exists(conn)
+
+        logs = output.getvalue()
+        self.assertIn("INTENTS_TOTAL 0", logs)
+        self.assertIn("INTENTS_NEW 0", logs)
+        self.assertIn("INTENTS_READY 0", logs)
+        self.assertIn("INTENTS_CANCELLED 0", logs)
+        self.assertFalse(table_exists)
+
+    def test_inspect_execution_intents_does_not_initialize_binance_client(self):
+        class ForbiddenClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("Binance client must not be initialized in inspection mode")
+
+        original_client = trader.BinanceFuturesClient
+        try:
+            trader.BinanceFuturesClient = ForbiddenClient
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state_db_path = os.path.join(temp_dir, "live_state.db")
+                with closing(sqlite3.connect(state_db_path)) as conn:
+                    trader.init_execution_intents_table(conn)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.inspect_execution_intents_once(argparse.Namespace(state_db_path=state_db_path))
+        finally:
+            trader.BinanceFuturesClient = original_client
+
+        self.assertIn("INTENTS_TOTAL 0", output.getvalue())
+
     def test_main_dispatches_to_setup_consumer_only_when_flag_is_enabled(self):
         original_parse_args = trader.parse_args
         original_process_once = trader.process_once

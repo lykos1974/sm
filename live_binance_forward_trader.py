@@ -868,6 +868,71 @@ def init_execution_intents_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+
+EXECUTION_INTENT_INSPECT_COLUMNS = (
+    "intent_id",
+    "setup_id",
+    "symbol",
+    "side",
+    "entry",
+    "stop",
+    "tp1",
+    "tp2",
+    "rr1",
+    "rr2",
+    "reference_ts",
+    "created_ts",
+    "intent_status",
+)
+
+
+def execution_intents_table_exists(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_intents'"
+    ).fetchone()
+    return row is not None
+
+
+def inspect_execution_intents_once(args: argparse.Namespace) -> None:
+    state_db_path = resolve_state_db_path(args)
+    try:
+        conn = connect_state_db_readonly(state_db_path)
+    except sqlite3.OperationalError:
+        print("INTENTS_TOTAL 0")
+        print("INTENTS_NEW 0")
+        print("INTENTS_READY 0")
+        print("INTENTS_CANCELLED 0")
+        return
+
+    with closing(conn):
+        if not execution_intents_table_exists(conn):
+            print("INTENTS_TOTAL 0")
+            print("INTENTS_NEW 0")
+            print("INTENTS_READY 0")
+            print("INTENTS_CANCELLED 0")
+            return
+
+        status_counts = {status: 0 for status in EXECUTION_INTENT_STATUSES}
+        rows = conn.execute(
+            f"""
+            SELECT {", ".join(EXECUTION_INTENT_INSPECT_COLUMNS)}
+            FROM execution_intents
+            ORDER BY created_ts, intent_id
+            """
+        ).fetchall()
+        for row in rows:
+            status = row["intent_status"]
+            if status in status_counts:
+                status_counts[status] += 1
+
+        print(f"INTENTS_TOTAL {len(rows)}")
+        print(f"INTENTS_NEW {status_counts[EXECUTION_INTENT_STATUS_NEW]}")
+        print(f"INTENTS_READY {status_counts[EXECUTION_INTENT_STATUS_READY]}")
+        print(f"INTENTS_CANCELLED {status_counts[EXECUTION_INTENT_STATUS_CANCELLED]}")
+        for row in rows:
+            payload = {column: row[column] for column in EXECUTION_INTENT_INSPECT_COLUMNS}
+            print(f"INTENT_ROW {json.dumps(payload, sort_keys=True)}")
+
 def execution_intent_id(setup_id: str) -> str:
     digest = hashlib.sha256(setup_id.encode("utf-8")).hexdigest()[:16]
     return f"intent-{digest}"
@@ -3484,9 +3549,9 @@ def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forward-validate strict PnF triangles with guarded Binance USD-M futures micro-orders")
-    parser.add_argument("--db-path", required=True, help="Path to existing market_data.db; opened read-only and used only as the candle source")
+    parser.add_argument("--db-path", help="Path to existing market_data.db; opened read-only and used only as the candle source")
     parser.add_argument("--state-db-path", required=True, help="Path to trader-owned state DB for Binance live signal/trade/state tables")
-    parser.add_argument("--settings", required=True, help="Path to settings.json with PnF profiles")
+    parser.add_argument("--settings", help="Path to settings.json with PnF profiles")
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode even if LIVE_TRADING_ENABLED=1")
     parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
     parser.add_argument("--enable-demo-doubles", action="store_true", help="Enable strict double top/bottom smoke-test execution only for DEMO LIVE mode")
@@ -3510,11 +3575,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--research-rule-json", help="Path to research_v2 optimizer rule JSON used as pre-order forward-test gate (demo/dry-run only)")
     parser.add_argument("--consume-strategy-setups", action="store_true", help="Read scanner-generated strategy_setups rows and emit setup execution intents; read-only/no orders")
     parser.add_argument("--strategy-setups-db", help="Path to strategy_validation.db containing strategy_setups for --consume-strategy-setups")
-    return parser.parse_args()
+    parser.add_argument("--inspect-execution-intents", action="store_true", help="Read-only summary of execution_intents in --state-db-path; exits before Binance initialization or scanning")
+    args = parser.parse_args()
+    if not args.inspect_execution_intents:
+        missing = [flag for flag, value in (("--db-path", args.db_path), ("--settings", args.settings)) if not value]
+        if missing:
+            parser.error(f"the following arguments are required unless --inspect-execution-intents is used: {', '.join(missing)}")
+    return args
 
 
 def main() -> None:
     args = parse_args()
+    if bool(getattr(args, "inspect_execution_intents", False)):
+        inspect_execution_intents_once(args)
+        return
+
     if getattr(args, "export_trade_journal", None):
         run_trade_journal_export_once(args)
         return
