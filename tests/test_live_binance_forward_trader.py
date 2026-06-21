@@ -231,6 +231,9 @@ class LifecycleClient(LiveClient):
         self.submitted_orders.append(order)
         return {"algoId": f"algo-{len(self.submitted_orders)}", "clientAlgoId": order.get("clientAlgoId"), "status": "NEW"}
 
+    def get_mark_price(self, symbol):
+        return Decimal("100.00")
+
     def get_symbol_spec(self, symbol):
         return trader.SymbolSpec(
             symbol=symbol,

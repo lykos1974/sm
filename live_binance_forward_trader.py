@@ -296,6 +296,13 @@ class BinanceFuturesClient:
     def get_position_risk(self, symbol: str) -> Any:
         return self._request_json("GET", "/fapi/v3/positionRisk", params={"symbol": symbol}, signed=True)
 
+    def get_mark_price(self, symbol: str) -> Decimal:
+        data = self._request_json("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
+        try:
+            return _dec(data["markPrice"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Binance mark-price response missing markPrice: {data!r}") from exc
+
     def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
         return self._request_json("POST", "/fapi/v1/order", params=order, signed=True)
 
@@ -1958,6 +1965,46 @@ def protective_position_side_for_trade(signal: TriangleSignal, raw_order_respons
     return "LONG" if signal.side == "LONG" else "SHORT"
 
 
+def protective_triggers_valid_for_mark(
+    *,
+    side: str,
+    mark_price: Decimal,
+    stop_trigger: Decimal,
+    tp_trigger: Decimal,
+) -> bool:
+    side_upper = side.upper()
+    if side_upper == "LONG":
+        return mark_price > stop_trigger and mark_price < tp_trigger
+    if side_upper == "SHORT":
+        return mark_price < stop_trigger and mark_price > tp_trigger
+    raise ValueError(f"unsupported protective side: {side}")
+
+
+def mark_protective_attach_blocked(
+    conn: sqlite3.Connection,
+    *,
+    trade_id: int,
+    status: str,
+    error: str,
+    raw_response: dict[str, Any],
+) -> None:
+    conn.execute(
+        """
+        UPDATE live_trades_binance
+        SET status = ?, protective_orders_status = ?, protective_orders_raw_response = ?, protective_orders_error = ?
+        WHERE id = ?
+        """,
+        (
+            "POSITION_OPEN_UNPROTECTED",
+            status,
+            json.dumps(raw_response, sort_keys=True, default=str),
+            error,
+            int(trade_id),
+        ),
+    )
+    conn.commit()
+
+
 def attach_protective_algo_orders(
     conn: sqlite3.Connection,
     client: BinanceFuturesClient,
@@ -2019,6 +2066,51 @@ def attach_protective_algo_orders(
                 "tp_trigger_price": tp_order["triggerPrice"],
             },
         )
+        try:
+            mark_price = client.get_mark_price(binance_symbol(signal.symbol))
+        except Exception as exc:
+            payload = {
+                "symbol": signal.symbol,
+                "trade_id": int(trade_id),
+                "stop_trigger": stop_order["triggerPrice"],
+                "tp_trigger": tp_order["triggerPrice"],
+                "side": signal.side,
+                "error": str(exc),
+            }
+            mark_protective_attach_blocked(
+                conn,
+                trade_id=int(trade_id),
+                status="MARK_PRICE_UNAVAILABLE",
+                error=f"PROTECTIVE_ORDER_MARK_PRICE_UNAVAILABLE: {exc}",
+                raw_response={"stop_order": stop_order, "tp_order": tp_order, "mark_price_error": str(exc)},
+            )
+            console("PROTECTIVE_ORDER_MARK_PRICE_UNAVAILABLE", f"{signal.symbol} trade_id={trade_id} UNPROTECTED", payload)
+            return
+        stop_trigger = _dec(stop_order["triggerPrice"])
+        tp_trigger = _dec(tp_order["triggerPrice"])
+        if not protective_triggers_valid_for_mark(
+            side=signal.side,
+            mark_price=mark_price,
+            stop_trigger=stop_trigger,
+            tp_trigger=tp_trigger,
+        ):
+            payload = {
+                "symbol": signal.symbol,
+                "trade_id": int(trade_id),
+                "mark_price": str(mark_price),
+                "stop_trigger": str(stop_trigger),
+                "tp_trigger": str(tp_trigger),
+                "side": signal.side,
+            }
+            mark_protective_attach_blocked(
+                conn,
+                trade_id=int(trade_id),
+                status="BLOCKED_IMMEDIATE_TRIGGER",
+                error="PROTECTIVE_ORDER_BLOCKED_IMMEDIATE_TRIGGER",
+                raw_response={"stop_order": stop_order, "tp_order": tp_order, **payload},
+            )
+            console("PROTECTIVE_ORDER_BLOCKED_IMMEDIATE_TRIGGER", f"{signal.symbol} trade_id={trade_id} UNPROTECTED", payload)
+            return
         console(
             "PROTECTIVE_ATTACH_ATTEMPT",
             f"{signal.symbol} trade_id={trade_id}",
