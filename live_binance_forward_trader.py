@@ -212,17 +212,38 @@ class BinanceFuturesClient:
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
+        self._time_offset_ms = 0
 
     @property
     def has_credentials(self) -> bool:
         return bool(self.api_key and self.api_secret)
+
+    def get_server_time(self) -> int:
+        data = self._request_json("GET", "/fapi/v1/time")
+        try:
+            return int(data["serverTime"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Binance server-time response missing serverTime: {data!r}") from exc
+
+    def sync_server_time(self) -> int:
+        local_time = int(time.time() * 1000)
+        server_time = self.get_server_time()
+        self._time_offset_ms = server_time - local_time
+        console(
+            "BINANCE_TIME_SYNC",
+            "",
+            {"server_time": server_time, "local_time": local_time, "offset_ms": self._time_offset_ms},
+        )
+        return self._time_offset_ms
 
     def _signed_params(self, params: dict[str, Any] | None = None, *, timestamp: int | None = None) -> dict[str, Any]:
         if not self.has_credentials:
             raise RuntimeError("missing Binance USD-M futures API credentials")
         signed: dict[str, Any] = {k: v for k, v in (params or {}).items() if v is not None}
         signed.setdefault("recvWindow", RECV_WINDOW_MS)
-        signed["timestamp"] = int(timestamp if timestamp is not None else time.time() * 1000)
+        if timestamp is None:
+            self.sync_server_time()
+        signed["timestamp"] = int(timestamp if timestamp is not None else (time.time() * 1000) + self._time_offset_ms)
         query = urllib.parse.urlencode(signed, doseq=True)
         signed["signature"] = hmac.new(str(self.api_secret).encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
         return signed
