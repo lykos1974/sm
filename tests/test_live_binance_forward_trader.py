@@ -227,6 +227,10 @@ class LifecycleClient(LiveClient):
     def get_user_trades(self, symbol, *, order_id=None):
         return [{"orderId": int(order_id), "commission": "0.00001", "commissionAsset": "USDT"}]
 
+    def submit_algo_order(self, order):
+        self.submitted_orders.append(order)
+        return {"algoId": f"algo-{len(self.submitted_orders)}", "clientAlgoId": order.get("clientAlgoId"), "status": "NEW"}
+
     def cancel_order(self, symbol, *, order_id=None, orig_client_order_id=None):
         response = {
             "symbol": symbol,
@@ -2900,6 +2904,177 @@ class BinanceForwardTraderTests(unittest.TestCase):
                 after = conn.execute("SELECT * FROM strategy_setups").fetchall()
         self.assertEqual(before, after)
 
+    def _create_order_sent_trade_state_db(self, state_db_path, *, entry_status="NEW"):
+        with closing(sqlite3.connect(state_db_path)) as conn:
+            trader.init_live_tables(conn)
+            order_request = {"symbol": "SOLUSDT", "newClientOrderId": "entry-client", "side": "BUY"}
+            order_response = {"orderId": 42, "clientOrderId": "entry-client", "status": "NEW"}
+            conn.execute(
+                """
+                INSERT INTO live_trades_binance(
+                    created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
+                    tp1_price, tp2_price, notional_usdt, decision, status, dry_run, exchange_order_id,
+                    raw_order_response, entry_order_status, protective_orders_status, setup_id, intent_id,
+                    active_stop_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trader.now_iso(),
+                    "BINANCE_FUT:SOLUSDT",
+                    "execution_intent",
+                    "LONG",
+                    1700000000,
+                    100,
+                    99,
+                    102,
+                    103,
+                    1,
+                    "ORDER_SENT",
+                    "ORDER_SENT",
+                    0,
+                    "42",
+                    json.dumps({"order_request": order_request, "order_response": order_response}),
+                    entry_status,
+                    "PENDING_ENTRY_FILL",
+                    "setup-test",
+                    "intent-test",
+                    99,
+                ),
+            )
+            conn.commit()
+
+    def _run_execution_trade_sync(self, state_db_path, *, demo=True, dry_run=False, live_env="1", client_cls=LifecycleClient, status="FILLED"):
+        class SyncClient(client_cls):
+            instances = []
+            def __init__(self, api_key=None, api_secret=None, *, base_url=trader.BINANCE_BASE_URL):
+                super().__init__(status=status)
+                self.api_key = api_key
+                self.api_secret = api_secret
+                self.base_url = base_url
+                self.has_credentials = bool(api_key and api_secret)
+                SyncClient.instances.append(self)
+
+        original_client = trader.BinanceFuturesClient
+        old_live = os.environ.get("LIVE_TRADING_ENABLED")
+        old_key = os.environ.get(trader.BINANCE_DEMO_API_KEY_ENV)
+        old_secret = os.environ.get(trader.BINANCE_DEMO_API_SECRET_ENV)
+        try:
+            trader.BinanceFuturesClient = SyncClient
+            if live_env is None:
+                os.environ.pop("LIVE_TRADING_ENABLED", None)
+            else:
+                os.environ["LIVE_TRADING_ENABLED"] = live_env
+            os.environ[trader.BINANCE_DEMO_API_KEY_ENV] = "key"
+            os.environ[trader.BINANCE_DEMO_API_SECRET_ENV] = "secret"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_sync_execution_trades_once(
+                    argparse.Namespace(state_db_path=state_db_path, demo=demo, dry_run=dry_run),
+                    iteration=1,
+                )
+            return output.getvalue(), list(SyncClient.instances)
+        finally:
+            trader.BinanceFuturesClient = original_client
+            if old_live is None:
+                os.environ.pop("LIVE_TRADING_ENABLED", None)
+            else:
+                os.environ["LIVE_TRADING_ENABLED"] = old_live
+            if old_key is None:
+                os.environ.pop(trader.BINANCE_DEMO_API_KEY_ENV, None)
+            else:
+                os.environ[trader.BINANCE_DEMO_API_KEY_ENV] = old_key
+            if old_secret is None:
+                os.environ.pop(trader.BINANCE_DEMO_API_SECRET_ENV, None)
+            else:
+                os.environ[trader.BINANCE_DEMO_API_SECRET_ENV] = old_secret
+
+    def test_sync_execution_trades_non_demo_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with self.assertRaisesRegex(RuntimeError, "requires --demo"):
+                self._run_execution_trade_sync(state, demo=False)
+
+    def test_sync_execution_trades_dry_run_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with self.assertRaisesRegex(RuntimeError, "blocked by --dry-run"):
+                self._run_execution_trade_sync(state, dry_run=True)
+
+    def test_sync_execution_trades_missing_live_env_blocked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with self.assertRaisesRegex(RuntimeError, "LIVE_TRADING_ENABLED=1"):
+                self._run_execution_trade_sync(state, live_env=None)
+
+    def test_sync_execution_trades_entry_new_no_protective_orders(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state, entry_status="NEW")
+            logs, clients = self._run_execution_trade_sync(state, status="NEW")
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, entry_order_status, protective_orders_status FROM live_trades_binance").fetchone()
+        self.assertIn("ENTRY_NOT_FILLED", logs)
+        self.assertEqual(row, ("ORDER_SENT", "NEW", "PENDING_ENTRY_FILL"))
+        self.assertEqual(clients[0].submitted_orders, [])
+
+    def test_sync_execution_trades_entry_filled_attaches_tp_sl(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED")
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, entry_order_status, avg_fill_price, executed_qty, protective_orders_status, stop_algo_id, tp_algo_id FROM live_trades_binance").fetchone()
+        self.assertIn("PROTECTIVE_ORDERS_ATTACHED", logs)
+        self.assertEqual(row[0:5], ("POSITION_OPEN", "FILLED", 100.50, 0.009, "ATTACHED"))
+        self.assertTrue(row[5])
+        self.assertTrue(row[6])
+        self.assertEqual([order["type"] for order in clients[0].submitted_orders], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+
+    def test_sync_execution_trades_duplicate_sync_does_not_attach_twice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED")
+            logs2, clients2 = self._run_execution_trade_sync(state, status="FILLED")
+        self.assertIn("PROTECTIVE_ORDERS_ATTACHED", logs)
+        self.assertIn("EXECUTION_TRADES_SYNC_FOUND 0", logs2)
+        self.assertEqual(len(clients[0].submitted_orders), 2)
+        self.assertEqual(len(clients2[0].submitted_orders), 0)
+
+    def test_sync_execution_trades_protective_failure_marks_unprotected(self):
+        class FailingProtectiveClient(LifecycleClient):
+            def submit_algo_order(self, order):
+                self.submitted_orders.append(order)
+                raise RuntimeError("protective boom")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED", client_cls=FailingProtectiveClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, protective_orders_status, protective_orders_error FROM live_trades_binance").fetchone()
+        self.assertIn("PROTECTIVE_ORDER_FAILED", logs)
+        self.assertEqual(row[0], "POSITION_OPEN_UNPROTECTED")
+        self.assertEqual(row[1], "ATTACH_FAILED")
+        self.assertIn("protective boom", row[2])
+        self.assertEqual(len(clients[0].submitted_orders), 1)
+
+    def test_sync_execution_trades_does_not_mutate_strategy_setups(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            setup_db = os.path.join(temp_dir, "strategy_validation.db")
+            state = os.path.join(temp_dir, "state.db")
+            create_strategy_setups_db(setup_db, [{"setup_id": "setup-test", "symbol": "BINANCE_FUT:SOLUSDT"}])
+            self._create_order_sent_trade_state_db(state)
+            with closing(sqlite3.connect(setup_db)) as conn:
+                before = conn.execute("SELECT * FROM strategy_setups").fetchall()
+            self._run_execution_trade_sync(state, status="FILLED")
+            with closing(sqlite3.connect(setup_db)) as conn:
+                after = conn.execute("SELECT * FROM strategy_setups").fetchall()
+        self.assertEqual(before, after)
+
     def test_execution_intents_no_path_runs_unless_flag_supplied(self):
         original_parse_args = trader.parse_args
         original_process_once = trader.process_once
@@ -2921,6 +3096,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
                 loop=False,
                 poll_seconds=0,
                 inspect_execution_intents=False,
+                sync_execution_trades=False,
             )
             with redirect_stdout(io.StringIO()):
                 trader.main()
