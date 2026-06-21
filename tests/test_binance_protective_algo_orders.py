@@ -27,9 +27,15 @@ def sample_signal(side="LONG"):
 
 
 class CapturingBinanceClient(trader.BinanceFuturesClient):
-    def __init__(self):
+    def __init__(self, mark_price=Decimal("100")):
         super().__init__("key", "secret", base_url=trader.BINANCE_DEMO_BASE_URL)
         self.calls = []
+        self.mark_price = mark_price
+
+    def get_mark_price(self, symbol):
+        if isinstance(self.mark_price, Exception):
+            raise self.mark_price
+        return self.mark_price
 
     def _request_json(self, method, path, *, params=None, signed=False):
         self.calls.append({"method": method, "path": path, "params": params, "signed": signed})
@@ -339,10 +345,126 @@ def test_xrp_like_floating_trigger_prices_are_quantized_before_submission():
             )
 
     conn, trade_id = setup_trade(signal)
-    client = XrpSpecClient()
+    client = XrpSpecClient(mark_price=Decimal("1.1500"))
 
     trader.attach_protective_algo_orders(conn, client, trade_id, signal)
 
-    submitted = [call["params"] for call in client.calls]
+    submitted = [call["params"] for call in algo_order_calls(client)]
     assert [order["triggerPrice"] for order in submitted] == ["1.1300", "1.1700"]
     assert all("000000000000" not in order["triggerPrice"] for order in submitted)
+
+
+def algo_order_calls(client):
+    return [call for call in client.calls if call["path"] == "/fapi/v1/algoOrder"]
+
+
+def test_long_mark_below_stop_blocks_attach_without_algo_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=Decimal("98.99"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    assert algo_order_calls(client) == []
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status, protective_orders_error FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("POSITION_OPEN_UNPROTECTED", None, None, "BLOCKED_IMMEDIATE_TRIGGER", "PROTECTIVE_ORDER_BLOCKED_IMMEDIATE_TRIGGER")
+
+
+def test_long_mark_equal_stop_blocks_attach_without_algo_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=Decimal("99.00"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    assert algo_order_calls(client) == []
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("POSITION_OPEN_UNPROTECTED", None, None, "BLOCKED_IMMEDIATE_TRIGGER")
+
+
+def test_long_mark_above_tp_blocks_attach_without_algo_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=Decimal("103.01"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    assert algo_order_calls(client) == []
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("POSITION_OPEN_UNPROTECTED", None, None, "BLOCKED_IMMEDIATE_TRIGGER")
+
+
+def test_long_mark_equal_tp_blocks_attach_without_algo_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=Decimal("103.00"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    assert algo_order_calls(client) == []
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("POSITION_OPEN_UNPROTECTED", None, None, "BLOCKED_IMMEDIATE_TRIGGER")
+
+
+def test_long_mark_between_stop_and_tp_submits_protective_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=Decimal("100.00"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    submitted = [call["params"] for call in algo_order_calls(client)]
+    assert [order["type"] for order in submitted] == ["STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status, protective_orders_error FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("POSITION_OPEN", "123", "123", "ATTACHED", None)
+
+
+def test_blocked_attach_can_retry_later_when_mark_returns_inside_valid_range():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=Decimal("99.00"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+    assert algo_order_calls(client) == []
+
+    client.mark_price = Decimal("100.00")
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    submitted = [call["params"] for call in algo_order_calls(client)]
+    assert [order["type"] for order in submitted] == ["STOP_MARKET", "TAKE_PROFIT_MARKET"]
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status, protective_orders_error FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row == ("POSITION_OPEN_UNPROTECTED", "123", "123", "ATTACHED", None)
+
+
+def test_mark_price_unavailable_fails_closed_without_algo_orders():
+    signal = sample_signal("LONG")
+    conn, trade_id = setup_trade(signal)
+    client = CapturingBinanceClient(mark_price=RuntimeError("mark unavailable"))
+
+    trader.attach_protective_algo_orders(conn, client, trade_id, signal)
+
+    assert algo_order_calls(client) == []
+    row = conn.execute(
+        "SELECT status, stop_algo_id, tp_algo_id, protective_orders_status, protective_orders_error FROM live_trades_binance WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    assert row[0:4] == ("POSITION_OPEN_UNPROTECTED", None, None, "MARK_PRICE_UNAVAILABLE")
+    assert "PROTECTIVE_ORDER_MARK_PRICE_UNAVAILABLE" in row[4]
