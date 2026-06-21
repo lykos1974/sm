@@ -1350,6 +1350,8 @@ class App(tk.Tk):
             return text if text else "N/A"
 
     def _format_trade_setup_field_value(self, field: str, setup: dict, profile: PnFProfile) -> str:
+        if field == "status":
+            return self._trade_visualization_label_status(setup)
         if field == "quality":
             return self._quality_grade_from_score(setup.get("quality_score"))
         if field == "rr":
@@ -2102,6 +2104,40 @@ class App(tk.Tk):
             self._log(f"Support/resistance overlay failed for {symbol}: {e}")
 
 
+    def _normalized_lifecycle_value(self, setup: dict, field: str, default: str = "") -> str:
+        return str(setup.get(field) or default).upper()
+
+    def is_open_active_trade(self, setup: dict) -> bool:
+        return (
+            self._normalized_lifecycle_value(setup, "activation_status") == "ACTIVE"
+            and self._normalized_lifecycle_value(setup, "resolution_status", "PENDING") == "PENDING"
+        )
+
+    def _is_resolved_trade_setup(self, setup: dict) -> bool:
+        resolution_status = self._normalized_lifecycle_value(setup, "resolution_status", "PENDING")
+        return bool(resolution_status) and resolution_status != "PENDING"
+
+    def _is_pending_visual_setup(self, setup: dict) -> bool:
+        if self._is_resolved_trade_setup(setup):
+            return False
+        return self._normalized_lifecycle_value(setup, "status") in {"CANDIDATE", "WATCH"}
+
+    def _trade_visualization_lifecycle_rank(self, setup: dict) -> int:
+        if self.is_open_active_trade(setup):
+            return 0
+        status = self._normalized_lifecycle_value(setup, "status")
+        if status == "CANDIDATE" and self._is_pending_visual_setup(setup):
+            return 1
+        if status == "WATCH" and self._is_pending_visual_setup(setup):
+            return 2
+        return 99
+
+    def _trade_visualization_label_status(self, setup: dict) -> str:
+        if self.is_open_active_trade(setup):
+            return "ACTIVE"
+        status = self._normalized_lifecycle_value(setup, "status")
+        return status if status else "N/A"
+
     def _get_active_trade_visual_setup(self, symbol: str):
         try:
             engine = self.engines.get(symbol)
@@ -2111,8 +2147,7 @@ class App(tk.Tk):
             _structure, setups = self._evaluate_strategy_setups(symbol, engine)
             active_setups = []
             for setup in setups:
-                status = str(setup.get("status") or "").upper()
-                if status not in {"ACTIVE", "CANDIDATE", "WATCH"}:
+                if not self.is_open_active_trade(setup) and not self._is_pending_visual_setup(setup):
                     continue
                 if any(setup.get(field) is None for field in ("ideal_entry", "invalidation", "tp1", "tp2")):
                     continue
@@ -2121,12 +2156,11 @@ class App(tk.Tk):
             if not active_setups:
                 return None
 
-            status_rank = {"ACTIVE": 0, "CANDIDATE": 1, "WATCH": 2}
             side_rank = {"LONG": 0, "SHORT": 1}
             return sorted(
                 active_setups,
                 key=lambda setup: (
-                    status_rank.get(str(setup.get("status") or "").upper(), 99),
+                    self._trade_visualization_lifecycle_rank(setup),
                     side_rank.get(str(setup.get("side") or "").upper(), 99),
                     -float(setup.get("quality_score") or 0.0),
                 ),
@@ -2157,7 +2191,6 @@ class App(tk.Tk):
                 ("tp2", "TP2", "#2fbf71", 1, (10, 6), ("Consolas", 8), ("Consolas", 8)),
             )
             side = str(setup.get("side") or "").upper()
-            status = str(setup.get("status") or "").upper()
 
             for field, label, color, width, dash, chart_font, axis_font in line_specs:
                 try:
@@ -2206,7 +2239,7 @@ class App(tk.Tk):
             self.chart_canvas.create_text(
                 8,
                 16,
-                text=f"TRADE SETUP {side} {status}",
+                text=f"TRADE SETUP {side} {self._trade_visualization_label_status(setup)}",
                 fill="#d7dde2",
                 anchor="w",
                 font=("Consolas", 9, "bold"),
