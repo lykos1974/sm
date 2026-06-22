@@ -3312,8 +3312,82 @@ class BinanceForwardTraderTests(unittest.TestCase):
         plan, reason = trader.calculate_mexc_futures_position_size(signal)
         self.assertIsNone(reason)
         self.assertLessEqual(plan.risk_usdt, Decimal("0.20"))
-        self.assertLessEqual(plan.notional_usdt, Decimal("100"))
+        self.assertLessEqual(plan.notional_usdt, Decimal("20"))
         self.assertEqual(plan.leverage, Decimal("5"))
+
+    def test_mexc_order_payload_uses_btc_contract_size_symbol_tick_and_integer_vol(self):
+        signal = trader.TriangleSignal(
+            symbol="MEXC_FUT:BTCUSDT", pattern="execution_intent", side="LONG", trigger_ts=1,
+            entry_price=Decimal("100.06"), stop_price=Decimal("99.99"), tp1_price=Decimal("101"), tp2_price=Decimal("102"),
+            trigger_column_idx=0, support_level=Decimal("99.99"), resistance_level=Decimal("100.06"),
+            break_distance_boxes=Decimal("0"), pattern_quality="test",
+        )
+        plan, reason = trader.calculate_mexc_futures_position_size(signal, contract_size=Decimal("0.0001"), tick_size=Decimal("0.1"))
+        self.assertIsNone(reason)
+        self.assertEqual(plan.mexc_symbol, "BTC_USDT")
+        self.assertEqual(plan.rounded_entry, Decimal("100.0"))
+        self.assertEqual(plan.vol, 2000)
+        self.assertIsInstance(plan.vol, int)
+        order = trader.mexc_order_from_plan({"intent_id": "intent-btc-test"}, plan)
+        self.assertEqual(order["symbol"], "BTC_USDT")
+        self.assertEqual(order["price"], "100.0")
+        self.assertEqual(order["vol"], 2000)
+        self.assertEqual(order["side"], 1)
+        self.assertEqual(order["type"], 1)
+        self.assertEqual(order["openType"], 1)
+        self.assertEqual(order["leverage"], 5)
+        self.assertEqual(order["externalOid"], "pnf-mexc-btc-test")
+
+    def test_mexc_order_payload_uses_ena_contract_size(self):
+        signal = trader.TriangleSignal(
+            symbol="MEXC_FUT:ENAUSDT", pattern="execution_intent", side="LONG", trigger_ts=1,
+            entry_price=Decimal("0.50009"), stop_price=Decimal("0.49999"), tp1_price=Decimal("0.51"), tp2_price=Decimal("0.52"),
+            trigger_column_idx=0, support_level=Decimal("0.49999"), resistance_level=Decimal("0.50009"),
+            break_distance_boxes=Decimal("0"), pattern_quality="test",
+        )
+        plan, reason = trader.calculate_mexc_futures_position_size(signal, contract_size=Decimal("1"), tick_size=Decimal("0.00001"), price_precision=5)
+        self.assertIsNone(reason)
+        self.assertEqual(plan.mexc_symbol, "ENA_USDT")
+        self.assertEqual(plan.rounded_entry, Decimal("0.50009"))
+        order = trader.mexc_order_from_plan({"intent_id": "intent-ena-test"}, plan)
+        self.assertEqual(order["price"], "0.50009")
+        self.assertEqual(plan.vol, 39)
+        self.assertEqual(plan.quantity, Decimal("39"))
+
+
+    def test_mexc_order_payload_formats_symbol_price_precision(self):
+        cases = [
+            ("BTCUSDT", Decimal("100.06"), "100.0"),
+            ("ETHUSDT", Decimal("100.019"), "100.01"),
+            ("SOLUSDT", Decimal("150.123"), "150.12"),
+            ("SUIUSDT", Decimal("3.50009"), "3.5000"),
+            ("ENAUSDT", Decimal("0.500099"), "0.50009"),
+        ]
+        for symbol, entry, expected_price in cases:
+            with self.subTest(symbol=symbol):
+                signal = trader.TriangleSignal(
+                    symbol=f"MEXC_FUT:{symbol}", pattern="execution_intent", side="LONG", trigger_ts=1,
+                    entry_price=entry, stop_price=entry - Decimal("0.00001"), tp1_price=entry + Decimal("1"), tp2_price=entry + Decimal("2"),
+                    trigger_column_idx=0, support_level=entry - Decimal("0.00001"), resistance_level=entry,
+                    break_distance_boxes=Decimal("0"), pattern_quality="test",
+                )
+                plan, reason = trader.calculate_mexc_futures_position_size(signal)
+                self.assertIsNone(reason)
+                order = trader.mexc_order_from_plan({"intent_id": f"intent-{symbol.lower()}"}, plan)
+                self.assertEqual(order["price"], expected_price)
+
+    def test_mexc_order_builder_enforces_notional_and_risk_caps(self):
+        signal = trader.TriangleSignal(
+            symbol="MEXC_FUT:BTCUSDT", pattern="execution_intent", side="LONG", trigger_ts=1,
+            entry_price=Decimal("100"), stop_price=Decimal("99"), tp1_price=Decimal("101"), tp2_price=Decimal("102"),
+            trigger_column_idx=0, support_level=Decimal("99"), resistance_level=Decimal("100"),
+            break_distance_boxes=Decimal("0"), pattern_quality="test",
+        )
+        _plan, reason = trader.calculate_mexc_futures_position_size(signal, contract_size=Decimal("0.0001"), tick_size=Decimal("0.1"), notional_usdt=Decimal("20.01"))
+        self.assertIn("20 USDT", reason)
+        risky = replace_signal(signal, stop_price=Decimal("90"), support_level=Decimal("90"))
+        _plan, reason = trader.calculate_mexc_futures_position_size(risky, contract_size=Decimal("0.0001"), tick_size=Decimal("0.1"))
+        self.assertEqual(reason, "0.20 USDT risk cap exceeded")
 
     def test_mexc_max_open_position_blocks_second_trade(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3350,7 +3424,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
             logs = self._run_mexc_intent_executor(state)
             with closing(sqlite3.connect(state)) as conn:
                 row = conn.execute("SELECT symbol, status, dry_run, raw_order_response FROM live_trades_binance").fetchone()
-        self.assertIn("MEXC_ORDER_DRY_RUN", logs)
+        self.assertIn("MEXC_ORDER_PAYLOAD_DRY_RUN", logs)
         self.assertEqual(row[0], "MEXC_FUT:SOLUSDT")
         self.assertEqual(row[1], "DRY_RUN")
         self.assertEqual(row[2], 1)
