@@ -41,6 +41,15 @@ BINANCE_API_KEY_ENV = "BINANCE_FUTURES_API_KEY"
 BINANCE_API_SECRET_ENV = "BINANCE_FUTURES_API_SECRET"
 BINANCE_DEMO_API_KEY_ENV = "BINANCE_DEMO_FUTURES_API_KEY"
 BINANCE_DEMO_API_SECRET_ENV = "BINANCE_DEMO_FUTURES_API_SECRET"
+MEXC_FUTURES_BASE_URL = "https://contract.mexc.com"
+MEXC_FUTURES_API_KEY_ENV = "MEXC_FUTURES_API_KEY"
+MEXC_FUTURES_API_SECRET_ENV = "MEXC_FUTURES_API_SECRET"
+MEXC_FUTURES_ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "ENAUSDT"}
+MEXC_FUTURES_ALLOWED_VENUE_SYMBOLS = {f"MEXC_FUT:{symbol}" for symbol in MEXC_FUTURES_ALLOWED_SYMBOLS}
+MEXC_FUTURES_DEFAULT_LEVERAGE = Decimal("5")
+MEXC_FUTURES_MAX_BANKROLL_USDT = Decimal("20")
+MEXC_FUTURES_RISK_PER_TRADE_USDT = Decimal("0.20")
+MEXC_FUTURES_MAX_OPEN_POSITIONS = 1
 MAX_NOTIONAL_USDT = Decimal("1")
 EXECUTION_INTENT_DEMO_MAX_NOTIONAL_USDT = Decimal("100")
 DEFAULT_NOTIONAL_USDT = Decimal("1")
@@ -1208,7 +1217,126 @@ def mark_setup_candidate_seen(conn: sqlite3.Connection, setup_id: str, *, seen_t
 def is_setup_symbol_supported_for_execution(symbol: str, execution_venue: str | None) -> bool:
     if execution_venue == "BINANCE_DEMO":
         return symbol in BINANCE_DEMO_SETUP_SYMBOLS
+    if execution_venue == "MEXC_FUT":
+        return symbol in MEXC_FUTURES_ALLOWED_SYMBOLS or symbol in MEXC_FUTURES_ALLOWED_VENUE_SYMBOLS
     return True
+
+
+@dataclass(frozen=True)
+class MexcFuturesOrderPlan:
+    symbol: str
+    entry: Decimal
+    stop: Decimal
+    tp1: Decimal
+    tp2: Decimal
+    quantity: Decimal
+    risk_usdt: Decimal
+    notional_usdt: Decimal
+    leverage: Decimal
+
+
+class MexcFuturesExecutionClient:
+    """Fail-closed MEXC Futures client skeleton for the execution-intent path."""
+
+    def __init__(self, api_key: str | None, api_secret: str | None, *, base_url: str = MEXC_FUTURES_BASE_URL) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url.rstrip("/")
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.api_key and self.api_secret)
+
+    def get_open_positions(self) -> list[dict[str, Any]]:
+        raise RuntimeError("MEXC live position sync is not enabled in Phase A dry-run mode")
+
+    def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("MEXC live order submission requires explicit Phase B implementation")
+
+
+def normalize_mexc_futures_symbol(symbol: str) -> str:
+    return symbol.split(":", 1)[-1].upper()
+
+
+def is_mexc_futures_symbol_allowed(symbol: str) -> bool:
+    return normalize_mexc_futures_symbol(symbol) in MEXC_FUTURES_ALLOWED_SYMBOLS
+
+
+def count_open_mexc_execution_trades(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM live_trades_binance
+        WHERE pattern = 'execution_intent'
+          AND symbol LIKE 'MEXC_FUT:%'
+          AND status IN ('ORDER_SENT','POSITION_OPEN','POSITION_OPEN_UNPROTECTED','EXIT_PENDING')
+        """
+    ).fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def mexc_setup_already_executed(conn: sqlite3.Connection, setup_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM live_trades_binance WHERE setup_id = ? AND symbol LIKE 'MEXC_FUT:%' LIMIT 1",
+        (setup_id,),
+    ).fetchone()
+    return row is not None
+
+
+def calculate_mexc_futures_position_size(signal: TriangleSignal) -> tuple[MexcFuturesOrderPlan | None, str | None]:
+    risk_reason = validate_risk_levels(signal)
+    if risk_reason is not None:
+        return None, risk_reason
+    if signal.side != "LONG":
+        return None, "SHORT execution intents are blocked"
+    stop_distance = signal.entry_price - signal.stop_price
+    if stop_distance <= 0:
+        return None, "invalid stop distance"
+    risk_quantity = MEXC_FUTURES_RISK_PER_TRADE_USDT / stop_distance
+    max_notional = MEXC_FUTURES_MAX_BANKROLL_USDT * MEXC_FUTURES_DEFAULT_LEVERAGE
+    max_quantity = max_notional / signal.entry_price
+    quantity = min(risk_quantity, max_quantity)
+    notional = quantity * signal.entry_price
+    risk_usdt = quantity * stop_distance
+    if quantity <= 0 or notional <= 0:
+        return None, "calculated quantity is non-positive"
+    if notional > max_notional:
+        return None, "5x leverage cap exceeded"
+    if risk_usdt > MEXC_FUTURES_RISK_PER_TRADE_USDT:
+        return None, "0.20 USDT risk cap exceeded"
+    return (
+        MexcFuturesOrderPlan(
+            symbol=f"MEXC_FUT:{normalize_mexc_futures_symbol(signal.symbol)}",
+            entry=signal.entry_price,
+            stop=signal.stop_price,
+            tp1=signal.tp1_price,
+            tp2=signal.tp2_price,
+            quantity=quantity,
+            risk_usdt=risk_usdt,
+            notional_usdt=notional,
+            leverage=MEXC_FUTURES_DEFAULT_LEVERAGE,
+        ),
+        None,
+    )
+
+
+def mexc_order_from_plan(row: sqlite3.Row | dict[str, Any], plan: MexcFuturesOrderPlan) -> dict[str, Any]:
+    return {
+        "venue": "MEXC_FUT",
+        "symbol": normalize_mexc_futures_symbol(plan.symbol),
+        "side": "BUY",
+        "positionSide": "LONG",
+        "type": "LIMIT",
+        "entry": str(plan.entry),
+        "stop": str(plan.stop),
+        "tp1": str(plan.tp1),
+        "tp2": str(plan.tp2),
+        "quantity": str(plan.quantity),
+        "notional_usdt": str(plan.notional_usdt),
+        "risk_usdt": str(plan.risk_usdt),
+        "leverage": str(plan.leverage),
+        "clientOrderId": f"pnf-mexc-{str(row['intent_id']).replace('intent-', '')}"[:32],
+    }
 
 def load_settings(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
@@ -4422,6 +4550,132 @@ def process_execution_intents_once(args: argparse.Namespace, *, iteration: int |
         console("EXECUTION_INTENTS_FAILED", str(failed))
 
 
+def record_mexc_execution_intent_trade(
+    conn: sqlite3.Connection,
+    signal: TriangleSignal,
+    *,
+    intent_id: str,
+    setup_id: str,
+    plan: MexcFuturesOrderPlan,
+    order: dict[str, Any],
+    response: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO live_trades_binance(
+            created_at, symbol, pattern, strategy_id, candidate_id, side, trigger_timestamp, entry_price,
+            stop_price, tp1_price, tp2_price, notional_usdt, decision, status,
+            block_reason, dry_run, exchange_order_id, raw_order_response, notes,
+            break_even_armed, active_stop_price, entry_order_status, protective_orders_status, setup_id, intent_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            now_iso(),
+            plan.symbol,
+            "execution_intent",
+            "MEXC_FUT",
+            setup_id,
+            signal.side,
+            signal.trigger_ts,
+            float(plan.entry),
+            float(plan.stop),
+            float(plan.tp1),
+            float(plan.tp2),
+            float(plan.notional_usdt),
+            "DRY_RUN" if dry_run else "ORDER_SENT",
+            "DRY_RUN" if dry_run else "ORDER_SENT",
+            None,
+            int(dry_run),
+            str(response.get("orderId") or response.get("data") or "") or None,
+            json.dumps({"order_request": order, "order_response": response, "venue": "MEXC_FUT"}, sort_keys=True, default=str),
+            "MEXC Futures execution intent dry-run; Phase B live submit remains fail-closed" if dry_run else "MEXC Futures execution intent order submitted; protective TP/SL pending fill sync",
+            0,
+            float(plan.stop),
+            "DRY_RUN" if dry_run else str(response.get("status") or "NEW"),
+            "DRY_RUN" if dry_run else "PENDING_ENTRY_FILL",
+            setup_id,
+            intent_id,
+        ),
+    )
+    if dry_run:
+        conn.execute(
+            "UPDATE execution_intents SET intent_status = ? WHERE intent_id = ? AND intent_status = ?",
+            (EXECUTION_INTENT_STATUS_READY, intent_id, EXECUTION_INTENT_STATUS_NEW),
+        )
+    conn.commit()
+
+
+def process_mexc_execution_intents_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
+    loop_iteration = 1 if iteration is None else iteration
+    console("LOOP_BEGIN", f"iteration={loop_iteration}")
+    console("MEXC_EXECUTION_INTENT_EXECUTOR_MODE", "DRY_RUN_PHASE_A")
+    state_db_path = resolve_state_db_path(args)
+    live_requested = str(getattr(args, "mexc_demo_or_live_mode_name_if_supported", "")).upper() == "LIVE"
+    live_enabled = live_requested and os.environ.get("LIVE_TRADING_ENABLED") == "1"
+    client = MexcFuturesExecutionClient(
+        os.environ.get(MEXC_FUTURES_API_KEY_ENV),
+        os.environ.get(MEXC_FUTURES_API_SECRET_ENV),
+        base_url=MEXC_FUTURES_BASE_URL,
+    )
+    with closing(sqlite3.connect(state_db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        init_live_tables(conn)
+        init_execution_intents_table(conn)
+        rows = load_execution_intents(conn)
+        sent = 0
+        rejected = 0
+        for row in rows:
+            def reject(reason: str) -> None:
+                nonlocal rejected
+                rejected += 1
+                console("MEXC_INTENT_REJECTED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": row["symbol"], "reason": reason})
+
+            if row["intent_status"] != EXECUTION_INTENT_STATUS_NEW:
+                reject(f"intent_status is not NEW: {row['intent_status']}")
+                continue
+            signal = execution_intent_to_signal(row)
+            if not is_mexc_futures_symbol_allowed(signal.symbol):
+                reject(UNSUPPORTED_EXECUTION_VENUE)
+                continue
+            signal = TriangleSignal(**{**signal.__dict__, "symbol": f"MEXC_FUT:{normalize_mexc_futures_symbol(signal.symbol)}"})
+            if signal.side != "LONG":
+                reject("SHORT execution intents are blocked")
+                continue
+            if count_open_mexc_execution_trades(conn) >= MEXC_FUTURES_MAX_OPEN_POSITIONS:
+                reject("max open MEXC positions reached")
+                continue
+            if mexc_setup_already_executed(conn, row["setup_id"]):
+                reject("setup_id already executed on MEXC")
+                continue
+            if not client.has_credentials:
+                reject("API credentials missing")
+                continue
+            plan, reason = calculate_mexc_futures_position_size(signal)
+            if reason is not None or plan is None:
+                reject(reason or "position sizing failed")
+                continue
+            console("MEXC_POSITION_SIZE", "", {"intent_id": row["intent_id"], "symbol": plan.symbol, "quantity": str(plan.quantity), "notional_usdt": str(plan.notional_usdt), "risk_usdt": str(plan.risk_usdt)})
+            console("MEXC_RISK_CHECK", "", {"risk_cap_usdt": str(MEXC_FUTURES_RISK_PER_TRADE_USDT), "bankroll_cap_usdt": str(MEXC_FUTURES_MAX_BANKROLL_USDT), "leverage": str(MEXC_FUTURES_DEFAULT_LEVERAGE)})
+            order = mexc_order_from_plan(row, plan)
+            console("MEXC_INTENT_ACCEPTED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": plan.symbol})
+            if not live_enabled:
+                record_mexc_execution_intent_trade(conn, signal, intent_id=row["intent_id"], setup_id=row["setup_id"], plan=plan, order=order, response={"dry_run": True}, dry_run=True)
+                sent += 1
+                console("MEXC_ORDER_DRY_RUN", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": plan.symbol, "order": order})
+                continue
+            reject("MEXC live order submission is fail-closed until Phase B is explicitly implemented")
+        console("MEXC_INTENTS_ACCEPTED", str(sent))
+        console("MEXC_INTENTS_REJECTED", str(rejected))
+
+
+def process_sync_mexc_trades_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
+    loop_iteration = 1 if iteration is None else iteration
+    console("LOOP_BEGIN", f"iteration={loop_iteration}")
+    console("MEXC_TRADE_SYNC_MODE", "DRY_RUN_PHASE_A")
+    raise RuntimeError("--sync-mexc-trades is fail-closed until MEXC Phase B fill/protective-order sync is implemented")
+
+
 def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
     loop_iteration = 1 if iteration is None else iteration
     console("LOOP_BEGIN", f"iteration={loop_iteration}")
@@ -4630,9 +4884,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy-setups-db", help="Path to strategy_validation.db containing strategy_setups for --consume-strategy-setups")
     parser.add_argument("--execute-execution-intents", action="store_true", help="Submit NEW execution_intents to Binance Demo under strict guards")
     parser.add_argument("--sync-execution-trades", action="store_true", help="Sync Binance Demo execution-intent entry fills and attach protective TP/SL orders")
+    parser.add_argument("--mexc-demo-or-live-mode-name-if-supported", default="DRY_RUN", help="MEXC mode selector; only DRY_RUN/paper is enabled in this repo, LIVE fails closed")
+    parser.add_argument("--execute-mexc-intents", action="store_true", help="Process NEW execution_intents for MEXC Futures through Phase A dry-run guards")
+    parser.add_argument("--sync-mexc-trades", action="store_true", help="Fail-closed placeholder for MEXC Futures fill/protective-order/closure sync")
     parser.add_argument("--inspect-execution-intents", action="store_true", help="Read-only summary of execution_intents in --state-db-path; exits before Binance initialization or scanning")
     args = parser.parse_args()
-    if not (args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades):
+    if not (args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades or args.execute_mexc_intents or args.sync_mexc_trades):
         missing = [flag for flag, value in (("--db-path", args.db_path), ("--settings", args.settings)) if not value]
         if missing:
             parser.error(f"the following arguments are required unless --inspect-execution-intents or --execute-execution-intents is used: {', '.join(missing)}")
@@ -4651,6 +4908,14 @@ def main() -> None:
     if bool(getattr(args, "sync_execution_trades", False)):
         log_startup(args)
         process_sync_execution_trades_once(args, iteration=1)
+        return
+    if bool(getattr(args, "execute_mexc_intents", False)):
+        log_startup(args)
+        process_mexc_execution_intents_once(args, iteration=1)
+        return
+    if bool(getattr(args, "sync_mexc_trades", False)):
+        log_startup(args)
+        process_sync_mexc_trades_once(args, iteration=1)
         return
 
     if getattr(args, "export_trade_journal", None):
