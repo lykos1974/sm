@@ -44,7 +44,8 @@ BINANCE_DEMO_API_SECRET_ENV = "BINANCE_DEMO_FUTURES_API_SECRET"
 MAX_NOTIONAL_USDT = Decimal("1")
 EXECUTION_INTENT_DEMO_MAX_NOTIONAL_USDT = Decimal("100")
 DEFAULT_NOTIONAL_USDT = Decimal("1")
-RECV_WINDOW_MS = 5000
+RECV_WINDOW_MS = 10000
+BINANCE_SIGNED_TIMESTAMP_SAFETY_MARGIN_MS = 1500
 
 ALLOWED_SYMBOLS = {"BINANCE_FUT:BTCUSDT", "BINANCE_FUT:ETHUSDT", "BINANCE_FUT:BNBUSDT", "BINANCE_FUT:SOLUSDT", "BINANCE_FUT:XRPUSDT"}
 BINANCE_DEMO_SETUP_SYMBOLS = {
@@ -213,6 +214,7 @@ class BinanceFuturesClient:
         self.api_secret = api_secret
         self.base_url = base_url.rstrip("/")
         self._time_offset_ms = 0
+        self._last_server_time_ms: int | None = None
 
     @property
     def has_credentials(self) -> bool:
@@ -229,12 +231,27 @@ class BinanceFuturesClient:
         local_time = int(time.time() * 1000)
         server_time = self.get_server_time()
         self._time_offset_ms = server_time - local_time
+        self._last_server_time_ms = server_time
         console(
             "BINANCE_TIME_SYNC",
             "",
             {"server_time": server_time, "local_time": local_time, "offset_ms": self._time_offset_ms},
         )
         return self._time_offset_ms
+
+    def _current_signed_timestamp_ms(self) -> int:
+        if self._last_server_time_ms is not None:
+            return self._last_server_time_ms - BINANCE_SIGNED_TIMESTAMP_SAFETY_MARGIN_MS
+        return int((time.time() * 1000) + self._time_offset_ms - BINANCE_SIGNED_TIMESTAMP_SAFETY_MARGIN_MS)
+
+    @staticmethod
+    def _is_timestamp_ahead_error(raw: str) -> bool:
+        payload = raw[raw.find("{") :] if "{" in raw else raw
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        return data.get("code") == -1021
 
     def _signed_params(self, params: dict[str, Any] | None = None, *, timestamp: int | None = None) -> dict[str, Any]:
         if not self.has_credentials:
@@ -243,7 +260,7 @@ class BinanceFuturesClient:
         signed.setdefault("recvWindow", RECV_WINDOW_MS)
         if timestamp is None:
             self.sync_server_time()
-        signed["timestamp"] = int(timestamp if timestamp is not None else (time.time() * 1000) + self._time_offset_ms)
+        signed["timestamp"] = int(timestamp if timestamp is not None else self._current_signed_timestamp_ms())
         query = urllib.parse.urlencode(signed, doseq=True)
         signed["signature"] = hmac.new(str(self.api_secret).encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
         return signed
@@ -257,32 +274,48 @@ class BinanceFuturesClient:
         signed: bool = False,
     ) -> Any:
         method = method.upper()
-        request_params = self._signed_params(params) if signed else {k: v for k, v in (params or {}).items() if v is not None}
-        query = urllib.parse.urlencode(request_params, doseq=True)
-        url = f"{self.base_url}{path}"
-        body_bytes: bytes | None = None
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        if signed:
-            headers["X-MBX-APIKEY"] = str(self.api_key)
-        if method in {"GET", "DELETE"} and query:
-            url = f"{url}?{query}"
-        elif method == "POST":
-            body_bytes = query.encode("utf-8")
 
-        request = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+        def send_once() -> Any:
+            request_params = self._signed_params(params) if signed else {k: v for k, v in (params or {}).items() if v is not None}
+            query = urllib.parse.urlencode(request_params, doseq=True)
+            url = f"{self.base_url}{path}"
+            body_bytes: bytes | None = None
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            if signed:
+                headers["X-MBX-APIKEY"] = str(self.api_key)
+            if method in {"GET", "DELETE"} and query:
+                url = f"{url}?{query}"
+            elif method == "POST":
+                body_bytes = query.encode("utf-8")
+
+            request = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    raw = response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Binance HTTP {exc.code}: {raw}") from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Binance request failed: {exc}") from exc
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Binance non-JSON response: {raw[:500]}") from exc
+
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Binance HTTP {exc.code}: {raw}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Binance request failed: {exc}") from exc
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Binance non-JSON response: {raw[:500]}") from exc
-        return data
+            return send_once()
+        except RuntimeError as original_exc:
+            cause = original_exc.__cause__
+            if not signed or not isinstance(cause, urllib.error.HTTPError):
+                raise
+            raw = getattr(original_exc, "args", [""])[0]
+            if not self._is_timestamp_ahead_error(str(raw)):
+                raise
+            console("BINANCE_SIGNED_RETRY_TIMESTAMP", "", {"method": method, "path": path})
+            try:
+                return send_once()
+            except RuntimeError as retry_exc:
+                raise original_exc from retry_exc
 
     def get_exchange_info(self) -> dict[str, Any]:
         return self._request_json("GET", "/fapi/v1/exchangeInfo")

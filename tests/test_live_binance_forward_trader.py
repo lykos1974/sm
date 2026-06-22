@@ -1473,7 +1473,7 @@ class BinanceForwardTraderTests(unittest.TestCase):
         signed = client._signed_params({"symbol": "SOLUSDT", "side": "BUY"}, timestamp=1700000000000)
         self.assertEqual(signed["timestamp"], 1700000000000)
         self.assertIn("signature", signed)
-        query = "symbol=SOLUSDT&side=BUY&recvWindow=5000&timestamp=1700000000000"
+        query = "symbol=SOLUSDT&side=BUY&recvWindow=10000&timestamp=1700000000000"
         expected = trader.hmac.new(b"secret", query.encode("utf-8"), trader.hashlib.sha256).hexdigest()
         self.assertEqual(signed["signature"], expected)
 
@@ -1492,12 +1492,130 @@ class BinanceForwardTraderTests(unittest.TestCase):
         finally:
             trader.time.time = original_time
 
-        self.assertEqual(signed["timestamp"], 1700000007500)
-        self.assertEqual(signed["recvWindow"], 5000)
+        self.assertEqual(signed["timestamp"], 1700000006000)
+        self.assertLess(signed["timestamp"], 1700000007500)
+        self.assertEqual(signed["recvWindow"], 10000)
         self.assertIn("BINANCE_TIME_SYNC", output.getvalue())
         self.assertIn('"server_time": 1700000007500', output.getvalue())
         self.assertIn('"local_time": 1700000000000', output.getvalue())
         self.assertIn('"offset_ms": 7500', output.getvalue())
+
+
+    def test_signed_timestamp_uses_safety_margin_not_ahead_of_server(self):
+        class OffsetClient(trader.BinanceFuturesClient):
+            def get_server_time(self):
+                return 1700000014061
+
+        client = OffsetClient("key", "secret")
+        original_time = trader.time.time
+        try:
+            trader.time.time = lambda: 1700000000.0
+            signed = client._signed_params({"symbol": "SOLUSDT"})
+        finally:
+            trader.time.time = original_time
+
+        self.assertEqual(signed["timestamp"], 1700000012561)
+        self.assertLessEqual(signed["timestamp"], 1700000014061 - 1500)
+
+    def test_signed_request_timestamp_error_resyncs_and_retries_once(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self):
+                return self.payload
+
+        calls = []
+        signed_order_urls = []
+
+        def fake_urlopen(request, timeout=15):
+            calls.append(request.full_url)
+            if "/fapi/v1/time" in request.full_url:
+                return FakeResponse(b'{"serverTime":1700000005000}')
+            signed_order_urls.append(request.full_url)
+            if len(signed_order_urls) == 1:
+                raise trader.urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"code":-1021,"msg":"Timestamp ahead"}'))
+            return FakeResponse(b'{"orderId":123}')
+
+        client = trader.BinanceFuturesClient("key", "secret")
+        original_urlopen = trader.urllib.request.urlopen
+        output = io.StringIO()
+        try:
+            trader.urllib.request.urlopen = fake_urlopen
+            with redirect_stdout(output):
+                result = client._request_json("GET", "/fapi/v1/order", params={"symbol": "SOLUSDT"}, signed=True)
+        finally:
+            trader.urllib.request.urlopen = original_urlopen
+
+        self.assertEqual(result, {"orderId": 123})
+        self.assertEqual(len(signed_order_urls), 2)
+        self.assertEqual(sum(1 for url in calls if "/fapi/v1/time" in url), 2)
+        self.assertIn("BINANCE_SIGNED_RETRY_TIMESTAMP", output.getvalue())
+
+    def test_signed_request_non_timestamp_error_is_not_retried(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self):
+                return b'{"serverTime":1700000005000}'
+
+        signed_order_calls = 0
+
+        def fake_urlopen(request, timeout=15):
+            nonlocal signed_order_calls
+            if "/fapi/v1/time" in request.full_url:
+                return FakeResponse()
+            signed_order_calls += 1
+            raise trader.urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"code":-2015,"msg":"Invalid API-key"}'))
+
+        client = trader.BinanceFuturesClient("key", "secret")
+        original_urlopen = trader.urllib.request.urlopen
+        try:
+            trader.urllib.request.urlopen = fake_urlopen
+            with self.assertRaisesRegex(RuntimeError, "-2015"):
+                client._request_json("GET", "/fapi/v1/order", params={"symbol": "SOLUSDT"}, signed=True)
+        finally:
+            trader.urllib.request.urlopen = original_urlopen
+
+        self.assertEqual(signed_order_calls, 1)
+
+    def test_signed_request_retry_success_does_not_duplicate_logical_operation(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+            def read(self):
+                return self.payload
+
+        posted_bodies = []
+
+        def fake_urlopen(request, timeout=15):
+            if "/fapi/v1/time" in request.full_url:
+                return FakeResponse(b'{"serverTime":1700000005000}')
+            posted_bodies.append(request.data.decode("utf-8"))
+            if len(posted_bodies) == 1:
+                raise trader.urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"code":-1021,"msg":"Timestamp ahead"}'))
+            return FakeResponse(b'{"orderId":456,"clientOrderId":"abc"}')
+
+        client = trader.BinanceFuturesClient("key", "secret")
+        original_urlopen = trader.urllib.request.urlopen
+        try:
+            trader.urllib.request.urlopen = fake_urlopen
+            result = client._request_json("POST", "/fapi/v1/order", params={"symbol": "SOLUSDT", "newClientOrderId": "abc"}, signed=True)
+        finally:
+            trader.urllib.request.urlopen = original_urlopen
+
+        self.assertEqual(result["orderId"], 456)
+        self.assertEqual(len(posted_bodies), 2)
+        self.assertTrue(all(body.count("newClientOrderId=abc") == 1 for body in posted_bodies))
 
     def test_exchange_info_filter_parsing(self):
         spec = trader.parse_symbol_spec(EXCHANGE_INFO, "SOLUSDT")
