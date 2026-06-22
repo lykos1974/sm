@@ -46,6 +46,7 @@ MEXC_FUTURES_API_KEY_ENV = "MEXC_FUTURES_API_KEY"
 MEXC_FUTURES_API_SECRET_ENV = "MEXC_FUTURES_API_SECRET"
 MEXC_FUTURES_ALLOWED_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "ENAUSDT"}
 MEXC_FUTURES_ALLOWED_VENUE_SYMBOLS = {f"MEXC_FUT:{symbol}" for symbol in MEXC_FUTURES_ALLOWED_SYMBOLS}
+MEXC_FUTURES_INSPECT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "ENAUSDT", "TAOUSDT", "HYPEUSDT")
 MEXC_FUTURES_DEFAULT_LEVERAGE = Decimal("5")
 MEXC_FUTURES_MAX_BANKROLL_USDT = Decimal("20")
 MEXC_FUTURES_RISK_PER_TRADE_USDT = Decimal("0.20")
@@ -1310,12 +1311,105 @@ class MexcFuturesExecutionClient:
         raise RuntimeError("MEXC live order submission requires explicit Phase B implementation")
 
 
+class MexcFuturesPublicClient:
+    """Read-only public MEXC Futures market-data client."""
+
+    def __init__(self, *, base_url: str = MEXC_FUTURES_BASE_URL) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def _request_json(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
+        query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
+        url = f"{self.base_url}{path}"
+        if query:
+            url = f"{url}?{query}"
+        request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"MEXC HTTP {exc.code}: {raw}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"MEXC request failed: {exc}") from exc
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"MEXC non-JSON response: {raw[:500]}") from exc
+
+    def get_contract_details(self) -> Any:
+        return self._request_json("/api/v1/contract/detail")
+
+
 def normalize_mexc_futures_symbol(symbol: str) -> str:
     return symbol.split(":", 1)[-1].upper()
 
 
 def is_mexc_futures_symbol_allowed(symbol: str) -> bool:
     return normalize_mexc_futures_symbol(symbol) in MEXC_FUTURES_ALLOWED_SYMBOLS
+
+
+def _first_present(row: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if name in row and row.get(name) not in (None, ""):
+            return row.get(name)
+    return None
+
+
+def _mexc_display_symbol(value: Any) -> str:
+    return str(value or "").replace("_", "").upper()
+
+
+def parse_mexc_contract_specs(response: Any, target_symbols: tuple[str, ...] = MEXC_FUTURES_INSPECT_SYMBOLS) -> list[dict[str, Any]]:
+    if not isinstance(response, dict):
+        raise RuntimeError(f"MEXC contract detail response must be an object: {response!r}")
+    data = response.get("data")
+    if isinstance(data, dict):
+        rows = [data]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        raise RuntimeError(f"MEXC contract detail response missing data list/object: {response!r}")
+    by_symbol = {_mexc_display_symbol(row.get("symbol")): row for row in rows if isinstance(row, dict)}
+    specs: list[dict[str, Any]] = []
+    for symbol in target_symbols:
+        row = by_symbol.get(symbol)
+        supported = symbol in MEXC_FUTURES_ALLOWED_SYMBOLS and row is not None
+        if row is None:
+            specs.append({"symbol": symbol, "supported": False, "unsupported_reason": "MISSING_FROM_EXCHANGE_RESPONSE"})
+            continue
+        specs.append(
+            {
+                "symbol": symbol,
+                "exchange_symbol": row.get("symbol"),
+                "base_asset": _first_present(row, ("baseCoin", "baseAsset", "base_currency", "baseCurrency")),
+                "quote_asset": _first_present(row, ("quoteCoin", "quoteAsset", "quote_currency", "quoteCurrency", "settleCoin")),
+                "tick_size": _first_present(row, ("priceUnit", "tickSize", "priceTick")),
+                "price_precision": _first_present(row, ("priceScale", "pricePrecision")),
+                "quantity_precision": _first_present(row, ("volScale", "quantityPrecision", "volumePrecision")),
+                "minimum_quantity": _first_present(row, ("minVol", "minQty", "minVolume")),
+                "minimum_notional": _first_present(row, ("minNotional", "minNominalValue", "minNominal")),
+                "contract_size": _first_present(row, ("contractSize", "contractUnit", "multiplier")),
+                "max_leverage": _first_present(row, ("maxLeverage", "max_leverage")),
+                "supported_order_types": _first_present(row, ("orderTypes", "supportOrderTypes")),
+                "status": _first_present(row, ("state", "status", "contractStatus")),
+                "supported": supported,
+                "unsupported_reason": None if supported else "NOT_ENABLED_FOR_MEXC_EXECUTION",
+            }
+        )
+    return specs
+
+
+def inspect_mexc_contracts_once(args: argparse.Namespace) -> None:
+    response = MexcFuturesPublicClient(base_url=getattr(args, "mexc_futures_base_url", MEXC_FUTURES_BASE_URL)).get_contract_details()
+    specs = parse_mexc_contract_specs(response)
+    found = sum(1 for spec in specs if spec.get("unsupported_reason") != "MISSING_FROM_EXCHANGE_RESPONSE")
+    supported = sum(1 for spec in specs if spec.get("supported") is True)
+    unsupported = len(specs) - supported
+    for spec in specs:
+        print(f"MEXC_CONTRACT_SPEC {json.dumps(spec, sort_keys=True, default=str)}", flush=True)
+    print(f"MEXC_CONTRACTS_FOUND {found}", flush=True)
+    print(f"MEXC_CONTRACTS_SUPPORTED {supported}", flush=True)
+    print(f"MEXC_CONTRACTS_UNSUPPORTED {unsupported}", flush=True)
 
 
 def count_open_mexc_execution_trades(conn: sqlite3.Connection) -> int:
@@ -4936,7 +5030,7 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Forward-validate strict PnF triangles with guarded Binance USD-M futures micro-orders")
     parser.add_argument("--db-path", help="Path to existing market_data.db; opened read-only and used only as the candle source")
-    parser.add_argument("--state-db-path", required=True, help="Path to trader-owned state DB for Binance live signal/trade/state tables")
+    parser.add_argument("--state-db-path", help="Path to trader-owned state DB for Binance live signal/trade/state tables")
     parser.add_argument("--settings", help="Path to settings.json with PnF profiles")
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run mode even if LIVE_TRADING_ENABLED=1")
     parser.add_argument("--demo", action="store_true", help="Use Binance Demo USD-M Futures at https://demo-fapi.binance.com with demo API credentials")
@@ -4968,9 +5062,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-mexc-dry-run-intents", action="store_true", help="Seed deterministic MEXC Futures dry-run test execution_intents into --state-db-path; requires --allow-test-seed")
     parser.add_argument("--allow-test-seed", action="store_true", help="Second confirmation required for --seed-mexc-dry-run-intents")
     parser.add_argument("--sync-mexc-trades", action="store_true", help="Fail-closed placeholder for MEXC Futures fill/protective-order/closure sync")
+    parser.add_argument("--inspect-mexc-contracts", action="store_true", help="Read-only public MEXC Futures contract/spec discovery; exits before any order/executor path")
+    parser.add_argument("--mexc-futures-base-url", default=MEXC_FUTURES_BASE_URL, help="Base URL for read-only MEXC Futures public API")
     parser.add_argument("--inspect-execution-intents", action="store_true", help="Read-only summary of execution_intents in --state-db-path; exits before Binance initialization or scanning")
     args = parser.parse_args()
-    if not (args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades or args.execute_mexc_intents or args.sync_mexc_trades or args.seed_mexc_dry_run_intents):
+    if not args.inspect_mexc_contracts and not args.state_db_path:
+        parser.error("the following arguments are required unless --inspect-mexc-contracts is used: --state-db-path")
+    if not (args.inspect_mexc_contracts or args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades or args.execute_mexc_intents or args.sync_mexc_trades or args.seed_mexc_dry_run_intents):
         missing = [flag for flag, value in (("--db-path", args.db_path), ("--settings", args.settings)) if not value]
         if missing:
             parser.error(f"the following arguments are required unless a state-db-only utility mode is used: {', '.join(missing)}")
@@ -4979,6 +5077,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if bool(getattr(args, "inspect_mexc_contracts", False)):
+        inspect_mexc_contracts_once(args)
+        return
     if bool(getattr(args, "inspect_execution_intents", False)):
         inspect_execution_intents_once(args)
         return
