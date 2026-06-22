@@ -3877,22 +3877,45 @@ def execution_mode_label(*, demo: bool, dry_run: bool) -> str:
     return f"{venue}_{execution}"
 
 
+def mexc_execution_mode_label(mode_name: str) -> tuple[str, str, bool]:
+    normalized = mode_name.upper()
+    if normalized == "PAPER":
+        return "MEXC_PAPER_PHASE_A", "PAPER", True
+    if normalized == "LIVE":
+        return "MEXC_LIVE_REQUESTED_PHASE_A_FAIL_CLOSED", "DRY_RUN", True
+    return "MEXC_DRY_RUN_PHASE_A", "DRY_RUN", True
+
+
 def log_startup(args: argparse.Namespace) -> None:
     dry_run = not (os.environ.get("LIVE_TRADING_ENABLED") == "1" and not args.dry_run)
+    details = {
+        "venue": "DEMO" if bool(getattr(args, 'demo', False)) else "PRODUCTION",
+        "execution": "DRY_RUN" if dry_run else "LIVE",
+        "base_url": binance_base_url(bool(getattr(args, 'demo', False))),
+        "dry_run": dry_run,
+        "api_key_env": binance_env_names(bool(getattr(args, 'demo', False)))[0],
+        "enable_demo_doubles": bool(getattr(args, "enable_demo_doubles", False)),
+        "enable_demo_pole_motif": bool(getattr(args, "enable_demo_pole_motif", False)),
+        "state_db_path": resolve_state_db_path(args),
+        "demo_max_notional_usdt": getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)),
+    }
+    mode = execution_mode_label(demo=bool(getattr(args, 'demo', False)), dry_run=dry_run)
+    if bool(getattr(args, "execute_mexc_intents", False)):
+        mexc_mode, mexc_execution, mexc_dry_run = mexc_execution_mode_label(str(getattr(args, "mexc_demo_or_live_mode_name_if_supported", "DRY_RUN")))
+        mode = mexc_mode
+        details.update(
+            {
+                "venue": "MEXC_FUT",
+                "execution": mexc_execution,
+                "base_url": "MEXC_FUTURES_BASE_URL",
+                "dry_run": mexc_dry_run,
+                "api_key_env": MEXC_FUTURES_API_KEY_ENV,
+            }
+        )
     console(
         "STARTUP",
-        f"mode={execution_mode_label(demo=bool(getattr(args, 'demo', False)), dry_run=dry_run)}",
-        {
-            "venue": "DEMO" if bool(getattr(args, 'demo', False)) else "PRODUCTION",
-            "execution": "DRY_RUN" if dry_run else "LIVE",
-            "base_url": binance_base_url(bool(getattr(args, 'demo', False))),
-            "dry_run": dry_run,
-            "api_key_env": binance_env_names(bool(getattr(args, 'demo', False)))[0],
-            "enable_demo_doubles": bool(getattr(args, "enable_demo_doubles", False)),
-            "enable_demo_pole_motif": bool(getattr(args, "enable_demo_pole_motif", False)),
-            "state_db_path": resolve_state_db_path(args),
-            "demo_max_notional_usdt": getattr(args, "demo_max_notional_usdt", str(MAX_NOTIONAL_USDT)),
-        },
+        f"mode={mode}",
+        details,
     )
     if getattr(args, "db_path", None):
         log_db_info(args.db_path)
