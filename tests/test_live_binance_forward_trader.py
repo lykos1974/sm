@@ -3111,6 +3111,113 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertIn("protective boom", row[2])
         self.assertEqual(len(clients[0].submitted_orders), 1)
 
+    def test_sync_execution_trades_long_unprotected_past_stop_emergency_closes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET status = 'POSITION_OPEN_UNPROTECTED', entry_order_status = 'FILLED',
+                        executed_qty = 0.009, active_stop_price = 101,
+                        protective_orders_status = 'BLOCKED_IMMEDIATE_TRIGGER'
+                    """
+                )
+                conn.commit()
+
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED")
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute(
+                    "SELECT status, protective_orders_status, protective_orders_raw_response FROM live_trades_binance"
+                ).fetchone()
+
+        self.assertIn("EMERGENCY_CLOSE_TRIGGERED", logs)
+        self.assertIn("EMERGENCY_CLOSE_ORDER_SENT", logs)
+        self.assertEqual(row[0:2], ("EMERGENCY_CLOSE_SENT", "EMERGENCY_CLOSE_SENT"))
+        self.assertEqual(len(clients[0].submitted_orders), 1)
+        close_order = clients[0].submitted_orders[0]
+        self.assertEqual(close_order["type"], "MARKET")
+        self.assertEqual(close_order["side"], "SELL")
+        self.assertEqual(close_order["reduceOnly"], "true")
+        self.assertEqual(close_order["quantity"], "0.009")
+        self.assertNotIn("STOP_MARKET", row[2])
+
+    def test_sync_execution_trades_long_unprotected_above_stop_does_not_emergency_close(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET status = 'POSITION_OPEN_UNPROTECTED', entry_order_status = 'FILLED',
+                        executed_qty = 0.009, active_stop_price = 99,
+                        protective_orders_status = 'ATTACH_FAILED'
+                    """
+                )
+                conn.commit()
+
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED")
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, protective_orders_status FROM live_trades_binance").fetchone()
+
+        self.assertNotIn("EMERGENCY_CLOSE_ORDER_SENT", logs)
+        self.assertEqual(row, ("POSITION_OPEN", "ATTACHED"))
+        self.assertEqual([order["type"] for order in clients[0].submitted_orders], ["STOP_MARKET", "TAKE_PROFIT_MARKET"])
+
+    def test_sync_execution_trades_emergency_close_duplicate_rerun_does_not_close_twice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET status = 'POSITION_OPEN_UNPROTECTED', entry_order_status = 'FILLED',
+                        executed_qty = 0.009, active_stop_price = 101,
+                        protective_orders_status = 'BLOCKED_IMMEDIATE_TRIGGER'
+                    """
+                )
+                conn.commit()
+
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED")
+            logs2, clients2 = self._run_execution_trade_sync(state, status="FILLED")
+
+        self.assertIn("EMERGENCY_CLOSE_ORDER_SENT", logs)
+        self.assertIn("UNPROTECTED_TRADES_SYNC_FOUND 0", logs2)
+        self.assertEqual(len(clients[0].submitted_orders), 1)
+        self.assertEqual(len(clients2[0].submitted_orders), 0)
+
+    def test_sync_execution_trades_emergency_close_submission_failure_keeps_unprotected(self):
+        class FailingCloseClient(LifecycleClient):
+            def submit_order(self, order):
+                self.submitted_orders.append(order)
+                raise RuntimeError("emergency close boom")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_order_sent_trade_state_db(state)
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    UPDATE live_trades_binance
+                    SET status = 'POSITION_OPEN_UNPROTECTED', entry_order_status = 'FILLED',
+                        executed_qty = 0.009, active_stop_price = 101,
+                        protective_orders_status = 'BLOCKED_IMMEDIATE_TRIGGER'
+                    """
+                )
+                conn.commit()
+
+            logs, clients = self._run_execution_trade_sync(state, status="FILLED", client_cls=FailingCloseClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, protective_orders_status, notes FROM live_trades_binance").fetchone()
+
+        self.assertIn("EMERGENCY_CLOSE_FAILED", logs)
+        self.assertEqual(row[0:2], ("POSITION_OPEN_UNPROTECTED", "BLOCKED_IMMEDIATE_TRIGGER"))
+        self.assertIn("emergency close boom", row[2])
+        self.assertEqual(len(clients[0].submitted_orders), 1)
+
     def test_sync_execution_trades_does_not_mutate_strategy_setups(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             setup_db = os.path.join(temp_dir, "strategy_validation.db")

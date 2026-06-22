@@ -1980,6 +1980,129 @@ def protective_triggers_valid_for_mark(
     raise ValueError(f"unsupported protective side: {side}")
 
 
+def emergency_close_stop_violated(*, side: str, mark_price: Decimal, stop_trigger: Decimal) -> bool:
+    side_upper = side.upper()
+    if side_upper == "LONG":
+        return mark_price <= stop_trigger
+    if side_upper == "SHORT":
+        return mark_price >= stop_trigger
+    raise ValueError(f"unsupported emergency close side: {side}")
+
+
+def build_emergency_market_close_order(
+    *,
+    trade_id: int,
+    symbol: str,
+    side: str,
+    quantity: Decimal,
+    spec: SymbolSpec,
+    position_side: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    if quantity <= 0:
+        return None, "emergency close quantity is non-positive"
+    quantity = quantize_down(quantity, spec.step_size)
+    if not aligned(quantity, spec.step_size):
+        return None, "emergency close quantity precision invalid"
+    if quantity < spec.min_qty:
+        return None, f"emergency close quantity below minQty: quantity={quantity} minQty={spec.min_qty}"
+    order = {
+        "symbol": binance_symbol(symbol),
+        "side": "SELL" if side.upper() == "LONG" else "BUY",
+        "type": "MARKET",
+        "quantity": format_decimal_for_step(quantity, spec.step_size),
+        "reduceOnly": "true",
+        "newClientOrderId": f"pnf-emerg-{trade_id}"[:36],
+    }
+    if position_side:
+        order["positionSide"] = position_side
+    return order, None
+
+
+def emergency_close_unprotected_if_stop_violated(
+    conn: sqlite3.Connection,
+    client: BinanceFuturesClient,
+    trade_id: int,
+    signal: TriangleSignal,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT status, protective_orders_status, active_stop_price, raw_order_response, executed_qty
+        FROM live_trades_binance
+        WHERE id = ?
+        """,
+        (int(trade_id),),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"trade_id={trade_id} not found for emergency close")
+    status, protective_status, active_stop, raw_order_response, executed_qty = row
+    if status == "EMERGENCY_CLOSE_SENT" or protective_status == "EMERGENCY_CLOSE_SENT":
+        console("EMERGENCY_CLOSE_TRIGGERED", f"{signal.symbol} trade_id={trade_id} skipped; already sent")
+        return True
+    if status != "POSITION_OPEN_UNPROTECTED":
+        return False
+
+    stop_trigger = _dec(active_stop) if active_stop not in (None, "") else signal.stop_price
+    mark_price = client.get_mark_price(binance_symbol(signal.symbol))
+    if not emergency_close_stop_violated(side=signal.side, mark_price=mark_price, stop_trigger=stop_trigger):
+        return False
+
+    payload = {
+        "symbol": signal.symbol,
+        "trade_id": int(trade_id),
+        "mark_price": str(mark_price),
+        "stop_trigger": str(stop_trigger),
+        "side": signal.side,
+    }
+    console("EMERGENCY_CLOSE_TRIGGERED", f"{signal.symbol} trade_id={trade_id}", payload)
+    try:
+        if executed_qty in (None, ""):
+            raise RuntimeError("missing executed quantity for emergency close")
+        mode_response = client.get_position_mode()
+        if not position_mode_is_unambiguous(mode_response):
+            raise RuntimeError(f"one-way position mode required for emergency reduceOnly close: {mode_response}")
+        spec = client.get_symbol_spec(binance_symbol(signal.symbol))
+        close_order, reason = build_emergency_market_close_order(
+            trade_id=int(trade_id),
+            symbol=signal.symbol,
+            side=signal.side,
+            quantity=_dec(executed_qty),
+            spec=spec,
+            position_side=protective_position_side_for_trade(signal, raw_order_response),
+        )
+        if reason is not None:
+            raise RuntimeError(reason)
+        close_response = client.submit_order(close_order or {})
+    except Exception as exc:
+        conn.execute(
+            """
+            UPDATE live_trades_binance
+            SET status = 'POSITION_OPEN_UNPROTECTED', notes = ?
+            WHERE id = ?
+            """,
+            (f"emergency close failed; still unprotected: {exc}", int(trade_id)),
+        )
+        conn.commit()
+        console("EMERGENCY_CLOSE_FAILED", f"{signal.symbol} trade_id={trade_id}", {**payload, "error": str(exc)})
+        return True
+
+    conn.execute(
+        """
+        UPDATE live_trades_binance
+        SET status = 'EMERGENCY_CLOSE_SENT', protective_orders_status = 'EMERGENCY_CLOSE_SENT',
+            protective_orders_raw_response = ?, protective_orders_error = NULL, notes = ?
+        WHERE id = ?
+        """,
+        (
+            json.dumps({"close_order": close_order, "close_response": close_response, **payload}, sort_keys=True, default=str),
+            "emergency reduce-only MARKET close sent; protective attach skipped",
+            int(trade_id),
+        ),
+    )
+    conn.commit()
+    console("EMERGENCY_CLOSE_ORDER_SENT", f"{signal.symbol} trade_id={trade_id}", {"close_order": close_order, "close_response": close_response})
+    return True
+
+
 def mark_protective_attach_blocked(
     conn: sqlite3.Connection,
     *,
@@ -3987,7 +4110,7 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
             """
             SELECT id, created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
                    tp1_price, tp2_price, raw_order_response, entry_order_status, setup_id, intent_id,
-                   stop_algo_id, tp_algo_id, protective_orders_status
+                   stop_algo_id, tp_algo_id, protective_orders_status, active_stop_price, executed_qty
             FROM live_trades_binance
             WHERE status = 'POSITION_OPEN_UNPROTECTED'
               AND setup_id IS NOT NULL AND setup_id != ''
@@ -3999,6 +4122,8 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
         for row in unprotected_rows:
             trade_id = int(row["id"])
             signal = trade_row_to_signal(row)
+            if emergency_close_unprotected_if_stop_violated(conn, client, trade_id, signal):
+                continue
             attach_protective_algo_orders(conn, client, trade_id, signal, dry_run=False)
             protected = conn.execute(
                 "SELECT protective_orders_status FROM live_trades_binance WHERE id = ?",
@@ -4076,7 +4201,7 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
                 conn.execute(
                     """
                     UPDATE live_trades_binance
-                    SET status = 'POSITION_OPEN', entry_order_status = ?, avg_fill_price = ?, executed_qty = ?,
+                    SET status = 'POSITION_OPEN_UNPROTECTED', entry_order_status = ?, avg_fill_price = ?, executed_qty = ?,
                         entry_order_update_time = ?, entry_commission = ?, entry_commission_asset = ?,
                         entry_slippage = ?, entry_slippage_bps = ?, fees = ?, order_status_response = ?,
                         user_trades_response = ?, raw_order_response = ?, notes = ?
@@ -4095,17 +4220,24 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
                         json.dumps(status_response, sort_keys=True, default=str),
                         json.dumps(trades_response, sort_keys=True, default=str),
                         json.dumps(merged_raw, sort_keys=True, default=str),
-                        "execution trade sync: entry filled; attaching protective orders",
+                        "execution trade sync: entry filled; emergency/protective decision pending",
                         trade_id,
                     ),
                 )
                 conn.commit()
+                if emergency_close_unprotected_if_stop_violated(conn, client, trade_id, signal):
+                    continue
                 attach_protective_algo_orders(conn, client, trade_id, signal, dry_run=False)
                 protected = conn.execute(
                     "SELECT protective_orders_status FROM live_trades_binance WHERE id = ?",
                     (trade_id,),
                 ).fetchone()
                 if protected is not None and protected[0] == "ATTACHED":
+                    conn.execute(
+                        "UPDATE live_trades_binance SET status = ?, notes = ? WHERE id = ?",
+                        ("POSITION_OPEN", "execution trade sync: protective orders attached", trade_id),
+                    )
+                    conn.commit()
                     console("PROTECTIVE_ORDERS_ATTACHED", f"{signal.symbol} trade_id={trade_id}", lifecycle)
                 else:
                     conn.execute(
