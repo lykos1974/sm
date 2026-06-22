@@ -49,8 +49,16 @@ MEXC_FUTURES_ALLOWED_VENUE_SYMBOLS = {f"MEXC_FUT:{symbol}" for symbol in MEXC_FU
 MEXC_FUTURES_INSPECT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "SUIUSDT", "ENAUSDT", "TAOUSDT", "HYPEUSDT")
 MEXC_FUTURES_DEFAULT_LEVERAGE = Decimal("5")
 MEXC_FUTURES_MAX_BANKROLL_USDT = Decimal("20")
+MEXC_FUTURES_MAX_NOTIONAL_USDT = Decimal("20")
 MEXC_FUTURES_RISK_PER_TRADE_USDT = Decimal("0.20")
 MEXC_FUTURES_MAX_OPEN_POSITIONS = 1
+MEXC_FUTURES_DRY_RUN_CONTRACT_SPECS = {
+    "BTCUSDT": {"contract_size": Decimal("0.0001"), "tick_size": Decimal("0.1"), "price_precision": 1},
+    "ETHUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.01"), "price_precision": 2},
+    "SOLUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.01"), "price_precision": 2},
+    "SUIUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.0001"), "price_precision": 4},
+    "ENAUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.00001"), "price_precision": 5},
+}
 
 MEXC_DRY_RUN_SEED_SYMBOLS = (
     "BTCUSDT",
@@ -1282,11 +1290,17 @@ def is_setup_symbol_supported_for_execution(symbol: str, execution_venue: str | 
 @dataclass(frozen=True)
 class MexcFuturesOrderPlan:
     symbol: str
+    mexc_symbol: str
     entry: Decimal
+    rounded_entry: Decimal
     stop: Decimal
     tp1: Decimal
     tp2: Decimal
     quantity: Decimal
+    vol: int
+    contract_size: Decimal
+    tick_size: Decimal
+    price_precision: int
     risk_usdt: Decimal
     notional_usdt: Decimal
     leverage: Decimal
@@ -1433,59 +1447,99 @@ def mexc_setup_already_executed(conn: sqlite3.Connection, setup_id: str) -> bool
     return row is not None
 
 
-def calculate_mexc_futures_position_size(signal: TriangleSignal) -> tuple[MexcFuturesOrderPlan | None, str | None]:
+# Official MEXC USDT-M Futures API audit notes (dry-run only): contracts use
+# underscore symbols such as BTC_USDT/ETH_USDT; the private order endpoint is
+# POST /api/v1/private/order/create; side 1 opens long and side 4 closes long;
+# type 1 is limit and type 5 is market; openType 1 is isolated margin; this
+# builder fixes leverage at 5x; vol is integer contracts, not coin quantity.
+def mexc_contract_symbol(symbol: str) -> str:
+    normalized = normalize_mexc_futures_symbol(symbol)
+    if not normalized.endswith("USDT"):
+        return normalized
+    return f"{normalized[:-4]}_USDT"
+
+
+def calculate_mexc_futures_position_size(
+    signal: TriangleSignal,
+    *,
+    contract_size: Decimal | None = None,
+    tick_size: Decimal | None = None,
+    price_precision: int | None = None,
+    notional_usdt: Decimal = MEXC_FUTURES_MAX_NOTIONAL_USDT,
+) -> tuple[MexcFuturesOrderPlan | None, str | None]:
     risk_reason = validate_risk_levels(signal)
     if risk_reason is not None:
         return None, risk_reason
     if signal.side != "LONG":
         return None, "SHORT execution intents are blocked"
+    normalized = normalize_mexc_futures_symbol(signal.symbol)
+    defaults = MEXC_FUTURES_DRY_RUN_CONTRACT_SPECS.get(normalized, {})
+    contract_size = _dec(defaults.get("contract_size", Decimal("0.0001")) if contract_size is None else contract_size)
+    tick_size = _dec(defaults.get("tick_size", Decimal("0.0001")) if tick_size is None else tick_size)
+    price_precision = int(defaults.get("price_precision", decimals_for_step(tick_size)) if price_precision is None else price_precision)
+    if contract_size <= 0:
+        return None, "contract_size must be positive"
+    if notional_usdt > MEXC_FUTURES_MAX_BANKROLL_USDT:
+        return None, "20 USDT bankroll cap exceeded"
+    if notional_usdt > MEXC_FUTURES_MAX_NOTIONAL_USDT:
+        return None, "20 USDT max notional cap exceeded"
+    if MEXC_FUTURES_DEFAULT_LEVERAGE > Decimal("5"):
+        return None, "5x leverage cap exceeded"
     stop_distance = signal.entry_price - signal.stop_price
     if stop_distance <= 0:
         return None, "invalid stop distance"
-    risk_quantity = MEXC_FUTURES_RISK_PER_TRADE_USDT / stop_distance
-    max_notional = MEXC_FUTURES_MAX_BANKROLL_USDT * MEXC_FUTURES_DEFAULT_LEVERAGE
-    max_quantity = max_notional / signal.entry_price
-    quantity = min(risk_quantity, max_quantity)
-    notional = quantity * signal.entry_price
+    rounded_entry = quantize_down(signal.entry_price, tick_size)
+    if rounded_entry <= 0:
+        return None, "rounded entry price is non-positive"
+    raw_contracts = notional_usdt / (rounded_entry * contract_size)
+    vol = int(raw_contracts.to_integral_value(rounding=ROUND_DOWN))
+    if vol <= 0:
+        return None, "calculated contract volume is non-positive"
+    quantity = Decimal(vol) * contract_size
+    actual_notional = quantity * rounded_entry
     risk_usdt = quantity * stop_distance
-    if quantity <= 0 or notional <= 0:
-        return None, "calculated quantity is non-positive"
-    if notional > max_notional:
-        return None, "5x leverage cap exceeded"
+    if actual_notional > MEXC_FUTURES_MAX_NOTIONAL_USDT:
+        return None, "20 USDT max notional cap exceeded"
     if risk_usdt > MEXC_FUTURES_RISK_PER_TRADE_USDT:
         return None, "0.20 USDT risk cap exceeded"
     return (
         MexcFuturesOrderPlan(
-            symbol=f"MEXC_FUT:{normalize_mexc_futures_symbol(signal.symbol)}",
+            symbol=f"MEXC_FUT:{normalized}",
+            mexc_symbol=mexc_contract_symbol(normalized),
             entry=signal.entry_price,
+            rounded_entry=rounded_entry,
             stop=signal.stop_price,
             tp1=signal.tp1_price,
             tp2=signal.tp2_price,
             quantity=quantity,
+            vol=vol,
+            contract_size=contract_size,
+            tick_size=tick_size,
+            price_precision=price_precision,
             risk_usdt=risk_usdt,
-            notional_usdt=notional,
+            notional_usdt=actual_notional,
             leverage=MEXC_FUTURES_DEFAULT_LEVERAGE,
         ),
         None,
     )
 
 
+def format_mexc_price(value: Decimal, price_precision: int) -> str:
+    if price_precision < 0:
+        raise ValueError("price_precision must be non-negative")
+    return f"{value:.{price_precision}f}"
+
+
 def mexc_order_from_plan(row: sqlite3.Row | dict[str, Any], plan: MexcFuturesOrderPlan) -> dict[str, Any]:
     return {
-        "venue": "MEXC_FUT",
-        "symbol": normalize_mexc_futures_symbol(plan.symbol),
-        "side": "BUY",
-        "positionSide": "LONG",
-        "type": "LIMIT",
-        "entry": str(plan.entry),
-        "stop": str(plan.stop),
-        "tp1": str(plan.tp1),
-        "tp2": str(plan.tp2),
-        "quantity": str(plan.quantity),
-        "notional_usdt": str(plan.notional_usdt),
-        "risk_usdt": str(plan.risk_usdt),
-        "leverage": str(plan.leverage),
-        "clientOrderId": f"pnf-mexc-{str(row['intent_id']).replace('intent-', '')}"[:32],
+        "symbol": plan.mexc_symbol,
+        "price": format_mexc_price(plan.rounded_entry, plan.price_precision),
+        "vol": plan.vol,
+        "leverage": int(plan.leverage),
+        "side": 1,
+        "type": 1,
+        "openType": 1,
+        "externalOid": f"pnf-mexc-{str(row['intent_id']).replace('intent-', '')}"[:32],
     }
 
 def load_settings(path: Path) -> dict[str, Any]:
@@ -4802,7 +4856,7 @@ def process_mexc_execution_intents_once(args: argparse.Namespace, *, iteration: 
             def reject(reason: str) -> None:
                 nonlocal rejected
                 rejected += 1
-                console("MEXC_INTENT_REJECTED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": row["symbol"], "reason": reason})
+                console("MEXC_ORDER_BUILD_REJECTED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": row["symbol"], "reason": reason})
 
             if row["intent_status"] != EXECUTION_INTENT_STATUS_NEW:
                 reject(f"intent_status is not NEW: {row['intent_status']}")
@@ -4828,14 +4882,14 @@ def process_mexc_execution_intents_once(args: argparse.Namespace, *, iteration: 
             if reason is not None or plan is None:
                 reject(reason or "position sizing failed")
                 continue
-            console("MEXC_POSITION_SIZE", "", {"intent_id": row["intent_id"], "symbol": plan.symbol, "quantity": str(plan.quantity), "notional_usdt": str(plan.notional_usdt), "risk_usdt": str(plan.risk_usdt)})
-            console("MEXC_RISK_CHECK", "", {"risk_cap_usdt": str(MEXC_FUTURES_RISK_PER_TRADE_USDT), "bankroll_cap_usdt": str(MEXC_FUTURES_MAX_BANKROLL_USDT), "leverage": str(MEXC_FUTURES_DEFAULT_LEVERAGE)})
+            console("MEXC_CONTRACT_SIZE", "", {"intent_id": row["intent_id"], "symbol": plan.symbol, "mexc_symbol": plan.mexc_symbol, "contract_size": str(plan.contract_size), "tick_size": str(plan.tick_size), "vol": plan.vol, "notional_usdt": str(plan.notional_usdt), "risk_usdt": str(plan.risk_usdt)})
+            console("MEXC_OFFICIAL_API_AUDIT", "", {"order_endpoint": "/api/v1/private/order/create", "open_long_side": 1, "close_long_side": 4, "limit_type": 1, "market_type": 5, "openType_isolated": 1, "leverage": 5, "vol_unit": "integer_contracts"})
             order = mexc_order_from_plan(row, plan)
             console("MEXC_INTENT_ACCEPTED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": plan.symbol})
             if not live_enabled:
                 record_mexc_execution_intent_trade(conn, signal, intent_id=row["intent_id"], setup_id=row["setup_id"], plan=plan, order=order, response={"dry_run": True}, dry_run=True)
                 sent += 1
-                console("MEXC_ORDER_DRY_RUN", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": plan.symbol, "order": order})
+                console("MEXC_ORDER_PAYLOAD_DRY_RUN", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": plan.symbol, "order": order})
                 continue
             reject("MEXC live order submission is fail-closed until Phase B is explicitly implemented")
         console("MEXC_INTENTS_ACCEPTED", str(sent))
