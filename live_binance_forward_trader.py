@@ -335,8 +335,29 @@ class BinanceFuturesClient:
             signed=True,
         )
 
-    def get_user_trades(self, symbol: str, *, order_id: str | None = None) -> Any:
-        return self._request_json("GET", "/fapi/v1/userTrades", params={"symbol": symbol, "orderId": order_id}, signed=True)
+    def get_user_trades(
+        self,
+        symbol: str,
+        *,
+        order_id: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int | None = None,
+    ) -> Any:
+        return self._request_json(
+            "GET",
+            "/fapi/v1/userTrades",
+            params={"symbol": symbol, "orderId": order_id, "startTime": start_time, "endTime": end_time, "limit": limit},
+            signed=True,
+        )
+
+    def get_algo_order(self, symbol: str, *, algo_id: str | None = None, client_algo_id: str | None = None) -> dict[str, Any]:
+        return self._request_json(
+            "GET",
+            "/fapi/v1/algoOrder",
+            params={"symbol": symbol, "algoId": algo_id, "clientAlgoId": client_algo_id},
+            signed=True,
+        )
 
 
 def now_iso() -> str:
@@ -855,6 +876,10 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             "protective_orders_status": "TEXT",
             "protective_orders_raw_response": "TEXT",
             "protective_orders_error": "TEXT",
+            "exit_ts": "INTEGER",
+            "realized_pnl": "REAL",
+            "realized_pnl_pct": "REAL",
+            "close_reason": "TEXT",
             "setup_id": "TEXT",
             "intent_id": "TEXT",
         },
@@ -2073,7 +2098,7 @@ def emergency_close_unprotected_if_stop_violated(
             raise RuntimeError(reason)
         close_response = client.submit_order(close_order or {})
     except Exception as exc:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE live_trades_binance
             SET status = 'POSITION_OPEN_UNPROTECTED', notes = ?
@@ -3977,6 +4002,291 @@ def process_setup_execution_once(args: argparse.Namespace, *, iteration: int | N
         console("NO_EXECUTABLE_SETUPS", "")
 
 
+
+def position_size_is_zero(position_response: Any) -> bool:
+    rows = _position_risk_rows(position_response)
+    if not rows:
+        return True
+    for row in rows:
+        try:
+            if _dec(row.get("positionAmt", "0")) != 0:
+                return False
+        except (AttributeError, ValueError):
+            return False
+    return True
+
+
+def _trade_time(trade: dict[str, Any]) -> int:
+    for key in ("time", "updateTime"):
+        if trade.get(key) not in (None, ""):
+            try:
+                return int(trade[key])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _trade_order_id_matches(trade: dict[str, Any], order_id: str) -> bool:
+    raw_order_id = trade.get("orderId", trade.get("orderID"))
+    return raw_order_id not in (None, "") and str(raw_order_id) == str(order_id)
+
+
+def _trade_is_exit_side(trade: dict[str, Any], side: str) -> bool:
+    raw_side = str(trade.get("side") or "").upper()
+    if not raw_side:
+        return True
+    expected = "SELL" if side.upper() == "LONG" else "BUY"
+    return raw_side == expected
+
+
+def _filled_trade_metrics(user_trades: Any, fallback_exit_price: Decimal) -> tuple[Decimal, Decimal | None, int | None]:
+    if not isinstance(user_trades, list):
+        return Decimal("0"), None, None
+    pnl = Decimal("0")
+    notional_qty = Decimal("0")
+    notional_px_qty = Decimal("0")
+    latest_ts: int | None = None
+    for trade in user_trades:
+        if not isinstance(trade, dict):
+            continue
+        if trade.get("realizedPnl") not in (None, ""):
+            try:
+                pnl += _dec(trade.get("realizedPnl"))
+            except ValueError:
+                pass
+        try:
+            qty = abs(_dec(trade.get("qty", trade.get("quantity", "0"))))
+            price = _dec(trade.get("price"))
+        except ValueError:
+            qty = Decimal("0")
+            price = fallback_exit_price
+        if qty > 0:
+            notional_qty += qty
+            notional_px_qty += price * qty
+        ts = _trade_time(trade)
+        if ts and (latest_ts is None or ts > latest_ts):
+            latest_ts = ts
+    exit_price = (notional_px_qty / notional_qty) if notional_qty > 0 else None
+    return pnl, exit_price, latest_ts
+
+
+def _valid_protective_trades(user_trades: Any, *, order_id: str, entry_fill_time: int, side: str) -> list[dict[str, Any]]:
+    if not isinstance(user_trades, list):
+        return []
+    valid: list[dict[str, Any]] = []
+    for trade in user_trades:
+        if not isinstance(trade, dict):
+            continue
+        trade_time = _trade_time(trade)
+        if trade_time < entry_fill_time:
+            continue
+        if not _trade_order_id_matches(trade, order_id):
+            continue
+        if not _trade_is_exit_side(trade, side):
+            continue
+        valid.append(trade)
+    return valid
+
+
+def _algo_order_status(client: BinanceFuturesClient, symbol: str, order_id: str | None) -> str | None:
+    if order_id in (None, ""):
+        return None
+    try:
+        response = client.get_algo_order(symbol, algo_id=str(order_id))
+    except Exception:
+        return None
+    return str(response.get("status") or response.get("orderStatus") or "").upper()
+
+
+def _protective_closure_candidate(
+    client: BinanceFuturesClient,
+    symbol: str,
+    *,
+    order_id: str | None,
+    entry_fill_time: int | None,
+    side: str,
+) -> tuple[bool, list[dict[str, Any]], int | None, str]:
+    """Return whether one stored protective order causally closed this trade.
+
+    Deterministic ambiguity rules:
+    - Only the single stored protective order id for this trade is eligible; duplicate
+      TP/STOP orders not persisted on the row are ignored instead of guessed.
+    - A FILLED/FINISHED algo status is insufficient by itself.  At least one user
+      trade for the same stored order must have an execution timestamp at or after
+      the entry fill timestamp.  Older fills are treated as stale and fall back to
+      MANUAL classification.
+    - If both stored TP and STOP independently pass this causality check, the close
+      is ambiguous and falls back to MANUAL rather than choosing a winner.
+    """
+    if order_id in (None, ""):
+        return False, [], None, "missing_protective_order_id"
+    if entry_fill_time is None:
+        return False, [], None, "missing_entry_fill_time"
+    status = _algo_order_status(client, symbol, order_id)
+    if status not in {"FILLED", "FINISHED"}:
+        return False, [], None, f"protective_status_not_filled:{status or 'MISSING'}"
+    trades = client.get_user_trades(symbol, order_id=str(order_id), start_time=entry_fill_time, limit=1000)
+    valid_trades = _valid_protective_trades(trades, order_id=str(order_id), entry_fill_time=entry_fill_time, side=side)
+    if not valid_trades:
+        return False, [], None, "no_causal_protective_execution"
+    fill_time = max(_trade_time(trade) for trade in valid_trades)
+    return True, valid_trades, fill_time, "causal_protective_execution"
+
+
+def _bounded_manual_trades(
+    client: BinanceFuturesClient,
+    symbol: str,
+    *,
+    entry_fill_time: int | None,
+    side: str,
+    executed_qty: Decimal,
+) -> tuple[list[dict[str, Any]], int | None, str]:
+    if entry_fill_time is None:
+        return [], None, "missing_entry_fill_time"
+    trades = client.get_user_trades(symbol, start_time=entry_fill_time, end_time=int(time.time() * 1000), limit=1000)
+    if not isinstance(trades, list):
+        return [], None, "manual_user_trades_unavailable"
+    selected: list[dict[str, Any]] = []
+    cumulative_qty = Decimal("0")
+    for trade in sorted((trade for trade in trades if isinstance(trade, dict)), key=_trade_time):
+        trade_time = _trade_time(trade)
+        if trade_time < entry_fill_time:
+            continue
+        if not _trade_is_exit_side(trade, side):
+            continue
+        if trade.get("realizedPnl") in (None, ""):
+            continue
+        selected.append(trade)
+        try:
+            cumulative_qty += abs(_dec(trade.get("qty", trade.get("quantity", "0"))))
+        except ValueError:
+            pass
+        if executed_qty > 0 and cumulative_qty >= executed_qty:
+            break
+    close_time = max((_trade_time(trade) for trade in selected), default=None)
+    return selected, close_time, "bounded_manual_exit_trades"
+
+
+def _classification_log(event: str, *, trade_id: int, symbol: str, entry_fill_time: int | None, protective_fill_time: int | None, close_time: int | None, classification_reason: str) -> None:
+    console(
+        event,
+        f"{symbol} trade_id={trade_id}",
+        {
+            "trade_id": trade_id,
+            "symbol": symbol,
+            "entry_fill_time": entry_fill_time,
+            "protective_fill_time": protective_fill_time,
+            "close_time": close_time,
+            "classification_reason": classification_reason,
+        },
+    )
+
+
+def sync_closed_execution_positions(conn: sqlite3.Connection, client: BinanceFuturesClient) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, symbol, side, entry_price, avg_fill_price, executed_qty, entry_order_update_time,
+               stop_algo_id, tp_algo_id
+        FROM live_trades_binance
+        WHERE status IN ('POSITION_OPEN','POSITION_OPEN_UNPROTECTED')
+          AND setup_id IS NOT NULL AND setup_id != ''
+          AND intent_id IS NOT NULL AND intent_id != ''
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    console("OPEN_POSITION_CLOSURE_SYNC_FOUND", str(len(rows)))
+    for row in rows:
+        trade_id = int(row["id"])
+        symbol = str(row["symbol"])
+        exchange_symbol = binance_symbol(symbol)
+        response = client.get_position_risk(exchange_symbol)
+        if not position_size_is_zero(response):
+            continue
+        entry_fill_time = int(row["entry_order_update_time"]) if row["entry_order_update_time"] not in (None, "") else None
+        side = str(row["side"]).upper()
+        executed_qty = _dec(row["executed_qty"] if row["executed_qty"] not in (None, "") else "0")
+        stop_valid, stop_trades, stop_fill_time, stop_reason = _protective_closure_candidate(
+            client,
+            exchange_symbol,
+            order_id=row["stop_algo_id"],
+            entry_fill_time=entry_fill_time,
+            side=side,
+        )
+        tp_valid, tp_trades, tp_fill_time, tp_reason = _protective_closure_candidate(
+            client,
+            exchange_symbol,
+            order_id=row["tp_algo_id"],
+            entry_fill_time=entry_fill_time,
+            side=side,
+        )
+        fallback_exit = _dec(row["avg_fill_price"] if row["avg_fill_price"] not in (None, "") else row["entry_price"])
+        if tp_valid and not stop_valid:
+            status = close_reason = "POSITION_CLOSED_TP"
+            trades = tp_trades
+            protective_fill_time = tp_fill_time
+            classification_reason = "tp_causal_protective_execution"
+            log_event = "CLOSE_CLASSIFICATION_TP"
+        elif stop_valid and not tp_valid:
+            status = close_reason = "POSITION_CLOSED_STOP"
+            trades = stop_trades
+            protective_fill_time = stop_fill_time
+            classification_reason = "stop_causal_protective_execution"
+            log_event = "CLOSE_CLASSIFICATION_STOP"
+        else:
+            status = close_reason = "POSITION_CLOSED_MANUAL"
+            trades, manual_close_time, manual_reason = _bounded_manual_trades(
+                client,
+                exchange_symbol,
+                entry_fill_time=entry_fill_time,
+                side=side,
+                executed_qty=executed_qty,
+            )
+            protective_fill_time = None
+            if tp_valid and stop_valid:
+                classification_reason = "ambiguous_tp_and_stop_causal_executions"
+            else:
+                classification_reason = f"manual_fallback:tp={tp_reason};stop={stop_reason};manual={manual_reason}"
+            log_event = "CLOSE_CLASSIFICATION_MANUAL"
+        pnl, exit_price, exit_ts = _filled_trade_metrics(trades, fallback_exit)
+        if exit_price is None:
+            exit_price = fallback_exit
+        close_time = exit_ts if exit_ts is not None else (protective_fill_time if protective_fill_time is not None else None)
+        _classification_log(
+            log_event,
+            trade_id=trade_id,
+            symbol=symbol,
+            entry_fill_time=entry_fill_time,
+            protective_fill_time=protective_fill_time,
+            close_time=close_time,
+            classification_reason=classification_reason,
+        )
+        entry_price = _dec(row["avg_fill_price"] if row["avg_fill_price"] not in (None, "") else row["entry_price"])
+        denominator = entry_price * executed_qty
+        pnl_pct = (pnl / denominator * Decimal("100")) if denominator != 0 else Decimal("0")
+        cursor = conn.execute(
+            """
+            UPDATE live_trades_binance
+            SET status = ?, exit_time = ?, exit_ts = ?, exit_price = ?, realized_pnl = ?,
+                realized_pnl_pct = ?, close_reason = ?, notes = ?
+            WHERE id = ? AND status IN ('POSITION_OPEN','POSITION_OPEN_UNPROTECTED')
+            """,
+            (
+                status,
+                close_time,
+                close_time,
+                float(exit_price),
+                float(pnl),
+                float(pnl_pct),
+                close_reason,
+                f"execution trade sync: {close_reason}; {classification_reason}",
+                trade_id,
+            ),
+        )
+        if cursor.rowcount:
+            conn.commit()
+            console(close_reason, f"{symbol} trade_id={trade_id}", {"exit_price": str(exit_price), "realized_pnl": str(pnl), "realized_pnl_pct": str(pnl_pct), "exit_ts": close_time})
+
+
 def process_execution_intents_once(args: argparse.Namespace, *, iteration: int | None = None) -> None:
     loop_iteration = 1 if iteration is None else iteration
     console("LOOP_BEGIN", f"iteration={loop_iteration}")
@@ -4254,6 +4564,7 @@ def process_sync_execution_trades_once(args: argparse.Namespace, *, iteration: i
                 conn.commit()
                 console("ENTRY_SYNC_FAILED", f"{signal.symbol} trade_id={trade_id}", {"error": str(exc)})
 
+        sync_closed_execution_positions(conn, client)
 
 
 def parse_args() -> argparse.Namespace:

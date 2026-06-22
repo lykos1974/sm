@@ -224,8 +224,14 @@ class LifecycleClient(LiveClient):
             "updateTime": 1700000000001,
         }
 
-    def get_user_trades(self, symbol, *, order_id=None):
+    def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
         return [{"orderId": int(order_id), "commission": "0.00001", "commissionAsset": "USDT"}]
+
+    def get_position_risk(self, symbol):
+        return [{"symbol": symbol, "positionAmt": "0.009", "entryPrice": "100.50", "positionSide": "BOTH"}]
+
+    def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+        return {"symbol": symbol, "algoId": algo_id or client_algo_id, "status": "NEW"}
 
     def submit_algo_order(self, order):
         self.submitted_orders.append(order)
@@ -3217,6 +3223,194 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(row[0:2], ("POSITION_OPEN_UNPROTECTED", "BLOCKED_IMMEDIATE_TRIGGER"))
         self.assertIn("emergency close boom", row[2])
         self.assertEqual(len(clients[0].submitted_orders), 1)
+
+
+    def _create_open_execution_trade_state_db(self, state_db_path, *, status="POSITION_OPEN"):
+        self._create_order_sent_trade_state_db(state_db_path)
+        with closing(sqlite3.connect(state_db_path)) as conn:
+            conn.execute(
+                """
+                UPDATE live_trades_binance
+                SET status = ?, entry_order_status = 'FILLED', avg_fill_price = 100.50,
+                    executed_qty = 0.009, entry_order_update_time = 1700000000000,
+                    protective_orders_status = 'ATTACHED', stop_algo_id = 'stop-1', tp_algo_id = 'tp-1'
+                """,
+                (status,),
+            )
+            conn.commit()
+
+    def test_sync_execution_trades_tp_closure_detected(self):
+        class ClosedTpClient(LifecycleClient):
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+                return {"status": "FILLED" if algo_id == "tp-1" else "NEW"}
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                self.last_user_trade_request = {"order_id": order_id, "start_time": start_time, "end_time": end_time, "limit": limit}
+                return [{"orderId": order_id, "side": "SELL", "price": "103", "qty": "0.009", "realizedPnl": "0.0225", "time": 1700000001000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, _clients = self._run_execution_trade_sync(state, client_cls=ClosedTpClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, exit_ts, exit_price, realized_pnl, realized_pnl_pct, close_reason FROM live_trades_binance").fetchone()
+        self.assertIn("POSITION_CLOSED_TP", logs)
+        self.assertEqual(row[0], "POSITION_CLOSED_TP")
+        self.assertEqual(row[1], 1700000001000)
+        self.assertEqual(row[2], 103.0)
+        self.assertEqual(row[3], 0.0225)
+        self.assertEqual(row[5], "POSITION_CLOSED_TP")
+
+    def test_sync_execution_trades_stop_closure_detected(self):
+        class ClosedStopClient(LifecycleClient):
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+                return {"status": "FILLED" if algo_id == "stop-1" else "NEW"}
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                return [{"orderId": order_id, "side": "SELL", "price": "99", "qty": "0.009", "realizedPnl": "-0.0135", "time": 1700000002000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, _clients = self._run_execution_trade_sync(state, client_cls=ClosedStopClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, exit_price, realized_pnl, close_reason FROM live_trades_binance").fetchone()
+        self.assertIn("POSITION_CLOSED_STOP", logs)
+        self.assertEqual(row, ("POSITION_CLOSED_STOP", 99.0, -0.0135, "POSITION_CLOSED_STOP"))
+
+    def test_sync_execution_trades_manual_closure_detected(self):
+        class ClosedManualClient(LifecycleClient):
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                return [{"side": "SELL", "price": "101", "qty": "0.009", "realizedPnl": "0.0045", "time": 1700000003000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, _clients = self._run_execution_trade_sync(state, client_cls=ClosedManualClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, exit_price, realized_pnl, close_reason FROM live_trades_binance").fetchone()
+        self.assertIn("POSITION_CLOSED_MANUAL", logs)
+        self.assertEqual(row, ("POSITION_CLOSED_MANUAL", 101.0, 0.0045, "POSITION_CLOSED_MANUAL"))
+
+
+    def test_sync_execution_trades_stale_tp_execution_falls_back_to_manual(self):
+        class StaleTpClient(LifecycleClient):
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+                return {"status": "FILLED" if algo_id == "tp-1" else "NEW"}
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                if order_id == "tp-1":
+                    return [{"orderId": order_id, "side": "SELL", "price": "103", "qty": "0.009", "realizedPnl": "0.0225", "time": 1699999999000}]
+                return [{"side": "SELL", "price": "101", "qty": "0.009", "realizedPnl": "0.0045", "time": 1700000003000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, _clients = self._run_execution_trade_sync(state, client_cls=StaleTpClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, close_reason, exit_price, realized_pnl FROM live_trades_binance").fetchone()
+        self.assertIn("CLOSE_CLASSIFICATION_MANUAL", logs)
+        self.assertEqual(row, ("POSITION_CLOSED_MANUAL", "POSITION_CLOSED_MANUAL", 101.0, 0.0045))
+
+    def test_sync_execution_trades_stale_stop_execution_falls_back_to_manual(self):
+        class StaleStopClient(LifecycleClient):
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+                return {"status": "FILLED" if algo_id == "stop-1" else "NEW"}
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                if order_id == "stop-1":
+                    return [{"orderId": order_id, "side": "SELL", "price": "99", "qty": "0.009", "realizedPnl": "-0.0135", "time": 1699999999000}]
+                return [{"side": "SELL", "price": "101", "qty": "0.009", "realizedPnl": "0.0045", "time": 1700000003000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, _clients = self._run_execution_trade_sync(state, client_cls=StaleStopClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, close_reason, exit_price, realized_pnl FROM live_trades_binance").fetchone()
+        self.assertIn("CLOSE_CLASSIFICATION_MANUAL", logs)
+        self.assertEqual(row, ("POSITION_CLOSED_MANUAL", "POSITION_CLOSED_MANUAL", 101.0, 0.0045))
+
+    def test_sync_execution_trades_tp_stop_ambiguity_falls_back_to_manual(self):
+        class AmbiguousClient(LifecycleClient):
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+                return {"status": "FILLED"}
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                if order_id in {"tp-1", "stop-1"}:
+                    return [{"orderId": order_id, "side": "SELL", "price": "100", "qty": "0.009", "realizedPnl": "0", "time": 1700000001000}]
+                return [{"side": "SELL", "price": "101", "qty": "0.009", "realizedPnl": "0.0045", "time": 1700000003000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, _clients = self._run_execution_trade_sync(state, client_cls=AmbiguousClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, close_reason FROM live_trades_binance").fetchone()
+        self.assertIn("ambiguous_tp_and_stop_causal_executions", logs)
+        self.assertEqual(row, ("POSITION_CLOSED_MANUAL", "POSITION_CLOSED_MANUAL"))
+
+    def test_sync_execution_trades_manual_close_metrics_isolation(self):
+        class ManualIsolationClient(LifecycleClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.manual_requests = []
+            def get_position_risk(self, symbol):
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                if order_id is None:
+                    self.manual_requests.append({"start_time": start_time, "end_time": end_time, "limit": limit})
+                return [
+                    {"side": "SELL", "price": "90", "qty": "0.009", "realizedPnl": "-0.1", "time": 1699999999000},
+                    {"side": "BUY", "price": "105", "qty": "0.009", "realizedPnl": "0.1", "time": 1700000001000},
+                    {"side": "SELL", "price": "101", "qty": "0.004", "realizedPnl": "0.002", "time": 1700000002000},
+                    {"side": "SELL", "price": "102", "qty": "0.005", "realizedPnl": "0.005", "time": 1700000003000},
+                    {"side": "SELL", "price": "110", "qty": "0.009", "realizedPnl": "1.0", "time": 1700000004000},
+                ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            logs, clients = self._run_execution_trade_sync(state, client_cls=ManualIsolationClient)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT status, exit_price, realized_pnl, exit_ts FROM live_trades_binance").fetchone()
+        self.assertIn("CLOSE_CLASSIFICATION_MANUAL", logs)
+        self.assertEqual(clients[0].manual_requests[0]["start_time"], 1700000000000)
+        self.assertEqual(clients[0].manual_requests[0]["limit"], 1000)
+        self.assertEqual(row[0], "POSITION_CLOSED_MANUAL")
+        self.assertAlmostEqual(row[1], ((101 * 0.004) + (102 * 0.005)) / 0.009)
+        self.assertEqual(row[2], 0.007)
+        self.assertEqual(row[3], 1700000003000)
+
+    def test_sync_execution_trades_closure_duplicate_rerun_noop_and_closed_skipped(self):
+        class CountingClosedClient(LifecycleClient):
+            risk_calls = 0
+            def get_position_risk(self, symbol):
+                type(self).risk_calls += 1
+                return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+            def get_algo_order(self, symbol, *, algo_id=None, client_algo_id=None):
+                return {"status": "FILLED" if algo_id == "tp-1" else "NEW"}
+            def get_user_trades(self, symbol, *, order_id=None, start_time=None, end_time=None, limit=None):
+                return [{"orderId": order_id, "side": "SELL", "price": "103", "qty": "0.009", "realizedPnl": "0.0225", "time": 1700000001000}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_open_execution_trade_state_db(state)
+            CountingClosedClient.risk_calls = 0
+            logs, _ = self._run_execution_trade_sync(state, client_cls=CountingClosedClient)
+            logs2, _ = self._run_execution_trade_sync(state, client_cls=CountingClosedClient)
+            with closing(sqlite3.connect(state)) as conn:
+                rows = conn.execute("SELECT status FROM live_trades_binance").fetchall()
+        self.assertIn("POSITION_CLOSED_TP", logs)
+        self.assertIn("OPEN_POSITION_CLOSURE_SYNC_FOUND 0", logs2)
+        self.assertEqual(rows, [("POSITION_CLOSED_TP",)])
 
     def test_sync_execution_trades_does_not_mutate_strategy_setups(self):
         with tempfile.TemporaryDirectory() as temp_dir:
