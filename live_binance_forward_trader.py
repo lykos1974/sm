@@ -52,13 +52,6 @@ MEXC_FUTURES_MAX_BANKROLL_USDT = Decimal("20")
 MEXC_FUTURES_MAX_NOTIONAL_USDT = Decimal("20")
 MEXC_FUTURES_RISK_PER_TRADE_USDT = Decimal("0.20")
 MEXC_FUTURES_MAX_OPEN_POSITIONS = 1
-MEXC_FUTURES_DRY_RUN_CONTRACT_SPECS = {
-    "BTCUSDT": {"contract_size": Decimal("0.0001"), "tick_size": Decimal("0.1"), "price_precision": 1},
-    "ETHUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.01"), "price_precision": 2},
-    "SOLUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.01"), "price_precision": 2},
-    "SUIUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.0001"), "price_precision": 4},
-    "ENAUSDT": {"contract_size": Decimal("0.01"), "tick_size": Decimal("0.00001"), "price_precision": 5},
-}
 
 MEXC_DRY_RUN_SEED_SYMBOLS = (
     "BTCUSDT",
@@ -1301,6 +1294,9 @@ class MexcFuturesOrderPlan:
     contract_size: Decimal
     tick_size: Decimal
     price_precision: int
+    quantity_precision: int
+    minimum_quantity: Decimal
+    raw_contracts: Decimal
     risk_usdt: Decimal
     notional_usdt: Decimal
     leverage: Decimal
@@ -1426,6 +1422,31 @@ def inspect_mexc_contracts_once(args: argparse.Namespace) -> None:
     print(f"MEXC_CONTRACTS_UNSUPPORTED {unsupported}", flush=True)
 
 
+def discover_mexc_contract_specs(*, base_url: str = MEXC_FUTURES_BASE_URL) -> dict[str, dict[str, Any]]:
+    """Fetch and parse the public MEXC contract specs used by dry-run order sizing."""
+    response = MexcFuturesPublicClient(base_url=base_url).get_contract_details()
+    return {str(spec["symbol"]): spec for spec in parse_mexc_contract_specs(response) if spec.get("supported") is True}
+
+
+def _mexc_required_decimal(spec: dict[str, Any], key: str) -> Decimal:
+    value = spec.get(key)
+    if value in (None, ""):
+        raise ValueError(f"missing discovered MEXC {key}")
+    parsed = _dec(value)
+    if parsed <= 0:
+        raise ValueError(f"discovered MEXC {key} must be positive")
+    return parsed
+
+
+def _mexc_required_int(spec: dict[str, Any], key: str) -> int:
+    value = spec.get(key)
+    if value in (None, ""):
+        raise ValueError(f"missing discovered MEXC {key}")
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"discovered MEXC {key} must be non-negative")
+    return parsed
+
 def count_open_mexc_execution_trades(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         """
@@ -1462,9 +1483,12 @@ def mexc_contract_symbol(symbol: str) -> str:
 def calculate_mexc_futures_position_size(
     signal: TriangleSignal,
     *,
+    contract_spec: dict[str, Any] | None = None,
     contract_size: Decimal | None = None,
     tick_size: Decimal | None = None,
     price_precision: int | None = None,
+    quantity_precision: int | None = None,
+    minimum_quantity: Decimal | None = None,
     notional_usdt: Decimal = MEXC_FUTURES_MAX_NOTIONAL_USDT,
 ) -> tuple[MexcFuturesOrderPlan | None, str | None]:
     risk_reason = validate_risk_levels(signal)
@@ -1473,12 +1497,31 @@ def calculate_mexc_futures_position_size(
     if signal.side != "LONG":
         return None, "SHORT execution intents are blocked"
     normalized = normalize_mexc_futures_symbol(signal.symbol)
-    defaults = MEXC_FUTURES_DRY_RUN_CONTRACT_SPECS.get(normalized, {})
-    contract_size = _dec(defaults.get("contract_size", Decimal("0.0001")) if contract_size is None else contract_size)
-    tick_size = _dec(defaults.get("tick_size", Decimal("0.0001")) if tick_size is None else tick_size)
-    price_precision = int(defaults.get("price_precision", decimals_for_step(tick_size)) if price_precision is None else price_precision)
+    try:
+        if contract_spec is not None:
+            if str(contract_spec.get("symbol")) != normalized:
+                return None, "discovered MEXC contract spec symbol mismatch"
+            contract_size = _mexc_required_decimal(contract_spec, "contract_size")
+            tick_size = _mexc_required_decimal(contract_spec, "tick_size")
+            price_precision = _mexc_required_int(contract_spec, "price_precision")
+            quantity_precision = _mexc_required_int(contract_spec, "quantity_precision")
+            minimum_quantity = _mexc_required_decimal(contract_spec, "minimum_quantity")
+        elif contract_size is None or tick_size is None or price_precision is None:
+            return None, "discovered MEXC contract spec unavailable"
+        else:
+            contract_size = _dec(contract_size)
+            tick_size = _dec(tick_size)
+            price_precision = int(price_precision)
+            quantity_precision = 0 if quantity_precision is None else int(quantity_precision)
+            minimum_quantity = Decimal("1") if minimum_quantity is None else _dec(minimum_quantity)
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        return None, str(exc)
     if contract_size <= 0:
         return None, "contract_size must be positive"
+    if tick_size <= 0:
+        return None, "tick_size must be positive"
+    if minimum_quantity <= 0:
+        return None, "minimum_quantity must be positive"
     if notional_usdt > MEXC_FUTURES_MAX_BANKROLL_USDT:
         return None, "20 USDT bankroll cap exceeded"
     if notional_usdt > MEXC_FUTURES_MAX_NOTIONAL_USDT:
@@ -1495,6 +1538,8 @@ def calculate_mexc_futures_position_size(
     vol = int(raw_contracts.to_integral_value(rounding=ROUND_DOWN))
     if vol <= 0:
         return None, "calculated contract volume is non-positive"
+    if Decimal(vol) < minimum_quantity:
+        return None, "calculated contract volume is below minimum_quantity"
     quantity = Decimal(vol) * contract_size
     actual_notional = quantity * rounded_entry
     risk_usdt = quantity * stop_distance
@@ -1516,6 +1561,9 @@ def calculate_mexc_futures_position_size(
             contract_size=contract_size,
             tick_size=tick_size,
             price_precision=price_precision,
+            quantity_precision=quantity_precision,
+            minimum_quantity=minimum_quantity,
+            raw_contracts=raw_contracts,
             risk_usdt=risk_usdt,
             notional_usdt=actual_notional,
             leverage=MEXC_FUTURES_DEFAULT_LEVERAGE,
@@ -4845,6 +4893,11 @@ def process_mexc_execution_intents_once(args: argparse.Namespace, *, iteration: 
         os.environ.get(MEXC_FUTURES_API_SECRET_ENV),
         base_url=MEXC_FUTURES_BASE_URL,
     )
+    try:
+        discovered_contract_specs = discover_mexc_contract_specs(base_url=getattr(args, "mexc_futures_base_url", MEXC_FUTURES_BASE_URL))
+    except Exception as exc:
+        console("MEXC_CONTRACT_SPEC_DISCOVERY_FAILED", "", {"error": str(exc)})
+        discovered_contract_specs = {}
     with closing(sqlite3.connect(state_db_path)) as conn:
         conn.row_factory = sqlite3.Row
         init_live_tables(conn)
@@ -4878,11 +4931,13 @@ def process_mexc_execution_intents_once(args: argparse.Namespace, *, iteration: 
             if not client.has_credentials:
                 reject("API credentials missing")
                 continue
-            plan, reason = calculate_mexc_futures_position_size(signal)
+            contract_spec = discovered_contract_specs.get(normalize_mexc_futures_symbol(signal.symbol))
+            plan, reason = calculate_mexc_futures_position_size(signal, contract_spec=contract_spec)
             if reason is not None or plan is None:
                 reject(reason or "position sizing failed")
                 continue
-            console("MEXC_CONTRACT_SIZE", "", {"intent_id": row["intent_id"], "symbol": plan.symbol, "mexc_symbol": plan.mexc_symbol, "contract_size": str(plan.contract_size), "tick_size": str(plan.tick_size), "vol": plan.vol, "notional_usdt": str(plan.notional_usdt), "risk_usdt": str(plan.risk_usdt)})
+            console("MEXC_CONTRACT_SPEC_SELECTED", "", {"intent_id": row["intent_id"], "symbol": plan.symbol, "mexc_symbol": plan.mexc_symbol, "contract_size": str(plan.contract_size), "tick_size": str(plan.tick_size), "price_precision": plan.price_precision, "quantity_precision": plan.quantity_precision})
+            console("MEXC_USDT_TO_CONTRACTS", "", {"intent_id": row["intent_id"], "symbol": plan.symbol, "target_notional_usdt": str(MEXC_FUTURES_MAX_NOTIONAL_USDT), "entry_price": str(plan.rounded_entry), "contract_size": str(plan.contract_size), "raw_contracts": str(plan.raw_contracts), "vol": plan.vol, "actual_notional_usdt": str(plan.notional_usdt)})
             console("MEXC_OFFICIAL_API_AUDIT", "", {"order_endpoint": "/api/v1/private/order/create", "open_long_side": 1, "close_long_side": 4, "limit_type": 1, "market_type": 5, "openType_isolated": 1, "leverage": 5, "vol_unit": "integer_contracts"})
             order = mexc_order_from_plan(row, plan)
             console("MEXC_INTENT_ACCEPTED", "", {"intent_id": row["intent_id"], "setup_id": row["setup_id"], "symbol": plan.symbol})
