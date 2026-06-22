@@ -3200,6 +3200,99 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertFalse(trader.is_mexc_futures_symbol_allowed("MEXC_FUT:TAOUSDT"))
         self.assertFalse(trader.is_mexc_futures_symbol_allowed("MEXC_FUT:HYPEUSDT"))
 
+    def test_mexc_contract_response_parses_allowed_symbols_and_marks_tao_hype_unsupported(self):
+        response = {
+            "success": True,
+            "data": [
+                {
+                    "symbol": "BTC_USDT",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "priceUnit": "0.1",
+                    "priceScale": 1,
+                    "volScale": 3,
+                    "minVol": "0.001",
+                    "minNotional": "5",
+                    "contractSize": "0.0001",
+                    "maxLeverage": 200,
+                    "orderTypes": ["LIMIT", "MARKET"],
+                    "state": 0,
+                },
+                {"symbol": "ETH_USDT", "baseCoin": "ETH", "quoteCoin": "USDT", "priceUnit": "0.01", "volScale": 3, "minVol": "0.001", "contractSize": "0.01", "maxLeverage": 200, "state": 0},
+                {"symbol": "SOL_USDT", "baseCoin": "SOL", "quoteCoin": "USDT", "priceUnit": "0.001", "volScale": 1, "minVol": "0.1", "contractSize": "1", "maxLeverage": 100, "state": 0},
+                {"symbol": "SUI_USDT", "baseCoin": "SUI", "quoteCoin": "USDT", "priceUnit": "0.0001", "volScale": 1, "minVol": "1", "contractSize": "1", "maxLeverage": 50, "state": 0},
+                {"symbol": "ENA_USDT", "baseCoin": "ENA", "quoteCoin": "USDT", "priceUnit": "0.0001", "volScale": 1, "minVol": "1", "contractSize": "1", "maxLeverage": 50, "state": 0},
+                {"symbol": "TAO_USDT", "baseCoin": "TAO", "quoteCoin": "USDT", "priceUnit": "0.01", "minVol": "0.01", "contractSize": "0.01", "maxLeverage": 50, "state": 0},
+                {"symbol": "HYPE_USDT", "baseCoin": "HYPE", "quoteCoin": "USDT", "priceUnit": "0.001", "minVol": "0.1", "contractSize": "0.1", "maxLeverage": 50, "state": 0},
+            ],
+        }
+        specs = trader.parse_mexc_contract_specs(response)
+        by_symbol = {spec["symbol"]: spec for spec in specs}
+        self.assertTrue(by_symbol["BTCUSDT"]["supported"])
+        self.assertEqual(by_symbol["BTCUSDT"]["base_asset"], "BTC")
+        self.assertEqual(by_symbol["BTCUSDT"]["tick_size"], "0.1")
+        self.assertEqual(by_symbol["BTCUSDT"]["minimum_notional"], "5")
+        self.assertEqual(by_symbol["BTCUSDT"]["supported_order_types"], ["LIMIT", "MARKET"])
+        self.assertFalse(by_symbol["TAOUSDT"]["supported"])
+        self.assertEqual(by_symbol["TAOUSDT"]["unsupported_reason"], "NOT_ENABLED_FOR_MEXC_EXECUTION")
+        self.assertFalse(by_symbol["HYPEUSDT"]["supported"])
+        self.assertEqual(sum(1 for spec in specs if spec["supported"]), 5)
+
+    def test_mexc_contract_missing_symbol_handled_cleanly(self):
+        specs = trader.parse_mexc_contract_specs({"success": True, "data": [{"symbol": "BTC_USDT"}]})
+        by_symbol = {spec["symbol"]: spec for spec in specs}
+        self.assertEqual(by_symbol["ETHUSDT"]["unsupported_reason"], "MISSING_FROM_EXCHANGE_RESPONSE")
+        self.assertFalse(by_symbol["ETHUSDT"]["supported"])
+
+    def test_mexc_contract_malformed_response_handled_cleanly(self):
+        with self.assertRaisesRegex(RuntimeError, "missing data"):
+            trader.parse_mexc_contract_specs({"success": True, "data": None})
+
+    def test_inspect_mexc_contracts_prints_summary_and_does_not_initialize_order_clients(self):
+        class FakePublicClient:
+            def __init__(self, *, base_url):
+                self.base_url = base_url
+
+            def get_contract_details(self):
+                return {
+                    "success": True,
+                    "data": [
+                        {"symbol": "BTC_USDT", "baseCoin": "BTC", "quoteCoin": "USDT", "priceUnit": "0.1", "minVol": "0.001", "contractSize": "0.0001", "maxLeverage": 200, "state": 0},
+                        {"symbol": "ETH_USDT", "baseCoin": "ETH", "quoteCoin": "USDT", "priceUnit": "0.01", "minVol": "0.001", "contractSize": "0.01", "maxLeverage": 200, "state": 0},
+                        {"symbol": "SOL_USDT", "baseCoin": "SOL", "quoteCoin": "USDT", "priceUnit": "0.001", "minVol": "0.1", "contractSize": "1", "maxLeverage": 100, "state": 0},
+                        {"symbol": "SUI_USDT", "baseCoin": "SUI", "quoteCoin": "USDT", "priceUnit": "0.0001", "minVol": "1", "contractSize": "1", "maxLeverage": 50, "state": 0},
+                        {"symbol": "ENA_USDT", "baseCoin": "ENA", "quoteCoin": "USDT", "priceUnit": "0.0001", "minVol": "1", "contractSize": "1", "maxLeverage": 50, "state": 0},
+                        {"symbol": "TAO_USDT", "baseCoin": "TAO", "quoteCoin": "USDT", "state": 0},
+                        {"symbol": "HYPE_USDT", "baseCoin": "HYPE", "quoteCoin": "USDT", "state": 0},
+                    ],
+                }
+
+        class ForbiddenOrderClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("order/execution clients must not initialize during MEXC contract inspection")
+
+        original_public = trader.MexcFuturesPublicClient
+        original_binance = trader.BinanceFuturesClient
+        original_mexc_execution = trader.MexcFuturesExecutionClient
+        try:
+            trader.MexcFuturesPublicClient = FakePublicClient
+            trader.BinanceFuturesClient = ForbiddenOrderClient
+            trader.MexcFuturesExecutionClient = ForbiddenOrderClient
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.inspect_mexc_contracts_once(argparse.Namespace(mexc_futures_base_url="https://example.invalid"))
+        finally:
+            trader.MexcFuturesPublicClient = original_public
+            trader.BinanceFuturesClient = original_binance
+            trader.MexcFuturesExecutionClient = original_mexc_execution
+        logs = output.getvalue()
+        self.assertIn("MEXC_CONTRACT_SPEC", logs)
+        self.assertIn('"symbol": "BTCUSDT"', logs)
+        self.assertIn('"unsupported_reason": "NOT_ENABLED_FOR_MEXC_EXECUTION"', logs)
+        self.assertIn("MEXC_CONTRACTS_FOUND 7", logs)
+        self.assertIn("MEXC_CONTRACTS_SUPPORTED 5", logs)
+        self.assertIn("MEXC_CONTRACTS_UNSUPPORTED 2", logs)
+
     def test_mexc_position_size_enforces_bankroll_leverage_and_risk_caps(self):
         signal = trader.TriangleSignal(
             symbol="MEXC_FUT:BTCUSDT",
