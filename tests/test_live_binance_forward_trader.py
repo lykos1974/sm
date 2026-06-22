@@ -574,6 +574,129 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertIn("INTENTS_CANCELLED 0", logs)
         self.assertFalse(table_exists)
 
+    def test_seed_mexc_dry_run_intents_requires_double_confirmation_flags(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            with self.assertRaises(SystemExit):
+                trader.seed_mexc_dry_run_intents_once(
+                    argparse.Namespace(
+                        state_db_path=state_db_path,
+                        seed_mexc_dry_run_intents=True,
+                        allow_test_seed=False,
+                    )
+                )
+            self.assertFalse(os.path.exists(state_db_path))
+
+    def test_seed_mexc_dry_run_intents_creates_new_mexc_intents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.seed_mexc_dry_run_intents_once(
+                    argparse.Namespace(
+                        state_db_path=state_db_path,
+                        seed_mexc_dry_run_intents=True,
+                        allow_test_seed=True,
+                    )
+                )
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT setup_id, intent_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2, intent_status
+                    FROM execution_intents
+                    ORDER BY setup_id
+                    """
+                ).fetchall()
+                strategy_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'strategy_setups'"
+                ).fetchone()
+
+        logs = output.getvalue()
+        self.assertIn("MEXC_DRY_RUN_INTENTS_SEEDED 7", logs)
+        self.assertEqual(logs.count("MEXC_DRY_RUN_INTENT_SEEDED"), 7)
+        self.assertEqual(len(rows), 7)
+        self.assertIsNone(strategy_table)
+        for setup_id, intent_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2, status in rows:
+            self.assertTrue(setup_id.startswith("test-mexc-dry-run-"))
+            self.assertEqual(intent_id, trader.execution_intent_id(setup_id))
+            self.assertTrue(symbol.startswith("MEXC_FUT:"))
+            self.assertEqual(side, "LONG")
+            self.assertLess(Decimal(stop), Decimal(entry))
+            self.assertLess(Decimal(entry), Decimal(tp1))
+            self.assertLess(Decimal(tp1), Decimal(tp2))
+            self.assertEqual((rr1, rr2, status), ("2", "3", "NEW"))
+        self.assertIn(("test-mexc-dry-run-taousdt", trader.execution_intent_id("test-mexc-dry-run-taousdt"), "MEXC_FUT:TAOUSDT", "LONG", "100", "99", "102", "103", "2", "3", "NEW"), rows)
+        self.assertIn(("test-mexc-dry-run-hypeusdt", trader.execution_intent_id("test-mexc-dry-run-hypeusdt"), "MEXC_FUT:HYPEUSDT", "LONG", "100", "99", "102", "103", "2", "3", "NEW"), rows)
+
+    def test_seed_mexc_dry_run_intents_skips_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            args = argparse.Namespace(state_db_path=state_db_path, seed_mexc_dry_run_intents=True, allow_test_seed=True)
+            with redirect_stdout(io.StringIO()):
+                trader.seed_mexc_dry_run_intents_once(args)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.seed_mexc_dry_run_intents_once(args)
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM execution_intents").fetchone()[0]
+
+        logs = output.getvalue()
+        self.assertEqual(count, 7)
+        self.assertIn("MEXC_DRY_RUN_INTENTS_SEEDED 0", logs)
+        self.assertEqual(logs.count("MEXC_DRY_RUN_INTENT_ALREADY_EXISTS"), 7)
+
+    def test_seed_mexc_dry_run_intents_does_not_alter_existing_binance_ready_intents(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_db_path = os.path.join(temp_dir, "live_state.db")
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                trader.init_execution_intents_table(conn)
+                conn.execute(
+                    """
+                    INSERT INTO execution_intents(
+                        intent_id, setup_id, symbol, side, entry, stop, tp1, tp2, rr1, rr2,
+                        reference_ts, created_ts, intent_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("intent-binance-ready", "binance-ready", "BINANCE_FUT:BTCUSDT", "LONG", "100", "99", "102", "103", "2", "3", 1, 2, "READY"),
+                )
+                conn.commit()
+            with redirect_stdout(io.StringIO()):
+                trader.seed_mexc_dry_run_intents_once(
+                    argparse.Namespace(state_db_path=state_db_path, seed_mexc_dry_run_intents=True, allow_test_seed=True)
+                )
+            with closing(sqlite3.connect(state_db_path)) as conn:
+                ready = conn.execute(
+                    "SELECT intent_id, setup_id, symbol, intent_status FROM execution_intents WHERE setup_id = ?",
+                    ("binance-ready",),
+                ).fetchone()
+                mexc_count = conn.execute("SELECT COUNT(*) FROM execution_intents WHERE symbol LIKE 'MEXC_FUT:%'").fetchone()[0]
+
+        self.assertEqual(ready, ("intent-binance-ready", "binance-ready", "BINANCE_FUT:BTCUSDT", "READY"))
+        self.assertEqual(mexc_count, 7)
+
+    def test_seed_mexc_dry_run_intents_does_not_initialize_clients_or_submit_orders(self):
+        class ForbiddenClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("client must not be initialized while seeding MEXC dry-run intents")
+
+        original_binance_client = trader.BinanceFuturesClient
+        original_mexc_client = trader.MexcFuturesExecutionClient
+        try:
+            trader.BinanceFuturesClient = ForbiddenClient
+            trader.MexcFuturesExecutionClient = ForbiddenClient
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state_db_path = os.path.join(temp_dir, "live_state.db")
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    trader.seed_mexc_dry_run_intents_once(
+                        argparse.Namespace(state_db_path=state_db_path, seed_mexc_dry_run_intents=True, allow_test_seed=True)
+                    )
+        finally:
+            trader.BinanceFuturesClient = original_binance_client
+            trader.MexcFuturesExecutionClient = original_mexc_client
+
+        self.assertIn("MEXC_DRY_RUN_INTENTS_SEEDED 7", output.getvalue())
+
     def test_inspect_execution_intents_does_not_initialize_binance_client(self):
         class ForbiddenClient:
             def __init__(self, *args, **kwargs):

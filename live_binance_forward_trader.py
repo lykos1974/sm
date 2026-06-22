@@ -50,6 +50,18 @@ MEXC_FUTURES_DEFAULT_LEVERAGE = Decimal("5")
 MEXC_FUTURES_MAX_BANKROLL_USDT = Decimal("20")
 MEXC_FUTURES_RISK_PER_TRADE_USDT = Decimal("0.20")
 MEXC_FUTURES_MAX_OPEN_POSITIONS = 1
+
+MEXC_DRY_RUN_SEED_SYMBOLS = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "ENAUSDT",
+    "TAOUSDT",
+    "HYPEUSDT",
+)
+MEXC_DRY_RUN_SEED_REFERENCE_TS = 1_700_000_000
+MEXC_DRY_RUN_SEED_CREATED_TS = 1_700_000_001
 MAX_NOTIONAL_USDT = Decimal("1")
 EXECUTION_INTENT_DEMO_MAX_NOTIONAL_USDT = Decimal("100")
 DEFAULT_NOTIONAL_USDT = Decimal("1")
@@ -1035,6 +1047,50 @@ def inspect_execution_intents_once(args: argparse.Namespace) -> None:
 def execution_intent_id(setup_id: str) -> str:
     digest = hashlib.sha256(setup_id.encode("utf-8")).hexdigest()[:16]
     return f"intent-{digest}"
+
+
+def mexc_dry_run_seed_intents() -> list[SetupExecutionIntent]:
+    return [
+        SetupExecutionIntent(
+            setup_id=f"test-mexc-dry-run-{symbol.lower()}",
+            symbol=f"MEXC_FUT:{symbol}",
+            side="LONG",
+            entry=Decimal("100"),
+            stop=Decimal("99"),
+            tp1=Decimal("102"),
+            tp2=Decimal("103"),
+            rr1=Decimal("2"),
+            rr2=Decimal("3"),
+            reference_ts=MEXC_DRY_RUN_SEED_REFERENCE_TS + idx,
+        )
+        for idx, symbol in enumerate(MEXC_DRY_RUN_SEED_SYMBOLS)
+    ]
+
+
+def seed_mexc_dry_run_intents_once(args: argparse.Namespace) -> None:
+    if not (bool(getattr(args, "seed_mexc_dry_run_intents", False)) and bool(getattr(args, "allow_test_seed", False))):
+        raise SystemExit("--seed-mexc-dry-run-intents requires --allow-test-seed")
+
+    state_db_path = resolve_state_db_path(args)
+    seeded = 0
+    with closing(sqlite3.connect(state_db_path)) as conn:
+        init_execution_intents_table(conn)
+        for intent in mexc_dry_run_seed_intents():
+            intent_id = execution_intent_id(intent.setup_id)
+            if create_execution_intent(conn, intent, created_ts=MEXC_DRY_RUN_SEED_CREATED_TS):
+                seeded += 1
+                console(
+                    "MEXC_DRY_RUN_INTENT_SEEDED",
+                    "",
+                    {"intent_id": intent_id, "setup_id": intent.setup_id, "symbol": intent.symbol, "intent_status": EXECUTION_INTENT_STATUS_NEW},
+                )
+            else:
+                console(
+                    "MEXC_DRY_RUN_INTENT_ALREADY_EXISTS",
+                    "",
+                    {"intent_id": intent_id, "setup_id": intent.setup_id, "symbol": intent.symbol},
+                )
+    console("MEXC_DRY_RUN_INTENTS_SEEDED", str(seeded))
 
 
 def create_execution_intent(
@@ -4886,13 +4942,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync-execution-trades", action="store_true", help="Sync Binance Demo execution-intent entry fills and attach protective TP/SL orders")
     parser.add_argument("--mexc-demo-or-live-mode-name-if-supported", default="DRY_RUN", help="MEXC mode selector; only DRY_RUN/paper is enabled in this repo, LIVE fails closed")
     parser.add_argument("--execute-mexc-intents", action="store_true", help="Process NEW execution_intents for MEXC Futures through Phase A dry-run guards")
+    parser.add_argument("--seed-mexc-dry-run-intents", action="store_true", help="Seed deterministic MEXC Futures dry-run test execution_intents into --state-db-path; requires --allow-test-seed")
+    parser.add_argument("--allow-test-seed", action="store_true", help="Second confirmation required for --seed-mexc-dry-run-intents")
     parser.add_argument("--sync-mexc-trades", action="store_true", help="Fail-closed placeholder for MEXC Futures fill/protective-order/closure sync")
     parser.add_argument("--inspect-execution-intents", action="store_true", help="Read-only summary of execution_intents in --state-db-path; exits before Binance initialization or scanning")
     args = parser.parse_args()
-    if not (args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades or args.execute_mexc_intents or args.sync_mexc_trades):
+    if not (args.inspect_execution_intents or args.execute_execution_intents or args.sync_execution_trades or args.execute_mexc_intents or args.sync_mexc_trades or args.seed_mexc_dry_run_intents):
         missing = [flag for flag, value in (("--db-path", args.db_path), ("--settings", args.settings)) if not value]
         if missing:
-            parser.error(f"the following arguments are required unless --inspect-execution-intents or --execute-execution-intents is used: {', '.join(missing)}")
+            parser.error(f"the following arguments are required unless a state-db-only utility mode is used: {', '.join(missing)}")
     return args
 
 
@@ -4900,6 +4958,9 @@ def main() -> None:
     args = parse_args()
     if bool(getattr(args, "inspect_execution_intents", False)):
         inspect_execution_intents_once(args)
+        return
+    if bool(getattr(args, "seed_mexc_dry_run_intents", False)):
+        seed_mexc_dry_run_intents_once(args)
         return
     if bool(getattr(args, "execute_execution_intents", False)):
         log_startup(args)
