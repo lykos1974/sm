@@ -1314,6 +1314,62 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(sum(" STARTUP " in line for line in events), 1)
         self.assertIn("STARTUP mode=DEMO_DRY_RUN", events[0])
 
+    def test_mexc_dry_run_startup_log_uses_mexc_execution_context(self):
+        args = argparse.Namespace(
+            db_path=None,
+            state_db_path="data/mexc_phase_a_state.db",
+            dry_run=True,
+            demo=False,
+            execute_mexc_intents=True,
+            mexc_demo_or_live_mode_name_if_supported="DRY_RUN",
+            enable_demo_doubles=False,
+            enable_demo_pole_motif=False,
+            demo_max_notional_usdt=str(trader.MAX_NOTIONAL_USDT),
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            trader.log_startup(args)
+
+        startup_line = next(line for line in output.getvalue().splitlines() if " STARTUP " in line)
+        self.assertIn("STARTUP mode=MEXC_DRY_RUN_PHASE_A", startup_line)
+        self.assertIn('"venue": "MEXC_FUT"', startup_line)
+        self.assertIn('"execution": "DRY_RUN"', startup_line)
+        self.assertIn('"base_url": "MEXC_FUTURES_BASE_URL"', startup_line)
+        self.assertIn('"api_key_env": "MEXC_FUTURES_API_KEY"', startup_line)
+        self.assertNotIn("PRODUCTION_LIVE", startup_line)
+        self.assertNotIn("BINANCE_FUTURES_API_KEY", startup_line)
+        self.assertNotIn('"execution": "LIVE"', startup_line)
+
+    def test_binance_production_live_startup_log_remains_unchanged(self):
+        old_live = os.environ.get("LIVE_TRADING_ENABLED")
+        os.environ["LIVE_TRADING_ENABLED"] = "1"
+        try:
+            args = argparse.Namespace(
+                db_path="data/binance_state.db",
+                state_db_path=None,
+                dry_run=False,
+                demo=False,
+                execute_mexc_intents=False,
+                enable_demo_doubles=False,
+                enable_demo_pole_motif=False,
+                demo_max_notional_usdt=str(trader.MAX_NOTIONAL_USDT),
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.log_startup(args)
+        finally:
+            if old_live is None:
+                os.environ.pop("LIVE_TRADING_ENABLED", None)
+            else:
+                os.environ["LIVE_TRADING_ENABLED"] = old_live
+
+        startup_line = next(line for line in output.getvalue().splitlines() if " STARTUP " in line)
+        self.assertIn("STARTUP mode=PRODUCTION_LIVE", startup_line)
+        self.assertIn('"venue": "PRODUCTION"', startup_line)
+        self.assertIn('"execution": "LIVE"', startup_line)
+        self.assertIn(f'"base_url": "{trader.BINANCE_BASE_URL}"', startup_line)
+        self.assertIn('"api_key_env": "BINANCE_FUTURES_API_KEY"', startup_line)
+
     def test_detect_latest_strict_double_top_breakout(self):
         original_engine = trader.PnFEngine
         try:
