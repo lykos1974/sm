@@ -2983,6 +2983,107 @@ class BinanceForwardTraderTests(unittest.TestCase):
         self.assertEqual(trade, ("setup-test", "intent-test", "ORDER_SENT"))
         self.assertEqual(len(clients[0].submitted_orders), 1)
 
+    def _run_mexc_intent_executor(self, state_db_path, *, key="key", secret="secret"):
+        old_key = os.environ.get(trader.MEXC_FUTURES_API_KEY_ENV)
+        old_secret = os.environ.get(trader.MEXC_FUTURES_API_SECRET_ENV)
+        try:
+            if key is None:
+                os.environ.pop(trader.MEXC_FUTURES_API_KEY_ENV, None)
+            else:
+                os.environ[trader.MEXC_FUTURES_API_KEY_ENV] = key
+            if secret is None:
+                os.environ.pop(trader.MEXC_FUTURES_API_SECRET_ENV, None)
+            else:
+                os.environ[trader.MEXC_FUTURES_API_SECRET_ENV] = secret
+            output = io.StringIO()
+            with redirect_stdout(output):
+                trader.process_mexc_execution_intents_once(
+                    argparse.Namespace(
+                        state_db_path=state_db_path,
+                        mexc_demo_or_live_mode_name_if_supported="DRY_RUN",
+                    ),
+                    iteration=1,
+                )
+            return output.getvalue()
+        finally:
+            if old_key is None:
+                os.environ.pop(trader.MEXC_FUTURES_API_KEY_ENV, None)
+            else:
+                os.environ[trader.MEXC_FUTURES_API_KEY_ENV] = old_key
+            if old_secret is None:
+                os.environ.pop(trader.MEXC_FUTURES_API_SECRET_ENV, None)
+            else:
+                os.environ[trader.MEXC_FUTURES_API_SECRET_ENV] = old_secret
+
+    def test_mexc_allowed_symbols_accepted_and_tao_hype_rejected(self):
+        self.assertTrue(trader.is_mexc_futures_symbol_allowed("MEXC_FUT:BTCUSDT"))
+        self.assertTrue(trader.is_mexc_futures_symbol_allowed("ENAUSDT"))
+        self.assertFalse(trader.is_mexc_futures_symbol_allowed("MEXC_FUT:TAOUSDT"))
+        self.assertFalse(trader.is_mexc_futures_symbol_allowed("MEXC_FUT:HYPEUSDT"))
+
+    def test_mexc_position_size_enforces_bankroll_leverage_and_risk_caps(self):
+        signal = trader.TriangleSignal(
+            symbol="MEXC_FUT:BTCUSDT",
+            pattern="execution_intent",
+            side="LONG",
+            trigger_ts=1,
+            entry_price=Decimal("100"),
+            stop_price=Decimal("99"),
+            tp1_price=Decimal("102"),
+            tp2_price=Decimal("103"),
+            trigger_column_idx=0,
+            support_level=Decimal("99"),
+            resistance_level=Decimal("100"),
+            break_distance_boxes=Decimal("0"),
+            pattern_quality="test",
+        )
+        plan, reason = trader.calculate_mexc_futures_position_size(signal)
+        self.assertIsNone(reason)
+        self.assertLessEqual(plan.risk_usdt, Decimal("0.20"))
+        self.assertLessEqual(plan.notional_usdt, Decimal("100"))
+        self.assertEqual(plan.leverage, Decimal("5"))
+
+    def test_mexc_max_open_position_blocks_second_trade(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state, symbol="MEXC_FUT:BTCUSDT")
+            with closing(sqlite3.connect(state)) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO live_trades_binance(
+                        created_at, symbol, pattern, side, trigger_timestamp, entry_price, stop_price,
+                        tp1_price, tp2_price, notional_usdt, decision, status, dry_run
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (trader.now_iso(), "MEXC_FUT:ETHUSDT", "execution_intent", "LONG", 1, 100, 99, 102, 103, 20, "ORDER_SENT", "ORDER_SENT", 1),
+                )
+                conn.commit()
+            logs = self._run_mexc_intent_executor(state)
+        self.assertIn("max open MEXC positions reached", logs)
+
+    def test_mexc_missing_credentials_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state, symbol="MEXC_FUT:BTCUSDT")
+            logs = self._run_mexc_intent_executor(state, key=None, secret=None)
+            with closing(sqlite3.connect(state)) as conn:
+                trade_count = conn.execute("SELECT COUNT(*) FROM live_trades_binance").fetchone()[0]
+        self.assertIn("API credentials missing", logs)
+        self.assertEqual(trade_count, 0)
+
+    def test_mexc_dry_run_records_venue_tagged_trade_without_binance_submit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = os.path.join(temp_dir, "state.db")
+            self._create_intent_state_db(state, symbol="MEXC_FUT:SOLUSDT")
+            logs = self._run_mexc_intent_executor(state)
+            with closing(sqlite3.connect(state)) as conn:
+                row = conn.execute("SELECT symbol, status, dry_run, raw_order_response FROM live_trades_binance").fetchone()
+        self.assertIn("MEXC_ORDER_DRY_RUN", logs)
+        self.assertEqual(row[0], "MEXC_FUT:SOLUSDT")
+        self.assertEqual(row[1], "DRY_RUN")
+        self.assertEqual(row[2], 1)
+        self.assertIn('"venue": "MEXC_FUT"', row[3])
+
     def test_execution_intents_timestamp_rejection_leaves_intent_new(self):
         class TimestampRejectingClient(SubmittingClient):
             def submit_order(self, order):
