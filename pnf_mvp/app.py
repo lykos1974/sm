@@ -449,6 +449,7 @@ class App(tk.Tk):
 
     def _schedule_refresh(self):
         if not self._refresh_running and self.bootstrap_completed:
+            self._refresh_running = True
             threading.Thread(target=self._refresh_incremental_once, daemon=True).start()
         self.after(REFRESH_MS, self._schedule_refresh)
 
@@ -459,6 +460,7 @@ class App(tk.Tk):
         if not self.bootstrap_completed:
             self._log("Bootstrap still running.")
             return
+        self._refresh_running = True
         threading.Thread(target=self._refresh_incremental_once, daemon=True).start()
 
     def _priority_from_snapshot(self, state: str, signal: str, score: int) -> str:
@@ -696,9 +698,56 @@ class App(tk.Tk):
         candles = self.storage.load_candles_after(symbol, after_close_ts)
         return candles[:-1] if len(candles) > 1 else []
 
+    def _format_refresh_ts(self, ts_ms) -> str:
+        if ts_ms is None:
+            return "None"
+        try:
+            return datetime.utcfromtimestamp(int(ts_ms) / 1000.0).isoformat(timespec="milliseconds") + "Z"
+        except Exception:
+            return str(ts_ms)
+
+    def _safe_console_log(self, message: str):
+        try:
+            print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] {message}", flush=True)
+        except Exception:
+            pass
+
+    def _safe_log(self, message: str):
+        try:
+            self._log(message)
+        except Exception as exc:
+            self._safe_console_log(f"{message} (log_failed={exc})")
+
+    def _safe_status_set(self, text: str):
+        try:
+            self.status_var.set(text)
+        except Exception as exc:
+            self._safe_console_log(f"status_set_failed text={text!r} error={exc}")
+
+    def _finish_refresh_state(self, status_text: str, end_message: str | None = None):
+        self._refresh_running = False
+        self._safe_status_set(status_text)
+        if end_message:
+            self._safe_log(end_message)
+        self._safe_log("REFRESH_STATE_RESET running=False")
+
+    def _schedule_refresh_completion(self, callback, failure_message: str):
+        try:
+            self.after(0, callback)
+            return True
+        except Exception as exc:
+            self._refresh_running = False
+            self._safe_console_log(f"{failure_message}: {exc}")
+            self._safe_console_log("REFRESH_STATE_RESET running=False")
+            return False
+
     def _bootstrap_from_db_once(self):
         self._refresh_running = True
-        self.status_var.set("Bootstrapping from DB...")
+        try:
+            self.after(0, lambda: self._safe_status_set("Bootstrapping from DB..."))
+        except Exception as exc:
+            self._safe_console_log(f"bootstrap_status_schedule_failed: {exc}")
+        bootstrap_logs = []
         try:
             new_engines = {}
             new_snapshots = {}
@@ -739,32 +788,46 @@ class App(tk.Tk):
                 new_snapshots[symbol] = snapshot
                 if last_processed is not None:
                     new_last_processed[symbol] = last_processed
-                self._log(f"{symbol} bootstrap source={source_label} columns={len(engine.columns)}")
+                bootstrap_logs.append(f"{symbol} bootstrap source={source_label} columns={len(engine.columns)}")
 
             def apply_ui_updates():
-                current_symbol = self.active_symbol
-                self.engines = new_engines
-                self.latest_scanner = new_snapshots
-                self.last_processed_close_ts_by_symbol = new_last_processed
-                self._refresh_tree()
-                self._draw_selected(current_symbol)
-                self._focus_active_area(current_symbol)
-                self._save_current_view_for_symbol(current_symbol)
-                self.bootstrap_completed = True
-                self._update_structure_debug_choices()
-                self.status_var.set("DB synced")
-                self._log("Bootstrap completed. Incremental refresh enabled.")
+                failed = False
+                try:
+                    for line in bootstrap_logs:
+                        self._safe_log(line)
+                    current_symbol = self.active_symbol
+                    self.engines = new_engines
+                    self.latest_scanner = new_snapshots
+                    self.last_processed_close_ts_by_symbol = new_last_processed
+                    self._refresh_tree()
+                    self._draw_selected(current_symbol)
+                    self._focus_active_area(current_symbol)
+                    self._save_current_view_for_symbol(current_symbol)
+                    self.bootstrap_completed = True
+                    self._update_structure_debug_choices()
+                    self._safe_log("Bootstrap completed. Incremental refresh enabled.")
+                except Exception as exc:
+                    failed = True
+                    self._safe_log(f"Bootstrap UI apply failed: {exc}")
+                finally:
+                    self._finish_refresh_state("Bootstrap error" if failed else "DB synced")
 
-            self.after(0, apply_ui_updates)
+            self._schedule_refresh_completion(apply_ui_updates, "bootstrap_apply_schedule_failed")
         except Exception as e:
-            self.after(0, lambda: self._log(f"Bootstrap failed: {e}"))
-            self.after(0, lambda: self.status_var.set("Bootstrap error"))
-        finally:
-            self._refresh_running = False
+            def apply_bootstrap_error(exc=e):
+                self._safe_log(f"Bootstrap failed: {exc}")
+                self._finish_refresh_state("Bootstrap error")
+
+            self._schedule_refresh_completion(apply_bootstrap_error, "bootstrap_error_schedule_failed")
 
     def _refresh_incremental_once(self):
-        self._refresh_running = True
-        self.status_var.set("Refreshing from DB...")
+        if not self._refresh_running:
+            self._refresh_running = True
+        try:
+            self.after(0, lambda: (self._safe_status_set("Refreshing from DB..."), self._safe_log("REFRESH_BEGIN")))
+        except Exception as exc:
+            self._safe_console_log(f"refresh_begin_schedule_failed: {exc}")
+        refresh_logs = []
         try:
             new_snapshots = {}
             new_signal_objects = []
@@ -777,7 +840,14 @@ class App(tk.Tk):
                     self.last_processed_close_ts_by_symbol[symbol] = last_processed
 
                 last_processed = self.last_processed_close_ts_by_symbol.get(symbol)
-                new_candles = self._load_new_closed_candles(symbol, last_processed)
+                raw_new_candles = self.storage.load_candles_after(symbol, last_processed)
+                latest_close_time = raw_new_candles[-1]["close_time"] if raw_new_candles else None
+                refresh_logs.append(
+                    "REFRESH_DB_ROWS "
+                    f"symbol={symbol} rows={len(raw_new_candles)} "
+                    f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
+                )
+                new_candles = raw_new_candles[:-1] if len(raw_new_candles) > 1 else []
 
                 for candle in new_candles:
                     candle_close_ts = int(candle["close_time"])
@@ -794,38 +864,58 @@ class App(tk.Tk):
                 new_snapshots[symbol] = snapshot
                 self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
                 self._run_validation_for_symbol(symbol, engine, new_candles)
+                refresh_logs.append(
+                    "REFRESH_SYMBOL_UPDATED "
+                    f"symbol={symbol} processed={len(new_candles)} "
+                    f"last_processed={self._format_refresh_ts(last_processed)} "
+                    f"last_price={float(engine.last_price or 0.0)}"
+                )
 
             def apply_ui_updates():
-                previous_symbol = self.current_symbol_drawn
-                current_symbol = self.active_symbol
-                self.selected_symbol.set(current_symbol)
-                symbol_changed = previous_symbol != current_symbol
+                failed = False
+                try:
+                    for line in refresh_logs:
+                        self._safe_log(line)
+                    previous_symbol = self.current_symbol_drawn
+                    current_symbol = self.active_symbol
+                    self.selected_symbol.set(current_symbol)
+                    symbol_changed = previous_symbol != current_symbol
 
-                self.latest_scanner = new_snapshots
-                self._refresh_tree()
-                self._draw_selected(current_symbol)
+                    self.latest_scanner = new_snapshots
+                    self._refresh_tree()
+                    self._draw_selected(current_symbol)
 
-                if symbol_changed:
-                    self.user_panned = False
-                    self._focus_active_area(current_symbol)
-                    self._save_current_view_for_symbol(current_symbol)
-                else:
-                    if self.user_panned:
-                        self.after(10, lambda: self._restore_saved_view_for_symbol(current_symbol))
-                    elif not self.first_focus_done_for_symbol.get(current_symbol, False):
+                    if symbol_changed:
+                        self.user_panned = False
                         self._focus_active_area(current_symbol)
                         self._save_current_view_for_symbol(current_symbol)
+                    else:
+                        if self.user_panned:
+                            self.after(10, lambda: self._restore_saved_view_for_symbol(current_symbol))
+                        elif not self.first_focus_done_for_symbol.get(current_symbol, False):
+                            self._focus_active_area(current_symbol)
+                            self._save_current_view_for_symbol(current_symbol)
 
-                for symbol, sig, snapshot in new_signal_objects:
-                    self._append_filtered_alert_if_needed(symbol, sig, snapshot)
-                self.status_var.set("DB synced")
+                    for symbol, sig, snapshot in new_signal_objects:
+                        self._append_filtered_alert_if_needed(symbol, sig, snapshot)
+                except Exception as exc:
+                    failed = True
+                    self._safe_log(f"REFRESH_EXCEPTION apply_ui_updates failed: {exc}")
+                finally:
+                    self._finish_refresh_state(
+                        "Refresh error" if failed else "DB synced",
+                        f"REFRESH_END status={'failure' if failed else 'success'}",
+                    )
 
-            self.after(0, apply_ui_updates)
+            self._schedule_refresh_completion(apply_ui_updates, "refresh_apply_schedule_failed")
         except Exception as e:
-            self.after(0, lambda: self._log(f"Refresh failed: {e}"))
-            self.after(0, lambda: self.status_var.set("Refresh error"))
-        finally:
-            self._refresh_running = False
+            def apply_refresh_error(exc=e, logs=tuple(refresh_logs)):
+                for line in logs:
+                    self._safe_log(line)
+                self._safe_log(f"REFRESH_EXCEPTION worker failed: {exc}")
+                self._finish_refresh_state("Refresh error", "REFRESH_END status=failure")
+
+            self._schedule_refresh_completion(apply_refresh_error, "refresh_error_schedule_failed")
 
     def _refresh_tree(self):
         existing = set(self.tree.get_children())
