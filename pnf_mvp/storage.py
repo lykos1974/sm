@@ -193,6 +193,42 @@ class Storage:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    def load_latest_candle_close_time(self, symbol):
+        cur = self.conn.execute(
+            """
+            SELECT close_time
+            FROM candles
+            WHERE symbol=? AND interval='1m'
+            ORDER BY open_time DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        )
+        row = cur.fetchone()
+        return int(row["close_time"]) if row else None
+
+    def count_candles_after(self, symbol, after_close_ts=None):
+        if after_close_ts is None:
+            cur = self.conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM candles
+                WHERE symbol=? AND interval='1m'
+                """,
+                (symbol,),
+            )
+        else:
+            cur = self.conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM candles
+                WHERE symbol=? AND interval='1m' AND close_time > ?
+                """,
+                (symbol, int(after_close_ts)),
+            )
+        row = cur.fetchone()
+        return int(row["count"]) if row else 0
+
     def save_state(self, symbol, profile, state):
         self.conn.execute(
             """
