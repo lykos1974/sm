@@ -206,7 +206,21 @@ class App(tk.Tk):
             self.opportunity_details_vars[field] = var
         self._set_opportunity_details_empty()
 
-        columns = ("exchange", "native_symbol", "setup_status", "state", "signal", "priority", "last", "score", "updated")
+        columns = (
+            "exchange",
+            "native_symbol",
+            "setup_status",
+            "state",
+            "signal",
+            "priority",
+            "last",
+            "score",
+            "updated",
+            "latest_db_close_time",
+            "last_processed_close_time",
+            "lag_seconds",
+            "lag_candles",
+        )
         self.tree = ttk.Treeview(left, columns=columns, show="headings", height=16)
         for col, width in [
             ("exchange", 90),
@@ -218,6 +232,10 @@ class App(tk.Tk):
             ("last", 100),
             ("score", 60),
             ("updated", 90),
+            ("latest_db_close_time", 170),
+            ("last_processed_close_time", 170),
+            ("lag_seconds", 95),
+            ("lag_candles", 90),
         ]:
             self.tree.heading(col, text=col.upper())
             self.tree.column(col, width=width, anchor="center")
@@ -638,6 +656,43 @@ class App(tk.Tk):
             "updated": datetime.utcnow().strftime("%H:%M:%S"),
         }
 
+    def _latest_candle_is_open(self, close_time_ms: int | None, now_ms: int | None = None) -> bool:
+        if close_time_ms is None:
+            return False
+        if now_ms is None:
+            now_ms = int(datetime.utcnow().timestamp() * 1000)
+        return int(close_time_ms) > (now_ms - 5000)
+
+    def _closed_candles_for_refresh(self, candles: list[dict], now_ms: int | None = None) -> tuple[list[dict], bool]:
+        if not candles:
+            return [], False
+        latest_close_time = int(candles[-1]["close_time"])
+        if self._latest_candle_is_open(latest_close_time, now_ms):
+            return candles[:-1], True
+        return candles, False
+
+    def _add_freshness_to_snapshot(
+        self,
+        snapshot: dict,
+        *,
+        latest_db_close_time: int | None,
+        last_processed_close_time: int | None,
+        lag_candles: int | None = None,
+    ) -> dict:
+        if latest_db_close_time is not None and last_processed_close_time is not None:
+            lag_seconds = max(0, int((int(latest_db_close_time) - int(last_processed_close_time)) / 1000))
+        else:
+            lag_seconds = None
+        if lag_candles is None:
+            lag_candles = 0 if lag_seconds == 0 else None
+        return {
+            **snapshot,
+            "latest_db_close_time": self._format_refresh_ts(latest_db_close_time),
+            "last_processed_close_time": self._format_refresh_ts(last_processed_close_time),
+            "lag_seconds": lag_seconds if lag_seconds is not None else "N/A",
+            "lag_candles": lag_candles if lag_candles is not None else "N/A",
+        }
+
     def _save_engine_snapshot(self, symbol: str, engine: PnFEngine, last_processed_close_ts: int | None, snapshot: dict):
         profile = self._get_profile(symbol)
         state = engine.state_dict()
@@ -692,11 +747,11 @@ class App(tk.Tk):
 
     def _load_all_closed_candles(self, symbol: str):
         candles = self.storage.load_recent_candles(symbol, None)
-        return candles[:-1] if len(candles) > 1 else []
+        return self._closed_candles_for_refresh(candles)[0]
 
     def _load_new_closed_candles(self, symbol: str, after_close_ts: int | None):
         candles = self.storage.load_candles_after(symbol, after_close_ts)
-        return candles[:-1] if len(candles) > 1 else []
+        return self._closed_candles_for_refresh(candles)[0]
 
     def _format_refresh_ts(self, ts_ms) -> str:
         if ts_ms is None:
@@ -783,6 +838,14 @@ class App(tk.Tk):
                     engine.update_from_price(last_processed, candle["close"])
 
                 snapshot = self._build_snapshot(symbol, engine)
+                latest_db_close_time = self.storage.load_latest_candle_close_time(symbol)
+                lag_candles = self.storage.count_candles_after(symbol, last_processed)
+                snapshot = self._add_freshness_to_snapshot(
+                    snapshot,
+                    latest_db_close_time=latest_db_close_time,
+                    last_processed_close_time=last_processed,
+                    lag_candles=lag_candles,
+                )
                 self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
                 new_engines[symbol] = engine
                 new_snapshots[symbol] = snapshot
@@ -841,13 +904,37 @@ class App(tk.Tk):
 
                 last_processed = self.last_processed_close_ts_by_symbol.get(symbol)
                 raw_new_candles = self.storage.load_candles_after(symbol, last_processed)
-                latest_close_time = raw_new_candles[-1]["close_time"] if raw_new_candles else None
+                latest_close_time = (
+                    int(raw_new_candles[-1]["close_time"])
+                    if raw_new_candles
+                    else self.storage.load_latest_candle_close_time(symbol)
+                )
                 refresh_logs.append(
                     "REFRESH_DB_ROWS "
                     f"symbol={symbol} rows={len(raw_new_candles)} "
                     f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
                 )
-                new_candles = raw_new_candles[:-1] if len(raw_new_candles) > 1 else []
+                now_ms = int(datetime.utcnow().timestamp() * 1000)
+                new_candles, dropped_open_candle = self._closed_candles_for_refresh(raw_new_candles, now_ms)
+                pre_process_lag_candles = len(raw_new_candles)
+                pre_process_lag_seconds = (
+                    max(0, int((int(latest_close_time) - int(last_processed)) / 1000))
+                    if latest_close_time is not None and last_processed is not None
+                    else None
+                )
+                refresh_logs.append(
+                    "REFRESH_FRESHNESS "
+                    f"symbol={symbol} "
+                    f"latest_db_close={self._format_refresh_ts(latest_close_time)} "
+                    f"last_processed={self._format_refresh_ts(last_processed)} "
+                    f"lag_seconds={pre_process_lag_seconds if pre_process_lag_seconds is not None else 'N/A'} "
+                    f"lag_candles={pre_process_lag_candles}"
+                )
+                refresh_logs.append(
+                    "REFRESH_PROCESSING_CANDLES "
+                    f"symbol={symbol} count={len(new_candles)} "
+                    f"dropped_open_candle={str(dropped_open_candle).lower()}"
+                )
 
                 for candle in new_candles:
                     candle_close_ts = int(candle["close_time"])
@@ -861,6 +948,13 @@ class App(tk.Tk):
 
                 self.last_processed_close_ts_by_symbol[symbol] = last_processed
                 snapshot = self._build_snapshot(symbol, engine)
+                post_process_lag_candles = self.storage.count_candles_after(symbol, last_processed)
+                snapshot = self._add_freshness_to_snapshot(
+                    snapshot,
+                    latest_db_close_time=latest_close_time,
+                    last_processed_close_time=last_processed,
+                    lag_candles=post_process_lag_candles,
+                )
                 new_snapshots[symbol] = snapshot
                 self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
                 self._run_validation_for_symbol(symbol, engine, new_candles)
@@ -942,7 +1036,21 @@ class App(tk.Tk):
             iid = item["symbol"]
             exchange, native_symbol = self._split_storage_symbol(item["symbol"])
             setup_status = item.get("setup_status", "NONE")
-            values = (exchange, native_symbol, setup_status, item["state"], item["signal"], item["priority"], item["last"], item["score"], item["updated"])
+            values = (
+                exchange,
+                native_symbol,
+                setup_status,
+                item["state"],
+                item["signal"],
+                item["priority"],
+                item["last"],
+                item["score"],
+                item["updated"],
+                item.get("latest_db_close_time", "N/A"),
+                item.get("last_processed_close_time", "N/A"),
+                item.get("lag_seconds", "N/A"),
+                item.get("lag_candles", "N/A"),
+            )
             tags = (f"setup_status_{setup_status.lower()}",)
             if iid in existing:
                 self.tree.item(iid, values=values, tags=tags)
