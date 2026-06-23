@@ -58,3 +58,37 @@ def test_schedule_refresh_completion_failure_resets_refresh_running():
     assert dummy._refresh_running is False
     assert any("refresh_apply_schedule_failed" in message for message in dummy.console_messages)
     assert any("REFRESH_STATE_RESET running=False" in message for message in dummy.console_messages)
+
+
+class CandleFilterDummy:
+    _latest_candle_is_open = App._latest_candle_is_open
+    _closed_candles_for_refresh = App._closed_candles_for_refresh
+
+
+def test_closed_candles_for_refresh_filters_each_open_or_future_candle():
+    dummy = CandleFilterDummy()
+    now_ms = 1_000_000
+    candles = [
+        {"close_time": now_ms - 60_000, "close": 1},
+        {"close_time": now_ms - 4_000, "close": 2},
+        {"close_time": now_ms + 60_000, "close": 3},
+    ]
+
+    closed, dropped = dummy._closed_candles_for_refresh(candles, now_ms)
+
+    assert closed == [candles[0]]
+    assert dropped is True
+
+
+def test_closed_candles_for_refresh_keeps_all_eligible_closed_candles():
+    dummy = CandleFilterDummy()
+    now_ms = 1_000_000
+    candles = [
+        {"close_time": now_ms - 60_000, "close": 1},
+        {"close_time": now_ms - 5_000, "close": 2},
+    ]
+
+    closed, dropped = dummy._closed_candles_for_refresh(candles, now_ms)
+
+    assert closed == candles
+    assert dropped is False
