@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import tkinter as tk
 from urllib import parse, request
 from tkinter import ttk, messagebox
@@ -910,107 +911,154 @@ class App(tk.Tk):
     def _refresh_incremental_once(self):
         if not self._refresh_running:
             self._refresh_running = True
+        refresh_started_at = time.perf_counter()
+        refresh_logs = []
+
+        def elapsed_ms() -> int:
+            return int((time.perf_counter() - refresh_started_at) * 1000)
+
+        def stage_log(message: str):
+            line = f"{message} elapsed_ms={elapsed_ms()}"
+            self._safe_console_log(line)
+            try:
+                self.after(0, lambda line=line: self._safe_log(line))
+            except Exception as exc:
+                self._safe_console_log(f"refresh_stage_log_schedule_failed: {exc}")
+
         try:
             self.after(0, lambda: (self._safe_status_set("Refreshing from DB..."), self._safe_log("REFRESH_BEGIN")))
         except Exception as exc:
             self._safe_console_log(f"refresh_begin_schedule_failed: {exc}")
-        refresh_logs = []
         try:
             new_snapshots = {}
             new_signal_objects = []
 
             for symbol in self.settings["symbols"]:
-                engine = self.engines.get(symbol)
-                if engine is None:
-                    engine, last_processed, _ = self._load_stateful_engine(symbol)
-                    self.engines[symbol] = engine
-                    self.last_processed_close_ts_by_symbol[symbol] = last_processed
+                symbol_failed = False
+                try:
+                    stage_log(f"REFRESH_SYMBOL_BEGIN symbol={symbol}")
+                    engine = self.engines.get(symbol)
+                    if engine is None:
+                        engine, last_processed, _ = self._load_stateful_engine(symbol)
+                        self.engines[symbol] = engine
+                        self.last_processed_close_ts_by_symbol[symbol] = last_processed
 
-                last_processed = self.last_processed_close_ts_by_symbol.get(symbol)
-                raw_new_candles = self.storage.load_candles_after(symbol, last_processed)
-                latest_close_time = self.storage.load_latest_candle_close_time(symbol)
-                refresh_logs.append(
-                    "REFRESH_DB_ROWS "
-                    f"symbol={symbol} rows={len(raw_new_candles)} "
-                    f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
-                )
-                now_ms = int(datetime.utcnow().timestamp() * 1000)
-                new_candles, dropped_open_candle = self._closed_candles_for_refresh(raw_new_candles, now_ms)
-                eligible_closed_count = len(new_candles)
-                refresh_logs.append(self._refresh_eligible_candles_log(symbol, new_candles))
-                pre_process_lag_candles = eligible_closed_count
-                pre_process_lag_seconds = (
-                    max(0, int((int(latest_close_time) - int(last_processed)) / 1000))
-                    if latest_close_time is not None and last_processed is not None
-                    else None
-                )
-                refresh_logs.append(
-                    "REFRESH_FRESHNESS "
-                    f"symbol={symbol} "
-                    f"latest_db_close={self._format_refresh_ts(latest_close_time)} "
-                    f"last_processed={self._format_refresh_ts(last_processed)} "
-                    f"lag_seconds={pre_process_lag_seconds if pre_process_lag_seconds is not None else 'N/A'} "
-                    f"lag_candles={pre_process_lag_candles}"
-                )
-                newest_processed_close_time = int(new_candles[-1]["close_time"]) if new_candles else last_processed
-                refresh_logs.append(
-                    "REFRESH_PROCESSING_CANDLES "
-                    f"symbol={symbol} count={len(new_candles)} "
-                    f"latest_db_close_time={self._format_refresh_ts(latest_close_time)} "
-                    f"newest_processed_close_time={self._format_refresh_ts(newest_processed_close_time)} "
-                    f"eligible_closed_count={eligible_closed_count} "
-                    f"dropped_open_candle={str(dropped_open_candle).lower()} "
-                    f"lag_candles={pre_process_lag_candles}"
-                )
-
-                for candle in new_candles:
-                    candle_close_ts = int(candle["close_time"])
-                    before_last_price = engine.last_price
-                    result = engine.update_from_price(candle_close_ts, candle["close"])
-                    last_processed = candle_close_ts
-                    refresh_logs.append(
-                        "REFRESH_ENGINE_UPDATE "
-                        f"symbol={symbol} "
-                        f"close_time={self._format_refresh_ts(candle_close_ts)} "
-                        f"close={float(candle['close'])} "
-                        f"before_last_price={float(before_last_price) if before_last_price is not None else 'None'} "
-                        f"after_last_price={float(engine.last_price) if engine.last_price is not None else 'None'}"
+                    last_processed = self.last_processed_close_ts_by_symbol.get(symbol)
+                    stage_log(
+                        "REFRESH_LOAD_BEGIN "
+                        f"symbol={symbol} last_processed={self._format_refresh_ts(last_processed)}"
                     )
-                    if result["new_signal"]:
-                        event_snapshot = self._build_snapshot(symbol, engine)
-                        for sig in result["new_signals"]:
-                            new_signal_objects.append((symbol, sig, event_snapshot))
-                            self.storage.insert_signal(symbol, self._get_profile(symbol), sig)
+                    raw_new_candles = self.storage.load_candles_after(symbol, last_processed)
+                    latest_close_time = self.storage.load_latest_candle_close_time(symbol)
+                    stage_log(
+                        "REFRESH_LOAD_END "
+                        f"symbol={symbol} rows={len(raw_new_candles)} "
+                        f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
+                    )
+                    refresh_logs.append(
+                        "REFRESH_DB_ROWS "
+                        f"symbol={symbol} rows={len(raw_new_candles)} "
+                        f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
+                    )
+                    now_ms = int(datetime.utcnow().timestamp() * 1000)
+                    stage_log(f"REFRESH_FILTER_BEGIN symbol={symbol} rows={len(raw_new_candles)}")
+                    new_candles, dropped_open_candle = self._closed_candles_for_refresh(raw_new_candles, now_ms)
+                    eligible_closed_count = len(new_candles)
+                    stage_log(
+                        "REFRESH_FILTER_END "
+                        f"symbol={symbol} eligible_closed_count={eligible_closed_count} "
+                        f"dropped_open_candle={str(dropped_open_candle).lower()}"
+                    )
+                    refresh_logs.append(self._refresh_eligible_candles_log(symbol, new_candles))
+                    pre_process_lag_candles = eligible_closed_count
+                    pre_process_lag_seconds = (
+                        max(0, int((int(latest_close_time) - int(last_processed)) / 1000))
+                        if latest_close_time is not None and last_processed is not None
+                        else None
+                    )
+                    refresh_logs.append(
+                        "REFRESH_FRESHNESS "
+                        f"symbol={symbol} "
+                        f"latest_db_close={self._format_refresh_ts(latest_close_time)} "
+                        f"last_processed={self._format_refresh_ts(last_processed)} "
+                        f"lag_seconds={pre_process_lag_seconds if pre_process_lag_seconds is not None else 'N/A'} "
+                        f"lag_candles={pre_process_lag_candles}"
+                    )
+                    newest_processed_close_time = int(new_candles[-1]["close_time"]) if new_candles else last_processed
+                    refresh_logs.append(
+                        "REFRESH_PROCESSING_CANDLES "
+                        f"symbol={symbol} count={len(new_candles)} "
+                        f"latest_db_close_time={self._format_refresh_ts(latest_close_time)} "
+                        f"newest_processed_close_time={self._format_refresh_ts(newest_processed_close_time)} "
+                        f"eligible_closed_count={eligible_closed_count} "
+                        f"dropped_open_candle={str(dropped_open_candle).lower()} "
+                        f"lag_candles={pre_process_lag_candles}"
+                    )
 
-                self.last_processed_close_ts_by_symbol[symbol] = last_processed
-                snapshot = self._build_snapshot(symbol, engine)
-                post_process_lag_candles = self._count_eligible_closed_after(symbol, last_processed, now_ms)
-                snapshot = self._add_freshness_to_snapshot(
-                    snapshot,
-                    latest_db_close_time=latest_close_time,
-                    last_processed_close_time=last_processed,
-                    lag_candles=post_process_lag_candles,
-                )
-                new_snapshots[symbol] = snapshot
-                self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
-                refresh_logs.append(
-                    "REFRESH_STATE_PERSIST "
-                    f"symbol={symbol} "
-                    f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
-                    f"last_price={float(engine.last_price or 0.0)}"
-                )
-                self._run_validation_for_symbol(symbol, engine, new_candles)
-                refresh_logs.append(
-                    "REFRESH_SYMBOL_UPDATED "
-                    f"symbol={symbol} processed={len(new_candles)} "
-                    f"last_processed={self._format_refresh_ts(last_processed)} "
-                    f"last_price={float(engine.last_price or 0.0)} "
-                    f"latest_db_close_time={self._format_refresh_ts(latest_close_time)} "
-                    f"newest_processed_close_time={self._format_refresh_ts(last_processed)} "
-                    f"eligible_closed_count={eligible_closed_count} "
-                    f"dropped_open_candle={str(dropped_open_candle).lower()} "
-                    f"lag_candles={post_process_lag_candles}"
-                )
+                    stage_log(f"REFRESH_APPLY_BEGIN symbol={symbol} eligible_closed_count={eligible_closed_count}")
+                    for candle in new_candles:
+                        candle_close_ts = int(candle["close_time"])
+                        before_last_price = engine.last_price
+                        result = engine.update_from_price(candle_close_ts, candle["close"])
+                        last_processed = candle_close_ts
+                        refresh_logs.append(
+                            "REFRESH_ENGINE_UPDATE "
+                            f"symbol={symbol} "
+                            f"close_time={self._format_refresh_ts(candle_close_ts)} "
+                            f"close={float(candle['close'])} "
+                            f"before_last_price={float(before_last_price) if before_last_price is not None else 'None'} "
+                            f"after_last_price={float(engine.last_price) if engine.last_price is not None else 'None'}"
+                        )
+                        if result["new_signal"]:
+                            event_snapshot = self._build_snapshot(symbol, engine)
+                            for sig in result["new_signals"]:
+                                new_signal_objects.append((symbol, sig, event_snapshot))
+                                self.storage.insert_signal(symbol, self._get_profile(symbol), sig)
+                    stage_log(
+                        "REFRESH_APPLY_END "
+                        f"symbol={symbol} newest_processed_close_time={self._format_refresh_ts(last_processed)} "
+                        f"last_price={float(engine.last_price or 0.0)}"
+                    )
+
+                    self.last_processed_close_ts_by_symbol[symbol] = last_processed
+                    snapshot = self._build_snapshot(symbol, engine)
+                    post_process_lag_candles = self._count_eligible_closed_after(symbol, last_processed, now_ms)
+                    snapshot = self._add_freshness_to_snapshot(
+                        snapshot,
+                        latest_db_close_time=latest_close_time,
+                        last_processed_close_time=last_processed,
+                        lag_candles=post_process_lag_candles,
+                    )
+                    new_snapshots[symbol] = snapshot
+                    stage_log(f"REFRESH_SAVE_BEGIN symbol={symbol}")
+                    self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
+                    stage_log(f"REFRESH_SAVE_END symbol={symbol}")
+                    refresh_logs.append(
+                        "REFRESH_STATE_PERSIST "
+                        f"symbol={symbol} "
+                        f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
+                        f"last_price={float(engine.last_price or 0.0)}"
+                    )
+                    stage_log(f"REFRESH_VALIDATION_BEGIN symbol={symbol} eligible_closed_count={len(new_candles)}")
+                    self._run_validation_for_symbol(symbol, engine, new_candles)
+                    stage_log(f"REFRESH_VALIDATION_END symbol={symbol}")
+                    refresh_logs.append(
+                        "REFRESH_SYMBOL_UPDATED "
+                        f"symbol={symbol} processed={len(new_candles)} "
+                        f"last_processed={self._format_refresh_ts(last_processed)} "
+                        f"last_price={float(engine.last_price or 0.0)} "
+                        f"latest_db_close_time={self._format_refresh_ts(latest_close_time)} "
+                        f"newest_processed_close_time={self._format_refresh_ts(last_processed)} "
+                        f"eligible_closed_count={eligible_closed_count} "
+                        f"dropped_open_candle={str(dropped_open_candle).lower()} "
+                        f"lag_candles={post_process_lag_candles}"
+                    )
+                    stage_log(f"REFRESH_SYMBOL_END symbol={symbol}")
+                except Exception as exc:
+                    symbol_failed = True
+                    stage_log(f"REFRESH_SYMBOL_EXCEPTION symbol={symbol} error={exc}")
+                if symbol_failed:
+                    continue
 
             def apply_ui_updates():
                 failed = False
@@ -1022,7 +1070,7 @@ class App(tk.Tk):
                     self.selected_symbol.set(current_symbol)
                     symbol_changed = previous_symbol != current_symbol
 
-                    self.latest_scanner = new_snapshots
+                    self.latest_scanner = {**self.latest_scanner, **new_snapshots}
                     self._refresh_tree()
                     self._draw_selected(current_symbol)
 
@@ -1045,18 +1093,23 @@ class App(tk.Tk):
                 finally:
                     self._finish_refresh_state(
                         "Refresh error" if failed else "DB synced",
-                        f"REFRESH_END status={'failure' if failed else 'success'}",
+                        f"REFRESH_END status={'failure' if failed else 'success'} elapsed_ms={elapsed_ms()}",
                     )
 
-            self._schedule_refresh_completion(apply_ui_updates, "refresh_apply_schedule_failed")
+            if not self._schedule_refresh_completion(apply_ui_updates, "refresh_apply_schedule_failed"):
+                self._safe_console_log(f"REFRESH_END status=failure elapsed_ms={elapsed_ms()}")
         except Exception as e:
             def apply_refresh_error(exc=e, logs=tuple(refresh_logs)):
                 for line in logs:
                     self._safe_log(line)
                 self._safe_log(f"REFRESH_EXCEPTION worker failed: {exc}")
-                self._finish_refresh_state("Refresh error", "REFRESH_END status=failure")
+                self._finish_refresh_state(
+                    "Refresh error",
+                    f"REFRESH_END status=failure elapsed_ms={elapsed_ms()}",
+                )
 
-            self._schedule_refresh_completion(apply_refresh_error, "refresh_error_schedule_failed")
+            if not self._schedule_refresh_completion(apply_refresh_error, "refresh_error_schedule_failed"):
+                self._safe_console_log(f"REFRESH_END status=failure elapsed_ms={elapsed_ms()}")
 
     def _refresh_tree(self):
         existing = set(self.tree.get_children())
