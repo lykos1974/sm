@@ -676,10 +676,24 @@ class App(tk.Tk):
             closed_candles.append(candle)
         return closed_candles, dropped_open_candle
 
-    def _count_eligible_closed_after(self, symbol: str, after_close_ts: int | None, now_ms: int | None = None) -> int:
+    def _eligible_closed_after(self, symbol: str, after_close_ts: int | None, now_ms: int | None = None) -> list[dict]:
         candles = self.storage.load_candles_after(symbol, after_close_ts)
         closed_candles, _ = self._closed_candles_for_refresh(candles, now_ms)
-        return len(closed_candles)
+        return closed_candles
+
+    def _count_eligible_closed_after(self, symbol: str, after_close_ts: int | None, now_ms: int | None = None) -> int:
+        return len(self._eligible_closed_after(symbol, after_close_ts, now_ms))
+
+    def _refresh_eligible_candles_log(self, symbol: str, candles: list[dict]) -> str:
+        first_close_time = int(candles[0]["close_time"]) if candles else None
+        last_close_time = int(candles[-1]["close_time"]) if candles else None
+        return (
+            "REFRESH_ELIGIBLE_CANDLES "
+            f"symbol={symbol} "
+            f"count={len(candles)} "
+            f"first_close_time={self._format_refresh_ts(first_close_time)} "
+            f"last_close_time={self._format_refresh_ts(last_close_time)}"
+        )
 
     def _add_freshness_to_snapshot(
         self,
@@ -923,6 +937,7 @@ class App(tk.Tk):
                 now_ms = int(datetime.utcnow().timestamp() * 1000)
                 new_candles, dropped_open_candle = self._closed_candles_for_refresh(raw_new_candles, now_ms)
                 eligible_closed_count = len(new_candles)
+                refresh_logs.append(self._refresh_eligible_candles_log(symbol, new_candles))
                 pre_process_lag_candles = eligible_closed_count
                 pre_process_lag_seconds = (
                     max(0, int((int(latest_close_time) - int(last_processed)) / 1000))
@@ -950,8 +965,17 @@ class App(tk.Tk):
 
                 for candle in new_candles:
                     candle_close_ts = int(candle["close_time"])
+                    before_last_price = engine.last_price
                     result = engine.update_from_price(candle_close_ts, candle["close"])
                     last_processed = candle_close_ts
+                    refresh_logs.append(
+                        "REFRESH_ENGINE_UPDATE "
+                        f"symbol={symbol} "
+                        f"close_time={self._format_refresh_ts(candle_close_ts)} "
+                        f"close={float(candle['close'])} "
+                        f"before_last_price={float(before_last_price) if before_last_price is not None else 'None'} "
+                        f"after_last_price={float(engine.last_price) if engine.last_price is not None else 'None'}"
+                    )
                     if result["new_signal"]:
                         event_snapshot = self._build_snapshot(symbol, engine)
                         for sig in result["new_signals"]:
@@ -969,6 +993,12 @@ class App(tk.Tk):
                 )
                 new_snapshots[symbol] = snapshot
                 self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
+                refresh_logs.append(
+                    "REFRESH_STATE_PERSIST "
+                    f"symbol={symbol} "
+                    f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
+                    f"last_price={float(engine.last_price or 0.0)}"
+                )
                 self._run_validation_for_symbol(symbol, engine, new_candles)
                 refresh_logs.append(
                     "REFRESH_SYMBOL_UPDATED "
