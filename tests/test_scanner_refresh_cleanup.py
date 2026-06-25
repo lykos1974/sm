@@ -6,6 +6,7 @@ PNF_MVP = ROOT / "pnf_mvp"
 if str(PNF_MVP) not in sys.path:
     sys.path.insert(0, str(PNF_MVP))
 
+import app as app_module
 from app import App
 
 
@@ -61,6 +62,7 @@ def test_schedule_refresh_completion_failure_resets_refresh_running():
 
 
 class CandleFilterDummy:
+    _epoch_now_ms = App._epoch_now_ms
     _latest_candle_is_open = App._latest_candle_is_open
     _closed_candles_for_refresh = App._closed_candles_for_refresh
 
@@ -92,3 +94,37 @@ def test_closed_candles_for_refresh_keeps_all_eligible_closed_candles():
 
     assert closed == candles
     assert dropped is False
+
+
+def test_latest_candle_is_open_uses_epoch_time_not_naive_utc_timestamp(monkeypatch):
+    dummy = CandleFilterDummy()
+    epoch_now_ms = 1_782_429_158_213
+    naive_utcnow_ms = epoch_now_ms - (3 * 60 * 60 * 1000)
+
+    monkeypatch.setattr(app_module.time, "time", lambda: epoch_now_ms / 1000)
+
+    assert dummy._epoch_now_ms() == epoch_now_ms
+    assert dummy._latest_candle_is_open(naive_utcnow_ms + 60_000) is False
+    assert dummy._latest_candle_is_open(epoch_now_ms - 4_000) is True
+
+
+def test_closed_candles_for_refresh_keeps_db_candle_closed_by_epoch_time(monkeypatch):
+    dummy = CandleFilterDummy()
+    epoch_now_ms = 1_782_429_158_213
+    monkeypatch.setattr(app_module.time, "time", lambda: epoch_now_ms / 1000)
+    candle = {"close_time": epoch_now_ms - 5_000, "close": 1}
+
+    closed, dropped = dummy._closed_candles_for_refresh([candle])
+
+    assert closed == [candle]
+    assert dropped is False
+
+
+def test_scanner_clock_logic_has_no_hardcoded_timezone_offset():
+    source = Path(ROOT / "pnf_mvp" / "app.py").read_text()
+
+    assert "datetime.utcnow().timestamp() * 1000" not in source
+    assert "+ 3" not in source
+    assert "+3" not in source
+    assert "10800000" not in source
+    assert "10_800_000" not in source
