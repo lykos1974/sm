@@ -657,11 +657,14 @@ class App(tk.Tk):
             "updated": datetime.utcnow().strftime("%H:%M:%S"),
         }
 
+    def _epoch_now_ms(self) -> int:
+        return int(time.time() * 1000)
+
     def _latest_candle_is_open(self, close_time_ms: int | None, now_ms: int | None = None) -> bool:
         if close_time_ms is None:
             return False
         if now_ms is None:
-            now_ms = int(datetime.utcnow().timestamp() * 1000)
+            now_ms = self._epoch_now_ms()
         return int(close_time_ms) > (now_ms - 5000)
 
     def _closed_candles_for_refresh(self, candles: list[dict], now_ms: int | None = None) -> tuple[list[dict], bool]:
@@ -1008,7 +1011,7 @@ class App(tk.Tk):
                         f"symbol={symbol} rows={len(raw_new_candles)} "
                         f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
                     )
-                    now_ms = int(datetime.utcnow().timestamp() * 1000)
+                    now_ms = self._epoch_now_ms()
                     latest_db_ahead_of_scanner_now = (
                         latest_close_time is not None and int(latest_close_time) > now_ms
                     )
