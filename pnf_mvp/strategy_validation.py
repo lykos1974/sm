@@ -127,6 +127,8 @@ class StrategyValidationStore:
                     "update_pending_only_timestamp_updates": 0,
                     "update_pending_excursion_updates": 0,
                     "update_pending_noop_candidate_updates": 0,
+                    "commit_count": 0,
+                    "commit_elapsed_s": 0.0,
                 }
             ),
             "register_setup": {
@@ -138,6 +140,8 @@ class StrategyValidationStore:
                 "sql_update_count": 0,
                 "sql_insert_count": 0,
                 "sql_select_count": 0,
+                "commit_count": 0,
+                "commit_elapsed_s": 0.0,
             },
         }
 
@@ -333,16 +337,28 @@ class StrategyValidationStore:
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
-    def _mark_dirty(self, units: int = 1) -> None:
+    def _record_commit(self, category: str = "update_pending", symbol: Optional[str] = None) -> None:
+        started = time.perf_counter()
+        self._conn.commit()
+        elapsed = time.perf_counter() - started
+        self._perf_inc(category, "commit_count", 1, symbol=symbol)
+        self._perf_inc(category, "commit_elapsed_s", elapsed, symbol=symbol)
+
+    def _mark_dirty(
+        self,
+        units: int = 1,
+        category: str = "update_pending",
+        symbol: Optional[str] = None,
+    ) -> None:
         self._dirty_writes += max(1, int(units))
         if self._dirty_writes >= self._commit_every:
-            self._conn.commit()
+            self._record_commit(category=category, symbol=symbol)
             self._dirty_writes = 0
 
     def flush(self) -> None:
         with self._lock:
             if self._dirty_writes:
-                self._conn.commit()
+                self._record_commit(category="register_setup")
                 self._dirty_writes = 0
 
     def close(self) -> None:
@@ -513,7 +529,7 @@ class StrategyValidationStore:
             )
             if cur.rowcount and cur.rowcount > 0:
                 self._pending_by_symbol.setdefault(symbol, []).append(dict(row))
-                self._mark_dirty()
+                self._mark_dirty(category="register_setup")
                 self._perf_inc("register_setup", "successful_inserts", 1)
             else:
                 self._perf_inc("register_setup", "duplicate_noop_inserts", 1)
@@ -693,7 +709,7 @@ class StrategyValidationStore:
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
-                        self._mark_dirty()
+                        self._mark_dirty(category="update_pending", symbol=symbol)
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
                         _record_update_diagnostic(event_key="update_pending_event_activation")
@@ -717,7 +733,7 @@ class StrategyValidationStore:
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
-                    self._mark_dirty()
+                    self._mark_dirty(category="update_pending", symbol=symbol)
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                     _record_update_diagnostic(
                         progress_key="update_pending_progress_pending_not_activated",
@@ -804,7 +820,7 @@ class StrategyValidationStore:
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
-                        self._mark_dirty()
+                        self._mark_dirty(category="update_pending", symbol=symbol)
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
                         _record_update_diagnostic(
@@ -863,7 +879,7 @@ class StrategyValidationStore:
                         row["resolution_note"] = resolution_note
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
-                        self._mark_dirty()
+                        self._mark_dirty(category="update_pending", symbol=symbol)
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
                         self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
@@ -920,7 +936,7 @@ class StrategyValidationStore:
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
-                    self._mark_dirty()
+                    self._mark_dirty(category="update_pending", symbol=symbol)
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                     _record_update_diagnostic(
                         progress_key="update_pending_progress_unresolved_active",
@@ -969,7 +985,7 @@ class StrategyValidationStore:
                     row["resolution_note"] = resolution_note
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
-                    self._mark_dirty()
+                    self._mark_dirty(category="update_pending", symbol=symbol)
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                     self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
                     if resolution_status == RESOLUTION_TP2:

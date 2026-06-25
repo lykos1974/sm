@@ -696,6 +696,50 @@ class App(tk.Tk):
             f"last_close_time={self._format_refresh_ts(last_close_time)}"
         )
 
+    def _validation_perf_snapshot(self, symbol: str) -> dict:
+        try:
+            perf = self.validation_store.get_perf_snapshot()
+        except Exception:
+            return {"update_pending": {}, "register_setup": {}}
+        return {
+            "update_pending": dict((perf.get("update_pending") or {}).get(symbol) or {}),
+            "register_setup": dict(perf.get("register_setup") or {}),
+        }
+
+    def _validation_perf_delta(self, before: dict, after: dict) -> dict:
+        update_before = before.get("update_pending") or {}
+        update_after = after.get("update_pending") or {}
+        register_before = before.get("register_setup") or {}
+        register_after = after.get("register_setup") or {}
+
+        def diff(section_before: dict, section_after: dict, key: str):
+            return section_after.get(key, 0) - section_before.get(key, 0)
+
+        return {
+            "pending_rows_count": update_after.get("current_pending_count", 0),
+            "max_pending_count": diff(update_before, update_after, "max_pending_count"),
+            "trades_scanned": diff(update_before, update_after, "trades_scanned"),
+            "trades_updated": diff(update_before, update_after, "trades_updated"),
+            "sql_update_count": diff(update_before, update_after, "sql_update_count"),
+            "sql_select_count": diff(update_before, update_after, "sql_select_count"),
+            "sql_insert_count": diff(update_before, update_after, "sql_insert_count"),
+            "register_attempts": diff(register_before, register_after, "call_count"),
+            "register_inserts": diff(register_before, register_after, "successful_inserts"),
+            "register_duplicate_noops": diff(register_before, register_after, "duplicate_noop_inserts"),
+            "register_sql_insert_count": diff(register_before, register_after, "sql_insert_count"),
+            "register_sql_select_count": diff(register_before, register_after, "sql_select_count"),
+            "commit_count": diff(update_before, update_after, "commit_count") + diff(register_before, register_after, "commit_count"),
+            "commit_elapsed_ms": int(
+                round(
+                    1000
+                    * (
+                        diff(update_before, update_after, "commit_elapsed_s")
+                        + diff(register_before, register_after, "commit_elapsed_s")
+                    )
+                )
+            ),
+        }
+
     def _add_freshness_to_snapshot(
         self,
         snapshot: dict,
@@ -950,10 +994,14 @@ class App(tk.Tk):
                     )
                     raw_new_candles = self.storage.load_candles_after(symbol, last_processed)
                     latest_close_time = self.storage.load_latest_candle_close_time(symbol)
+                    first_loaded_close_time = int(raw_new_candles[0]["close_time"]) if raw_new_candles else None
+                    last_loaded_close_time = int(raw_new_candles[-1]["close_time"]) if raw_new_candles else None
                     stage_log(
                         "REFRESH_LOAD_END "
                         f"symbol={symbol} rows={len(raw_new_candles)} "
-                        f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
+                        f"latest_close_time={self._format_refresh_ts(latest_close_time)} "
+                        f"first_loaded_close_time={self._format_refresh_ts(first_loaded_close_time)} "
+                        f"last_loaded_close_time={self._format_refresh_ts(last_loaded_close_time)}"
                     )
                     refresh_logs.append(
                         "REFRESH_DB_ROWS "
@@ -961,6 +1009,22 @@ class App(tk.Tk):
                         f"latest_close_time={self._format_refresh_ts(latest_close_time)}"
                     )
                     now_ms = int(datetime.utcnow().timestamp() * 1000)
+                    latest_db_ahead_of_scanner_now = (
+                        latest_close_time is not None and int(latest_close_time) > now_ms
+                    )
+                    last_loaded_ahead_of_scanner_now = (
+                        last_loaded_close_time is not None and int(last_loaded_close_time) > now_ms
+                    )
+                    stage_log(
+                        "REFRESH_CLOCK_CHECK "
+                        f"symbol={symbol} "
+                        f"scanner_now_utc={self._format_refresh_ts(now_ms)} "
+                        f"latest_db_close_time={self._format_refresh_ts(latest_close_time)} "
+                        f"first_loaded_close_time={self._format_refresh_ts(first_loaded_close_time)} "
+                        f"last_loaded_close_time={self._format_refresh_ts(last_loaded_close_time)} "
+                        f"latest_db_ahead_of_scanner_now={str(latest_db_ahead_of_scanner_now).lower()} "
+                        f"last_loaded_ahead_of_scanner_now={str(last_loaded_ahead_of_scanner_now).lower()}"
+                    )
                     stage_log(f"REFRESH_FILTER_BEGIN symbol={symbol} rows={len(raw_new_candles)}")
                     new_candles, dropped_open_candle = self._closed_candles_for_refresh(raw_new_candles, now_ms)
                     eligible_closed_count = len(new_candles)
@@ -1039,8 +1103,28 @@ class App(tk.Tk):
                         f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
                         f"last_price={float(engine.last_price or 0.0)}"
                     )
+                    validation_perf_before = self._validation_perf_snapshot(symbol)
                     stage_log(f"REFRESH_VALIDATION_BEGIN symbol={symbol} eligible_closed_count={len(new_candles)}")
-                    self._run_validation_for_symbol(symbol, engine, new_candles)
+                    validation_breakdown = self._run_validation_for_symbol(symbol, engine, new_candles) or {}
+                    validation_perf_after = self._validation_perf_snapshot(symbol)
+                    validation_delta = self._validation_perf_delta(validation_perf_before, validation_perf_after)
+                    stage_log(
+                        "REFRESH_VALIDATION_METRICS "
+                        f"symbol={symbol} "
+                        f"validation_new_candles_count={len(new_candles)} "
+                        f"pending_rows_count={validation_delta['pending_rows_count']} "
+                        f"trades_scanned={validation_delta['trades_scanned']} "
+                        f"trades_updated={validation_delta['trades_updated']} "
+                        f"sql_update_count={validation_delta['sql_update_count']} "
+                        f"register_attempts={validation_delta['register_attempts']} "
+                        f"register_inserts={validation_delta['register_inserts']} "
+                        f"register_duplicate_noops={validation_delta['register_duplicate_noops']} "
+                        f"update_pending_elapsed_ms={validation_breakdown.get('update_pending_elapsed_ms', 0)} "
+                        f"evaluate_strategy_setups_elapsed_ms={validation_breakdown.get('evaluate_strategy_setups_elapsed_ms', 0)} "
+                        f"register_setup_elapsed_ms={validation_breakdown.get('register_setup_elapsed_ms', 0)} "
+                        f"commit_count={validation_delta['commit_count']} "
+                        f"commit_elapsed_ms={validation_delta['commit_elapsed_ms']}"
+                    )
                     stage_log(f"REFRESH_VALIDATION_END symbol={symbol}")
                     refresh_logs.append(
                         "REFRESH_SYMBOL_UPDATED "
@@ -1552,9 +1636,15 @@ class App(tk.Tk):
             return {"status": "NONE", "setup": None}
 
     def _run_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list):
+        metrics = {
+            "update_pending_elapsed_ms": 0,
+            "evaluate_strategy_setups_elapsed_ms": 0,
+            "register_setup_elapsed_ms": 0,
+        }
         if engine is None or not engine.columns:
-            return
+            return metrics
 
+        update_started = time.perf_counter()
         for candle in new_candles:
             close_ts = int(candle.get("close_time") or 0)
             close_price = float(candle.get("close") or 0.0)
@@ -1567,12 +1657,16 @@ class App(tk.Tk):
                 low_price=low_price,
                 close_price=close_price,
             )
+        metrics["update_pending_elapsed_ms"] = int((time.perf_counter() - update_started) * 1000)
 
+        evaluate_started = time.perf_counter()
         structure, setups = self._evaluate_strategy_setups(symbol, engine)
+        metrics["evaluate_strategy_setups_elapsed_ms"] = int((time.perf_counter() - evaluate_started) * 1000)
         reference_ts = self.last_processed_close_ts_by_symbol.get(symbol)
         if reference_ts is None:
-            return
+            return metrics
 
+        register_started = time.perf_counter()
         for setup in setups:
             status = str(setup.get("status") or "").upper()
             if status not in VALIDATION_ELIGIBLE_STATUSES:
@@ -1583,6 +1677,8 @@ class App(tk.Tk):
                 structure_state=structure,
                 reference_ts=int(reference_ts),
             )
+        metrics["register_setup_elapsed_ms"] = int((time.perf_counter() - register_started) * 1000)
+        return metrics
 
     def _structure_panel_field_value(self, field: str, value, profile: PnFProfile) -> str:
         if value is None:
