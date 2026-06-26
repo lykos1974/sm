@@ -67,6 +67,10 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
 class StrategyValidationStore:
     def __init__(
         self,
@@ -127,6 +131,8 @@ class StrategyValidationStore:
                     "update_pending_only_timestamp_updates": 0,
                     "update_pending_excursion_updates": 0,
                     "update_pending_noop_candidate_updates": 0,
+                    "noop_skipped_count": 0,
+                    "lifecycle_update_count": 0,
                     "commit_count": 0,
                     "commit_elapsed_s": 0.0,
                 }
@@ -403,26 +409,61 @@ class StrategyValidationStore:
     ) -> Optional[str]:
         now_ts = int(reference_ts)
         started = time.perf_counter()
+        profile = {
+            "candidate_gate_elapsed_ms": 0,
+            "setup_id_generation_elapsed_ms": 0,
+            "duplicate_detection_elapsed_ms": 0,
+            "insert_elapsed_ms": 0,
+            "cache_append_elapsed_ms": 0,
+            "commit_elapsed_ms": 0,
+        }
+        setup_id: Optional[str] = None
+
+        def _print_register_summary(*, inserted: bool = False, duplicate: bool = False, skipped_gate: bool = False) -> None:
+            print(
+                "REGISTER_SETUP_SUMMARY "
+                f"symbol={symbol} "
+                f"setup_id={setup_id or 'None'} "
+                f"inserted={str(inserted).lower()} "
+                f"duplicate={str(duplicate).lower()} "
+                f"skipped_gate={str(skipped_gate).lower()} "
+                f"candidate_gate_elapsed_ms={profile['candidate_gate_elapsed_ms']} "
+                f"setup_id_generation_elapsed_ms={profile['setup_id_generation_elapsed_ms']} "
+                f"duplicate_detection_elapsed_ms={profile['duplicate_detection_elapsed_ms']} "
+                f"insert_elapsed_ms={profile['insert_elapsed_ms']} "
+                f"cache_append_elapsed_ms={profile['cache_append_elapsed_ms']} "
+                f"commit_elapsed_ms={profile['commit_elapsed_ms']} "
+                f"total_elapsed_ms={_elapsed_ms(started)}",
+                flush=True,
+            )
 
         with self._lock:
             self._perf_inc("register_setup", "call_count", 1)
+            gate_started = time.perf_counter()
             self._ensure_pending_loaded(symbol, perf_category="register_setup")
 
             setup_status = str(setup.get("status") or "").upper()
+            duplicate_started = time.perf_counter()
             pending_candidate_exists = any(
                 str(row.get("status") or "").upper() == "CANDIDATE"
                 for row in self._pending_by_symbol.get(symbol, [])
             )
+            profile["duplicate_detection_elapsed_ms"] += _elapsed_ms(duplicate_started)
             if (
                 not self.allow_multiple_trades_per_symbol
                 and setup_status == "CANDIDATE"
                 and pending_candidate_exists
             ):
+                profile["candidate_gate_elapsed_ms"] += _elapsed_ms(gate_started)
                 elapsed = time.perf_counter() - started
                 self._perf_inc("register_setup", "elapsed_s", elapsed)
+                _print_register_summary(skipped_gate=True)
                 return None
+            profile["candidate_gate_elapsed_ms"] += _elapsed_ms(gate_started)
 
+            setup_id_started = time.perf_counter()
             setup_id = self._make_setup_id(symbol, setup, structure_state, now_ts)
+            profile["setup_id_generation_elapsed_ms"] += _elapsed_ms(setup_id_started)
 
             stored_active_column_index = (
                 _safe_int(active_column_index)
@@ -486,6 +527,7 @@ class StrategyValidationStore:
                 "raw_structure_json": json.dumps(structure_state, ensure_ascii=False, sort_keys=True),
             }
 
+            insert_started = time.perf_counter()
             cur = self._execute_counted(
                 "register_setup",
                 """
@@ -527,14 +569,25 @@ class StrategyValidationStore:
                 """,
                 row,
             )
+            profile["insert_elapsed_ms"] += _elapsed_ms(insert_started)
             if cur.rowcount and cur.rowcount > 0:
+                cache_started = time.perf_counter()
                 self._pending_by_symbol.setdefault(symbol, []).append(dict(row))
+                profile["cache_append_elapsed_ms"] += _elapsed_ms(cache_started)
+                commit_before = self._perf_counter("register_setup").get("commit_elapsed_s", 0.0)
                 self._mark_dirty(category="register_setup")
+                commit_after = self._perf_counter("register_setup").get("commit_elapsed_s", 0.0)
+                profile["commit_elapsed_ms"] += round(max(0.0, commit_after - commit_before) * 1000, 3)
                 self._perf_inc("register_setup", "successful_inserts", 1)
+                inserted = True
+                duplicate = False
             else:
                 self._perf_inc("register_setup", "duplicate_noop_inserts", 1)
+                inserted = False
+                duplicate = True
             elapsed = time.perf_counter() - started
             self._perf_inc("register_setup", "elapsed_s", elapsed)
+            _print_register_summary(inserted=inserted, duplicate=duplicate)
             return setup_id
 
     def _should_activate(self, side: str, close_price: float, ideal_entry: Optional[float]) -> bool:
@@ -616,6 +669,45 @@ class StrategyValidationStore:
         close_price = float(close_price)
 
         with self._lock:
+            print(
+                "VALIDATION_FUNCTION_BEGIN "
+                f"symbol={symbol} close_ts={close_ts} "
+                f"high_price={high_price} low_price={low_price} close_price={close_price}",
+                flush=True,
+            )
+            profile = {
+                "rows_scanned": 0,
+                "rows_updated": 0,
+                "rows_skipped": 0,
+                "rows_removed": 0,
+                "activation_checks": 0,
+                "activation_elapsed_ms": 0,
+                "mfe_mae_elapsed_ms": 0,
+                "resolver_before_tp1_elapsed_ms": 0,
+                "resolver_after_tp1_elapsed_ms": 0,
+                "sql_update_elapsed_ms": 0,
+                "commit_elapsed_ms": 0,
+            }
+
+            def _print_validation_summary() -> None:
+                print(
+                    "VALIDATION_FUNCTION_SUMMARY "
+                    f"symbol={symbol} "
+                    f"rows_scanned={profile['rows_scanned']} "
+                    f"rows_updated={profile['rows_updated']} "
+                    f"rows_skipped={profile['rows_skipped']} "
+                    f"rows_removed={profile['rows_removed']} "
+                    f"activation_checks={profile['activation_checks']} "
+                    f"activation_elapsed_ms={profile['activation_elapsed_ms']} "
+                    f"mfe_mae_elapsed_ms={profile['mfe_mae_elapsed_ms']} "
+                    f"resolver_before_tp1_elapsed_ms={profile['resolver_before_tp1_elapsed_ms']} "
+                    f"resolver_after_tp1_elapsed_ms={profile['resolver_after_tp1_elapsed_ms']} "
+                    f"sql_update_elapsed_ms={profile['sql_update_elapsed_ms']} "
+                    f"commit_elapsed_ms={profile['commit_elapsed_ms']} "
+                    f"total_elapsed_ms={_elapsed_ms(started)}",
+                    flush=True,
+                )
+
             self._perf_inc("update_pending", "call_count", 1, symbol=symbol)
             self._ensure_pending_loaded(symbol, perf_category="update_pending")
             pending = self._pending_by_symbol.get(symbol, [])
@@ -627,9 +719,58 @@ class StrategyValidationStore:
                 counter["max_pending_count"] = max(counter.get("max_pending_count", 0), pending_count)
             if not pending:
                 self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
+                _print_validation_summary()
                 return
 
             still_pending: list[dict[str, Any]] = []
+
+            def _execute_update_profiled(sql: str, params: Any) -> None:
+                sql_started = time.perf_counter()
+                self._execute_counted("update_pending", sql, params, symbol=symbol)
+                profile["sql_update_elapsed_ms"] += _elapsed_ms(sql_started)
+                profile["rows_updated"] += 1
+
+            def _mark_dirty_profiled() -> None:
+                commit_before = self._perf_counter("update_pending", symbol=symbol).get("commit_elapsed_s", 0.0)
+                self._mark_dirty(category="update_pending", symbol=symbol)
+                commit_after = self._perf_counter("update_pending", symbol=symbol).get("commit_elapsed_s", 0.0)
+                profile["commit_elapsed_ms"] += round(max(0.0, commit_after - commit_before) * 1000, 3)
+
+            def _print_slow_row(row: dict[str, Any], row_elapsed_ms: float) -> None:
+                if row_elapsed_ms <= 100:
+                    return
+                print(
+                    "VALIDATION_SLOW_ROW "
+                    f"setup_id={row.get('setup_id')} "
+                    f"symbol={symbol} "
+                    f"activation_status={row.get('activation_status')} "
+                    f"resolution_status={row.get('resolution_status')} "
+                    f"elapsed_ms={row_elapsed_ms}",
+                    flush=True,
+                )
+
+            def _print_progress() -> None:
+                if profile["rows_scanned"] % 100 != 0:
+                    return
+                print(
+                    "VALIDATION_PROGRESS "
+                    f"symbol={symbol} "
+                    f"processed_rows={profile['rows_scanned']} "
+                    f"elapsed_ms={_elapsed_ms(started)}",
+                    flush=True,
+                )
+
+            def _floats_meaningfully_different(left: Optional[float], right: Optional[float]) -> bool:
+                if left is None or right is None:
+                    return left is not right
+                return abs(float(left) - float(right)) > 1e-12
+
+            def _record_noop_skipped(*, progress_key: Optional[str] = None, noop_candidate: bool = True) -> None:
+                self._perf_inc("update_pending", "noop_skipped_count", 1, symbol=symbol)
+                if progress_key is not None:
+                    self._perf_inc("update_pending", progress_key, 1, symbol=symbol)
+                if noop_candidate:
+                    self._perf_inc("update_pending", "update_pending_noop_candidate_updates", 1, symbol=symbol)
 
             def _record_update_diagnostic(
                 *,
@@ -642,6 +783,7 @@ class StrategyValidationStore:
                 self._perf_inc("update_pending", "update_pending_sql_updates_total", 1, symbol=symbol)
                 if event_key is not None:
                     self._perf_inc("update_pending", "update_pending_event_updates", 1, symbol=symbol)
+                    self._perf_inc("update_pending", "lifecycle_update_count", 1, symbol=symbol)
                     self._perf_inc("update_pending", event_key, 1, symbol=symbol)
                 if progress_key is not None:
                     self._perf_inc("update_pending", "update_pending_progress_updates", 1, symbol=symbol)
@@ -654,9 +796,14 @@ class StrategyValidationStore:
                     self._perf_inc("update_pending", "update_pending_noop_candidate_updates", 1, symbol=symbol)
 
             for row in pending:
+                row_started = time.perf_counter()
                 self._perf_inc("update_pending", "trades_scanned", 1, symbol=symbol)
+                profile["rows_scanned"] += 1
                 if int(row.get("reference_ts") or 0) >= close_ts:
                     still_pending.append(row)
+                    profile["rows_skipped"] += 1
+                    _print_progress()
+                    _print_slow_row(row, _elapsed_ms(row_started))
                     continue
 
                 bars_observed = int(row.get("bars_observed") or 0) + 1
@@ -674,10 +821,13 @@ class StrategyValidationStore:
                 last_outcome_ts = close_ts
 
                 if activation_status == ACTIVATION_PENDING:
-                    if self._should_activate(side=side, close_price=close_price, ideal_entry=ideal_entry):
+                    activation_started = time.perf_counter()
+                    should_activate = self._should_activate(side=side, close_price=close_price, ideal_entry=ideal_entry)
+                    profile["activation_checks"] += 1
+                    profile["activation_elapsed_ms"] += _elapsed_ms(activation_started)
+                    if should_activate:
                         activated_price = ideal_entry if ideal_entry is not None else close_price
-                        self._execute_counted(
-                            "update_pending",
+                        _execute_update_profiled(
                             """
                             UPDATE strategy_setups
                             SET updated_ts = ?,
@@ -699,7 +849,6 @@ class StrategyValidationStore:
                                 last_outcome_ts,
                                 row["setup_id"],
                             ),
-                            symbol=symbol,
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -709,46 +858,36 @@ class StrategyValidationStore:
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
-                        self._mark_dirty(category="update_pending", symbol=symbol)
+                        _mark_dirty_profiled()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
                         _record_update_diagnostic(event_key="update_pending_event_activation")
+                        _print_progress()
+                        _print_slow_row(row, _elapsed_ms(row_started))
                         continue
 
-                    self._execute_counted(
-                        "update_pending",
-                        """
-                        UPDATE strategy_setups
-                        SET updated_ts = ?,
-                            bars_observed = ?,
-                            first_outcome_ts = ?,
-                            last_outcome_ts = ?
-                        WHERE setup_id = ?
-                        """,
-                        (close_ts, bars_observed, first_outcome_ts, last_outcome_ts, row["setup_id"]),
-                        symbol=symbol,
-                    )
-                    row["updated_ts"] = close_ts
-                    row["bars_observed"] = bars_observed
-                    row["first_outcome_ts"] = first_outcome_ts
-                    row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
-                    self._mark_dirty(category="update_pending", symbol=symbol)
-                    self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                    _record_update_diagnostic(
+                    profile["rows_skipped"] += 1
+                    _record_noop_skipped(
                         progress_key="update_pending_progress_pending_not_activated",
                         noop_candidate=True,
                     )
+                    _print_progress()
+                    _print_slow_row(row, _elapsed_ms(row_started))
                     continue
 
                 if activation_status != ACTIVATION_ACTIVE:
                     still_pending.append(row)
+                    profile["rows_skipped"] += 1
+                    _print_progress()
+                    _print_slow_row(row, _elapsed_ms(row_started))
                     continue
 
                 entry_price = _safe_float(row.get("activated_price"))
                 if entry_price is None:
                     entry_price = ideal_entry
 
+                mfe_mae_started = time.perf_counter()
                 if entry_price is not None:
                     if side == "LONG":
                         favorable = high_price - entry_price
@@ -760,6 +899,7 @@ class StrategyValidationStore:
                     adverse = max(0.0, adverse)
                     max_fav = favorable if max_fav is None else max(max_fav, favorable)
                     max_adv = adverse if max_adv is None else max(max_adv, adverse)
+                profile["mfe_mae_elapsed_ms"] += _elapsed_ms(mfe_mae_started)
 
                 resolution_status = None
                 resolved_price = None
@@ -780,6 +920,7 @@ class StrategyValidationStore:
                                     tp1_hit = True
                                     tp1 = trigger
 
+                    resolver_started = time.perf_counter()
                     if side == "LONG":
                         resolution_status, resolved_price, resolution_note, mark_tp1_hit, direct_tp2 = self._resolve_long_before_tp1(
                             low_price, high_price, close_price, invalidation, tp1, tp2
@@ -790,10 +931,10 @@ class StrategyValidationStore:
                         )
                     else:
                         mark_tp1_hit = False
+                    profile["resolver_before_tp1_elapsed_ms"] += _elapsed_ms(resolver_started)
 
                     if mark_tp1_hit and resolution_status is None:
-                        self._execute_counted(
-                            "update_pending",
+                        _execute_update_profiled(
                             """
                             UPDATE strategy_setups
                             SET updated_ts = ?,
@@ -808,7 +949,6 @@ class StrategyValidationStore:
                             WHERE setup_id = ?
                             """,
                             (close_ts, bars_observed, close_ts, tp1, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
-                            symbol=symbol,
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -820,18 +960,19 @@ class StrategyValidationStore:
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
-                        self._mark_dirty(category="update_pending", symbol=symbol)
+                        _mark_dirty_profiled()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
                         _record_update_diagnostic(
                             event_key="update_pending_event_tp1_hit",
                             excursion=True,
                         )
+                        _print_progress()
+                        _print_slow_row(row, _elapsed_ms(row_started))
                         continue
 
                     if mark_tp1_hit and resolution_status is not None:
-                        self._execute_counted(
-                            "update_pending",
+                        _execute_update_profiled(
                             """
                             UPDATE strategy_setups
                             SET updated_ts = ?,
@@ -864,7 +1005,6 @@ class StrategyValidationStore:
                                 last_outcome_ts,
                                 row["setup_id"],
                             ),
-                            symbol=symbol,
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -879,7 +1019,7 @@ class StrategyValidationStore:
                         row["resolution_note"] = resolution_note
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
-                        self._mark_dirty(category="update_pending", symbol=symbol)
+                        _mark_dirty_profiled()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
                         self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
@@ -897,13 +1037,20 @@ class StrategyValidationStore:
                             self._perf_inc("update_pending", "update_pending_event_stop_loss", 1, symbol=symbol)
                         elif resolution_status == RESOLUTION_TP1_PARTIAL_THEN_BE:
                             self._perf_inc("update_pending", "update_pending_event_break_even", 1, symbol=symbol)
+                        profile["rows_removed"] += 1
+                        _print_progress()
+                        _print_slow_row(row, _elapsed_ms(row_started))
                         continue
                 else:
                     if entry_price is None:
                         still_pending.append(row)
+                        profile["rows_skipped"] += 1
+                        _print_progress()
+                        _print_slow_row(row, _elapsed_ms(row_started))
                         continue
                     be_price = self._breakeven_price(side, entry_price)
 
+                    resolver_started = time.perf_counter()
                     if side == "LONG":
                         resolution_status, resolved_price, resolution_note = self._resolve_long_after_tp1(
                             low_price, high_price, close_price, be_price, tp2
@@ -912,10 +1059,25 @@ class StrategyValidationStore:
                         resolution_status, resolved_price, resolution_note = self._resolve_short_after_tp1(
                             low_price, high_price, close_price, be_price, tp2
                         )
+                    profile["resolver_after_tp1_elapsed_ms"] += _elapsed_ms(resolver_started)
 
                 if resolution_status is None:
-                    self._execute_counted(
-                        "update_pending",
+                    excursion_changed = (
+                        _floats_meaningfully_different(_safe_float(row.get("max_favorable_excursion")), max_fav)
+                        or _floats_meaningfully_different(_safe_float(row.get("max_adverse_excursion")), max_adv)
+                    )
+                    if not excursion_changed:
+                        still_pending.append(row)
+                        profile["rows_skipped"] += 1
+                        _record_noop_skipped(
+                            progress_key="update_pending_progress_unresolved_active",
+                            noop_candidate=True,
+                        )
+                        _print_progress()
+                        _print_slow_row(row, _elapsed_ms(row_started))
+                        continue
+
+                    _execute_update_profiled(
                         """
                         UPDATE strategy_setups
                         SET updated_ts = ?,
@@ -927,7 +1089,6 @@ class StrategyValidationStore:
                         WHERE setup_id = ?
                         """,
                         (close_ts, bars_observed, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
-                        symbol=symbol,
                     )
                     row["updated_ts"] = close_ts
                     row["bars_observed"] = bars_observed
@@ -936,16 +1097,17 @@ class StrategyValidationStore:
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
-                    self._mark_dirty(category="update_pending", symbol=symbol)
+                    _mark_dirty_profiled()
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                     _record_update_diagnostic(
                         progress_key="update_pending_progress_unresolved_active",
                         excursion=True,
-                        noop_candidate=True,
+                        noop_candidate=False,
                     )
+                    _print_progress()
+                    _print_slow_row(row, _elapsed_ms(row_started))
                 else:
-                    self._execute_counted(
-                        "update_pending",
+                    _execute_update_profiled(
                         """
                         UPDATE strategy_setups
                         SET updated_ts = ?,
@@ -973,7 +1135,6 @@ class StrategyValidationStore:
                             last_outcome_ts,
                             row["setup_id"],
                         ),
-                        symbol=symbol,
                     )
                     row["updated_ts"] = close_ts
                     row["bars_observed"] = bars_observed
@@ -985,7 +1146,7 @@ class StrategyValidationStore:
                     row["resolution_note"] = resolution_note
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
-                    self._mark_dirty(category="update_pending", symbol=symbol)
+                    _mark_dirty_profiled()
                     self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                     self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
                     if resolution_status == RESOLUTION_TP2:
@@ -1002,6 +1163,10 @@ class StrategyValidationStore:
                         self._perf_inc("update_pending", "update_pending_event_stop_loss", 1, symbol=symbol)
                     elif resolution_status == RESOLUTION_TP1_PARTIAL_THEN_BE:
                         self._perf_inc("update_pending", "update_pending_event_break_even", 1, symbol=symbol)
+                    profile["rows_removed"] += 1
+                    _print_progress()
+                    _print_slow_row(row, _elapsed_ms(row_started))
 
             self._pending_by_symbol[symbol] = [r for r in still_pending if str(r.get("resolution_status") or "").upper() == RESOLUTION_PENDING]
             self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
+            _print_validation_summary()
