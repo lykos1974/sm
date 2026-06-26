@@ -128,3 +128,92 @@ def test_scanner_clock_logic_has_no_hardcoded_timezone_offset():
     assert "+3" not in source
     assert "10800000" not in source
     assert "10_800_000" not in source
+
+
+class ValidationRefreshDummy:
+    _refresh_validation_for_symbol = App._refresh_validation_for_symbol
+
+    def __init__(self):
+        self.run_calls = []
+        self.snapshot_calls = []
+        self.delta_calls = []
+
+    def _run_validation_for_symbol(self, symbol, engine, new_candles):
+        self.run_calls.append((symbol, engine, list(new_candles)))
+        return {
+            "update_pending_elapsed_ms": 1,
+            "evaluate_strategy_setups_elapsed_ms": 2,
+            "register_setup_elapsed_ms": 3,
+        }
+
+    def _validation_perf_snapshot(self, symbol):
+        self.snapshot_calls.append(symbol)
+        return {"symbol": symbol, "index": len(self.snapshot_calls)}
+
+    def _validation_perf_delta(self, before, after):
+        self.delta_calls.append((before, after))
+        return {
+            "pending_rows_count": 0,
+            "trades_scanned": 1,
+            "trades_updated": 1,
+            "sql_update_count": 1,
+            "register_attempts": 1,
+            "register_inserts": 1,
+            "register_duplicate_noops": 0,
+            "commit_count": 1,
+            "commit_elapsed_ms": 1,
+        }
+
+
+def test_no_new_candles_skips_refresh_validation_register_work():
+    dummy = ValidationRefreshDummy()
+    logs = []
+
+    metrics = dummy._refresh_validation_for_symbol("BTCUSDT", object(), [], logs.append)
+
+    assert metrics == {
+        "update_pending_elapsed_ms": 0,
+        "evaluate_strategy_setups_elapsed_ms": 0,
+        "register_setup_elapsed_ms": 0,
+    }
+    assert dummy.run_calls == []
+    assert dummy.snapshot_calls == []
+    assert dummy.delta_calls == []
+    assert logs == ["REFRESH_VALIDATION_SKIPPED symbol=BTCUSDT reason=no_new_closed_candles"]
+
+
+def test_new_candles_run_refresh_validation_metrics_path():
+    dummy = ValidationRefreshDummy()
+    logs = []
+    candle = {"close_time": 123, "close": 10.0}
+    engine = object()
+
+    metrics = dummy._refresh_validation_for_symbol("ETHUSDT", engine, [candle], logs.append)
+
+    assert metrics["register_setup_elapsed_ms"] == 3
+    assert dummy.run_calls == [("ETHUSDT", engine, [candle])]
+    assert dummy.snapshot_calls == ["ETHUSDT", "ETHUSDT"]
+    assert len(dummy.delta_calls) == 1
+    assert logs[0] == "REFRESH_VALIDATION_BEGIN symbol=ETHUSDT eligible_closed_count=1"
+    assert "REFRESH_VALIDATION_METRICS symbol=ETHUSDT validation_new_candles_count=1" in logs[1]
+    assert "register_setup_elapsed_ms=3" in logs[1]
+    assert logs[2] == "REFRESH_VALIDATION_END symbol=ETHUSDT"
+
+
+def test_refresh_persists_pnf_state_before_validation_skip():
+    source = Path(ROOT / "pnf_mvp" / "app.py").read_text()
+
+    save_index = source.index("self._save_engine_snapshot(symbol, engine, last_processed, snapshot)")
+    persist_index = source.index("REFRESH_STATE_PERSIST")
+    validation_index = source.index("self._refresh_validation_for_symbol(symbol, engine, new_candles, stage_log)")
+
+    assert save_index < persist_index < validation_index
+
+
+def test_refresh_validation_change_does_not_touch_strategy_logic():
+    source = Path(ROOT / "pnf_mvp" / "app.py").read_text()
+
+    assert "evaluate_pullback_retest_long" in source
+    assert "evaluate_pullback_retest_short" in source
+    assert "def _run_validation_for_symbol" in source
+    assert "REFRESH_VALIDATION_SKIPPED symbol={symbol} reason=no_new_closed_candles" in source
