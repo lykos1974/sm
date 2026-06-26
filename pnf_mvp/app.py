@@ -1106,29 +1106,7 @@ class App(tk.Tk):
                         f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
                         f"last_price={float(engine.last_price or 0.0)}"
                     )
-                    validation_perf_before = self._validation_perf_snapshot(symbol)
-                    stage_log(f"REFRESH_VALIDATION_BEGIN symbol={symbol} eligible_closed_count={len(new_candles)}")
-                    validation_breakdown = self._run_validation_for_symbol(symbol, engine, new_candles) or {}
-                    validation_perf_after = self._validation_perf_snapshot(symbol)
-                    validation_delta = self._validation_perf_delta(validation_perf_before, validation_perf_after)
-                    stage_log(
-                        "REFRESH_VALIDATION_METRICS "
-                        f"symbol={symbol} "
-                        f"validation_new_candles_count={len(new_candles)} "
-                        f"pending_rows_count={validation_delta['pending_rows_count']} "
-                        f"trades_scanned={validation_delta['trades_scanned']} "
-                        f"trades_updated={validation_delta['trades_updated']} "
-                        f"sql_update_count={validation_delta['sql_update_count']} "
-                        f"register_attempts={validation_delta['register_attempts']} "
-                        f"register_inserts={validation_delta['register_inserts']} "
-                        f"register_duplicate_noops={validation_delta['register_duplicate_noops']} "
-                        f"update_pending_elapsed_ms={validation_breakdown.get('update_pending_elapsed_ms', 0)} "
-                        f"evaluate_strategy_setups_elapsed_ms={validation_breakdown.get('evaluate_strategy_setups_elapsed_ms', 0)} "
-                        f"register_setup_elapsed_ms={validation_breakdown.get('register_setup_elapsed_ms', 0)} "
-                        f"commit_count={validation_delta['commit_count']} "
-                        f"commit_elapsed_ms={validation_delta['commit_elapsed_ms']}"
-                    )
-                    stage_log(f"REFRESH_VALIDATION_END symbol={symbol}")
+                    self._refresh_validation_for_symbol(symbol, engine, new_candles, stage_log)
                     refresh_logs.append(
                         "REFRESH_SYMBOL_UPDATED "
                         f"symbol={symbol} processed={len(new_candles)} "
@@ -1637,6 +1615,42 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"Setup status summary failed for {symbol}: {e}")
             return {"status": "NONE", "setup": None}
+
+
+    def _refresh_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list, stage_log):
+        eligible_closed_count = len(new_candles)
+        if eligible_closed_count == 0:
+            stage_log(f"REFRESH_VALIDATION_SKIPPED symbol={symbol} reason=no_new_closed_candles")
+            return {
+                "update_pending_elapsed_ms": 0,
+                "evaluate_strategy_setups_elapsed_ms": 0,
+                "register_setup_elapsed_ms": 0,
+            }
+
+        validation_perf_before = self._validation_perf_snapshot(symbol)
+        stage_log(f"REFRESH_VALIDATION_BEGIN symbol={symbol} eligible_closed_count={eligible_closed_count}")
+        validation_breakdown = self._run_validation_for_symbol(symbol, engine, new_candles) or {}
+        validation_perf_after = self._validation_perf_snapshot(symbol)
+        validation_delta = self._validation_perf_delta(validation_perf_before, validation_perf_after)
+        stage_log(
+            "REFRESH_VALIDATION_METRICS "
+            f"symbol={symbol} "
+            f"validation_new_candles_count={eligible_closed_count} "
+            f"pending_rows_count={validation_delta['pending_rows_count']} "
+            f"trades_scanned={validation_delta['trades_scanned']} "
+            f"trades_updated={validation_delta['trades_updated']} "
+            f"sql_update_count={validation_delta['sql_update_count']} "
+            f"register_attempts={validation_delta['register_attempts']} "
+            f"register_inserts={validation_delta['register_inserts']} "
+            f"register_duplicate_noops={validation_delta['register_duplicate_noops']} "
+            f"update_pending_elapsed_ms={validation_breakdown.get('update_pending_elapsed_ms', 0)} "
+            f"evaluate_strategy_setups_elapsed_ms={validation_breakdown.get('evaluate_strategy_setups_elapsed_ms', 0)} "
+            f"register_setup_elapsed_ms={validation_breakdown.get('register_setup_elapsed_ms', 0)} "
+            f"commit_count={validation_delta['commit_count']} "
+            f"commit_elapsed_ms={validation_delta['commit_elapsed_ms']}"
+        )
+        stage_log(f"REFRESH_VALIDATION_END symbol={symbol}")
+        return validation_breakdown
 
     def _run_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list):
         metrics = {
