@@ -1,4 +1,6 @@
+import gc
 import json
+import sys
 import threading
 import time
 import tkinter as tk
@@ -122,6 +124,13 @@ class App(tk.Tk):
         self.first_focus_done_for_symbol = {}
         self.saved_view_by_symbol = {}
         self.suppress_tree_select_handler = False
+        self.ui_resource_refresh_number = 0
+        self._latest_ui_resource_stats = {}
+        self._latest_top_opportunity_resource_stats = {
+            "top_widgets_before_destroy": 0,
+            "top_widgets_after_destroy": 0,
+            "top_widgets_after_recreation": 0,
+        }
 
         self._build_ui()
         self._setup_signal_tags()
@@ -425,6 +434,139 @@ class App(tk.Tk):
         self.tree.tag_configure("setup_status_watch", background="#d6a800", foreground="#101418")
         self.tree.tag_configure("setup_status_reject", background="#8b1a1a", foreground="#ffffff")
         self.tree.tag_configure("setup_status_none", background="", foreground="")
+
+    def _canvas_resource_stats(self, canvas: tk.Canvas) -> dict:
+        try:
+            item_ids = canvas.find_all()
+            return {
+                "items": len(item_ids),
+                "max_item_id": max(item_ids) if item_ids else 0,
+            }
+        except Exception as exc:
+            return {"items": -1, "max_item_id": -1, "error": str(exc)}
+
+    def _text_resource_stats(self, text_widget: tk.Text) -> dict:
+        try:
+            end_index = text_widget.index("end-1c")
+            line_text, char_text = end_index.split(".", 1)
+            return {
+                "lines": int(line_text),
+                "chars": int(text_widget.count("1.0", "end-1c", "chars")[0] or 0),
+                "last_line_chars": int(char_text),
+            }
+        except Exception as exc:
+            return {"lines": -1, "chars": -1, "last_line_chars": -1, "error": str(exc)}
+
+    def _widget_resource_stats(self) -> dict:
+        def walk(widget):
+            total = 1
+            popups = 1 if isinstance(widget, tk.Toplevel) else 0
+            try:
+                children = widget.winfo_children()
+            except Exception:
+                return total, popups
+            for child in children:
+                child_total, child_popups = walk(child)
+                total += child_total
+                popups += child_popups
+            return total, popups
+
+        try:
+            total_widgets, popup_count = walk(self)
+            return {
+                "root_children": len(self.winfo_children()),
+                "total_widgets": total_widgets,
+                "popup_count": popup_count,
+            }
+        except Exception as exc:
+            return {"root_children": -1, "total_widgets": -1, "popup_count": -1, "error": str(exc)}
+
+    def _python_memory_resource_stats(self) -> dict:
+        stats = {"gc_objects": -1, "largest_containers": "unavailable"}
+        try:
+            objects = gc.get_objects()
+            stats["gc_objects"] = len(objects)
+            containers = []
+            for obj in objects:
+                if isinstance(obj, (dict, list, tuple, set, frozenset)):
+                    try:
+                        containers.append((len(obj), type(obj).__name__, sys.getsizeof(obj)))
+                    except Exception:
+                        continue
+            containers.sort(reverse=True)
+            stats["largest_containers"] = ";".join(
+                f"{kind}:{length}:{size}" for length, kind, size in containers[:5]
+            )
+        except Exception as exc:
+            stats["error"] = str(exc)
+        return stats
+
+    def _collect_ui_resource_stats(self, chart_before: dict | None = None) -> dict:
+        chart_stats = self._canvas_resource_stats(self.chart_canvas)
+        left_stats = self._canvas_resource_stats(self.left_axis)
+        right_stats = self._canvas_resource_stats(self.right_axis)
+        widget_stats = self._widget_resource_stats()
+        log_stats = self._text_resource_stats(self.log_text)
+        signal_stats = self._text_resource_stats(self.signal_text)
+        memory_stats = self._python_memory_resource_stats()
+        stats = {
+            "refresh_number": self.ui_resource_refresh_number,
+            "canvas_items_before": (chart_before or {}).get("items", -1),
+            "canvas_max_item_id_before": (chart_before or {}).get("max_item_id", -1),
+            "chart_items": chart_stats.get("items", -1),
+            "left_axis_items": left_stats.get("items", -1),
+            "right_axis_items": right_stats.get("items", -1),
+            "max_chart_item_id": chart_stats.get("max_item_id", -1),
+            "max_left_axis_item_id": left_stats.get("max_item_id", -1),
+            "max_right_axis_item_id": right_stats.get("max_item_id", -1),
+            "root_children": widget_stats.get("root_children", -1),
+            "total_widgets": widget_stats.get("total_widgets", -1),
+            "popup_count": widget_stats.get("popup_count", -1),
+            "top_widgets": len(getattr(self, "top_opportunity_widgets", [])),
+            "top_widgets_before_destroy": self._latest_top_opportunity_resource_stats.get("top_widgets_before_destroy", -1),
+            "top_widgets_after_destroy": self._latest_top_opportunity_resource_stats.get("top_widgets_after_destroy", -1),
+            "top_widgets_after_recreation": self._latest_top_opportunity_resource_stats.get("top_widgets_after_recreation", -1),
+            "log_lines": log_stats.get("lines", -1),
+            "log_chars": log_stats.get("chars", -1),
+            "signal_lines": signal_stats.get("lines", -1),
+            "signal_chars": signal_stats.get("chars", -1),
+            "signal_tags": len(self.signal_text.tag_names()),
+            "gc_objects": memory_stats.get("gc_objects", -1),
+            "largest_containers": memory_stats.get("largest_containers", "unavailable"),
+        }
+        self._latest_ui_resource_stats = stats
+        return stats
+
+    def _emit_ui_resource_stats_if_due(self, stats: dict) -> None:
+        if stats.get("refresh_number", 0) % 60 != 0:
+            return
+        line = (
+            "UI_RESOURCE_STATS "
+            f"refresh_number={stats['refresh_number']} "
+            f"canvas_items_before={stats['canvas_items_before']} "
+            f"chart_items={stats['chart_items']} "
+            f"left_axis_items={stats['left_axis_items']} "
+            f"right_axis_items={stats['right_axis_items']} "
+            f"total_widgets={stats['total_widgets']} "
+            f"root_children={stats['root_children']} "
+            f"top_widgets={stats['top_widgets']} "
+            f"top_widgets_before_destroy={stats['top_widgets_before_destroy']} "
+            f"top_widgets_after_destroy={stats['top_widgets_after_destroy']} "
+            f"top_widgets_after_recreation={stats['top_widgets_after_recreation']} "
+            f"log_lines={stats['log_lines']} "
+            f"log_chars={stats['log_chars']} "
+            f"signal_lines={stats['signal_lines']} "
+            f"signal_chars={stats['signal_chars']} "
+            f"signal_tags={stats['signal_tags']} "
+            f"popup_count={stats['popup_count']} "
+            f"max_chart_item_id={stats['max_chart_item_id']} "
+            f"max_left_axis_item_id={stats['max_left_axis_item_id']} "
+            f"max_right_axis_item_id={stats['max_right_axis_item_id']} "
+            f"canvas_max_item_id_before={stats['canvas_max_item_id_before']} "
+            f"gc_objects={stats['gc_objects']} "
+            f"largest_containers={stats['largest_containers']}"
+        )
+        self._safe_log(line)
 
     def _quality_grade_from_score(self, score) -> str:
         try:
@@ -1355,14 +1497,21 @@ class App(tk.Tk):
 
     def _render_top_opportunities(self, opportunities: list[dict]):
         self.current_top_opportunities = opportunities
+        top_widgets_before_destroy = len(getattr(self, "top_opportunity_widgets", []))
         for widget in getattr(self, "top_opportunity_widgets", []):
             widget.destroy()
         self.top_opportunity_widgets = []
+        top_widgets_after_destroy = len(self.top_opportunity_widgets)
 
         if not opportunities:
             empty = ttk.Label(self.top_opportunities_panel, text="No ranked opportunities")
             empty.grid(row=1, column=0, sticky="w")
             self.top_opportunity_widgets.append(empty)
+            self._latest_top_opportunity_resource_stats = {
+                "top_widgets_before_destroy": top_widgets_before_destroy,
+                "top_widgets_after_destroy": top_widgets_after_destroy,
+                "top_widgets_after_recreation": len(self.top_opportunity_widgets),
+            }
             return
 
         for idx, opportunity in enumerate(opportunities, start=1):
@@ -1386,6 +1535,11 @@ class App(tk.Tk):
             label.grid(row=idx, column=0, sticky="ew", pady=(0, 3))
             label.bind("<Button-1>", lambda _event, selected=symbol: self._select_symbol_from_opportunity(selected))
             self.top_opportunity_widgets.append(label)
+        self._latest_top_opportunity_resource_stats = {
+            "top_widgets_before_destroy": top_widgets_before_destroy,
+            "top_widgets_after_destroy": top_widgets_after_destroy,
+            "top_widgets_after_recreation": len(self.top_opportunity_widgets),
+        }
 
     def _update_top_opportunities(self, visible_items: list[dict] | None = None):
         if visible_items is None:
@@ -2081,6 +2235,8 @@ class App(tk.Tk):
         }
 
     def _draw_selected(self, symbol: str):
+        self.ui_resource_refresh_number += 1
+        chart_before = self._canvas_resource_stats(self.chart_canvas)
         self.chart_canvas.delete("all")
         self.left_axis.delete("all")
         self.right_axis.delete("all")
@@ -2095,6 +2251,8 @@ class App(tk.Tk):
             self._set_structure_panel_na()
             self._set_trade_setup_panel_na()
             self._set_setup_explanation_panel_na()
+            stats = self._collect_ui_resource_stats(chart_before)
+            self._emit_ui_resource_stats_if_due(stats)
             return
 
         self.chart_surface = surface
@@ -2175,6 +2333,8 @@ class App(tk.Tk):
         self._update_setup_explanation_panel(symbol)
         self._update_chart_header_badges(symbol)
         self._sync_axes_to_chart_yview()
+        stats = self._collect_ui_resource_stats(chart_before)
+        self._emit_ui_resource_stats_if_due(stats)
 
 
     def _column_center_x(self, column_index: int, surface: dict) -> float:
