@@ -107,6 +107,7 @@ TRADE_SEQUENCE_MONEY_OUTPUT_NAMES = (
     "monthly_returns_usdt.csv",
 )
 TRADE_SEQUENCE_COST_OUTPUT_NAMES = ("cost_adjusted_equity_curve.csv",)
+TRADE_SEQUENCE_SIZING_OUTPUT_NAME = "portfolio_reality_trade_sequence_sizing.csv"
 MONEY_EQUITY_FIELDS = [
     "sequence",
     "exit_timestamp",
@@ -611,6 +612,70 @@ def _monthly_money_rows(
     return rows
 
 
+def _load_trade_sequence_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), [dict(row) for row in reader]
+
+
+def _trade_sequence_sizing_status(
+    fieldnames: list[str], rows: list[dict[str, str]]
+) -> tuple[bool, str]:
+    missing_columns = [
+        field for field in ("entry_price", "stop_price") if field not in fieldnames
+    ]
+    if missing_columns:
+        return False, f"missing required sizing column(s): {', '.join(missing_columns)}"
+    for index, row in enumerate(rows, start=2):
+        if row.get("entry_price") in (None, "") or row.get("stop_price") in (None, ""):
+            return False, f"missing entry_price/stop_price value at row {index}"
+        try:
+            entry_price = float(row["entry_price"])
+            stop_price = float(row["stop_price"])
+        except (TypeError, ValueError):
+            return False, f"invalid entry_price/stop_price value at row {index}"
+        if abs(entry_price - stop_price) <= 0:
+            return False, f"non-positive risk_per_unit at row {index}"
+    return True, ""
+
+
+def _trade_sequence_sizing_fields(fieldnames: list[str]) -> list[str]:
+    sizing_fields = [
+        "entry_price",
+        "stop_price",
+        "risk_per_unit",
+        "fixed_risk_usdt",
+        "position_qty",
+        "approximate_notional_usdt",
+    ]
+    return [*fieldnames, *[field for field in sizing_fields if field not in fieldnames]]
+
+
+def _trade_sequence_sizing_rows(
+    fieldnames: list[str], rows: list[dict[str, str]], fixed_risk_usdt: float
+) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        output_row: dict[str, Any] = {field: row.get(field, "") for field in fieldnames}
+        trade = PortfolioTrade(
+            trade_id=row.get("trade_id", ""),
+            opportunity_id=row.get("opportunity_id", ""),
+            symbol=row.get("symbol", ""),
+            direction=row.get("direction", ""),
+            entry_ts=0,
+            exit_ts=0,
+            classification=row.get("classification", ""),
+            result_r=0.0,
+            active_positions_at_entry=0,
+            active_risk_r_at_entry=0.0,
+            entry_price=float(row["entry_price"]),
+            stop_price=float(row["stop_price"]),
+        )
+        output_row.update(_risk_sizing_values(trade, fixed_risk_usdt))
+        enriched.append(output_row)
+    return enriched
+
+
 def _load_trade_sequence(path: Path) -> list[PortfolioTrade]:
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle)
@@ -723,13 +788,23 @@ def run_trade_sequence(
     fee_bps: float | None = None,
     slippage_bps: float | None = None,
 ) -> None:
+    fieldnames, source_rows = _load_trade_sequence_rows(trade_sequence)
     trades = _load_trade_sequence(trade_sequence)
     cost_enabled = fee_bps is not None or slippage_bps is not None
+    money_config = _money_config(initial_capital_usdt, fixed_position_size_usdt)
+    if money_config is None:
+        raise ValueError(
+            "money simulation requires --initial-capital or --fixed-position-size"
+        )
+    sizing_available, missing_sizing_reason = _trade_sequence_sizing_status(
+        fieldnames, source_rows
+    )
     output_names = (
         "portfolio_reality_summary.md",
         "portfolio_reality_manifest.json",
         *TRADE_SEQUENCE_MONEY_OUTPUT_NAMES,
         *(TRADE_SEQUENCE_COST_OUTPUT_NAMES if cost_enabled else ()),
+        *((TRADE_SEQUENCE_SIZING_OUTPUT_NAME,) if sizing_available else ()),
     )
     output_root.mkdir(parents=True, exist_ok=True)
     existing = [name for name in output_names if (output_root / name).exists()]
@@ -756,6 +831,12 @@ def run_trade_sequence(
         MONEY_MONTHLY_FIELDS,
         monthly_money_rows,
     )
+    if sizing_available:
+        _write_csv(
+            output_root / TRADE_SEQUENCE_SIZING_OUTPUT_NAME,
+            _trade_sequence_sizing_fields(fieldnames),
+            _trade_sequence_sizing_rows(fieldnames, source_rows, money_config[1]),
+        )
     if cost_enabled:
         _write_csv(
             output_root / TRADE_SEQUENCE_COST_OUTPUT_NAMES[0],
@@ -774,6 +855,8 @@ def run_trade_sequence(
         "production_modifications": False,
         "input_trade_sequence": str(trade_sequence),
         "resolved_portfolio_trades": len(trades),
+        "sizing_available": sizing_available,
+        "missing_sizing_reason": "" if sizing_available else missing_sizing_reason,
         "money_simulation": {
             "enabled": True,
             "initial_capital_usdt": money_summary["initial_capital_usdt"],
@@ -790,6 +873,7 @@ def run_trade_sequence(
             "portfolio_reality_summary.md",
             *TRADE_SEQUENCE_MONEY_OUTPUT_NAMES,
             *(TRADE_SEQUENCE_COST_OUTPUT_NAMES if cost_enabled else ()),
+            *((TRADE_SEQUENCE_SIZING_OUTPUT_NAME,) if sizing_available else ()),
         ],
     }
     if cost_enabled:
