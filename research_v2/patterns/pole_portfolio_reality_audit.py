@@ -72,6 +72,7 @@ SYMBOL_FIELDS = ["symbol", "trades", "wins", "losses", "BE_exits", "total_R", "e
 PERIOD_FIELDS = ["period", "trades", "total_R", "win_rate", "max_losing_streak"]
 FLAG_FIELDS = ["flag", "severity", "details"]
 MONEY_OUTPUT_NAMES = ("equity_curve_usdt.csv", "monthly_returns_usdt.csv")
+COST_OUTPUT_NAMES = ("cost_adjusted_equity_curve_usdt.csv",)
 MONEY_EQUITY_FIELDS = [
     "sequence",
     "exit_timestamp",
@@ -85,6 +86,21 @@ MONEY_EQUITY_FIELDS = [
     "drawdown_percent",
 ]
 MONEY_MONTHLY_FIELDS = ["month", "starting_equity_usdt", "ending_equity_usdt", "pnl_usdt", "return_percent", "trades"]
+COST_EQUITY_FIELDS = [
+    "sequence",
+    "exit_timestamp",
+    "exit_time_utc",
+    "symbol",
+    "result_R",
+    "fixed_position_size_usdt",
+    "approximate_notional_usdt",
+    "gross_pnl_usdt",
+    "total_cost_usdt",
+    "net_pnl_usdt",
+    "net_equity_usdt",
+    "net_drawdown_usdt",
+    "net_drawdown_percent",
+]
 
 
 @dataclass(frozen=True)
@@ -323,6 +339,82 @@ def _money_equity_curve(
     return rows, summary
 
 
+def _cost_config(fee_bps: float | None, slippage_bps: float | None, money_enabled: bool) -> tuple[float, float] | None:
+    if fee_bps is None and slippage_bps is None:
+        return None
+    if not money_enabled:
+        raise ValueError("--fee-bps and --slippage-bps are only valid when money simulation is enabled")
+    fee = 0.0 if fee_bps is None else float(fee_bps)
+    slippage = 0.0 if slippage_bps is None else float(slippage_bps)
+    if fee < 0:
+        raise ValueError("--fee-bps must be non-negative")
+    if slippage < 0:
+        raise ValueError("--slippage-bps must be non-negative")
+    return fee, slippage
+
+
+def _cost_adjusted_equity_curve(
+    trades: list[PortfolioTrade],
+    initial_capital_usdt: float,
+    fixed_position_size_usdt: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    net_equity = initial_capital_usdt
+    peak = initial_capital_usdt
+    max_drawdown_usdt = 0.0
+    max_drawdown_percent = 0.0
+    total_gross_pnl = 0.0
+    total_cost = 0.0
+    rows: list[dict[str, Any]] = []
+    cost_rate = (fee_bps + slippage_bps) / 10_000
+    ordered = sorted(trades, key=lambda row: (row.exit_ts, row.entry_ts, row.symbol, row.trade_id))
+    for sequence, trade in enumerate(ordered, start=1):
+        gross_pnl = trade.result_r * fixed_position_size_usdt
+        approximate_notional = fixed_position_size_usdt
+        trade_cost = approximate_notional * cost_rate * 2
+        net_pnl = gross_pnl - trade_cost
+        net_equity += net_pnl
+        peak = max(peak, net_equity)
+        drawdown_usdt = peak - net_equity
+        drawdown_percent = drawdown_usdt / peak * 100 if peak > 0 else 0.0
+        max_drawdown_usdt = max(max_drawdown_usdt, drawdown_usdt)
+        max_drawdown_percent = max(max_drawdown_percent, drawdown_percent)
+        total_gross_pnl += gross_pnl
+        total_cost += trade_cost
+        rows.append(
+            {
+                "sequence": sequence,
+                "exit_timestamp": trade.exit_ts,
+                "exit_time_utc": _ts_to_utc(trade.exit_ts),
+                "symbol": trade.symbol,
+                "result_R": _round(trade.result_r),
+                "fixed_position_size_usdt": _round(fixed_position_size_usdt),
+                "approximate_notional_usdt": _round(approximate_notional),
+                "gross_pnl_usdt": _round(gross_pnl),
+                "total_cost_usdt": _round(trade_cost),
+                "net_pnl_usdt": _round(net_pnl),
+                "net_equity_usdt": _round(net_equity),
+                "net_drawdown_usdt": _round(drawdown_usdt),
+                "net_drawdown_percent": _round(drawdown_percent),
+            }
+        )
+    summary = {
+        "enabled": True,
+        "fee_bps": _round(fee_bps),
+        "slippage_bps": _round(slippage_bps),
+        "notional_assumption": "approximate_notional_usdt uses fixed_position_size_usdt because trade-level notional is not available in the resolved portfolio baseline",
+        "cost_timing_assumption": "fee and slippage bps are charged on approximate notional for entry and exit",
+        "gross_pnl_usdt": _round(total_gross_pnl),
+        "total_cost_usdt": _round(total_cost),
+        "net_pnl_usdt": _round(net_equity - initial_capital_usdt),
+        "final_net_equity_usdt": _round(net_equity),
+        "max_net_drawdown_usdt": _round(max_drawdown_usdt),
+        "max_net_drawdown_percent": _round(max_drawdown_percent),
+    }
+    return rows, summary
+
+
 def _monthly_money_rows(money_rows: list[dict[str, Any]], initial_capital_usdt: float) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     current_month: str | None = None
@@ -489,10 +581,13 @@ def run(
     candle_symbols: dict[str, str] | None = None,
     initial_capital_usdt: float | None = None,
     fixed_position_size_usdt: float | None = None,
+    fee_bps: float | None = None,
+    slippage_bps: float | None = None,
 ) -> None:
     symbols, observations, candles_by_symbol = _load_observations(symbol_inputs, columns_inputs, candles_inputs, candle_symbols or {})
     money_config = _money_config(initial_capital_usdt, fixed_position_size_usdt)
-    output_names = (*OUTPUT_NAMES, *MONEY_OUTPUT_NAMES) if money_config else OUTPUT_NAMES
+    cost_config = _cost_config(fee_bps, slippage_bps, money_config is not None)
+    output_names = (*OUTPUT_NAMES, *MONEY_OUTPUT_NAMES, *(COST_OUTPUT_NAMES if cost_config else ())) if money_config else OUTPUT_NAMES
     output_root.mkdir(parents=True, exist_ok=True)
     existing = [name for name in output_names if (output_root / name).exists()]
     if existing:
@@ -511,10 +606,15 @@ def run(
     money_rows: list[dict[str, Any]] = []
     money_summary: dict[str, Any] = {}
     monthly_money_rows: list[dict[str, Any]] = []
+    cost_rows: list[dict[str, Any]] = []
+    cost_summary: dict[str, Any] = {}
     if money_config:
         initial_capital, fixed_position_size = money_config
         money_rows, money_summary = _money_equity_curve(trades, initial_capital, fixed_position_size)
         monthly_money_rows = _monthly_money_rows(money_rows, initial_capital)
+        if cost_config:
+            fee, slippage = cost_config
+            cost_rows, cost_summary = _cost_adjusted_equity_curve(trades, initial_capital, fixed_position_size, fee, slippage)
     ordered_results = [trade.result_r for trade in sorted(trades, key=lambda row: (row.exit_ts, row.entry_ts, row.symbol, row.trade_id))]
     streaks = {
         "longest_losing_streak": _max_streak(ordered_results, lambda value: value < 0),
@@ -539,6 +639,10 @@ def run(
             handle.write("\n## Money simulation (USDT)\n\n")
             for key, value in money_summary.items():
                 handle.write(f"- `{key}`: {value}\n")
+        if cost_config:
+            handle.write("\n## Cost-adjusted money simulation (USDT)\n\n")
+            for key, value in cost_summary.items():
+                handle.write(f"- `{key}`: {value}\n")
         handle.write("\n## Portfolio exposure\n\n")
         for key, value in exposure.items():
             handle.write(f"- `{key}`: {value}\n")
@@ -558,6 +662,8 @@ def run(
     if money_config:
         _write_csv(output_root / MONEY_OUTPUT_NAMES[0], MONEY_EQUITY_FIELDS, money_rows)
         _write_csv(output_root / MONEY_OUTPUT_NAMES[1], MONEY_MONTHLY_FIELDS, monthly_money_rows)
+    if cost_config:
+        _write_csv(output_root / COST_OUTPUT_NAMES[0], COST_EQUITY_FIELDS, cost_rows)
     manifest = {
         "created_at_utc": datetime.now(UTC).isoformat(),
         "stage": "pole_portfolio_reality_audit",
@@ -580,7 +686,7 @@ def run(
         "verdict": verdict,
         "verdict_reason": reason,
         "summary_metrics": {**equity, **streaks, **exposure},
-        "artifacts": [*OUTPUT_NAMES[:-1], *(MONEY_OUTPUT_NAMES if money_config else ())],
+        "artifacts": [*OUTPUT_NAMES[:-1], *(MONEY_OUTPUT_NAMES if money_config else ()), *(COST_OUTPUT_NAMES if cost_config else ())],
     }
     if money_config:
         manifest["money_simulation"] = {
@@ -595,6 +701,8 @@ def run(
             },
             "artifacts": list(MONEY_OUTPUT_NAMES),
         }
+    if cost_config:
+        manifest["cost_adjusted_summary"] = {**cost_summary, "artifacts": list(COST_OUTPUT_NAMES)}
     with (output_root / OUTPUT_NAMES[7]).open("x") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -609,6 +717,8 @@ def main() -> None:
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--initial-capital", type=float, default=None, help="Optional starting capital in USDT for the money simulation layer")
     parser.add_argument("--fixed-position-size", type=float, default=None, help="Optional fixed USDT position size per 1R result for money simulation")
+    parser.add_argument("--fee-bps", type=float, default=None, help="Optional fee cost in basis points for cost-adjusted money simulation")
+    parser.add_argument("--slippage-bps", type=float, default=None, help="Optional slippage cost in basis points for cost-adjusted money simulation")
     args = parser.parse_args()
     try:
         run(
@@ -619,6 +729,8 @@ def main() -> None:
             dict(args.candle_symbol),
             args.initial_capital,
             args.fixed_position_size,
+            args.fee_bps,
+            args.slippage_bps,
         )
     except (FileExistsError, OSError, sqlite3.Error, ValueError) as exc:
         parser.error(str(exc))
