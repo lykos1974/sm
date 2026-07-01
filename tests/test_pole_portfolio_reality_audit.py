@@ -36,7 +36,11 @@ def _trade(
         direction="LONG",
         entry_ts=entry,
         exit_ts=exit_,
-        classification="TARGET_FIRST" if result > 0 else "BREAK_EVEN_EXIT" if result == 0 else "STOP_FIRST",
+        classification=(
+            "TARGET_FIRST"
+            if result > 0
+            else "BREAK_EVEN_EXIT" if result == 0 else "STOP_FIRST"
+        ),
         result_r=result,
         active_positions_at_entry=active,
         active_risk_r_at_entry=float(active),
@@ -44,7 +48,12 @@ def _trade(
 
 
 def test_equity_curve_construction_and_max_drawdown() -> None:
-    trades = [_trade("BTC", 1, 10, 2.5), _trade("ETH", 2, 20, -1.0), _trade("SOL", 3, 30, -1.0), _trade("BTC", 31, 40, 2.5)]
+    trades = [
+        _trade("BTC", 1, 10, 2.5),
+        _trade("ETH", 2, 20, -1.0),
+        _trade("SOL", 3, 30, -1.0),
+        _trade("BTC", 31, 40, 2.5),
+    ]
 
     rows, summary = _equity_curve(trades)
 
@@ -59,9 +68,15 @@ def test_equity_curve_construction_and_max_drawdown() -> None:
 
 
 def test_optional_money_equity_curve_uses_existing_trade_sequence() -> None:
-    trades = [_trade("BTC", 1, 10, 2.5), _trade("ETH", 2, 20, -1.0), _trade("SOL", 3, 30, 0.0)]
+    trades = [
+        _trade("BTC", 1, 10, 2.5),
+        _trade("ETH", 2, 20, -1.0),
+        _trade("SOL", 3, 30, 0.0),
+    ]
 
-    rows, summary = _money_equity_curve(trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0)
+    rows, summary = _money_equity_curve(
+        trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0
+    )
 
     assert [row["pnl_usdt"] for row in rows] == [125.0, -50.0, 0.0]
     assert [row["equity_usdt"] for row in rows] == [1125.0, 1075.0, 1075.0]
@@ -80,7 +95,9 @@ def test_optional_monthly_money_returns_follow_money_equity_rows() -> None:
     jan = 1704067200
     feb = 1706745600
     trades = [_trade("BTC", jan - 1, jan, 2.5), _trade("ETH", feb - 1, feb, -1.0)]
-    money_rows, _ = _money_equity_curve(trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0)
+    money_rows, _ = _money_equity_curve(
+        trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0
+    )
 
     assert _monthly_money_rows(money_rows, initial_capital_usdt=1000.0) == [
         {
@@ -112,9 +129,33 @@ def test_losing_flat_and_non_winning_streaks() -> None:
 
 def test_concurrent_exposure_and_one_position_per_symbol_filter() -> None:
     outcomes = [
-        {"opportunity": type("Opp", (), {"opportunity_id": "OPP-1"})(), "symbol": "BTC", "direction": "LONG", "entry_ts": 10, "exit_ts": 30, "classification": "TARGET_FIRST", "result_r": 2.5},
-        {"opportunity": type("Opp", (), {"opportunity_id": "OPP-2"})(), "symbol": "ETH", "direction": "LONG", "entry_ts": 20, "exit_ts": 40, "classification": "STOP_FIRST", "result_r": -1.0},
-        {"opportunity": type("Opp", (), {"opportunity_id": "OPP-3"})(), "symbol": "BTC", "direction": "LONG", "entry_ts": 25, "exit_ts": 50, "classification": "TARGET_FIRST", "result_r": 2.5},
+        {
+            "opportunity": type("Opp", (), {"opportunity_id": "OPP-1"})(),
+            "symbol": "BTC",
+            "direction": "LONG",
+            "entry_ts": 10,
+            "exit_ts": 30,
+            "classification": "TARGET_FIRST",
+            "result_r": 2.5,
+        },
+        {
+            "opportunity": type("Opp", (), {"opportunity_id": "OPP-2"})(),
+            "symbol": "ETH",
+            "direction": "LONG",
+            "entry_ts": 20,
+            "exit_ts": 40,
+            "classification": "STOP_FIRST",
+            "result_r": -1.0,
+        },
+        {
+            "opportunity": type("Opp", (), {"opportunity_id": "OPP-3"})(),
+            "symbol": "BTC",
+            "direction": "LONG",
+            "entry_ts": 25,
+            "exit_ts": 50,
+            "classification": "TARGET_FIRST",
+            "result_r": 2.5,
+        },
     ]
 
     trades, flags = _apply_one_position_per_symbol(outcomes)
@@ -132,7 +173,11 @@ def test_concurrent_exposure_and_one_position_per_symbol_filter() -> None:
 
 
 def test_symbol_contribution() -> None:
-    trades = [_trade("BTC", 1, 10, 2.5), _trade("BTC", 11, 20, 0.0), _trade("ETH", 2, 12, -1.0)]
+    trades = [
+        _trade("BTC", 1, 10, 2.5),
+        _trade("BTC", 11, 20, 0.0),
+        _trade("ETH", 2, 12, -1.0),
+    ]
 
     rows = _symbol_rows(trades, total_r=1.5)
     btc = next(row for row in rows if row["symbol"] == "BTC")
@@ -151,18 +196,46 @@ def test_symbol_contribution() -> None:
 def test_monthly_and_quarterly_grouping() -> None:
     jan = 1704067200  # 2024-01-01T00:00:00Z
     apr = 1711929600  # 2024-04-01T00:00:00Z
-    trades = [_trade("BTC", jan - 1, jan, 2.5), _trade("ETH", jan, jan + 10, -1.0), _trade("SOL", apr - 1, apr, 0.0)]
+    trades = [
+        _trade("BTC", jan - 1, jan, 2.5),
+        _trade("ETH", jan, jan + 10, -1.0),
+        _trade("SOL", apr - 1, apr, 0.0),
+    ]
 
     monthly = _period_rows(trades, "month")
     quarterly = _period_rows(trades, "quarter")
 
     assert monthly == [
-        {"period": "2024-01", "trades": 2, "total_R": 1.5, "win_rate": 0.5, "max_losing_streak": 1},
-        {"period": "2024-04", "trades": 1, "total_R": 0.0, "win_rate": 0.0, "max_losing_streak": 0},
+        {
+            "period": "2024-01",
+            "trades": 2,
+            "total_R": 1.5,
+            "win_rate": 0.5,
+            "max_losing_streak": 1,
+        },
+        {
+            "period": "2024-04",
+            "trades": 1,
+            "total_R": 0.0,
+            "win_rate": 0.0,
+            "max_losing_streak": 0,
+        },
     ]
     assert quarterly == [
-        {"period": "2024-Q1", "trades": 2, "total_R": 1.5, "win_rate": 0.5, "max_losing_streak": 1},
-        {"period": "2024-Q2", "trades": 1, "total_R": 0.0, "win_rate": 0.0, "max_losing_streak": 0},
+        {
+            "period": "2024-Q1",
+            "trades": 2,
+            "total_R": 1.5,
+            "win_rate": 0.5,
+            "max_losing_streak": 1,
+        },
+        {
+            "period": "2024-Q2",
+            "trades": 1,
+            "total_R": 0.0,
+            "win_rate": 0.0,
+            "max_losing_streak": 0,
+        },
     ]
 
 
@@ -170,7 +243,10 @@ def test_verdict_logic_allows_only_portfolio_research_verdicts() -> None:
     assert "PROMOTE" not in ALLOWED_VERDICTS
     few_trades = [_trade("BTC", 1, 2, 2.5)]
     _, few_equity = _equity_curve(few_trades)
-    assert _verdict(few_trades, few_equity, []) == ("INSUFFICIENT_DATA", "fewer than 30 resolved portfolio trades are available")
+    assert _verdict(few_trades, few_equity, []) == (
+        "INSUFFICIENT_DATA",
+        "fewer than 30 resolved portfolio trades are available",
+    )
 
     robust = [_trade("BTC", i, i + 1, 2.5 if i % 2 == 0 else -1.0) for i in range(40)]
     _, robust_equity = _equity_curve(robust)
@@ -180,8 +256,17 @@ def test_verdict_logic_allows_only_portfolio_research_verdicts() -> None:
     _, fragile_equity = _equity_curve(fragile)
     assert _verdict(fragile, fragile_equity, [])[0] == "PORTFOLIO_FRAGILE"
 
-    risky_flags = [{"flag": "FREQUENT_EXPOSURE_OVER_2R", "severity": "MEDIUM", "details": "synthetic"}]
-    assert _verdict(robust, robust_equity, risky_flags)[0] == "PORTFOLIO_PROMISING_BUT_RISKY"
+    risky_flags = [
+        {
+            "flag": "FREQUENT_EXPOSURE_OVER_2R",
+            "severity": "MEDIUM",
+            "details": "synthetic",
+        }
+    ]
+    assert (
+        _verdict(robust, robust_equity, risky_flags)[0]
+        == "PORTFOLIO_PROMISING_BUT_RISKY"
+    )
 
 
 def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -213,7 +298,9 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return label_path, column_path, candle_path
 
 
-def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(tmp_path: Path) -> None:
+def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
+    tmp_path: Path,
+) -> None:
     labels, columns, candles = _write_fixture(tmp_path)
     output = tmp_path / "output"
 
@@ -237,7 +324,9 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     assert {path.name for path in output.iterdir()} == set(OUTPUT_NAMES)
     assert not (output / "equity_curve_usdt.csv").exists()
     assert not (output / "monthly_returns_usdt.csv").exists()
-    trades = list(csv.DictReader((output / "portfolio_reality_trade_sequence.csv").open()))
+    trades = list(
+        csv.DictReader((output / "portfolio_reality_trade_sequence.csv").open())
+    )
     assert len(trades) == 2
     assert trades[0]["result_R"] == "2.5"
     assert trades[1]["result_R"] == "0.0"
@@ -251,7 +340,13 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     assert manifest["stop"] == "fixed_3_box_stop"
     assert manifest["target_R"] == 2.5
     assert manifest["break_even_after_R"] == 2.0
-    assert manifest["management_rules"] == {"pyramiding": False, "scaling": False, "tp1": False, "tp2": False, "trailing": False}
+    assert manifest["management_rules"] == {
+        "pyramiding": False,
+        "scaling": False,
+        "tp1": False,
+        "tp2": False,
+        "trailing": False,
+    }
     assert "PROMOTE" not in manifest["allowed_verdicts"]
 
     source = Path("research_v2/patterns/pole_portfolio_reality_audit.py").read_text()
@@ -259,7 +354,9 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     assert "strategy_historical_backfill" not in source
 
 
-def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outputs(tmp_path: Path) -> None:
+def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outputs(
+    tmp_path: Path,
+) -> None:
     labels, columns, candles = _write_fixture(tmp_path)
     output = tmp_path / "output"
 
@@ -284,7 +381,11 @@ def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outp
         check=True,
     )
 
-    assert {path.name for path in output.iterdir()} == {*OUTPUT_NAMES, "equity_curve_usdt.csv", "monthly_returns_usdt.csv"}
+    assert {path.name for path in output.iterdir()} == {
+        *OUTPUT_NAMES,
+        "equity_curve_usdt.csv",
+        "monthly_returns_usdt.csv",
+    }
     summary = (output / "portfolio_reality_summary.md").read_text()
     assert "- `final_equity_usdt`: 1125.0" in summary
     assert "- `total_pnl_usdt`: 125.0" in summary
@@ -292,6 +393,16 @@ def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outp
     assert "- `max_drawdown_percent`: 0.0" in summary
 
     money_rows = list(csv.DictReader((output / "equity_curve_usdt.csv").open()))
+    trade_rows = list(
+        csv.DictReader((output / "portfolio_reality_trade_sequence.csv").open())
+    )
+    assert trade_rows[0]["entry_price"] == "100.0"
+    assert trade_rows[0]["stop_price"] == "97.0"
+    assert trade_rows[0]["risk_per_unit"] == "3.0"
+    assert trade_rows[0]["fixed_risk_usdt"] == "50.0"
+    assert trade_rows[0]["position_qty"] == "16.666667"
+    assert trade_rows[0]["approximate_notional_usdt"] == "1666.666667"
+
     assert [row["pnl_usdt"] for row in money_rows] == ["125.0", "0.0"]
     assert [row["equity_usdt"] for row in money_rows] == ["1125.0", "1125.0"]
 
@@ -309,6 +420,13 @@ def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outp
 
     manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
     assert manifest["verdict"] == "INSUFFICIENT_DATA"
+    assert manifest["notional_sizing_validation"] == {
+        "enabled": True,
+        "formula": "position_qty = fixed_risk_usdt / abs(entry_price - stop_price)",
+        "fixed_risk_usdt_source": "--fixed-position-size money simulation 1R amount",
+        "sizable_trades": 2,
+        "missing_or_invalid_geometry_trades": 0,
+    }
     assert manifest["money_simulation"] == {
         "enabled": True,
         "initial_capital_usdt": 1000.0,
@@ -323,15 +441,29 @@ def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outp
     }
 
 
-def test_cost_adjusted_money_curve_reduces_final_equity_and_preserves_gross_sequence() -> None:
-    from research_v2.patterns.pole_portfolio_reality_audit import _cost_adjusted_equity_curve
+def test_cost_adjusted_money_curve_reduces_final_equity_and_preserves_gross_sequence() -> (
+    None
+):
+    from research_v2.patterns.pole_portfolio_reality_audit import (
+        _cost_adjusted_equity_curve,
+    )
 
-    trades = [_trade("BTC", 1, 10, 2.5), _trade("ETH", 2, 20, -1.0), _trade("SOL", 3, 30, 0.0)]
-    gross_rows, gross_summary = _money_equity_curve(trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0)
+    trades = [
+        _trade("BTC", 1, 10, 2.5),
+        _trade("ETH", 2, 20, -1.0),
+        _trade("SOL", 3, 30, 0.0),
+    ]
+    gross_rows, gross_summary = _money_equity_curve(
+        trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0
+    )
 
-    cost_rows, cost_summary = _cost_adjusted_equity_curve(trades, 1000.0, 50.0, fee_bps=10.0, slippage_bps=5.0)
+    cost_rows, cost_summary = _cost_adjusted_equity_curve(
+        trades, 1000.0, 50.0, fee_bps=10.0, slippage_bps=5.0
+    )
 
-    assert [row["gross_pnl_usdt"] for row in cost_rows] == [row["pnl_usdt"] for row in gross_rows]
+    assert [row["gross_pnl_usdt"] for row in cost_rows] == [
+        row["pnl_usdt"] for row in gross_rows
+    ]
     assert [row["total_cost_usdt"] for row in cost_rows] == [0.15, 0.15, 0.15]
     assert cost_summary["gross_pnl_usdt"] == gross_summary["total_pnl_usdt"]
     assert cost_summary["total_cost_usdt"] == 0.45
@@ -367,11 +499,16 @@ def test_cli_cost_arguments_require_money_simulation(tmp_path: Path) -> None:
     )
 
     assert result.returncode != 0
-    assert "--fee-bps and --slippage-bps are only valid when money simulation is enabled" in result.stderr
+    assert (
+        "--fee-bps and --slippage-bps are only valid when money simulation is enabled"
+        in result.stderr
+    )
     assert not output.exists()
 
 
-def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_promotion(tmp_path: Path) -> None:
+def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_promotion(
+    tmp_path: Path,
+) -> None:
     labels, columns, candles = _write_fixture(tmp_path)
     output = tmp_path / "output"
 
@@ -400,12 +537,22 @@ def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_pro
         check=True,
     )
 
-    assert "cost_adjusted_equity_curve_usdt.csv" in {path.name for path in output.iterdir()}
+    assert "cost_adjusted_equity_curve_usdt.csv" in {
+        path.name for path in output.iterdir()
+    }
     gross_rows = list(csv.DictReader((output / "equity_curve_usdt.csv").open()))
-    cost_rows = list(csv.DictReader((output / "cost_adjusted_equity_curve_usdt.csv").open()))
-    assert [row["result_R"] for row in cost_rows] == [row["result_R"] for row in gross_rows]
-    assert [row["gross_pnl_usdt"] for row in cost_rows] == [row["pnl_usdt"] for row in gross_rows]
-    assert float(cost_rows[-1]["net_equity_usdt"]) < float(gross_rows[-1]["equity_usdt"])
+    cost_rows = list(
+        csv.DictReader((output / "cost_adjusted_equity_curve_usdt.csv").open())
+    )
+    assert [row["result_R"] for row in cost_rows] == [
+        row["result_R"] for row in gross_rows
+    ]
+    assert [row["gross_pnl_usdt"] for row in cost_rows] == [
+        row["pnl_usdt"] for row in gross_rows
+    ]
+    assert float(cost_rows[-1]["net_equity_usdt"]) < float(
+        gross_rows[-1]["equity_usdt"]
+    )
 
     manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
     summary = manifest["cost_adjusted_summary"]
@@ -415,7 +562,10 @@ def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_pro
     assert summary["notional_assumption"] == (
         "approximate_notional_usdt uses fixed_position_size_usdt because trade-level notional is not available in the resolved portfolio baseline"
     )
-    assert summary["cost_timing_assumption"] == "fee and slippage bps are charged on approximate notional for entry and exit"
+    assert (
+        summary["cost_timing_assumption"]
+        == "fee and slippage bps are charged on approximate notional for entry and exit"
+    )
     assert summary["artifacts"] == ["cost_adjusted_equity_curve_usdt.csv"]
     assert manifest["strategy_promotion"] is False
     assert manifest["production_modifications"] is False
@@ -426,7 +576,10 @@ def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_pro
     assert "- `net_pnl_usdt`: 124.7" in summary_md
     assert "- `total_cost_usdt`: 0.3" in summary_md
 
-def test_cli_trade_sequence_mode_runs_money_and_cost_without_raw_inputs(tmp_path: Path) -> None:
+
+def test_cli_trade_sequence_mode_runs_money_and_cost_without_raw_inputs(
+    tmp_path: Path,
+) -> None:
     trade_sequence = tmp_path / "portfolio_reality_trade_sequence.csv"
     trade_sequence.write_text(
         "trade_id,opportunity_id,symbol,direction,entry_timestamp,entry_time_utc,exit_timestamp,exit_time_utc,classification,result_R,cumulative_R,active_positions_at_entry,active_risk_R_at_entry\n"
@@ -472,7 +625,10 @@ def test_cli_trade_sequence_mode_runs_money_and_cost_without_raw_inputs(tmp_path
     assert [row["total_cost_usdt"] for row in cost_rows] == ["0.15", "0.15", "0.15"]
 
     manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
-    assert manifest["stage"] == "pole_portfolio_reality_trade_sequence_money_cost_simulation"
+    assert (
+        manifest["stage"]
+        == "pole_portfolio_reality_trade_sequence_money_cost_simulation"
+    )
     assert manifest["input_trade_sequence"] == str(trade_sequence)
     assert manifest["resolved_portfolio_trades"] == 3
     assert manifest["money_simulation"]["summary"]["final_equity_usdt"] == 1075.0
