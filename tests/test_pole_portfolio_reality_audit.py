@@ -425,3 +425,84 @@ def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_pro
     assert "## Cost-adjusted money simulation (USDT)" in summary_md
     assert "- `net_pnl_usdt`: 124.7" in summary_md
     assert "- `total_cost_usdt`: 0.3" in summary_md
+
+def test_cli_trade_sequence_mode_runs_money_and_cost_without_raw_inputs(tmp_path: Path) -> None:
+    trade_sequence = tmp_path / "portfolio_reality_trade_sequence.csv"
+    trade_sequence.write_text(
+        "trade_id,opportunity_id,symbol,direction,entry_timestamp,entry_time_utc,exit_timestamp,exit_time_utc,classification,result_R,cumulative_R,active_positions_at_entry,active_risk_R_at_entry\n"
+        "TRADE-000001,OPP-1,BTC,LONG,1,1970-01-01T00:00:01+00:00,10,1970-01-01T00:00:10+00:00,TARGET_FIRST,2.5,2.5,0,0.0\n"
+        "TRADE-000002,OPP-2,ETH,LONG,2,1970-01-01T00:00:02+00:00,20,1970-01-01T00:00:20+00:00,STOP_FIRST,-1.0,1.5,1,1.0\n"
+        "TRADE-000003,OPP-3,SOL,LONG,3,1970-01-01T00:00:03+00:00,30,1970-01-01T00:00:30+00:00,BREAK_EVEN_EXIT,0.0,1.5,2,2.0\n"
+    )
+    output = tmp_path / "output"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.pole_portfolio_reality_audit",
+            "--trade-sequence",
+            str(trade_sequence),
+            "--output-root",
+            str(output),
+            "--initial-capital",
+            "1000",
+            "--fixed-position-size",
+            "50",
+            "--fee-bps",
+            "10",
+            "--slippage-bps",
+            "5",
+        ],
+        check=True,
+    )
+
+    assert {path.name for path in output.iterdir()} == {
+        "portfolio_reality_summary.md",
+        "portfolio_reality_manifest.json",
+        "money_equity_curve.csv",
+        "monthly_returns_usdt.csv",
+        "cost_adjusted_equity_curve.csv",
+    }
+    money_rows = list(csv.DictReader((output / "money_equity_curve.csv").open()))
+    cost_rows = list(csv.DictReader((output / "cost_adjusted_equity_curve.csv").open()))
+    assert [row["pnl_usdt"] for row in money_rows] == ["125.0", "-50.0", "0.0"]
+    assert [row["equity_usdt"] for row in money_rows] == ["1125.0", "1075.0", "1075.0"]
+    assert [row["gross_pnl_usdt"] for row in cost_rows] == ["125.0", "-50.0", "0.0"]
+    assert [row["total_cost_usdt"] for row in cost_rows] == ["0.15", "0.15", "0.15"]
+
+    manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
+    assert manifest["stage"] == "pole_portfolio_reality_trade_sequence_money_cost_simulation"
+    assert manifest["input_trade_sequence"] == str(trade_sequence)
+    assert manifest["resolved_portfolio_trades"] == 3
+    assert manifest["money_simulation"]["summary"]["final_equity_usdt"] == 1075.0
+    assert manifest["cost_adjusted_summary"]["final_net_equity_usdt"] == 1074.55
+
+
+def test_cli_trade_sequence_mode_does_not_require_raw_inputs(tmp_path: Path) -> None:
+    trade_sequence = tmp_path / "portfolio_reality_trade_sequence.csv"
+    trade_sequence.write_text(
+        "trade_id,symbol,entry_timestamp,exit_timestamp,result_R\n"
+        "TRADE-000001,BTC,1,10,2.5\n"
+    )
+    output = tmp_path / "output"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.pole_portfolio_reality_audit",
+            "--trade-sequence",
+            str(trade_sequence),
+            "--output-root",
+            str(output),
+            "--initial-capital",
+            "1000",
+            "--fixed-position-size",
+            "50",
+        ],
+        check=True,
+    )
+
+    assert (output / "money_equity_curve.csv").exists()
+    assert not (output / "cost_adjusted_equity_curve.csv").exists()

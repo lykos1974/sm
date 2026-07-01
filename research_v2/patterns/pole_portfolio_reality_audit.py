@@ -73,6 +73,8 @@ PERIOD_FIELDS = ["period", "trades", "total_R", "win_rate", "max_losing_streak"]
 FLAG_FIELDS = ["flag", "severity", "details"]
 MONEY_OUTPUT_NAMES = ("equity_curve_usdt.csv", "monthly_returns_usdt.csv")
 COST_OUTPUT_NAMES = ("cost_adjusted_equity_curve_usdt.csv",)
+TRADE_SEQUENCE_MONEY_OUTPUT_NAMES = ("money_equity_curve.csv", "monthly_returns_usdt.csv")
+TRADE_SEQUENCE_COST_OUTPUT_NAMES = ("cost_adjusted_equity_curve.csv",)
 MONEY_EQUITY_FIELDS = [
     "sequence",
     "exit_timestamp",
@@ -454,6 +456,120 @@ def _monthly_money_rows(money_rows: list[dict[str, Any]], initial_capital_usdt: 
     return rows
 
 
+def _load_trade_sequence(path: Path) -> list[PortfolioTrade]:
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = [field for field in ("trade_id", "symbol", "entry_timestamp", "exit_timestamp", "result_R") if field not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"--trade-sequence is missing required column(s): {', '.join(missing)}")
+        trades: list[PortfolioTrade] = []
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                trades.append(
+                    PortfolioTrade(
+                        trade_id=row.get("trade_id") or f"TRADE-{line_number - 1:06d}",
+                        opportunity_id=row.get("opportunity_id", ""),
+                        symbol=row["symbol"],
+                        direction=row.get("direction", ""),
+                        entry_ts=int(float(row["entry_timestamp"])),
+                        exit_ts=int(float(row["exit_timestamp"])),
+                        classification=row.get("classification", ""),
+                        result_r=float(row["result_R"]),
+                        active_positions_at_entry=int(float(row.get("active_positions_at_entry") or 0)),
+                        active_risk_r_at_entry=float(row.get("active_risk_R_at_entry") or 0.0),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid --trade-sequence row {line_number}: {exc}") from exc
+    return trades
+
+
+def _money_cost_outputs(
+    trades: list[PortfolioTrade],
+    initial_capital_usdt: float | None,
+    fixed_position_size_usdt: float | None,
+    fee_bps: float | None,
+    slippage_bps: float | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    money_config = _money_config(initial_capital_usdt, fixed_position_size_usdt)
+    if money_config is None:
+        raise ValueError("money simulation requires --initial-capital or --fixed-position-size")
+    cost_config = _cost_config(fee_bps, slippage_bps, True)
+    initial_capital, fixed_position_size = money_config
+    money_rows, money_summary = _money_equity_curve(trades, initial_capital, fixed_position_size)
+    monthly_money_rows = _monthly_money_rows(money_rows, initial_capital)
+    cost_rows: list[dict[str, Any]] = []
+    cost_summary: dict[str, Any] = {}
+    if cost_config:
+        fee, slippage = cost_config
+        cost_rows, cost_summary = _cost_adjusted_equity_curve(trades, initial_capital, fixed_position_size, fee, slippage)
+    return money_rows, money_summary, monthly_money_rows, cost_rows, cost_summary
+
+
+def _write_money_summary(path: Path, money_summary: dict[str, Any], cost_summary: dict[str, Any]) -> None:
+    with path.open("x") as handle:
+        handle.write("# Portfolio trade sequence money simulation\n\n")
+        handle.write("## Money simulation (USDT)\n\n")
+        for key, value in money_summary.items():
+            handle.write(f"- `{key}`: {value}\n")
+        if cost_summary:
+            handle.write("\n## Cost-adjusted money simulation (USDT)\n\n")
+            for key, value in cost_summary.items():
+                handle.write(f"- `{key}`: {value}\n")
+
+
+def run_trade_sequence(
+    trade_sequence: Path,
+    output_root: Path,
+    initial_capital_usdt: float | None = None,
+    fixed_position_size_usdt: float | None = None,
+    fee_bps: float | None = None,
+    slippage_bps: float | None = None,
+) -> None:
+    trades = _load_trade_sequence(trade_sequence)
+    cost_enabled = fee_bps is not None or slippage_bps is not None
+    output_names = ("portfolio_reality_summary.md", "portfolio_reality_manifest.json", *TRADE_SEQUENCE_MONEY_OUTPUT_NAMES, *(TRADE_SEQUENCE_COST_OUTPUT_NAMES if cost_enabled else ()))
+    output_root.mkdir(parents=True, exist_ok=True)
+    existing = [name for name in output_names if (output_root / name).exists()]
+    if existing:
+        raise FileExistsError(f"refusing to overwrite existing trade-sequence simulation output(s): {', '.join(existing)}")
+    money_rows, money_summary, monthly_money_rows, cost_rows, cost_summary = _money_cost_outputs(
+        trades, initial_capital_usdt, fixed_position_size_usdt, fee_bps, slippage_bps
+    )
+    _write_csv(output_root / TRADE_SEQUENCE_MONEY_OUTPUT_NAMES[0], MONEY_EQUITY_FIELDS, money_rows)
+    _write_csv(output_root / TRADE_SEQUENCE_MONEY_OUTPUT_NAMES[1], MONEY_MONTHLY_FIELDS, monthly_money_rows)
+    if cost_enabled:
+        _write_csv(output_root / TRADE_SEQUENCE_COST_OUTPUT_NAMES[0], COST_EQUITY_FIELDS, cost_rows)
+    _write_money_summary(output_root / "portfolio_reality_summary.md", money_summary, cost_summary)
+    manifest = {
+        "created_at_utc": datetime.now(UTC).isoformat(),
+        "stage": "pole_portfolio_reality_trade_sequence_money_cost_simulation",
+        "research_only": True,
+        "not_production": True,
+        "strategy_promotion": False,
+        "production_modifications": False,
+        "input_trade_sequence": str(trade_sequence),
+        "resolved_portfolio_trades": len(trades),
+        "money_simulation": {
+            "enabled": True,
+            "initial_capital_usdt": money_summary["initial_capital_usdt"],
+            "fixed_position_size_usdt": money_summary["fixed_position_size_usdt"],
+            "summary": {
+                "final_equity_usdt": money_summary["final_equity_usdt"],
+                "total_pnl_usdt": money_summary["total_pnl_usdt"],
+                "max_drawdown_usdt": money_summary["max_drawdown_usdt"],
+                "max_drawdown_percent": money_summary["max_drawdown_percent"],
+            },
+            "artifacts": list(TRADE_SEQUENCE_MONEY_OUTPUT_NAMES),
+        },
+        "artifacts": ["portfolio_reality_summary.md", *TRADE_SEQUENCE_MONEY_OUTPUT_NAMES, *(TRADE_SEQUENCE_COST_OUTPUT_NAMES if cost_enabled else ())],
+    }
+    if cost_enabled:
+        manifest["cost_adjusted_summary"] = {**cost_summary, "artifacts": list(TRADE_SEQUENCE_COST_OUTPUT_NAMES)}
+    with (output_root / "portfolio_reality_manifest.json").open("x") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
 def _max_streak(values: Iterable[float], predicate: Any) -> int:
     best = current = 0
     for value in values:
@@ -609,12 +725,9 @@ def run(
     cost_rows: list[dict[str, Any]] = []
     cost_summary: dict[str, Any] = {}
     if money_config:
-        initial_capital, fixed_position_size = money_config
-        money_rows, money_summary = _money_equity_curve(trades, initial_capital, fixed_position_size)
-        monthly_money_rows = _monthly_money_rows(money_rows, initial_capital)
-        if cost_config:
-            fee, slippage = cost_config
-            cost_rows, cost_summary = _cost_adjusted_equity_curve(trades, initial_capital, fixed_position_size, fee, slippage)
+        money_rows, money_summary, monthly_money_rows, cost_rows, cost_summary = _money_cost_outputs(
+            trades, initial_capital_usdt, fixed_position_size_usdt, fee_bps, slippage_bps
+        )
     ordered_results = [trade.result_r for trade in sorted(trades, key=lambda row: (row.exit_ts, row.entry_ts, row.symbol, row.trade_id))]
     streaks = {
         "longest_losing_streak": _max_streak(ordered_results, lambda value: value < 0),
@@ -710,9 +823,10 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Research-only portfolio reality audit for the fixed PnF pole baseline")
-    parser.add_argument("--symbol-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV")
-    parser.add_argument("--columns-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV")
-    parser.add_argument("--candles-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV_OR_DB")
+    parser.add_argument("--trade-sequence", type=Path, default=None, help="Existing portfolio_reality_trade_sequence.csv for money/cost simulation without raw inputs")
+    parser.add_argument("--symbol-input", action="append", type=_parse_symbol_input, metavar="SYMBOL=CSV")
+    parser.add_argument("--columns-input", action="append", type=_parse_symbol_input, metavar="SYMBOL=CSV")
+    parser.add_argument("--candles-input", action="append", type=_parse_symbol_input, metavar="SYMBOL=CSV_OR_DB")
     parser.add_argument("--candle-symbol", action="append", default=[], type=_parse_candle_symbol, metavar="SYMBOL=DB_SYMBOL")
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--initial-capital", type=float, default=None, help="Optional starting capital in USDT for the money simulation layer")
@@ -721,6 +835,18 @@ def main() -> None:
     parser.add_argument("--slippage-bps", type=float, default=None, help="Optional slippage cost in basis points for cost-adjusted money simulation")
     args = parser.parse_args()
     try:
+        if args.trade_sequence is not None:
+            run_trade_sequence(
+                args.trade_sequence,
+                args.output_root,
+                args.initial_capital,
+                args.fixed_position_size,
+                args.fee_bps,
+                args.slippage_bps,
+            )
+            return
+        if args.symbol_input is None or args.columns_input is None or args.candles_input is None:
+            parser.error("--symbol-input, --columns-input, and --candles-input are required unless --trade-sequence is supplied")
         run(
             dict(args.symbol_input),
             dict(args.columns_input),
