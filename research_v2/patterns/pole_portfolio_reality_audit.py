@@ -34,6 +34,8 @@ TARGET_R = 2.5
 BREAK_EVEN_TRIGGER_R = 2.0
 RISK_PER_TRADE_R = 1.0
 COMBINED = "COMBINED"
+DEFAULT_INITIAL_CAPITAL_USDT = 1000.0
+DEFAULT_FIXED_POSITION_SIZE_USDT = 50.0
 ALLOWED_VERDICTS = (
     "PORTFOLIO_READY_RESEARCH",
     "PORTFOLIO_PROMISING_BUT_RISKY",
@@ -69,6 +71,20 @@ EQUITY_FIELDS = ["sequence", "exit_timestamp", "exit_time_utc", "symbol", "resul
 SYMBOL_FIELDS = ["symbol", "trades", "wins", "losses", "BE_exits", "total_R", "expectancy_R", "contribution_percentage"]
 PERIOD_FIELDS = ["period", "trades", "total_R", "win_rate", "max_losing_streak"]
 FLAG_FIELDS = ["flag", "severity", "details"]
+MONEY_OUTPUT_NAMES = ("equity_curve_usdt.csv", "monthly_returns_usdt.csv")
+MONEY_EQUITY_FIELDS = [
+    "sequence",
+    "exit_timestamp",
+    "exit_time_utc",
+    "symbol",
+    "result_R",
+    "fixed_position_size_usdt",
+    "pnl_usdt",
+    "equity_usdt",
+    "drawdown_usdt",
+    "drawdown_percent",
+]
+MONEY_MONTHLY_FIELDS = ["month", "starting_equity_usdt", "ending_equity_usdt", "pnl_usdt", "return_percent", "trades"]
 
 
 @dataclass(frozen=True)
@@ -253,6 +269,99 @@ def _equity_curve(trades: list[PortfolioTrade]) -> tuple[list[dict[str, Any]], d
     return rows, summary
 
 
+def _money_config(initial_capital_usdt: float | None, fixed_position_size_usdt: float | None) -> tuple[float, float] | None:
+    if initial_capital_usdt is None and fixed_position_size_usdt is None:
+        return None
+    initial_capital = DEFAULT_INITIAL_CAPITAL_USDT if initial_capital_usdt is None else float(initial_capital_usdt)
+    fixed_position_size = DEFAULT_FIXED_POSITION_SIZE_USDT if fixed_position_size_usdt is None else float(fixed_position_size_usdt)
+    if initial_capital <= 0:
+        raise ValueError("--initial-capital must be positive when money simulation is enabled")
+    if fixed_position_size <= 0:
+        raise ValueError("--fixed-position-size must be positive when money simulation is enabled")
+    return initial_capital, fixed_position_size
+
+
+def _money_equity_curve(
+    trades: list[PortfolioTrade], initial_capital_usdt: float, fixed_position_size_usdt: float
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    equity = initial_capital_usdt
+    peak = initial_capital_usdt
+    max_drawdown_usdt = 0.0
+    max_drawdown_percent = 0.0
+    rows: list[dict[str, Any]] = []
+    ordered = sorted(trades, key=lambda row: (row.exit_ts, row.entry_ts, row.symbol, row.trade_id))
+    for sequence, trade in enumerate(ordered, start=1):
+        pnl_usdt = trade.result_r * fixed_position_size_usdt
+        equity += pnl_usdt
+        peak = max(peak, equity)
+        drawdown_usdt = peak - equity
+        drawdown_percent = drawdown_usdt / peak * 100 if peak > 0 else 0.0
+        max_drawdown_usdt = max(max_drawdown_usdt, drawdown_usdt)
+        max_drawdown_percent = max(max_drawdown_percent, drawdown_percent)
+        rows.append(
+            {
+                "sequence": sequence,
+                "exit_timestamp": trade.exit_ts,
+                "exit_time_utc": _ts_to_utc(trade.exit_ts),
+                "symbol": trade.symbol,
+                "result_R": _round(trade.result_r),
+                "fixed_position_size_usdt": _round(fixed_position_size_usdt),
+                "pnl_usdt": _round(pnl_usdt),
+                "equity_usdt": _round(equity),
+                "drawdown_usdt": _round(drawdown_usdt),
+                "drawdown_percent": _round(drawdown_percent),
+            }
+        )
+    summary = {
+        "initial_capital_usdt": _round(initial_capital_usdt),
+        "fixed_position_size_usdt": _round(fixed_position_size_usdt),
+        "final_equity_usdt": _round(equity),
+        "total_pnl_usdt": _round(equity - initial_capital_usdt),
+        "max_drawdown_usdt": _round(max_drawdown_usdt),
+        "max_drawdown_percent": _round(max_drawdown_percent),
+    }
+    return rows, summary
+
+
+def _monthly_money_rows(money_rows: list[dict[str, Any]], initial_capital_usdt: float) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    current_month: str | None = None
+    starting_equity = initial_capital_usdt
+    ending_equity = initial_capital_usdt
+    pnl = 0.0
+    trades = 0
+
+    def flush() -> None:
+        if current_month is None:
+            return
+        rows.append(
+            {
+                "month": current_month,
+                "starting_equity_usdt": _round(starting_equity),
+                "ending_equity_usdt": _round(ending_equity),
+                "pnl_usdt": _round(pnl),
+                "return_percent": _round(pnl / starting_equity * 100) if starting_equity > 0 else "",
+                "trades": trades,
+            }
+        )
+
+    for money_row in money_rows:
+        month = _dt(int(money_row["exit_timestamp"])).strftime("%Y-%m")
+        if current_month is None:
+            current_month = month
+        elif month != current_month:
+            flush()
+            current_month = month
+            starting_equity = ending_equity
+            pnl = 0.0
+            trades = 0
+        pnl += float(money_row["pnl_usdt"])
+        ending_equity = float(money_row["equity_usdt"])
+        trades += 1
+    flush()
+    return rows
+
+
 def _max_streak(values: Iterable[float], predicate: Any) -> int:
     best = current = 0
     for value in values:
@@ -378,10 +487,14 @@ def _write_csv(path: Path, fields: list[str], rows: Iterable[dict[str, Any]]) ->
 def run(
     symbol_inputs: dict[str, Path], columns_inputs: dict[str, Path], candles_inputs: dict[str, Path], output_root: Path,
     candle_symbols: dict[str, str] | None = None,
+    initial_capital_usdt: float | None = None,
+    fixed_position_size_usdt: float | None = None,
 ) -> None:
     symbols, observations, candles_by_symbol = _load_observations(symbol_inputs, columns_inputs, candles_inputs, candle_symbols or {})
+    money_config = _money_config(initial_capital_usdt, fixed_position_size_usdt)
+    output_names = (*OUTPUT_NAMES, *MONEY_OUTPUT_NAMES) if money_config else OUTPUT_NAMES
     output_root.mkdir(parents=True, exist_ok=True)
-    existing = [name for name in OUTPUT_NAMES if (output_root / name).exists()]
+    existing = [name for name in output_names if (output_root / name).exists()]
     if existing:
         raise FileExistsError(f"refusing to overwrite existing portfolio reality output(s): {', '.join(existing)}")
 
@@ -395,6 +508,13 @@ def run(
     monthly_rows = _period_rows(trades, "month")
     quarterly_rows = _period_rows(trades, "quarter")
     exposure = _exposure_summary(trades)
+    money_rows: list[dict[str, Any]] = []
+    money_summary: dict[str, Any] = {}
+    monthly_money_rows: list[dict[str, Any]] = []
+    if money_config:
+        initial_capital, fixed_position_size = money_config
+        money_rows, money_summary = _money_equity_curve(trades, initial_capital, fixed_position_size)
+        monthly_money_rows = _monthly_money_rows(money_rows, initial_capital)
     ordered_results = [trade.result_r for trade in sorted(trades, key=lambda row: (row.exit_ts, row.entry_ts, row.symbol, row.trade_id))]
     streaks = {
         "longest_losing_streak": _max_streak(ordered_results, lambda value: value < 0),
@@ -415,6 +535,10 @@ def run(
         handle.write("## Equity curve metrics\n\n")
         for key, value in {**equity, **streaks}.items():
             handle.write(f"- `{key}`: {value}\n")
+        if money_config:
+            handle.write("\n## Money simulation (USDT)\n\n")
+            for key, value in money_summary.items():
+                handle.write(f"- `{key}`: {value}\n")
         handle.write("\n## Portfolio exposure\n\n")
         for key, value in exposure.items():
             handle.write(f"- `{key}`: {value}\n")
@@ -431,6 +555,9 @@ def run(
     _write_csv(output_root / OUTPUT_NAMES[4], PERIOD_FIELDS, monthly_rows)
     _write_csv(output_root / OUTPUT_NAMES[5], PERIOD_FIELDS, quarterly_rows)
     _write_csv(output_root / OUTPUT_NAMES[6], FLAG_FIELDS, flags)
+    if money_config:
+        _write_csv(output_root / MONEY_OUTPUT_NAMES[0], MONEY_EQUITY_FIELDS, money_rows)
+        _write_csv(output_root / MONEY_OUTPUT_NAMES[1], MONEY_MONTHLY_FIELDS, monthly_money_rows)
     manifest = {
         "created_at_utc": datetime.now(UTC).isoformat(),
         "stage": "pole_portfolio_reality_audit",
@@ -453,8 +580,21 @@ def run(
         "verdict": verdict,
         "verdict_reason": reason,
         "summary_metrics": {**equity, **streaks, **exposure},
-        "artifacts": list(OUTPUT_NAMES[:-1]),
+        "artifacts": [*OUTPUT_NAMES[:-1], *(MONEY_OUTPUT_NAMES if money_config else ())],
     }
+    if money_config:
+        manifest["money_simulation"] = {
+            "enabled": True,
+            "initial_capital_usdt": money_summary["initial_capital_usdt"],
+            "fixed_position_size_usdt": money_summary["fixed_position_size_usdt"],
+            "summary": {
+                "final_equity_usdt": money_summary["final_equity_usdt"],
+                "total_pnl_usdt": money_summary["total_pnl_usdt"],
+                "max_drawdown_usdt": money_summary["max_drawdown_usdt"],
+                "max_drawdown_percent": money_summary["max_drawdown_percent"],
+            },
+            "artifacts": list(MONEY_OUTPUT_NAMES),
+        }
     with (output_root / OUTPUT_NAMES[7]).open("x") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -467,9 +607,19 @@ def main() -> None:
     parser.add_argument("--candles-input", action="append", required=True, type=_parse_symbol_input, metavar="SYMBOL=CSV_OR_DB")
     parser.add_argument("--candle-symbol", action="append", default=[], type=_parse_candle_symbol, metavar="SYMBOL=DB_SYMBOL")
     parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument("--initial-capital", type=float, default=None, help="Optional starting capital in USDT for the money simulation layer")
+    parser.add_argument("--fixed-position-size", type=float, default=None, help="Optional fixed USDT position size per 1R result for money simulation")
     args = parser.parse_args()
     try:
-        run(dict(args.symbol_input), dict(args.columns_input), dict(args.candles_input), args.output_root, dict(args.candle_symbol))
+        run(
+            dict(args.symbol_input),
+            dict(args.columns_input),
+            dict(args.candles_input),
+            args.output_root,
+            dict(args.candle_symbol),
+            args.initial_capital,
+            args.fixed_position_size,
+        )
     except (FileExistsError, OSError, sqlite3.Error, ValueError) as exc:
         parser.error(str(exc))
 

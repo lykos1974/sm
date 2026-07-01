@@ -11,6 +11,8 @@ from research_v2.patterns.pole_portfolio_reality_audit import (
     _apply_one_position_per_symbol,
     _equity_curve,
     _exposure_summary,
+    _money_equity_curve,
+    _monthly_money_rows,
     _max_streak,
     _period_rows,
     _risk_flags,
@@ -54,6 +56,50 @@ def test_equity_curve_construction_and_max_drawdown() -> None:
     assert summary["max_drawdown_R"] == 2.0
     assert summary["max_drawdown_percent_of_peak_R"] == 66.666667
     assert summary["recovery_time_after_drawdown"] == 30
+
+
+def test_optional_money_equity_curve_uses_existing_trade_sequence() -> None:
+    trades = [_trade("BTC", 1, 10, 2.5), _trade("ETH", 2, 20, -1.0), _trade("SOL", 3, 30, 0.0)]
+
+    rows, summary = _money_equity_curve(trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0)
+
+    assert [row["pnl_usdt"] for row in rows] == [125.0, -50.0, 0.0]
+    assert [row["equity_usdt"] for row in rows] == [1125.0, 1075.0, 1075.0]
+    assert [row["drawdown_usdt"] for row in rows] == [0.0, 50.0, 50.0]
+    assert summary == {
+        "initial_capital_usdt": 1000.0,
+        "fixed_position_size_usdt": 50.0,
+        "final_equity_usdt": 1075.0,
+        "total_pnl_usdt": 75.0,
+        "max_drawdown_usdt": 50.0,
+        "max_drawdown_percent": 4.444444,
+    }
+
+
+def test_optional_monthly_money_returns_follow_money_equity_rows() -> None:
+    jan = 1704067200
+    feb = 1706745600
+    trades = [_trade("BTC", jan - 1, jan, 2.5), _trade("ETH", feb - 1, feb, -1.0)]
+    money_rows, _ = _money_equity_curve(trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0)
+
+    assert _monthly_money_rows(money_rows, initial_capital_usdt=1000.0) == [
+        {
+            "month": "2024-01",
+            "starting_equity_usdt": 1000.0,
+            "ending_equity_usdt": 1125.0,
+            "pnl_usdt": 125.0,
+            "return_percent": 12.5,
+            "trades": 1,
+        },
+        {
+            "month": "2024-02",
+            "starting_equity_usdt": 1125.0,
+            "ending_equity_usdt": 1075.0,
+            "pnl_usdt": -50.0,
+            "return_percent": -4.444444,
+            "trades": 1,
+        },
+    ]
 
 
 def test_losing_flat_and_non_winning_streaks() -> None:
@@ -189,6 +235,8 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     )
 
     assert {path.name for path in output.iterdir()} == set(OUTPUT_NAMES)
+    assert not (output / "equity_curve_usdt.csv").exists()
+    assert not (output / "monthly_returns_usdt.csv").exists()
     trades = list(csv.DictReader((output / "portfolio_reality_trade_sequence.csv").open()))
     assert len(trades) == 2
     assert trades[0]["result_R"] == "2.5"
@@ -209,3 +257,67 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     source = Path("research_v2/patterns/pole_portfolio_reality_audit.py").read_text()
     assert "live_binance_forward_trader" not in source
     assert "strategy_historical_backfill" not in source
+
+
+def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outputs(tmp_path: Path) -> None:
+    labels, columns, candles = _write_fixture(tmp_path)
+    output = tmp_path / "output"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.pole_portfolio_reality_audit",
+            "--symbol-input",
+            f"BTC={labels}",
+            "--columns-input",
+            f"BTC={columns}",
+            "--candles-input",
+            f"BTC={candles}",
+            "--output-root",
+            str(output),
+            "--initial-capital",
+            "1000",
+            "--fixed-position-size",
+            "50",
+        ],
+        check=True,
+    )
+
+    assert {path.name for path in output.iterdir()} == {*OUTPUT_NAMES, "equity_curve_usdt.csv", "monthly_returns_usdt.csv"}
+    summary = (output / "portfolio_reality_summary.md").read_text()
+    assert "- `final_equity_usdt`: 1125.0" in summary
+    assert "- `total_pnl_usdt`: 125.0" in summary
+    assert "- `max_drawdown_usdt`: 0.0" in summary
+    assert "- `max_drawdown_percent`: 0.0" in summary
+
+    money_rows = list(csv.DictReader((output / "equity_curve_usdt.csv").open()))
+    assert [row["pnl_usdt"] for row in money_rows] == ["125.0", "0.0"]
+    assert [row["equity_usdt"] for row in money_rows] == ["1125.0", "1125.0"]
+
+    monthly_rows = list(csv.DictReader((output / "monthly_returns_usdt.csv").open()))
+    assert monthly_rows == [
+        {
+            "month": "1970-01",
+            "starting_equity_usdt": "1000.0",
+            "ending_equity_usdt": "1125.0",
+            "pnl_usdt": "125.0",
+            "return_percent": "12.5",
+            "trades": "2",
+        }
+    ]
+
+    manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
+    assert manifest["verdict"] == "INSUFFICIENT_DATA"
+    assert manifest["money_simulation"] == {
+        "enabled": True,
+        "initial_capital_usdt": 1000.0,
+        "fixed_position_size_usdt": 50.0,
+        "summary": {
+            "final_equity_usdt": 1125.0,
+            "total_pnl_usdt": 125.0,
+            "max_drawdown_usdt": 0.0,
+            "max_drawdown_percent": 0.0,
+        },
+        "artifacts": ["equity_curve_usdt.csv", "monthly_returns_usdt.csv"],
+    }
