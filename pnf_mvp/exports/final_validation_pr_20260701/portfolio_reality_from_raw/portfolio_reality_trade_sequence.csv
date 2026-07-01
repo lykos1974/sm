@@ -1,0 +1,2 @@
+trade_id,opportunity_id,symbol,direction,entry_timestamp,entry_time_utc,exit_timestamp,exit_time_utc,classification,result_R,cumulative_R,active_positions_at_entry,active_risk_R_at_entry,entry_price,stop_price,risk_per_unit,fixed_risk_usdt,position_qty,approximate_notional_usdt
+TRADE-000001,OPP-000001,BTC,LONG,1774827419999,2026-03-29T23:36:59.999000+00:00,1774830059999,2026-03-30T00:20:59.999000+00:00,TARGET_FIRST,2.5,2.5,0,0.0,65898.53,65598.53,300.0,50.0,0.166667,10983.088333
