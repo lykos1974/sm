@@ -1,0 +1,2 @@
+pattern_name,status,pole_column_index,reversal_column_index,pole_boxes,retrace_boxes,retrace_ratio,breakout_excess_boxes,direction_bias,risk_note,is_diagnostic_only,opposing_pole_nearby,opposing_pole_role,opposing_pole_partner_index,opposing_pole_distance_columns,enhanced_by_opposing_pole
+LOW_POLE,OVERRETRACE_POLE,2,3,12,15,1.25,8,BULLISH,Diagnostic reversal warning after >50% retrace of pole column.,True,False,NONE,,,False

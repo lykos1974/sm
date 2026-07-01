@@ -1,0 +1,5 @@
+flag,severity,details
+RESEARCH_ONLY,INFO,"portfolio audit only; no production strategy, live trading, or execution parameter changes"
+NO_PROMOTION,INFO,allowed verdicts never include PROMOTE
+SYMBOL_CONCENTRATION,HIGH,BTC contributes 100.0% of total_R
+PERIOD_CONCENTRATION,HIGH,2026-03 contributes 100.0% of total_R

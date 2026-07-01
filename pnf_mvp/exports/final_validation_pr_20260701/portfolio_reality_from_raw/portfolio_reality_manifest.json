@@ -1,0 +1,90 @@
+{
+  "allowed_verdicts": [
+    "PORTFOLIO_READY_RESEARCH",
+    "PORTFOLIO_PROMISING_BUT_RISKY",
+    "PORTFOLIO_FRAGILE",
+    "INSUFFICIENT_DATA"
+  ],
+  "artifacts": [
+    "portfolio_reality_summary.md",
+    "portfolio_reality_trade_sequence.csv",
+    "portfolio_reality_equity_curve.csv",
+    "portfolio_reality_symbol_contribution.csv",
+    "portfolio_reality_monthly.csv",
+    "portfolio_reality_quarterly.csv",
+    "portfolio_reality_flags.csv",
+    "equity_curve_usdt.csv",
+    "monthly_returns_usdt.csv"
+  ],
+  "break_even_after_R": 2.0,
+  "created_at_utc": "2026-07-01T22:42:46.257200+00:00",
+  "entry": "NEXT_COLUMN_OPEN_ENTRY",
+  "input_observations": 1,
+  "management_rules": {
+    "pyramiding": false,
+    "scaling": false,
+    "tp1": false,
+    "tp2": false,
+    "trailing": false
+  },
+  "money_simulation": {
+    "artifacts": [
+      "equity_curve_usdt.csv",
+      "monthly_returns_usdt.csv"
+    ],
+    "enabled": true,
+    "fixed_position_size_usdt": 50.0,
+    "initial_capital_usdt": 1000.0,
+    "summary": {
+      "final_equity_usdt": 1125.0,
+      "max_drawdown_percent": 0.0,
+      "max_drawdown_usdt": 0.0,
+      "total_pnl_usdt": 125.0
+    }
+  },
+  "not_production": true,
+  "notional_sizing_validation": {
+    "enabled": true,
+    "fixed_risk_usdt_source": "--fixed-position-size money simulation 1R amount",
+    "formula": "position_qty = fixed_risk_usdt / abs(entry_price - stop_price)",
+    "missing_or_invalid_geometry_trades": 0,
+    "sizable_trades": 1
+  },
+  "positioning_assumption": "one position per symbol; simultaneous positions across symbols allowed",
+  "production_modifications": false,
+  "research_only": true,
+  "resolved_portfolio_trades": 1,
+  "risk_assumption": "1R fixed fractional per trade; no compounding; R-based equity curve",
+  "stage": "pole_portfolio_reality_audit",
+  "stop": "fixed_3_box_stop",
+  "strategy_promotion": false,
+  "summary_metrics": {
+    "average_R_per_trade": 2.5,
+    "average_active_risk_R": 1.0,
+    "entries_over_2R_active_risk": 0,
+    "entries_over_2R_active_risk_rate": 0.0,
+    "longest_flat_BE_streak": 0,
+    "longest_losing_streak": 0,
+    "longest_non_winning_streak": 0,
+    "max_concurrent_positions": 1,
+    "max_drawdown_R": 0.0,
+    "max_drawdown_percent_of_peak_R": 0.0,
+    "median_R_per_trade": 2.5,
+    "median_concurrent_positions": 1.0,
+    "p90_concurrent_positions": 1.0,
+    "peak_active_risk_R": 1.0,
+    "recovery_time_after_drawdown": "",
+    "total_R": 2.5
+  },
+  "symbols": [
+    "BNB",
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP"
+  ],
+  "target_R": 2.5,
+  "unique_opportunities": 1,
+  "verdict": "INSUFFICIENT_DATA",
+  "verdict_reason": "fewer than 30 resolved portfolio trades are available"
+}

@@ -1,0 +1,2 @@
+sequence,exit_timestamp,exit_time_utc,symbol,result_R,fixed_position_size_usdt,pnl_usdt,equity_usdt,drawdown_usdt,drawdown_percent
+1,1774830059999,2026-03-30T00:20:59.999000+00:00,BTC,2.5,50.0,125.0,1125.0,0.0,0.0
