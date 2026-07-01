@@ -321,3 +321,107 @@ def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outp
         },
         "artifacts": ["equity_curve_usdt.csv", "monthly_returns_usdt.csv"],
     }
+
+
+def test_cost_adjusted_money_curve_reduces_final_equity_and_preserves_gross_sequence() -> None:
+    from research_v2.patterns.pole_portfolio_reality_audit import _cost_adjusted_equity_curve
+
+    trades = [_trade("BTC", 1, 10, 2.5), _trade("ETH", 2, 20, -1.0), _trade("SOL", 3, 30, 0.0)]
+    gross_rows, gross_summary = _money_equity_curve(trades, initial_capital_usdt=1000.0, fixed_position_size_usdt=50.0)
+
+    cost_rows, cost_summary = _cost_adjusted_equity_curve(trades, 1000.0, 50.0, fee_bps=10.0, slippage_bps=5.0)
+
+    assert [row["gross_pnl_usdt"] for row in cost_rows] == [row["pnl_usdt"] for row in gross_rows]
+    assert [row["total_cost_usdt"] for row in cost_rows] == [0.15, 0.15, 0.15]
+    assert cost_summary["gross_pnl_usdt"] == gross_summary["total_pnl_usdt"]
+    assert cost_summary["total_cost_usdt"] == 0.45
+    assert cost_summary["final_net_equity_usdt"] < gross_summary["final_equity_usdt"]
+    assert cost_summary["notional_assumption"] == (
+        "approximate_notional_usdt uses fixed_position_size_usdt because trade-level notional is not available in the resolved portfolio baseline"
+    )
+
+
+def test_cli_cost_arguments_require_money_simulation(tmp_path: Path) -> None:
+    labels, columns, candles = _write_fixture(tmp_path)
+    output = tmp_path / "output"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.pole_portfolio_reality_audit",
+            "--symbol-input",
+            f"BTC={labels}",
+            "--columns-input",
+            f"BTC={columns}",
+            "--candles-input",
+            f"BTC={candles}",
+            "--output-root",
+            str(output),
+            "--fee-bps",
+            "10",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "--fee-bps and --slippage-bps are only valid when money simulation is enabled" in result.stderr
+    assert not output.exists()
+
+
+def test_cli_cost_simulation_adds_cost_artifacts_manifest_assumptions_and_no_promotion(tmp_path: Path) -> None:
+    labels, columns, candles = _write_fixture(tmp_path)
+    output = tmp_path / "output"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.pole_portfolio_reality_audit",
+            "--symbol-input",
+            f"BTC={labels}",
+            "--columns-input",
+            f"BTC={columns}",
+            "--candles-input",
+            f"BTC={candles}",
+            "--output-root",
+            str(output),
+            "--initial-capital",
+            "1000",
+            "--fixed-position-size",
+            "50",
+            "--fee-bps",
+            "10",
+            "--slippage-bps",
+            "5",
+        ],
+        check=True,
+    )
+
+    assert "cost_adjusted_equity_curve_usdt.csv" in {path.name for path in output.iterdir()}
+    gross_rows = list(csv.DictReader((output / "equity_curve_usdt.csv").open()))
+    cost_rows = list(csv.DictReader((output / "cost_adjusted_equity_curve_usdt.csv").open()))
+    assert [row["result_R"] for row in cost_rows] == [row["result_R"] for row in gross_rows]
+    assert [row["gross_pnl_usdt"] for row in cost_rows] == [row["pnl_usdt"] for row in gross_rows]
+    assert float(cost_rows[-1]["net_equity_usdt"]) < float(gross_rows[-1]["equity_usdt"])
+
+    manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
+    summary = manifest["cost_adjusted_summary"]
+    assert summary["fee_bps"] == 10.0
+    assert summary["slippage_bps"] == 5.0
+    assert summary["total_cost_usdt"] == 0.3
+    assert summary["notional_assumption"] == (
+        "approximate_notional_usdt uses fixed_position_size_usdt because trade-level notional is not available in the resolved portfolio baseline"
+    )
+    assert summary["cost_timing_assumption"] == "fee and slippage bps are charged on approximate notional for entry and exit"
+    assert summary["artifacts"] == ["cost_adjusted_equity_curve_usdt.csv"]
+    assert manifest["strategy_promotion"] is False
+    assert manifest["production_modifications"] is False
+    assert "PROMOTE" not in manifest["allowed_verdicts"]
+
+    summary_md = (output / "portfolio_reality_summary.md").read_text()
+    assert "## Cost-adjusted money simulation (USDT)" in summary_md
+    assert "- `net_pnl_usdt`: 124.7" in summary_md
+    assert "- `total_cost_usdt`: 0.3" in summary_md
