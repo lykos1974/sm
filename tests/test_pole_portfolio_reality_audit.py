@@ -617,6 +617,7 @@ def test_cli_trade_sequence_mode_runs_money_and_cost_without_raw_inputs(
         "monthly_returns_usdt.csv",
         "cost_adjusted_equity_curve.csv",
     }
+    assert not (output / "portfolio_reality_trade_sequence_sizing.csv").exists()
     money_rows = list(csv.DictReader((output / "money_equity_curve.csv").open()))
     cost_rows = list(csv.DictReader((output / "cost_adjusted_equity_curve.csv").open()))
     assert [row["pnl_usdt"] for row in money_rows] == ["125.0", "-50.0", "0.0"]
@@ -631,6 +632,8 @@ def test_cli_trade_sequence_mode_runs_money_and_cost_without_raw_inputs(
     )
     assert manifest["input_trade_sequence"] == str(trade_sequence)
     assert manifest["resolved_portfolio_trades"] == 3
+    assert manifest["sizing_available"] is False
+    assert "missing required sizing column" in manifest["missing_sizing_reason"]
     assert manifest["money_simulation"]["summary"]["final_equity_usdt"] == 1075.0
     assert manifest["cost_adjusted_summary"]["final_net_equity_usdt"] == 1074.55
 
@@ -662,3 +665,62 @@ def test_cli_trade_sequence_mode_does_not_require_raw_inputs(tmp_path: Path) -> 
 
     assert (output / "money_equity_curve.csv").exists()
     assert not (output / "cost_adjusted_equity_curve.csv").exists()
+    assert not (output / "portfolio_reality_trade_sequence_sizing.csv").exists()
+
+    manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
+    assert manifest["sizing_available"] is False
+    assert "missing required sizing column" in manifest["missing_sizing_reason"]
+
+
+def test_cli_trade_sequence_mode_emits_sizing_for_enriched_input_without_r_changes(
+    tmp_path: Path,
+) -> None:
+    trade_sequence = tmp_path / "portfolio_reality_trade_sequence.csv"
+    trade_sequence.write_text(
+        "trade_id,symbol,entry_timestamp,exit_timestamp,result_R,cumulative_R,entry_price,stop_price\n"
+        "TRADE-000001,BTC,1,10,2.5,2.5,100,97\n"
+        "TRADE-000002,ETH,2,20,-1.0,1.5,50,55\n"
+    )
+    output = tmp_path / "output"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "research_v2.patterns.pole_portfolio_reality_audit",
+            "--trade-sequence",
+            str(trade_sequence),
+            "--output-root",
+            str(output),
+            "--initial-capital",
+            "1000",
+            "--fixed-position-size",
+            "50",
+        ],
+        check=True,
+    )
+
+    money_rows = list(csv.DictReader((output / "money_equity_curve.csv").open()))
+    assert [row["result_R"] for row in money_rows] == ["2.5", "-1.0"]
+    assert [row["pnl_usdt"] for row in money_rows] == ["125.0", "-50.0"]
+    assert [row["equity_usdt"] for row in money_rows] == ["1125.0", "1075.0"]
+
+    sizing_rows = list(
+        csv.DictReader((output / "portfolio_reality_trade_sequence_sizing.csv").open())
+    )
+    assert sizing_rows[0]["result_R"] == "2.5"
+    assert sizing_rows[0]["entry_price"] == "100.0"
+    assert sizing_rows[0]["stop_price"] == "97.0"
+    assert sizing_rows[0]["risk_per_unit"] == "3.0"
+    assert sizing_rows[0]["fixed_risk_usdt"] == "50.0"
+    assert sizing_rows[0]["position_qty"] == "16.666667"
+    assert sizing_rows[0]["approximate_notional_usdt"] == "1666.666667"
+    assert sizing_rows[1]["result_R"] == "-1.0"
+    assert sizing_rows[1]["risk_per_unit"] == "5.0"
+    assert sizing_rows[1]["position_qty"] == "10.0"
+    assert sizing_rows[1]["approximate_notional_usdt"] == "500.0"
+
+    manifest = json.loads((output / "portfolio_reality_manifest.json").read_text())
+    assert manifest["sizing_available"] is True
+    assert manifest["missing_sizing_reason"] == ""
+    assert "portfolio_reality_trade_sequence_sizing.csv" in manifest["artifacts"]
