@@ -1,0 +1,29 @@
+{
+  "live_trading_enabled": false,
+  "dry_run": true,
+  "candles_db_path": "pnf_mvp/pnf_mvp.db",
+  "state_db_path": "live_state.sqlite3",
+  "decisions_log_path": "live_decisions.log",
+  "orders_log_path": "live_orders.log",
+  "trade_plan_csv_path": "current_trade_plan.csv",
+  "fixed_risk_usdt": "1.0",
+  "max_open_positions": 1,
+  "max_daily_loss_usdt": "3.0",
+  "max_notional_usdt": "25.0",
+  "entry_order_type": "MARKET",
+  "mexc_base_url": "https://contract.mexc.com",
+  "allowed_symbols": [
+    "MEXC_FUT:BTCUSDT",
+    "MEXC_FUT:ETHUSDT",
+    "MEXC_FUT:SOLUSDT",
+    "MEXC_FUT:SUIUSDT",
+    "MEXC_FUT:ENAUSDT"
+  ],
+  "box_sizes": {
+    "MEXC_FUT:BTCUSDT": 100.0,
+    "MEXC_FUT:ETHUSDT": 10.0,
+    "MEXC_FUT:SOLUSDT": 1.0,
+    "MEXC_FUT:SUIUSDT": 0.01,
+    "MEXC_FUT:ENAUSDT": 0.001
+  }
+}
