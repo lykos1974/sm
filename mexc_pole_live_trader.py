@@ -34,6 +34,7 @@ from research_v2.patterns import mexc_pole_strategy_v1 as strategy  # noqa: E402
 
 MEXC_API_KEY_ENV = "MEXC_FUTURES_API_KEY"
 MEXC_API_SECRET_ENV = "MEXC_FUTURES_API_SECRET"
+MEXC_CREDENTIALS_FILE = Path("mexc_credentials.json")
 DEFAULT_ALLOWED_SYMBOLS = tuple(strategy.TARGET_SYMBOLS)
 OPEN_STATUSES = {"ENTRY_SENT", "OPEN", "STOP_UNVERIFIED", "BE_MOVED"}
 TERMINAL_STATUSES = {"CLOSED", "DRY_RUN", "BLOCKED", "KILLED"}
@@ -114,6 +115,35 @@ class ExchangeClient(Protocol):
     def replace_stop_to_break_even(self, trade_id: int, plan: TradePlan) -> dict[str, Any]: ...
     def get_mark_price(self, venue_symbol: str) -> Decimal: ...
     def sync_trade(self, row: sqlite3.Row) -> dict[str, Any]: ...
+
+
+def load_mexc_credentials(credentials_path: Path = MEXC_CREDENTIALS_FILE) -> tuple[str | None, str | None, str]:
+    """Load MEXC credentials from a local file first, then environment variables.
+
+    Returns the API key, API secret, and a non-secret source label suitable for
+    logs or error messages.  Secret values must never be logged by callers.
+    """
+    if credentials_path.exists():
+        try:
+            raw = json.loads(credentials_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid MEXC credentials file JSON: {credentials_path}") from exc
+        api_key = raw.get("api_key")
+        api_secret = raw.get("api_secret")
+        if not isinstance(api_key, str) or not api_key.strip() or not isinstance(api_secret, str) or not api_secret.strip():
+            raise RuntimeError(f"MEXC credentials file must define non-empty api_key and api_secret: {credentials_path}")
+        return api_key.strip(), api_secret.strip(), str(credentials_path)
+
+    api_key = os.environ.get(MEXC_API_KEY_ENV)
+    api_secret = os.environ.get(MEXC_API_SECRET_ENV)
+    if api_key and api_secret:
+        return api_key, api_secret, "environment"
+    return None, None, "missing"
+
+
+def has_mexc_credentials() -> bool:
+    api_key, api_secret, _source = load_mexc_credentials()
+    return bool(api_key and api_secret)
 
 
 class MexcFuturesClient:
@@ -378,8 +408,8 @@ def execute_plan(plan: TradePlan, config: LiveConfig, client: ExchangeClient) ->
     if config.dry_run or not config.live_trading_enabled:
         audit(config.orders_log_path, "DRY_RUN_ORDER_BLOCKED", {"live_trading_enabled": config.live_trading_enabled, "dry_run": config.dry_run, "plan": plan.__dict__})
         return "DRY_RUN"
-    if not (os.environ.get(MEXC_API_KEY_ENV) and os.environ.get(MEXC_API_SECRET_ENV)):
-        return "LIVE_FLAG_REQUIRES_API_ENV"
+    if not has_mexc_credentials():
+        return "LIVE_FLAG_REQUIRES_MEXC_CREDENTIALS"
     with sqlite3.connect(config.state_db_path) as conn:
         try:
             conn.execute("INSERT INTO trades(opportunity_id,symbol,status,entry_price,stop_price,target_price,be_trigger_price,qty,notional_usdt,opened_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (plan.opportunity_id, plan.symbol, "ENTRY_SENT", str(plan.entry_price), str(plan.stop_price), str(plan.target_price), str(plan.break_even_trigger_price), str(plan.position_qty), str(plan.notional_usdt), datetime.now(UTC).isoformat()))
@@ -445,7 +475,8 @@ def sync_open_trades(config: LiveConfig, client: ExchangeClient) -> None:
 def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[str]:
     init_state(config.state_db_path)
     if client is None:
-        client = MexcFuturesClient(os.environ.get(MEXC_API_KEY_ENV), os.environ.get(MEXC_API_SECRET_ENV), config.mexc_base_url)
+        api_key, api_secret, _source = load_mexc_credentials()
+        client = MexcFuturesClient(api_key, api_secret, config.mexc_base_url)
     if config.live_trading_enabled and not config.dry_run:
         reconcile_from_exchange(config, client)
     sync_open_trades(config, client)

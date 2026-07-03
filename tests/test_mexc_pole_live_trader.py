@@ -185,3 +185,46 @@ def test_stop_unverified_blocks_all_new_trades(tmp_path):
         conn.execute("INSERT INTO trades(opportunity_id,symbol,status,entry_price,stop_price,target_price,be_trigger_price,qty,notional_usdt,opened_at) VALUES ('bad','MEXC_FUT:BTCUSDT','STOP_UNVERIFIED','100','99','102.5','102','1','100',datetime('now'))")
     ok, reason = trader.can_open(plan(opportunity_id="new", symbol="MEXC_FUT:ETHUSDT"), c)
     assert not ok and reason == "STOP_UNVERIFIED_BLOCK"
+
+
+def test_mexc_credentials_file_takes_priority_over_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(trader.MEXC_API_KEY_ENV, "env-key")
+    monkeypatch.setenv(trader.MEXC_API_SECRET_ENV, "env-secret")
+    (tmp_path / "mexc_credentials.json").write_text('{"api_key":"file-key","api_secret":"file-secret"}')
+
+    api_key, api_secret, source = trader.load_mexc_credentials()
+
+    assert (api_key, api_secret) == ("file-key", "file-secret")
+    assert source == "mexc_credentials.json"
+
+
+def test_mexc_credentials_env_fallback(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(trader.MEXC_API_KEY_ENV, "env-key")
+    monkeypatch.setenv(trader.MEXC_API_SECRET_ENV, "env-secret")
+
+    api_key, api_secret, source = trader.load_mexc_credentials()
+
+    assert (api_key, api_secret) == ("env-key", "env-secret")
+    assert source == "environment"
+
+
+def test_mexc_credentials_missing_reports_no_secret_source(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(trader.MEXC_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(trader.MEXC_API_SECRET_ENV, raising=False)
+
+    assert trader.load_mexc_credentials() == (None, None, "missing")
+
+
+def test_live_orders_allowed_with_credentials_file_without_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(trader.MEXC_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(trader.MEXC_API_SECRET_ENV, raising=False)
+    (tmp_path / "mexc_credentials.json").write_text('{"api_key":"file-key","api_secret":"file-secret"}')
+    c = cfg(tmp_path, live_trading_enabled=True, dry_run=False, max_notional_usdt=Decimal("1000"))
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "OPEN"
+    assert [o[0] for o in client.orders] == ["entry", "stop", "target"]
