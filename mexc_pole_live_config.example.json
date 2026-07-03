@@ -12,6 +12,6 @@
     "MEXC_FUT:SUIUSDT",
     "MEXC_FUT:ENAUSDT"
   ],
-  "api_key_env": "MEXC_API_KEY",
-  "api_secret_env": "MEXC_API_SECRET"
+  "api_key_env": "MEXC_FUTURES_API_KEY",
+  "api_secret_env": "MEXC_FUTURES_API_SECRET"
 }

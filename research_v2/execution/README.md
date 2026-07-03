@@ -23,8 +23,17 @@ python mexc_pole_live_trader.py --config mexc_pole_live_config.example.json
 Required credential environment variable names documented by the example:
 
 ```bash
-export MEXC_API_KEY="<your-mexc-api-key>"
-export MEXC_API_SECRET="<your-mexc-api-secret>"
+export MEXC_FUTURES_API_KEY="<your-mexc-api-key>"
+export MEXC_FUTURES_API_SECRET="<your-mexc-api-secret>"
+```
+
+Alternatively, place credentials in a local `mexc_credentials.json` file at the repository root; this file takes priority over environment variables and must not be committed:
+
+```json
+{
+  "api_key": "<your-mexc-api-key>",
+  "api_secret": "<your-mexc-api-secret>"
+}
 ```
 
 The example remains dry-run only until the config is deliberately changed away from the documented safe defaults.
