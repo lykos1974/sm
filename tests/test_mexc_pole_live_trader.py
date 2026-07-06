@@ -63,6 +63,11 @@ def plan(**kw):
     return trader.TradePlan(**base)
 
 
+@pytest.fixture(autouse=True)
+def parity_matches(monkeypatch):
+    monkeypatch.setattr(trader, "recompute_research_plan_for_live", lambda live_plan, config, client: live_plan)
+
+
 def test_dry_run_cannot_place_real_orders(tmp_path):
     c = cfg(tmp_path, live_trading_enabled=True, dry_run=True)
     client = FakeClient()
@@ -228,3 +233,73 @@ def test_live_orders_allowed_with_credentials_file_without_env(tmp_path, monkeyp
 
     assert trader.execute_plan(plan(), c, client) == "OPEN"
     assert [o[0] for o in client.orders] == ["entry", "stop", "target"]
+
+
+def test_matching_live_research_plan_passes(tmp_path, monkeypatch):
+    monkeypatch.setenv(trader.MEXC_API_KEY_ENV, "k")
+    monkeypatch.setenv(trader.MEXC_API_SECRET_ENV, "s")
+    c = cfg(tmp_path, live_trading_enabled=True, dry_run=False, max_notional_usdt=Decimal("1000"))
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "OPEN"
+    assert [order[0] for order in client.orders] == ["entry", "stop", "target"]
+    assert "PARITY_PASSED" in c.decisions_log_path.read_text()
+
+
+def test_mismatched_entry_blocks_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        trader, "recompute_research_plan_for_live", lambda live_plan, config, client: plan(entry_price=Decimal("100.01"))
+    )
+    c = cfg(tmp_path, live_trading_enabled=False, dry_run=True)
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "PARITY_FAILED"
+    assert client.orders == []
+    assert "PARITY_FAILED" in c.decisions_log_path.read_text()
+
+
+def test_mismatched_stop_blocks_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        trader, "recompute_research_plan_for_live", lambda live_plan, config, client: plan(stop_price=Decimal("98.99"))
+    )
+    c = cfg(tmp_path, live_trading_enabled=False, dry_run=True)
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "PARITY_FAILED"
+    assert client.orders == []
+
+
+def test_parity_unavailable_blocks_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(trader, "recompute_research_plan_for_live", lambda live_plan, config, client: None)
+    c = cfg(tmp_path, live_trading_enabled=False, dry_run=True)
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "PARITY_UNAVAILABLE"
+    assert client.orders == []
+    assert "PARITY_UNAVAILABLE" in c.decisions_log_path.read_text()
+
+
+def test_live_mode_parity_failure_triggers_kill_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv(trader.MEXC_API_KEY_ENV, "k")
+    monkeypatch.setenv(trader.MEXC_API_SECRET_ENV, "s")
+    monkeypatch.setattr(
+        trader, "recompute_research_plan_for_live", lambda live_plan, config, client: plan(entry_price=Decimal("100.01"))
+    )
+    c = cfg(tmp_path, live_trading_enabled=True, dry_run=False, max_notional_usdt=Decimal("1000"))
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "PARITY_FAILED"
+    assert trader.is_killed(c.state_db_path)
+    assert client.orders == []
+
+
+def test_dry_run_parity_failure_does_not_place_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        trader, "recompute_research_plan_for_live", lambda live_plan, config, client: plan(stop_price=Decimal("98.99"))
+    )
+    c = cfg(tmp_path, live_trading_enabled=False, dry_run=True)
+    client = FakeClient()
+
+    assert trader.execute_plan(plan(), c, client) == "PARITY_FAILED"
+    assert client.orders == []
+    assert not trader.is_killed(c.state_db_path)
