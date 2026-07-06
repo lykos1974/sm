@@ -106,6 +106,10 @@ class TradePlan:
 
 
 class ExchangeClient(Protocol):
+    def authenticate(self) -> dict[str, Any]: ...
+    def query_account(self) -> dict[str, Any]: ...
+    def query_all_positions(self) -> list[dict[str, Any]]: ...
+    def query_all_open_orders(self) -> list[dict[str, Any]]: ...
     def get_contract_spec(self, venue_symbol: str) -> ContractSpec: ...
     def place_entry(self, plan: TradePlan, order_type: str) -> dict[str, Any]: ...
     def place_stop(self, plan: TradePlan) -> dict[str, Any]: ...
@@ -179,6 +183,23 @@ class MexcFuturesClient:
                 return json.loads(res.read().decode())
         except (urllib.error.URLError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"MEXC request failed: {exc}") from exc
+
+    def authenticate(self) -> dict[str, Any]:
+        return self.query_account()
+
+    def query_account(self) -> dict[str, Any]:
+        data = self._request("GET", "/api/v1/private/account/assets", signed=True).get("data", {})
+        return data if isinstance(data, dict) else {"data": data}
+
+    def query_all_positions(self) -> list[dict[str, Any]]:
+        data = self._request("GET", "/api/v1/private/position/open_positions", signed=True).get("data", [])
+        return data if isinstance(data, list) else []
+
+    def query_all_open_orders(self) -> list[dict[str, Any]]:
+        data = self._request("GET", "/api/v1/private/order/list/open_orders", signed=True, params={"page_num": 1, "page_size": 100}).get("data", [])
+        if isinstance(data, dict):
+            data = data.get("resultList", [])
+        return data if isinstance(data, list) else []
 
     def get_contract_spec(self, venue_symbol: str) -> ContractSpec:
         # Conservative fallback; tests inject exact specs. Live operators should verify contract metadata first.
@@ -575,6 +596,42 @@ def sync_open_trades(config: LiveConfig, client: ExchangeClient) -> None:
             with sqlite3.connect(config.state_db_path) as conn: conn.execute("UPDATE trades SET be_moved=1,status='BE_MOVED',stop_price=? WHERE id=?", (str(plan.entry_price), row["id"]))
 
 
+def run_health_check(config: LiveConfig, client: ExchangeClient | None = None) -> bool:
+    step = "Credentials"
+    try:
+        api_key, api_secret, _source = load_mexc_credentials()
+        if not (api_key and api_secret):
+            raise RuntimeError("missing MEXC futures API credentials")
+        print("PASS Credentials")
+
+        if client is None:
+            client = MexcFuturesClient(api_key, api_secret, config.mexc_base_url)
+
+        step = "Authentication"
+        client.authenticate()
+        print("PASS Authentication")
+
+        step = "Account"
+        client.query_account()
+        print("PASS Account")
+
+        step = "Positions"
+        client.query_all_positions()
+        print("PASS Positions")
+
+        step = "Open Orders"
+        client.query_all_open_orders()
+        print("PASS Open Orders")
+
+        print("OVERALL: READY")
+        return True
+    except Exception as exc:
+        print(f"FAIL {step}")
+        print(f"Reason: {exc}")
+        print("OVERALL: NOT_READY")
+        return False
+
+
 def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[str]:
     init_state(config.state_db_path)
     if client is None:
@@ -596,8 +653,12 @@ def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[s
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live MEXC Pole Trader v1")
     parser.add_argument("--config", type=Path, default=Path("mexc_pole_live_config.example.json"))
+    parser.add_argument("--health-check", action="store_true", help="Verify MEXC futures credentials and read-only account access, then exit")
     args = parser.parse_args()
-    for result in run_once(LiveConfig.from_json(args.config)):
+    config = LiveConfig.from_json(args.config)
+    if args.health_check:
+        raise SystemExit(0 if run_health_check(config) else 1)
+    for result in run_once(config):
         print(result)
 
 
