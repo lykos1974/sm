@@ -38,6 +38,7 @@ MEXC_CREDENTIALS_FILE = Path("mexc_credentials.json")
 DEFAULT_ALLOWED_SYMBOLS = tuple(strategy.TARGET_SYMBOLS)
 OPEN_STATUSES = {"ENTRY_SENT", "OPEN", "STOP_UNVERIFIED", "BE_MOVED"}
 TERMINAL_STATUSES = {"CLOSED", "DRY_RUN", "BLOCKED", "KILLED"}
+PARITY_NUMERIC_TOLERANCE = Decimal("0.000001")
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class TradePlan:
     position_qty: Decimal
     notional_usdt: Decimal
     observable_entry_ts: int
+    source_row_reference: str = ""
 
 
 class ExchangeClient(Protocol):
@@ -275,9 +277,94 @@ def generate_trade_plans(config: LiveConfig, client: ExchangeClient) -> list[Tra
         entry, stop = Decimal(str(row["entry_price"])), Decimal(str(row["stop_price"]))
         qty = compute_qty(entry, stop, config.fixed_risk_usdt, spec)
         notional = qty * entry * spec.contract_size
-        plans.append(TradePlan(row["symbol"], row["direction"], row["source_opportunity_id"], entry, stop, Decimal(str(row["target_price"])), Decimal(str(row["break_even_trigger_price"])), abs(entry-stop), qty, notional, int(row["observable_entry_ts"])))
+        plans.append(
+            TradePlan(
+                row["symbol"],
+                row["direction"],
+                row["source_opportunity_id"],
+                entry,
+                stop,
+                Decimal(str(row["target_price"])),
+                Decimal(str(row["break_even_trigger_price"])),
+                abs(entry - stop),
+                qty,
+                notional,
+                int(row["observable_entry_ts"]),
+                str(row.get("source_row_reference", "")),
+            )
+        )
     return plans
 
+
+@dataclass(frozen=True)
+class ParityCheckResult:
+    status: str
+    checked_at: str
+    error: str = ""
+
+
+def _decimal_close(left: Decimal, right: Decimal) -> bool:
+    return abs(left - right) <= PARITY_NUMERIC_TOLERANCE
+
+
+def recompute_research_plan_for_live(plan: TradePlan, config: LiveConfig, client: ExchangeClient) -> TradePlan | None:
+    """Rebuild the research strategy plan and select the row matching a live plan.
+
+    This is intentionally a thin wrapper around the research strategy pipeline used by
+    ``generate_trade_plans`` so execution cannot proceed from stale or hand-edited plan
+    data.  Prefer exact source opportunity matching; fall back to symbol/direction/time
+    only for artifacts where the source row reference is unavailable.
+    """
+    research_plans = generate_trade_plans(config, client)
+    for research_plan in research_plans:
+        if research_plan.opportunity_id == plan.opportunity_id:
+            return research_plan
+    for research_plan in research_plans:
+        if (
+            research_plan.symbol == plan.symbol
+            and research_plan.direction == plan.direction
+            and research_plan.observable_entry_ts == plan.observable_entry_ts
+        ):
+            return research_plan
+    return None
+
+
+def check_live_strategy_parity(plan: TradePlan, config: LiveConfig, client: ExchangeClient) -> ParityCheckResult:
+    checked_at = datetime.now(UTC).isoformat()
+    try:
+        research_plan = recompute_research_plan_for_live(plan, config, client)
+    except Exception as exc:
+        return ParityCheckResult("PARITY_UNAVAILABLE", checked_at, str(exc))
+    if research_plan is None:
+        return ParityCheckResult("PARITY_UNAVAILABLE", checked_at, "research plan was not generated for live plan")
+
+    mismatches: list[str] = []
+    exact_fields = ("symbol", "direction", "observable_entry_ts", "opportunity_id", "source_row_reference")
+    numeric_fields = (
+        "entry_price",
+        "stop_price",
+        "risk_per_unit",
+        "target_price",
+        "break_even_trigger_price",
+        "position_qty",
+        "notional_usdt",
+    )
+    for field in exact_fields:
+        live_value = getattr(plan, field)
+        research_value = getattr(research_plan, field)
+        if field == "source_row_reference" and not live_value and not research_value:
+            continue
+        if live_value != research_value:
+            mismatches.append(f"{field}: live={live_value} research={research_value}")
+    for field in numeric_fields:
+        live_value = Decimal(str(getattr(plan, field)))
+        research_value = Decimal(str(getattr(research_plan, field)))
+        if not _decimal_close(live_value, research_value):
+            label = "approximate_notional_usdt" if field == "notional_usdt" else field
+            mismatches.append(f"{label}: live={live_value} research={research_value}")
+    if mismatches:
+        return ParityCheckResult("PARITY_FAILED", checked_at, "; ".join(mismatches))
+    return ParityCheckResult("PARITY_PASSED", checked_at, "")
 
 def write_current_plan(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", newline="") as fh:
@@ -405,6 +492,22 @@ def execute_plan(plan: TradePlan, config: LiveConfig, client: ExchangeClient) ->
     ok, reason = can_open(plan, config)
     audit(config.decisions_log_path, "OPEN_CHECK", {"opportunity_id": plan.opportunity_id, "symbol": plan.symbol, "ok": ok, "reason": reason})
     if not ok: return reason
+    parity = check_live_strategy_parity(plan, config, client)
+    audit(
+        config.decisions_log_path,
+        parity.status,
+        {
+            "opportunity_id": plan.opportunity_id,
+            "symbol": plan.symbol,
+            "parity_status": parity.status,
+            "parity_checked_at": parity.checked_at,
+            "parity_error": parity.error,
+        },
+    )
+    if parity.status != "PARITY_PASSED":
+        if config.live_trading_enabled:
+            trigger_kill_switch(config.state_db_path, parity.error or parity.status)
+        return parity.status
     if config.dry_run or not config.live_trading_enabled:
         audit(config.orders_log_path, "DRY_RUN_ORDER_BLOCKED", {"live_trading_enabled": config.live_trading_enabled, "dry_run": config.dry_run, "plan": plan.__dict__})
         return "DRY_RUN"
