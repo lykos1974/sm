@@ -303,3 +303,125 @@ def test_dry_run_parity_failure_does_not_place_orders(tmp_path, monkeypatch):
     assert trader.execute_plan(plan(), c, client) == "PARITY_FAILED"
     assert client.orders == []
     assert not trader.is_killed(c.state_db_path)
+
+
+class FakeHealthClient:
+    def __init__(self, fail_step=None):
+        self.fail_step = fail_step
+        self.calls = []
+
+    def _call(self, name, payload):
+        self.calls.append(name)
+        if self.fail_step == name:
+            raise RuntimeError(f"{name} failed")
+        return payload
+
+    def authenticate(self):
+        return self._call("authenticate", {"ok": True})
+
+    def query_account(self):
+        return self._call("query_account", {"balance": []})
+
+    def query_all_positions(self):
+        return self._call("query_all_positions", [])
+
+    def query_all_open_orders(self):
+        return self._call("query_all_open_orders", [])
+
+
+def test_health_check_ready_is_read_only_and_reports_all_steps(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "mexc_credentials.json").write_text('{"api_key":"file-key","api_secret":"file-secret"}')
+    client = FakeHealthClient()
+
+    assert trader.run_health_check(cfg(tmp_path), client) is True
+
+    assert client.calls == ["authenticate", "query_account", "query_all_positions", "query_all_open_orders"]
+    assert capsys.readouterr().out.splitlines() == [
+        "PASS Credentials",
+        "PASS Authentication",
+        "PASS Account",
+        "PASS Positions",
+        "PASS Open Orders",
+        "OVERALL: READY",
+    ]
+    assert not (tmp_path / "live_state.sqlite3").exists()
+    assert not (tmp_path / "live_decisions.log").exists()
+    assert not (tmp_path / "live_orders.log").exists()
+
+
+def test_health_check_uses_env_credentials_fallback(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(trader.MEXC_API_KEY_ENV, "env-key")
+    monkeypatch.setenv(trader.MEXC_API_SECRET_ENV, "env-secret")
+    client = FakeHealthClient()
+
+    assert trader.run_health_check(cfg(tmp_path), client) is True
+
+    assert client.calls == ["authenticate", "query_account", "query_all_positions", "query_all_open_orders"]
+    assert "OVERALL: READY" in capsys.readouterr().out
+
+
+def test_health_check_missing_credentials_not_ready(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(trader.MEXC_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(trader.MEXC_API_SECRET_ENV, raising=False)
+    client = FakeHealthClient()
+
+    assert trader.run_health_check(cfg(tmp_path), client) is False
+
+    assert client.calls == []
+    assert capsys.readouterr().out.splitlines() == [
+        "FAIL Credentials",
+        "Reason: missing MEXC futures API credentials",
+        "OVERALL: NOT_READY",
+    ]
+
+
+def test_health_check_reports_failing_step(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "mexc_credentials.json").write_text('{"api_key":"file-key","api_secret":"file-secret"}')
+    client = FakeHealthClient(fail_step="query_all_open_orders")
+
+    assert trader.run_health_check(cfg(tmp_path), client) is False
+
+    assert client.calls == ["authenticate", "query_account", "query_all_positions", "query_all_open_orders"]
+    assert capsys.readouterr().out.splitlines() == [
+        "PASS Credentials",
+        "PASS Authentication",
+        "PASS Account",
+        "PASS Positions",
+        "FAIL Open Orders",
+        "Reason: query_all_open_orders failed",
+        "OVERALL: NOT_READY",
+    ]
+
+
+def test_health_check_cli_exit_code_ready(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "mexc_credentials.json").write_text('{"api_key":"file-key","api_secret":"file-secret"}')
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}")
+    monkeypatch.setattr(trader, "MexcFuturesClient", lambda api_key, api_secret, base_url: FakeHealthClient())
+    monkeypatch.setattr("sys.argv", ["mexc_pole_live_trader.py", "--config", str(config_path), "--health-check"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        trader.main()
+
+    assert excinfo.value.code == 0
+    assert "OVERALL: READY" in capsys.readouterr().out
+
+
+def test_health_check_cli_exit_code_not_ready(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}")
+    monkeypatch.delenv(trader.MEXC_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(trader.MEXC_API_SECRET_ENV, raising=False)
+    monkeypatch.setattr("sys.argv", ["mexc_pole_live_trader.py", "--config", str(config_path), "--health-check"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        trader.main()
+
+    assert excinfo.value.code == 1
+    assert "OVERALL: NOT_READY" in capsys.readouterr().out
