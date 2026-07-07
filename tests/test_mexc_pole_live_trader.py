@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import http.client
 import json
 
 import pytest
@@ -71,6 +72,61 @@ def plan(**kw):
 @pytest.fixture(autouse=True)
 def parity_matches(monkeypatch):
     monkeypatch.setattr(trader, "recompute_research_plan_for_live", lambda live_plan, config, client: live_plan)
+
+
+def test_mexc_request_incomplete_read_is_runtime_error(monkeypatch):
+    client = trader.MexcFuturesClient("api-key", "api-secret", "https://contract.mexc.com")
+
+    def raise_incomplete_read(*args, **kwargs):
+        raise http.client.IncompleteRead(b'{"success":', 32)
+
+    monkeypatch.setattr(trader.urllib.request, "urlopen", raise_incomplete_read)
+
+    with pytest.raises(RuntimeError, match="MEXC request failed:") as excinfo:
+        client._request("GET", "/api/v1/private/account/assets", signed=True)
+
+    message = str(excinfo.value)
+    assert "api-key" not in message
+    assert "api-secret" not in message
+
+
+def test_reconcile_query_error_logs_and_does_not_kill_without_unprotected_position(tmp_path):
+    c = cfg(tmp_path, allowed_symbols=("MEXC_FUT:BTCUSDT",))
+    client = FakeClient(positions=[])
+
+    def fail_open_orders(symbol):
+        raise RuntimeError("MEXC request failed: IncompleteRead(10 bytes read)")
+
+    client.query_open_orders = fail_open_orders
+
+    assert trader.reconcile_from_exchange(c, client) == "EXCHANGE_RECONCILE_ERROR"
+    assert not trader.is_killed(c.state_db_path)
+    payload = json.loads(c.decisions_log_path.read_text().splitlines()[0])
+    assert payload["event"] == "EXCHANGE_RECONCILE_ERROR"
+    assert payload["symbol"] == "MEXC_FUT:BTCUSDT"
+    assert payload["step"] == "query_open_orders"
+    assert payload["query"] == "query_open_orders"
+    assert "IncompleteRead" in payload["error"]
+
+
+def test_live_reconcile_error_blocks_trade_execution(tmp_path, monkeypatch):
+    monkeypatch.setenv(trader.MEXC_API_KEY_ENV, "k")
+    monkeypatch.setenv(trader.MEXC_API_SECRET_ENV, "s")
+    c = cfg(tmp_path, live_trading_enabled=True, dry_run=False, max_notional_usdt=Decimal("1000"), allowed_symbols=("MEXC_FUT:BTCUSDT",))
+    client = FakeClient(positions=[])
+
+    def fail_plan_orders(symbol):
+        raise RuntimeError("MEXC request failed: IncompleteRead(10 bytes read)")
+
+    client.query_plan_orders = fail_plan_orders
+    monkeypatch.setattr(trader, "generate_trade_plans", lambda config, exchange_client: [plan()])
+
+    assert trader.run_once(c, client) == ["EXCHANGE_RECONCILE_ERROR"]
+    assert client.orders == []
+    assert not trader.is_killed(c.state_db_path)
+    log = c.decisions_log_path.read_text()
+    assert "EXCHANGE_RECONCILE_ERROR" in log
+    assert "TRADING_BLOCKED" in log
 
 
 def test_config_symbols_key_loads_all_configured_symbols(tmp_path):
