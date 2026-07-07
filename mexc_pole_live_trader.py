@@ -12,6 +12,7 @@ import argparse
 import csv
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import sqlite3
@@ -199,7 +200,7 @@ class MexcFuturesClient:
         try:
             with urllib.request.urlopen(req, timeout=15) as res:
                 return json.loads(res.read().decode())
-        except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, json.JSONDecodeError, http.client.IncompleteRead) as exc:
             raise RuntimeError(f"MEXC request failed: {exc}") from exc
 
     def authenticate(self) -> dict[str, Any]:
@@ -500,12 +501,28 @@ def verify_plan_order_exists(client: ExchangeClient, plan: TradePlan, expected_p
     return False
 
 
-def reconcile_from_exchange(config: LiveConfig, client: ExchangeClient) -> None:
+def _log_reconcile_query_error(config: LiveConfig, symbol: str, query: str, exc: Exception) -> None:
+    audit(config.decisions_log_path, "EXCHANGE_RECONCILE_ERROR", {"symbol": symbol, "step": query, "query": query, "error": str(exc)})
+
+
+def reconcile_from_exchange(config: LiveConfig, client: ExchangeClient) -> str:
     init_state(config.state_db_path)
     for symbol in config.allowed_symbols:
-        positions = _active_position_rows(client, symbol)
-        open_orders = client.query_open_orders(symbol)
-        plan_orders = client.query_plan_orders(symbol)
+        try:
+            positions = _active_position_rows(client, symbol)
+        except Exception as exc:
+            _log_reconcile_query_error(config, symbol, "query_position", exc)
+            return "EXCHANGE_RECONCILE_ERROR"
+        try:
+            open_orders = client.query_open_orders(symbol)
+        except Exception as exc:
+            _log_reconcile_query_error(config, symbol, "query_open_orders", exc)
+            return "EXCHANGE_RECONCILE_ERROR"
+        try:
+            plan_orders = client.query_plan_orders(symbol)
+        except Exception as exc:
+            _log_reconcile_query_error(config, symbol, "query_plan_orders", exc)
+            return "EXCHANGE_RECONCILE_ERROR"
         audit(config.decisions_log_path, "EXCHANGE_RECONCILE", {"symbol": symbol, "positions": len(positions), "open_orders": len(open_orders), "plan_orders": len(plan_orders)})
         for position in positions:
             stop_exists = any(
@@ -524,6 +541,7 @@ def reconcile_from_exchange(config: LiveConfig, client: ExchangeClient) -> None:
                 )
             if not stop_exists:
                 halt_unprotected_position(config, symbol, "exchange position has no verified protective stop after restart")
+    return "OK"
 
 
 def execute_plan(plan: TradePlan, config: LiveConfig, client: ExchangeClient) -> str:
@@ -657,7 +675,10 @@ def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[s
         api_key, api_secret, _source = load_mexc_credentials()
         client = MexcFuturesClient(api_key, api_secret, config.mexc_base_url)
     if config.live_trading_enabled and not config.dry_run:
-        reconcile_from_exchange(config, client)
+        reconcile_result = reconcile_from_exchange(config, client)
+        if reconcile_result != "OK":
+            audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": reconcile_result})
+            return [reconcile_result]
     sync_open_trades(config, client)
     if is_killed(config.state_db_path):
         audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": "KILL_SWITCH_ACTIVE"}); return ["KILL_SWITCH_ACTIVE"]
