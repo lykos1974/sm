@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 
 import pytest
 
@@ -19,6 +20,7 @@ class FakeClient:
         self.positions = positions if positions is not None else [{"positionId": "pos-1", "symbol": "BTCUSDT", "state": 1, "holdVol": "1", "holdAvgPrice": "100"}]
         self.open_orders = open_orders if open_orders is not None else []
         self.query_counts = {"order": 0, "position": 0, "open_orders": 0, "plan_orders": 0}
+        self.queried_symbols = []
         self.be_moves = 0
 
     def get_contract_spec(self, venue_symbol): return self.spec
@@ -31,15 +33,18 @@ class FakeClient:
     def place_target(self, plan): self.orders.append(("target", plan.opportunity_id)); return {"order_id": "target-1"}
     def query_position(self, symbol):
         self.query_counts["position"] += 1
+        self.queried_symbols.append(("position", symbol))
         return self.positions
     def query_open_orders(self, symbol):
         self.query_counts["open_orders"] += 1
+        self.queried_symbols.append(("open_orders", symbol))
         return self.open_orders
     def query_order(self, order_id):
         self.query_counts["order"] += 1
         return {"orderId": order_id, "state": 3, "dealVol": "1"}
     def query_plan_orders(self, symbol):
         self.query_counts["plan_orders"] += 1
+        self.queried_symbols.append(("plan_orders", symbol))
         rows = []
         if self.stop_exists:
             rows.append({"id": "stop-1", "symbol": "BTCUSDT", "state": 1, "stopLossPrice": "99", "vol": "1"})
@@ -66,6 +71,64 @@ def plan(**kw):
 @pytest.fixture(autouse=True)
 def parity_matches(monkeypatch):
     monkeypatch.setattr(trader, "recompute_research_plan_for_live", lambda live_plan, config, client: live_plan)
+
+
+def test_config_symbols_key_loads_all_configured_symbols(tmp_path):
+    config_path = tmp_path / "config.json"
+    configured = ["MEXC_FUT:BTCUSDT", "MEXC_FUT:ETHUSDT", "MEXC_FUT:SOLUSDT"]
+    config_path.write_text(json.dumps({"symbols": configured}))
+
+    c = trader.LiveConfig.from_json(config_path)
+
+    assert c.allowed_symbols == tuple(configured)
+
+
+def test_config_allowed_symbols_fallback_still_works(tmp_path):
+    config_path = tmp_path / "config.json"
+    configured = ["MEXC_FUT:SUIUSDT", "MEXC_FUT:ENAUSDT"]
+    config_path.write_text(json.dumps({"allowed_symbols": configured}))
+
+    c = trader.LiveConfig.from_json(config_path)
+
+    assert c.allowed_symbols == tuple(configured)
+
+
+def test_config_conflicting_symbols_and_allowed_symbols_raises(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"symbols": ["MEXC_FUT:BTCUSDT"], "allowed_symbols": ["MEXC_FUT:ENAUSDT"]}))
+
+    with pytest.raises(ValueError, match="symbols and allowed_symbols both exist but differ"):
+        trader.LiveConfig.from_json(config_path)
+
+
+def test_reconcile_iterates_loaded_symbols(tmp_path):
+    symbols = ("MEXC_FUT:SUIUSDT", "MEXC_FUT:ENAUSDT")
+    c = cfg(tmp_path, allowed_symbols=symbols)
+    client = FakeClient(positions=[])
+
+    trader.reconcile_from_exchange(c, client)
+
+    assert client.queried_symbols == [
+        ("position", "MEXC_FUT:SUIUSDT"),
+        ("open_orders", "MEXC_FUT:SUIUSDT"),
+        ("plan_orders", "MEXC_FUT:SUIUSDT"),
+        ("position", "MEXC_FUT:ENAUSDT"),
+        ("open_orders", "MEXC_FUT:ENAUSDT"),
+        ("plan_orders", "MEXC_FUT:ENAUSDT"),
+    ]
+
+
+def test_run_once_audits_loaded_symbol_universe(tmp_path, monkeypatch):
+    symbols = ("MEXC_FUT:SUIUSDT", "MEXC_FUT:ENAUSDT")
+    c = cfg(tmp_path, allowed_symbols=symbols)
+    monkeypatch.setattr(trader, "generate_trade_plans", lambda config, client: [])
+
+    trader.run_once(c, FakeClient())
+
+    first_line = c.decisions_log_path.read_text().splitlines()[0]
+    payload = json.loads(first_line)
+    assert payload["event"] == "SYMBOL_UNIVERSE_LOADED"
+    assert payload["symbols"] == list(symbols)
 
 
 def test_dry_run_cannot_place_real_orders(tmp_path):

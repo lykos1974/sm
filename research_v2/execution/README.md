@@ -14,6 +14,8 @@ Future work: implement realistic execution simulation mode isolated from researc
 - `max_notional_usdt`: `100.0`
 - `symbols`: `MEXC_FUT:BTCUSDT`, `MEXC_FUT:ETHUSDT`, `MEXC_FUT:SOLUSDT`, `MEXC_FUT:SUIUSDT`, `MEXC_FUT:ENAUSDT`
 
+`symbols` is the canonical live universe key. The legacy `allowed_symbols` key is accepted only as a backward-compatible fallback when `symbols` is absent.
+
 Exact dry-run command:
 
 ```bash
