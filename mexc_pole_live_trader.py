@@ -62,6 +62,7 @@ class LiveConfig:
     @classmethod
     def from_json(cls, path: Path) -> "LiveConfig":
         raw = json.loads(path.read_text())
+        symbols = _configured_symbols(raw)
         return cls(
             live_trading_enabled=bool(raw.get("live_trading_enabled", False)),
             dry_run=bool(raw.get("dry_run", True)),
@@ -76,9 +77,26 @@ class LiveConfig:
             max_notional_usdt=None if raw.get("max_notional_usdt") is None else Decimal(str(raw["max_notional_usdt"])),
             entry_order_type=str(raw.get("entry_order_type", "MARKET")).upper(),
             mexc_base_url=str(raw.get("mexc_base_url", "https://contract.mexc.com")),
-            allowed_symbols=tuple(raw.get("allowed_symbols", DEFAULT_ALLOWED_SYMBOLS)),
+            allowed_symbols=symbols,
             box_sizes={k: float(v) for k, v in raw.get("box_sizes", {}).items()} or None,
         )
+
+
+def _symbol_tuple(value: Any, key: str) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{key} must be a list of symbols")
+    symbols = tuple(str(symbol).strip() for symbol in value if str(symbol).strip())
+    if not symbols:
+        raise ValueError(f"{key} must contain at least one symbol")
+    return symbols
+
+
+def _configured_symbols(raw: dict[str, Any]) -> tuple[str, ...]:
+    symbols = _symbol_tuple(raw["symbols"], "symbols") if "symbols" in raw else None
+    allowed_symbols = _symbol_tuple(raw["allowed_symbols"], "allowed_symbols") if "allowed_symbols" in raw else None
+    if symbols is not None and allowed_symbols is not None and symbols != allowed_symbols:
+        raise ValueError("config keys symbols and allowed_symbols both exist but differ; use symbols as the canonical key")
+    return symbols or allowed_symbols or DEFAULT_ALLOWED_SYMBOLS
 
 
 @dataclass(frozen=True)
@@ -634,6 +652,7 @@ def run_health_check(config: LiveConfig, client: ExchangeClient | None = None) -
 
 def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[str]:
     init_state(config.state_db_path)
+    audit(config.decisions_log_path, "SYMBOL_UNIVERSE_LOADED", {"symbols": list(config.allowed_symbols)})
     if client is None:
         api_key, api_secret, _source = load_mexc_credentials()
         client = MexcFuturesClient(api_key, api_secret, config.mexc_base_url)
