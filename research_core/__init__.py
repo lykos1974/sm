@@ -3,6 +3,7 @@ from .composite_evidence_source import CompositeEvidenceSource
 from .enums import DecisionType, ValidationOutcome
 from .evidence import Evidence
 from .evidence_source import EvidenceSource
+from .funding_rate_evidence_source import FundingRateEvidenceSource, FundingRateProvider
 from .static_evidence_source import StaticEvidenceSource
 from .exceptions import RequiredFieldError, ResearchCoreError
 from .hypothesis import Hypothesis
@@ -17,6 +18,8 @@ __all__ = (
     "CompositeEvidenceSource",
     "Evidence",
     "EvidenceSource",
+    "FundingRateEvidenceSource",
+    "FundingRateProvider",
     "Hypothesis",
     "Knowledge",
     "Observation",
