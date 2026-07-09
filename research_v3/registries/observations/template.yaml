@@ -1,0 +1,20 @@
+id: "TEMPLATE"
+title: ""
+status: "DRAFT"
+classification: "research_baseline_only"
+confidence: "unknown"
+source_artifacts:
+  - artifact_id: ""
+    path: ""
+    availability: "unknown"
+related_records:
+  upstream: []
+  downstream: []
+created_at: "YYYY-MM-DD"
+updated_at: "YYYY-MM-DD"
+owner: ""
+unknown_lost_never_recorded:
+  unknown: []
+  lost: []
+  never_recorded: []
+notes: ""
