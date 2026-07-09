@@ -7,6 +7,7 @@ from research_core import (
     Decision,
     DecisionType,
     Evidence,
+    EvidenceSource,
     Hypothesis,
     Knowledge,
     Observation,
@@ -90,3 +91,29 @@ def test_deterministic_id_helper():
     assert first == second
     assert first.startswith("obs_")
     assert first != different
+
+
+def test_evidence_source_protocol_accepts_structural_producers():
+    class SyntheticEvidenceSource:
+        @property
+        def source_id(self):
+            return "synthetic_source"
+
+        def produce_evidence(self, context):
+            return [Evidence("ev_protocol", tuple(context["observation_ids"]), 0.9, "high", "repeatable")]
+
+    source = SyntheticEvidenceSource()
+    produced = tuple(source.produce_evidence({"observation_ids": ("obs_1",)}))
+
+    assert isinstance(source, EvidenceSource)
+    assert source.source_id == "synthetic_source"
+    assert produced == (Evidence("ev_protocol", ("obs_1",), 0.9, "high", "repeatable"),)
+
+
+def test_evidence_source_protocol_rejects_missing_producer_method():
+    class MissingProducerMethod:
+        @property
+        def source_id(self):
+            return "incomplete_source"
+
+    assert not isinstance(MissingProducerMethod(), EvidenceSource)
