@@ -4,6 +4,7 @@ from .enums import DecisionType, ValidationOutcome
 from .evidence import Evidence
 from .evidence_source import EvidenceSource
 from .funding_rate_evidence_source import FundingRateEvidenceSource, FundingRateProvider
+from .liquidation_evidence_source import LiquidationEvidenceSource, LiquidationProvider
 from .open_interest_evidence_source import OpenInterestEvidenceSource, OpenInterestProvider
 from .static_evidence_source import StaticEvidenceSource
 from .exceptions import RequiredFieldError, ResearchCoreError
@@ -23,6 +24,8 @@ __all__ = (
     "FundingRateProvider",
     "Hypothesis",
     "Knowledge",
+    "LiquidationEvidenceSource",
+    "LiquidationProvider",
     "OpenInterestEvidenceSource",
     "OpenInterestProvider",
     "Observation",
