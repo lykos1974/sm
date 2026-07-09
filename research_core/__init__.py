@@ -2,6 +2,7 @@ from .decision import Decision
 from .enums import DecisionType, ValidationOutcome
 from .evidence import Evidence
 from .evidence_source import EvidenceSource
+from .static_evidence_source import StaticEvidenceSource
 from .exceptions import RequiredFieldError, ResearchCoreError
 from .hypothesis import Hypothesis
 from .ids import deterministic_id
@@ -19,6 +20,7 @@ __all__ = (
     "Observation",
     "RequiredFieldError",
     "ResearchCoreError",
+    "StaticEvidenceSource",
     "Validation",
     "ValidationOutcome",
     "deterministic_id",

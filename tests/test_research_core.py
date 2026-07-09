@@ -12,6 +12,7 @@ from research_core import (
     Knowledge,
     Observation,
     RequiredFieldError,
+    StaticEvidenceSource,
     Validation,
     ValidationOutcome,
     deterministic_id,
@@ -117,3 +118,34 @@ def test_evidence_source_protocol_rejects_missing_producer_method():
             return "incomplete_source"
 
     assert not isinstance(MissingProducerMethod(), EvidenceSource)
+
+
+def test_static_evidence_source_returns_predefined_evidence_unchanged():
+    first = Evidence("ev_static_1", ("obs_1",), 0.6, "medium", "repeatable")
+    second = Evidence("ev_static_2", ("obs_2",), 0.7, "high", "repeatable")
+    source = StaticEvidenceSource("static_source", [first, second])
+
+    produced = tuple(source.produce_evidence({"ignored": "context"}))
+
+    assert isinstance(source, EvidenceSource)
+    assert source.source_id == "static_source"
+    assert produced == (first, second)
+    assert produced[0] is first
+    assert produced[1] is second
+
+
+def test_static_evidence_source_is_deterministic_for_iterators_and_contexts():
+    evidence = [Evidence("ev_static_1", ("obs_1",), 0.6, "medium", "repeatable")]
+    source = StaticEvidenceSource("static_source", iter(evidence))
+
+    first_call = tuple(source.produce_evidence({"observation_ids": ("obs_1",)}))
+    second_call = tuple(source.produce_evidence({"observation_ids": ("different",)}))
+
+    assert first_call == second_call == tuple(evidence)
+
+
+def test_static_evidence_source_rejects_missing_source_id():
+    evidence = [Evidence("ev_static_1", ("obs_1",), 0.6, "medium", "repeatable")]
+
+    with pytest.raises(RequiredFieldError):
+        StaticEvidenceSource("", evidence)
