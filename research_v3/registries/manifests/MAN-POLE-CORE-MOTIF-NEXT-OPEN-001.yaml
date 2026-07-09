@@ -1,0 +1,41 @@
+id: "MAN-POLE-CORE-MOTIF-NEXT-OPEN-001"
+title: "Pole Core Motif / Next Open Entry pilot record"
+status: "ACTIVE"
+classification: "research baseline only; not production; concentrated edge; protected baseline unchanged"
+confidence: "unknown"
+source_artifacts:
+  - artifact_id: "ROS_ZERO_PROOF_OF_CONCEPT"
+    path: "ROS_ZERO_PROOF_OF_CONCEPT.md"
+    availability: "missing_in_repository_at_ros1_creation"
+related_records:
+  pilot_family: "Pole Core Motif / Next Open Entry"
+  all_pilot_records:
+    - "ES-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "OBS-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "BEL-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "HYP-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "VAL-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "EVD-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "DEC-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "KNW-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "DEBT-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "PRO-POLE-CORE-MOTIF-NEXT-OPEN-001"
+    - "RB-POLE-BASELINE-001"
+    - "MAN-POLE-CORE-MOTIF-NEXT-OPEN-001"
+created_at: "2026-07-08"
+updated_at: "2026-07-08"
+owner: "research"
+unknown_lost_never_recorded:
+  unknown:
+    - "Specific ROS_ZERO_PROOF_OF_CONCEPT.md values were unavailable in the repository at ROS-1 creation time."
+  lost: []
+  never_recorded:
+    - "Production approval is not recorded here."
+    - "Baseline modification is not recorded here because the protected baseline is unchanged."
+notes: |
+  Pilot registry seed for the Pole Core Motif / Next Open Entry family.
+  Research baseline only.
+  Not production.
+  Concentrated edge.
+  Protected baseline unchanged.
+  No missing data was invented.
