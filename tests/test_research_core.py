@@ -6,6 +6,7 @@ import pytest
 from research_core import (
     Decision,
     DecisionType,
+    CompositeEvidenceSource,
     Evidence,
     EvidenceSource,
     Hypothesis,
@@ -149,3 +150,81 @@ def test_static_evidence_source_rejects_missing_source_id():
 
     with pytest.raises(RequiredFieldError):
         StaticEvidenceSource("", evidence)
+
+
+def test_composite_evidence_source_collects_children_in_deterministic_order():
+    first = Evidence("ev_composite_1", ("obs_1",), 0.6, "medium", "repeatable")
+    second = Evidence("ev_composite_2", ("obs_2",), 0.7, "high", "repeatable")
+    duplicate = Evidence("ev_composite_1", ("obs_1",), 0.6, "medium", "repeatable")
+    left = StaticEvidenceSource("left_source", [first, duplicate])
+    right = StaticEvidenceSource("right_source", [second])
+    source = CompositeEvidenceSource("composite_source", [left, right])
+
+    produced = tuple(source.produce_evidence({"ignored": "context"}))
+
+    assert isinstance(source, EvidenceSource)
+    assert source.source_id == "composite_source"
+    assert produced == (first, duplicate, second)
+    assert produced[0] is first
+    assert produced[1] is duplicate
+    assert produced[2] is second
+
+
+def test_composite_evidence_source_snapshots_child_iterable():
+    first = Evidence("ev_composite_1", ("obs_1",), 0.6, "medium", "repeatable")
+    second = Evidence("ev_composite_2", ("obs_2",), 0.7, "high", "repeatable")
+    children = iter(
+        [
+            StaticEvidenceSource("left_source", [first]),
+            StaticEvidenceSource("right_source", [second]),
+        ]
+    )
+    source = CompositeEvidenceSource("composite_source", children)
+
+    first_call = tuple(source.produce_evidence({"observation_ids": ("obs_1",)}))
+    second_call = tuple(source.produce_evidence({"observation_ids": ("different",)}))
+
+    assert first_call == second_call == (first, second)
+
+
+def test_composite_evidence_source_forwards_context_to_each_child_in_order():
+    calls = []
+
+    class ContextRecordingSource:
+        def __init__(self, source_id):
+            self._source_id = source_id
+
+        @property
+        def source_id(self):
+            return self._source_id
+
+        def produce_evidence(self, context):
+            calls.append((self.source_id, context))
+            return [
+                Evidence(
+                    f"ev_{self.source_id}",
+                    tuple(context["observation_ids"]),
+                    0.5,
+                    "medium",
+                    "repeatable",
+                )
+            ]
+
+    context = {"observation_ids": ("obs_1",)}
+    source = CompositeEvidenceSource(
+        "composite_source",
+        [ContextRecordingSource("left"), ContextRecordingSource("right")],
+    )
+
+    produced = tuple(source.produce_evidence(context))
+
+    assert calls == [("left", context), ("right", context)]
+    assert produced == (
+        Evidence("ev_left", ("obs_1",), 0.5, "medium", "repeatable"),
+        Evidence("ev_right", ("obs_1",), 0.5, "medium", "repeatable"),
+    )
+
+
+def test_composite_evidence_source_rejects_missing_source_id():
+    with pytest.raises(RequiredFieldError):
+        CompositeEvidenceSource("", [])

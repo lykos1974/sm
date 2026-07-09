@@ -1,4 +1,5 @@
 from .decision import Decision
+from .composite_evidence_source import CompositeEvidenceSource
 from .enums import DecisionType, ValidationOutcome
 from .evidence import Evidence
 from .evidence_source import EvidenceSource
@@ -13,6 +14,7 @@ from .validation import Validation
 __all__ = (
     "Decision",
     "DecisionType",
+    "CompositeEvidenceSource",
     "Evidence",
     "EvidenceSource",
     "Hypothesis",
