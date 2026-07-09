@@ -3,6 +3,13 @@ from .composite_evidence_source import CompositeEvidenceSource
 from .enums import DecisionType, ValidationOutcome
 from .evidence import Evidence
 from .evidence_source import EvidenceSource
+from .evidence_pipeline import (
+    EvidencePipeline,
+    EvidencePipelineResult,
+    EvidencePipelineStatus,
+    EvidenceSourceExecutionStatus,
+    EvidenceSourceSnapshot,
+)
 from .funding_rate_evidence_source import FundingRateEvidenceSource, FundingRateProvider
 from .liquidation_evidence_source import LiquidationEvidenceSource, LiquidationProvider
 from .open_interest_evidence_source import OpenInterestEvidenceSource, OpenInterestProvider
@@ -20,6 +27,11 @@ __all__ = (
     "CompositeEvidenceSource",
     "Evidence",
     "EvidenceSource",
+    "EvidencePipeline",
+    "EvidencePipelineResult",
+    "EvidencePipelineStatus",
+    "EvidenceSourceExecutionStatus",
+    "EvidenceSourceSnapshot",
     "FundingRateEvidenceSource",
     "FundingRateProvider",
     "Hypothesis",
