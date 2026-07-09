@@ -9,6 +9,7 @@ from research_core import (
     CompositeEvidenceSource,
     Evidence,
     EvidenceSource,
+    FilteringEvidenceSource,
     Hypothesis,
     Knowledge,
     Observation,
@@ -228,3 +229,69 @@ def test_composite_evidence_source_forwards_context_to_each_child_in_order():
 def test_composite_evidence_source_rejects_missing_source_id():
     with pytest.raises(RequiredFieldError):
         CompositeEvidenceSource("", [])
+
+
+def test_filtering_evidence_source_returns_only_matching_evidence_in_original_order():
+    first = Evidence("ev_filter_1", ("obs_1",), 0.4, "low", "repeatable")
+    second = Evidence("ev_filter_2", ("obs_2",), 0.8, "high", "repeatable")
+    third = Evidence("ev_filter_3", ("obs_3",), 0.7, "medium", "repeatable")
+    wrapped = StaticEvidenceSource("wrapped_source", [first, second, third])
+    source = FilteringEvidenceSource(
+        "filtered_source",
+        wrapped,
+        lambda evidence: evidence.confidence >= 0.7,
+    )
+
+    produced = tuple(source.produce_evidence({"ignored": "context"}))
+
+    assert isinstance(source, EvidenceSource)
+    assert source.source_id == "filtered_source"
+    assert produced == (second, third)
+    assert produced[0] is second
+    assert produced[1] is third
+
+
+def test_filtering_evidence_source_forwards_context_to_wrapped_source():
+    calls = []
+
+    class ContextRecordingSource:
+        @property
+        def source_id(self):
+            return "recording_source"
+
+        def produce_evidence(self, context):
+            calls.append(context)
+            return [
+                Evidence(
+                    "ev_filter_context",
+                    tuple(context["observation_ids"]),
+                    0.9,
+                    "high",
+                    "repeatable",
+                )
+            ]
+
+    context = {"observation_ids": ("obs_1",)}
+    source = FilteringEvidenceSource(
+        "filtered_source",
+        ContextRecordingSource(),
+        lambda evidence: evidence.id == "ev_filter_context",
+    )
+
+    produced = tuple(source.produce_evidence(context))
+
+    assert calls == [context]
+    assert produced == (
+        Evidence("ev_filter_context", ("obs_1",), 0.9, "high", "repeatable"),
+    )
+
+
+def test_filtering_evidence_source_rejects_missing_source_id_and_predicate():
+    evidence = [Evidence("ev_filter_1", ("obs_1",), 0.6, "medium", "repeatable")]
+    wrapped = StaticEvidenceSource("wrapped_source", evidence)
+
+    with pytest.raises(RequiredFieldError):
+        FilteringEvidenceSource("", wrapped, lambda evidence: True)
+
+    with pytest.raises(RequiredFieldError):
+        FilteringEvidenceSource("filtered_source", wrapped, None)
