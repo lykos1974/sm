@@ -32,6 +32,7 @@ __all__ = (
     "EvidencePipelineStatus",
     "EvidenceSourceExecutionStatus",
     "EvidenceSourceSnapshot",
+    "FilteringEvidenceSource",
     "FundingRateEvidenceSource",
     "FundingRateProvider",
     "Hypothesis",
@@ -48,3 +49,11 @@ __all__ = (
     "ValidationOutcome",
     "deterministic_id",
 )
+
+
+def __getattr__(name):
+    if name == "FilteringEvidenceSource":
+        from .filtering_evidence_source import FilteringEvidenceSource
+
+        return FilteringEvidenceSource
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
