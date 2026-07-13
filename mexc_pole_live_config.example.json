@@ -13,5 +13,7 @@
     "MEXC_FUT:ENAUSDT"
   ],
   "api_key_env": "MEXC_FUTURES_API_KEY",
-  "api_secret_env": "MEXC_FUTURES_API_SECRET"
+  "api_secret_env": "MEXC_FUTURES_API_SECRET",
+  "candles_db_path": "pnf_mvp/data/mexc_live_candles.db",
+  "live_candle_backfill_minutes": 5000
 }

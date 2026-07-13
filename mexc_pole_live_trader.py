@@ -37,6 +37,16 @@ MEXC_API_KEY_ENV = "MEXC_FUTURES_API_KEY"
 MEXC_API_SECRET_ENV = "MEXC_FUTURES_API_SECRET"
 MEXC_CREDENTIALS_FILE = Path("mexc_credentials.json")
 DEFAULT_ALLOWED_SYMBOLS = tuple(strategy.TARGET_SYMBOLS)
+DEFAULT_LIVE_CANDLES_DB = REPO_ROOT / "pnf_mvp" / "data" / "mexc_live_candles.db"
+DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES = 5000
+# Current MEXC Pole Strategy v1 needs enough PnF structure to evaluate both
+# pole directions: prior same-type column, candidate pole column, reversal
+# column, immediate confirmation column, and the next closed candle used by
+# NEXT_COLUMN_OPEN_ENTRY.  In an alternating PnF sequence, the LOW_POLE side is
+# the deeper case from the default initial X column: X, O, X, O(pole),
+# X(reversal), O(confirmation), then one post-confirmation candle for entry.
+MEXC_POLE_REQUIRED_COLUMNS = 6
+MEXC_POLE_REQUIRED_CONTIGUOUS_CANDLES = MEXC_POLE_REQUIRED_COLUMNS + 1
 OPEN_STATUSES = {"ENTRY_SENT", "OPEN", "STOP_UNVERIFIED", "BE_MOVED"}
 TERMINAL_STATUSES = {"CLOSED", "DRY_RUN", "BLOCKED", "KILLED"}
 PARITY_NUMERIC_TOLERANCE = Decimal("0.000001")
@@ -46,7 +56,7 @@ PARITY_NUMERIC_TOLERANCE = Decimal("0.000001")
 class LiveConfig:
     live_trading_enabled: bool = False
     dry_run: bool = True
-    candles_db_path: Path = strategy.DEFAULT_DB
+    candles_db_path: Path = DEFAULT_LIVE_CANDLES_DB
     state_db_path: Path = Path("live_state.sqlite3")
     decisions_log_path: Path = Path("live_decisions.log")
     orders_log_path: Path = Path("live_orders.log")
@@ -59,6 +69,7 @@ class LiveConfig:
     mexc_base_url: str = "https://contract.mexc.com"
     allowed_symbols: tuple[str, ...] = DEFAULT_ALLOWED_SYMBOLS
     box_sizes: dict[str, float] | None = None
+    live_candle_backfill_minutes: int = DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES
 
     @classmethod
     def from_json(cls, path: Path) -> "LiveConfig":
@@ -67,7 +78,7 @@ class LiveConfig:
         return cls(
             live_trading_enabled=bool(raw.get("live_trading_enabled", False)),
             dry_run=bool(raw.get("dry_run", True)),
-            candles_db_path=Path(raw.get("candles_db_path", strategy.DEFAULT_DB)),
+            candles_db_path=Path(raw.get("candles_db_path", DEFAULT_LIVE_CANDLES_DB)),
             state_db_path=Path(raw.get("state_db_path", "live_state.sqlite3")),
             decisions_log_path=Path(raw.get("decisions_log_path", "live_decisions.log")),
             orders_log_path=Path(raw.get("orders_log_path", "live_orders.log")),
@@ -80,6 +91,7 @@ class LiveConfig:
             mexc_base_url=str(raw.get("mexc_base_url", "https://contract.mexc.com")),
             allowed_symbols=symbols,
             box_sizes={k: float(v) for k, v in raw.get("box_sizes", {}).items()} or None,
+            live_candle_backfill_minutes=int(raw.get("live_candle_backfill_minutes", DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES)),
         )
 
 
@@ -98,6 +110,43 @@ def _configured_symbols(raw: dict[str, Any]) -> tuple[str, ...]:
     if symbols is not None and allowed_symbols is not None and symbols != allowed_symbols:
         raise ValueError("config keys symbols and allowed_symbols both exist but differ; use symbols as the canonical key")
     return symbols or allowed_symbols or DEFAULT_ALLOWED_SYMBOLS
+
+
+@dataclass(frozen=True)
+class CandleWarmupStatus:
+    symbol: str
+    available_candles: int
+    required_candles: int
+    earliest_ts: int | None
+    latest_ts: int | None
+    contiguous: bool
+    pnf_columns: int
+    required_pnf_columns: int
+    latest_required_ts: int
+
+    @property
+    def ok(self) -> bool:
+        return (
+            self.available_candles >= self.required_candles
+            and self.contiguous
+            and self.latest_ts is not None
+            and self.latest_ts >= self.latest_required_ts
+            and self.pnf_columns >= self.required_pnf_columns
+        )
+
+    def audit_payload(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "available_candles": self.available_candles,
+            "required_candles": self.required_candles,
+            "earliest_ts": self.earliest_ts,
+            "latest_ts": self.latest_ts,
+            "contiguous": self.contiguous,
+            "pnf_columns": self.pnf_columns,
+            "required_pnf_columns": self.required_pnf_columns,
+            "latest_required_ts": self.latest_required_ts,
+            "warmup_status": "OK" if self.ok else "INSUFFICIENT",
+        }
 
 
 @dataclass(frozen=True)
@@ -299,6 +348,145 @@ def compute_qty(entry: Decimal, stop: Decimal, fixed_risk: Decimal, spec: Contra
         raise ValueError("risk_per_unit must be positive")
     return round_qty(fixed_risk / risk, spec)
 
+
+def init_live_candle_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS candles ("
+            "symbol TEXT NOT NULL, close_time INTEGER NOT NULL, open REAL NOT NULL, "
+            "high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, "
+            "PRIMARY KEY(symbol, close_time))"
+        )
+
+
+def _latest_live_candle_ts(db_path: Path, symbol: str) -> int | None:
+    init_live_candle_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute("SELECT MAX(close_time) FROM candles WHERE symbol=?", (symbol,)).fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def _store_live_candles(db_path: Path, symbol: str, rows: list[tuple[int, float, float, float, float]]) -> int:
+    if not rows:
+        return 0
+    init_live_candle_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)",
+            [(symbol, ts, open_, high, low, close) for ts, open_, high, low, close in rows],
+        )
+        return conn.total_changes - before
+
+
+def refresh_live_candles(config: LiveConfig) -> dict[str, int]:
+    """Refresh missing fully closed MEXC Min1 candles into the live candle DB.
+
+    Internal symbols stay in the live strategy form (for example
+    ``MEXC_FUT:BTCUSDT``).  The imported audit fetcher is responsible for
+    converting only public API request symbols to MEXC contract form.
+    """
+    from mexc_pole_missed_signal_audit import (
+        MEXC_INTERVAL_NAMES,
+        MEXC_REQUIRED_INTERVAL_SECONDS,
+        _closed_audit_end,
+        fetch_mexc_public_candles,
+    )
+
+    interval_seconds = MEXC_REQUIRED_INTERVAL_SECONDS
+    latest_closed = _closed_audit_end(int(time.time()), interval_seconds)
+    inserted: dict[str, int] = {}
+    init_live_candle_db(config.candles_db_path)
+    for symbol in config.allowed_symbols:
+        latest_local = _latest_live_candle_ts(config.candles_db_path, symbol)
+        if latest_local is None:
+            start_ts = latest_closed - max(1, int(config.live_candle_backfill_minutes)) * interval_seconds + interval_seconds
+        else:
+            start_ts = latest_local + interval_seconds
+        if start_ts > latest_closed:
+            inserted[symbol] = 0
+            continue
+        rows = fetch_mexc_public_candles(
+            config.mexc_base_url,
+            symbol,
+            start_ts,
+            latest_closed,
+            MEXC_INTERVAL_NAMES[interval_seconds],
+            interval_seconds,
+        )
+        inserted[symbol] = _store_live_candles(config.candles_db_path, symbol, rows)
+    return inserted
+
+
+def _candle_times_for_symbol(db_path: Path, symbol: str) -> list[int]:
+    init_live_candle_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        return [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT close_time FROM candles WHERE symbol=? ORDER BY close_time ASC",
+                (symbol,),
+            ).fetchall()
+        ]
+
+
+def _is_contiguous_min1(times: list[int], interval_seconds: int) -> bool:
+    return all(right - left == interval_seconds for left, right in zip(times, times[1:], strict=False))
+
+
+def _warmup_status(config: LiveConfig, symbol: str, latest_required_ts: int, interval_seconds: int) -> CandleWarmupStatus:
+    times = _candle_times_for_symbol(config.candles_db_path, symbol)
+    candles = strategy._load_market_candles(config.candles_db_path, symbol) if times else []
+    box_sizes = {**strategy.DEFAULT_BOX_SIZES, **(config.box_sizes or {})}
+    columns = strategy._build_columns(symbol, candles, box_sizes[symbol]) if candles else []
+    return CandleWarmupStatus(
+        symbol=symbol,
+        available_candles=len(times),
+        required_candles=MEXC_POLE_REQUIRED_CONTIGUOUS_CANDLES,
+        earliest_ts=times[0] if times else None,
+        latest_ts=times[-1] if times else None,
+        contiguous=_is_contiguous_min1(times, interval_seconds),
+        pnf_columns=len(columns),
+        required_pnf_columns=MEXC_POLE_REQUIRED_COLUMNS,
+        latest_required_ts=latest_required_ts,
+    )
+
+
+def _fetch_older_live_candles(config: LiveConfig, symbols: tuple[str, ...], interval_seconds: int) -> dict[str, int]:
+    from mexc_pole_missed_signal_audit import MEXC_INTERVAL_NAMES, fetch_mexc_public_candles
+
+    inserted: dict[str, int] = {}
+    for symbol in symbols:
+        earliest = _candle_times_for_symbol(config.candles_db_path, symbol)[:1]
+        if not earliest:
+            inserted[symbol] = 0
+            continue
+        end_ts = earliest[0] - interval_seconds
+        start_ts = end_ts - max(1, int(config.live_candle_backfill_minutes)) * interval_seconds + interval_seconds
+        rows = fetch_mexc_public_candles(
+            config.mexc_base_url,
+            symbol,
+            start_ts,
+            end_ts,
+            MEXC_INTERVAL_NAMES[interval_seconds],
+            interval_seconds,
+        )
+        inserted[symbol] = _store_live_candles(config.candles_db_path, symbol, rows)
+    return inserted
+
+
+def ensure_live_candle_warmup(config: LiveConfig) -> list[CandleWarmupStatus]:
+    from mexc_pole_missed_signal_audit import MEXC_REQUIRED_INTERVAL_SECONDS, _closed_audit_end
+
+    interval_seconds = MEXC_REQUIRED_INTERVAL_SECONDS
+    latest_required = _closed_audit_end(int(time.time()), interval_seconds)
+    statuses = [_warmup_status(config, symbol, latest_required, interval_seconds) for symbol in config.allowed_symbols]
+    insufficient = tuple(status.symbol for status in statuses if not status.ok)
+    if insufficient:
+        _fetch_older_live_candles(config, insufficient, interval_seconds)
+        statuses = [_warmup_status(config, symbol, latest_required, interval_seconds) for symbol in config.allowed_symbols]
+    return statuses
 
 def generate_trade_plans(config: LiveConfig, client: ExchangeClient) -> list[TradePlan]:
     box_sizes = {**strategy.DEFAULT_BOX_SIZES, **(config.box_sizes or {})}
@@ -679,6 +867,20 @@ def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[s
         if reconcile_result != "OK":
             audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": reconcile_result})
             return [reconcile_result]
+    try:
+        refresh_counts = refresh_live_candles(config)
+        audit(config.decisions_log_path, "CANDLE_REFRESH_OK", {"candles_db_path": str(config.candles_db_path), "inserted": refresh_counts})
+        warmup_statuses = ensure_live_candle_warmup(config)
+        for status in warmup_statuses:
+            audit(config.decisions_log_path, "CANDLE_WARMUP_STATUS", status.audit_payload())
+        if not all(status.ok for status in warmup_statuses):
+            audit(config.decisions_log_path, "CANDLE_WARMUP_INSUFFICIENT", {"symbols": [status.symbol for status in warmup_statuses if not status.ok]})
+            audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": "CANDLE_WARMUP_INSUFFICIENT"})
+            return ["CANDLE_WARMUP_INSUFFICIENT"]
+    except Exception as exc:
+        audit(config.decisions_log_path, "CANDLE_REFRESH_ERROR", {"candles_db_path": str(config.candles_db_path), "error": str(exc)})
+        audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": "CANDLE_REFRESH_ERROR"})
+        return ["CANDLE_REFRESH_ERROR"]
     sync_open_trades(config, client)
     if is_killed(config.state_db_path):
         audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": "KILL_SWITCH_ACTIVE"}); return ["KILL_SWITCH_ACTIVE"]
