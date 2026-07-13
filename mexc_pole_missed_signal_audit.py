@@ -138,6 +138,30 @@ def init_audit_cache(db_path: Path = AUDIT_CACHE_DB) -> None:
         )
 
 
+def _timestamp_scale(value: int) -> int:
+    """Return the storage scale for an epoch timestamp value.
+
+    Candle databases in this repository may store close_time as Unix seconds or
+    Unix milliseconds.  Values above 10 digits are treated as milliseconds; the
+    helper centralizes the conversion decision so datetime calls always receive
+    seconds.
+    """
+    return 1000 if abs(int(value)) > 10_000_000_000 else 1
+
+
+def _to_epoch_seconds(value: int) -> int:
+    scale = _timestamp_scale(value)
+    return int(value) // scale
+
+
+def _range_for_storage(start_ts: int, end_ts: int, scale: int) -> tuple[int, int]:
+    return start_ts * scale, end_ts * scale
+
+
+def _from_epoch_timestamp(value: int) -> datetime:
+    return datetime.fromtimestamp(_to_epoch_seconds(value), UTC)
+
+
 def _closed_audit_end(end_ts: int, interval_seconds: int = MEXC_INTERVAL_SECONDS) -> int:
     latest_closed = int(datetime.now(UTC).timestamp()) - interval_seconds
     return min(end_ts, latest_closed)
@@ -209,7 +233,7 @@ def latest_closed_candle_ts(db_path: Path, symbols: Iterable[str]) -> int | None
     placeholders = ",".join("?" for _ in symbol_list)
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         row = conn.execute(f"SELECT MAX(close_time) FROM candles WHERE symbol IN ({placeholders})", symbol_list).fetchone()
-    return None if row is None or row[0] is None else int(row[0])
+    return None if row is None or row[0] is None else _to_epoch_seconds(int(row[0]))
 
 
 def resolve_audit_range(
@@ -253,15 +277,26 @@ def resolve_audit_range(
     return AuditRange(start, end)
 
 
+def _candle_db_timestamp_scale(conn: sqlite3.Connection, symbols: Iterable[str]) -> int:
+    symbol_list = list(symbols)
+    if not symbol_list:
+        return 1
+    placeholders = ",".join("?" for _ in symbol_list)
+    row = conn.execute(f"SELECT MAX(close_time) FROM candles WHERE symbol IN ({placeholders})", symbol_list).fetchone()
+    return 1 if row is None or row[0] is None else _timestamp_scale(int(row[0]))
+
+
 def candle_times_in_gap(db_path: Path, symbols: Iterable[str], audit_range: AuditRange) -> list[int]:
     symbol_list = list(symbols)
     placeholders = ",".join("?" for _ in symbol_list)
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        scale = _candle_db_timestamp_scale(conn, symbol_list)
+        storage_start_ts, storage_end_ts = _range_for_storage(audit_range.start_ts, audit_range.end_ts, scale)
         rows = conn.execute(
             f"SELECT DISTINCT close_time FROM candles WHERE symbol IN ({placeholders}) AND close_time > ? AND close_time <= ? ORDER BY close_time ASC",
-            (*symbol_list, audit_range.start_ts, audit_range.end_ts),
+            (*symbol_list, storage_start_ts, storage_end_ts),
         ).fetchall()
-    return [int(row[0]) for row in rows]
+    return [_to_epoch_seconds(int(row[0])) for row in rows]
 
 
 def candle_times_in_gap_from_sources(db_paths: Sequence[Path], symbols: Iterable[str], audit_range: AuditRange) -> list[int]:
@@ -273,20 +308,22 @@ def candle_times_in_gap_from_sources(db_paths: Sequence[Path], symbols: Iterable
     return sorted(times)
 
 
-def _symbol_candle_times(conn: sqlite3.Connection, symbol: str, start_ts: int, end_ts: int) -> list[int]:
+def _symbol_candle_times(conn: sqlite3.Connection, symbol: str, start_ts: int, end_ts: int, scale: int) -> list[int]:
+    storage_start_ts, storage_end_ts = _range_for_storage(start_ts, end_ts, scale)
     rows = conn.execute(
         "SELECT close_time FROM candles WHERE symbol = ? AND close_time > ? AND close_time <= ? ORDER BY close_time ASC",
-        (symbol, start_ts, end_ts),
+        (symbol, storage_start_ts, storage_end_ts),
     ).fetchall()
-    return [int(row[0]) for row in rows]
+    return [_to_epoch_seconds(int(row[0])) for row in rows]
 
 
-def _infer_expected_interval(conn: sqlite3.Connection, symbol: str, end_ts: int) -> int | None:
+def _infer_expected_interval(conn: sqlite3.Connection, symbol: str, end_ts: int, scale: int) -> int | None:
+    _, storage_end_ts = _range_for_storage(0, end_ts, scale)
     rows = conn.execute(
         "SELECT close_time FROM candles WHERE symbol = ? AND close_time <= ? ORDER BY close_time DESC LIMIT 20",
-        (symbol, end_ts),
+        (symbol, storage_end_ts),
     ).fetchall()
-    times = sorted(int(row[0]) for row in rows)
+    times = sorted(_to_epoch_seconds(int(row[0])) for row in rows)
     deltas = [right - left for left, right in zip(times, times[1:]) if right > left]
     if not deltas:
         return None
@@ -302,18 +339,20 @@ def validate_local_candle_coverage(db_path: Path, symbols: Sequence[str], audit_
             if bounds is None or bounds[0] is None or bounds[1] is None:
                 missing.append(f"{symbol}: no local candles")
                 continue
-            min_ts, max_ts = int(bounds[0]), int(bounds[1])
+            raw_min_ts, raw_max_ts = int(bounds[0]), int(bounds[1])
+            scale = _timestamp_scale(raw_max_ts)
+            min_ts, max_ts = _to_epoch_seconds(raw_min_ts), _to_epoch_seconds(raw_max_ts)
             if min_ts > audit_range.start_ts or max_ts < audit_range.end_ts:
                 missing.append(
-                    f"{symbol}: local coverage {datetime.fromtimestamp(min_ts, UTC).isoformat()}..{datetime.fromtimestamp(max_ts, UTC).isoformat()} "
+                    f"{symbol}: local coverage {_from_epoch_timestamp(raw_min_ts).isoformat()}..{_from_epoch_timestamp(raw_max_ts).isoformat()} "
                     f"does not cover requested {audit_range.start.isoformat()}..{audit_range.end.isoformat()}"
                 )
                 continue
-            times = _symbol_candle_times(conn, symbol, audit_range.start_ts, audit_range.end_ts)
+            times = _symbol_candle_times(conn, symbol, audit_range.start_ts, audit_range.end_ts, scale)
             if not times:
                 missing.append(f"{symbol}: no candles in requested interval {audit_range.start.isoformat()}..{audit_range.end.isoformat()}")
                 continue
-            interval = _infer_expected_interval(conn, symbol, audit_range.end_ts)
+            interval = _infer_expected_interval(conn, symbol, audit_range.end_ts, scale)
             if interval is None:
                 continue
             expected_first_deadline = audit_range.start_ts + interval
@@ -337,11 +376,13 @@ def _coverage_times(db_paths: Sequence[Path], symbol: str, start_ts: int, end_ts
         if not candles_table_exists(db_path):
             continue
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            scale = _candle_db_timestamp_scale(conn, [symbol])
+            storage_start_ts, storage_end_ts = _range_for_storage(start_ts, end_ts, scale)
             rows = conn.execute(
                 "SELECT close_time FROM candles WHERE symbol = ? AND close_time > ? AND close_time <= ?",
-                (symbol, start_ts, end_ts),
+                (symbol, storage_start_ts, storage_end_ts),
             ).fetchall()
-        times.update(int(row[0]) for row in rows)
+        times.update(_to_epoch_seconds(int(row[0])) for row in rows)
     return times
 
 
