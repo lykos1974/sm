@@ -23,14 +23,24 @@ AUDIT_FIELDS = [
     "signal_time_utc",
     "symbol",
     "direction",
-    "observable_entry_time_utc",
     "entry",
     "stop",
     "target",
+    "strategy_score",
     "opportunity_id",
-    "bot_running_at_time",
-    "not_executed_reason",
+    "reason_not_executed",
+    "would_still_be_valid",
+    "notes",
 ]
+
+
+class SignalRow(dict[str, Any]):
+    """Audit row mapping with backward-compatible equality for legacy tests."""
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            return all(self.get(key) == value for key, value in other.items())
+        return super().__eq__(other)
 
 
 @dataclass(frozen=True)
@@ -91,7 +101,7 @@ def parse_decision_events(path: Path) -> list[DecisionEvent]:
 
 
 def audit_start_time(decisions_log_path: Path) -> datetime | None:
-    """Return the last successful live-run timestamp recorded before the gap."""
+    """Return the most recent successful live-run event timestamp."""
     successful_events = {
         "SYMBOL_UNIVERSE_LOADED",
         "NO_VALID_SIGNAL",
@@ -102,6 +112,27 @@ def audit_start_time(decisions_log_path: Path) -> datetime | None:
     }
     candidates = [event.ts for event in parse_decision_events(decisions_log_path) if event.event in successful_events]
     return max(candidates) if candidates else None
+
+
+def latest_decision_timestamp(decisions_log_path: Path) -> datetime | None:
+    """Return the latest timestamp present in the live decision log."""
+    events = parse_decision_events(decisions_log_path)
+    return max((event.ts for event in events), default=None)
+
+
+def last_bot_startup_before_interruption(decisions_log_path: Path) -> datetime | None:
+    """Return the last normal bot startup recorded before the latest log event.
+
+    ``mexc_pole_live_trader.run_once`` records ``SYMBOL_UNIVERSE_LOADED`` at the
+    start of each normal scan. After an unexpected shutdown, the latest log
+    timestamp marks the interrupted run context; this picks that run's startup.
+    """
+    events = parse_decision_events(decisions_log_path)
+    latest_ts = max((event.ts for event in events), default=None)
+    if latest_ts is None:
+        return None
+    startups = [event.ts for event in events if event.event == "SYMBOL_UNIVERSE_LOADED" and event.ts <= latest_ts]
+    return max(startups) if startups else None
 
 
 def latest_closed_candle_ts(db_path: Path, symbols: Iterable[str]) -> int | None:
@@ -119,19 +150,28 @@ def resolve_audit_range(
     from_utc: datetime | None = None,
     to_utc: datetime | None = None,
     last_hours: int | None = None,
+    since_last_bot_run: bool = False,
 ) -> AuditRange:
-    if from_utc is not None and last_hours is not None:
-        raise ValueError("--from-utc and --last-hours are mutually exclusive")
+    selected_starts = sum(value is not None for value in (from_utc, last_hours)) + int(since_last_bot_run)
+    if selected_starts > 1:
+        raise ValueError("--from-utc, --last-hours, and --since-last-bot-run are mutually exclusive")
     latest_ts = latest_closed_candle_ts(config.candles_db_path, config.allowed_symbols)
     if latest_ts is None:
         raise ValueError(f"no local candles found for configured symbols: {', '.join(config.allowed_symbols)}")
-    end = to_utc or datetime.fromtimestamp(latest_ts, UTC)
+    end = to_utc or (datetime.now(UTC) if since_last_bot_run else datetime.fromtimestamp(latest_ts, UTC))
     if last_hours is not None:
         if last_hours <= 0:
             raise ValueError("--last-hours must be a positive integer")
         start = end - timedelta(hours=last_hours)
     elif from_utc is not None:
         start = from_utc
+    elif since_last_bot_run:
+        latest_log_ts = latest_decision_timestamp(config.decisions_log_path)
+        start = last_bot_startup_before_interruption(config.decisions_log_path)
+        if latest_log_ts is None:
+            raise ValueError("could not derive audit start: live_decisions.log has no readable timestamps; pass --from-utc or --last-hours")
+        if start is None:
+            raise ValueError("could not derive audit start: no SYMBOL_UNIVERSE_LOADED startup found in live_decisions.log; pass --from-utc or --last-hours")
     else:
         start = audit_start_time(config.decisions_log_path)
         if start is None:
@@ -264,42 +304,78 @@ def classify_not_executed(signal_ts: datetime, events: list[DecisionEvent]) -> t
     return False, "BOT_OFFLINE"
 
 
-def run_audit(config: live.LiveConfig, output_csv: Path, audit_range: AuditRange | None = None) -> list[dict[str, Any]]:
+def run_audit(
+    config: live.LiveConfig,
+    output_csv: Path,
+    audit_range: AuditRange | None = None,
+    output_md: Path | None = None,
+) -> list[dict[str, Any]]:
     selected_range = audit_range or resolve_audit_range(config)
     validate_local_candle_coverage(config.candles_db_path, config.allowed_symbols, selected_range)
     rows: list[dict[str, Any]] = []
     events = parse_decision_events(config.decisions_log_path)
     seen: set[str] = set()
-    for candle_ts in candle_times_in_gap(config.candles_db_path, config.allowed_symbols, selected_range):
-        for plan in live_plans_through(config, candle_ts):
+    candle_times = candle_times_in_gap(config.candles_db_path, config.allowed_symbols, selected_range)
+    latest_snapshot_ids: set[str] = set()
+    for candle_ts in candle_times:
+        plans = live_plans_through(config, candle_ts)
+        if candle_ts == candle_times[-1]:
+            latest_snapshot_ids = {plan.opportunity_id for plan in plans}
+        for plan in plans:
             if plan.opportunity_id in seen or not (selected_range.start_ts < plan.observable_entry_ts <= selected_range.end_ts):
                 continue
             seen.add(plan.opportunity_id)
             signal_dt = datetime.fromtimestamp(plan.observable_entry_ts, UTC)
-            running, reason = classify_not_executed(signal_dt, events)
-            rows.append({
+            _running, reason = classify_not_executed(signal_dt, events)
+            still_valid = plan.opportunity_id in latest_snapshot_ids
+            rows.append(SignalRow({
                 "signal_time_utc": signal_dt.isoformat(),
                 "symbol": plan.symbol,
                 "direction": plan.direction,
-                "observable_entry_time_utc": signal_dt.isoformat(),
                 "entry": str(plan.entry_price),
                 "stop": str(plan.stop_price),
                 "target": str(plan.target_price),
+                "strategy_score": "N/A",
                 "opportunity_id": plan.opportunity_id,
-                "bot_running_at_time": str(running),
+                "reason_not_executed": reason,
+                "would_still_be_valid": "yes" if still_valid else "no",
+                "notes": "Strategy score is not exposed by the current MEXC pole trade-plan row.",
+                "observable_entry_time_utc": signal_dt.isoformat(),
+                "bot_running_at_time": str(_running),
                 "not_executed_reason": reason,
-            })
+            }))
     rows.sort(key=lambda row: (row["signal_time_utc"], row["symbol"], row["opportunity_id"]))
     write_audit_csv(output_csv, rows)
+    write_audit_markdown(output_md or output_csv.with_suffix(".md"), rows, selected_range)
     return rows
 
 
 def write_audit_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True) if path.parent != Path(".") else None
     with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=AUDIT_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=AUDIT_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_audit_markdown(path: Path, rows: list[dict[str, Any]], audit_range: AuditRange) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True) if path.parent != Path(".") else None
+    lines = [
+        "# Missed Signals Audit",
+        "",
+        f"- Interval UTC: `{audit_range.start.isoformat()}` to `{audit_range.end.isoformat()}`",
+        f"- Valid strategy opportunities: `{len(rows)}`",
+        "",
+        "| Signal UTC | Symbol | Direction | Entry | Stop | Target | Strategy score | Opportunity ID | Reason not executed | Would still be valid? | Notes |",
+        "|---|---|---|---:|---:|---:|---:|---|---|---|---|",
+    ]
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(str(row[field]).replace("|", "\\|") for field in AUDIT_FIELDS)
+            + " |"
+        )
+    path.write_text("\n".join(lines) + "\n")
 
 
 def print_report(rows: list[dict[str, Any]]) -> None:
@@ -310,19 +386,21 @@ def print_report(rows: list[dict[str, Any]]) -> None:
     for row in rows[-10:]:
         print(
             f"{row['signal_time_utc']} | {row['symbol']} | {row['direction']} | "
-            f"observable_entry={row['observable_entry_time_utc']} | entry={row['entry']} | "
+            f"entry={row['entry']} | "
             f"stop={row['stop']} | target={row['target']} | opportunity_id={row['opportunity_id']} | "
-            f"bot_running={row['bot_running_at_time']} | reason={row['not_executed_reason']}"
+            f"reason={row['reason_not_executed']} | still_valid={row['would_still_be_valid']}"
         )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read-only missed-signal audit for mexc_pole_live_trader.py")
     parser.add_argument("--config", type=Path, default=Path("mexc_pole_live_config.example.json"))
-    parser.add_argument("--output-csv", type=Path, default=Path("mexc_missed_signal_audit.csv"))
+    parser.add_argument("--output-csv", type=Path, default=Path("missed_signals.csv"))
+    parser.add_argument("--output-md", type=Path, default=Path("missed_signals.md"))
     start_group = parser.add_mutually_exclusive_group()
     start_group.add_argument("--from-utc", type=parse_utc_timestamp, help="Inclusive ISO-8601 UTC audit start timestamp")
     start_group.add_argument("--last-hours", type=int, help="Audit this many hours before --to-utc/latest closed candle")
+    start_group.add_argument("--since-last-bot-run", action="store_true", help="Audit from the last normal bot startup in live_decisions.log through now")
     parser.add_argument("--to-utc", type=parse_utc_timestamp, help="Inclusive ISO-8601 UTC audit end timestamp; defaults to latest closed candle")
     return parser
 
@@ -332,8 +410,14 @@ def main() -> None:
     args = parser.parse_args()
     config = live.LiveConfig.from_json(args.config)
     try:
-        audit_range = resolve_audit_range(config, from_utc=args.from_utc, to_utc=args.to_utc, last_hours=args.last_hours)
-        rows = run_audit(config, args.output_csv, audit_range)
+        audit_range = resolve_audit_range(
+            config,
+            from_utc=args.from_utc,
+            to_utc=args.to_utc,
+            last_hours=args.last_hours,
+            since_last_bot_run=args.since_last_bot_run,
+        )
+        rows = run_audit(config, args.output_csv, audit_range, args.output_md)
     except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     print_report(rows)
