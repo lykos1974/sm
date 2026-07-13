@@ -3,10 +3,14 @@ from __future__ import annotations
 from decimal import Decimal
 import http.client
 import json
+import sqlite3
 
 import pytest
 
 import mexc_pole_live_trader as trader
+
+ORIGINAL_REFRESH_LIVE_CANDLES = trader.refresh_live_candles
+ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP = trader.ensure_live_candle_warmup
 
 
 class FakeClient:
@@ -72,6 +76,8 @@ def plan(**kw):
 @pytest.fixture(autouse=True)
 def parity_matches(monkeypatch):
     monkeypatch.setattr(trader, "recompute_research_plan_for_live", lambda live_plan, config, client: live_plan)
+    monkeypatch.setattr(trader, "refresh_live_candles", lambda config: {})
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", lambda config: [])
 
 
 def test_mexc_request_incomplete_read_is_runtime_error(monkeypatch):
@@ -544,3 +550,222 @@ def test_health_check_cli_exit_code_not_ready(tmp_path, monkeypatch, capsys):
 
     assert excinfo.value.code == 1
     assert "OVERALL: NOT_READY" in capsys.readouterr().out
+
+
+def test_refresh_live_candles_fetches_missing_incrementally_and_preserves_symbols(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "refresh_live_candles", ORIGINAL_REFRESH_LIVE_CANDLES)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 180)
+    calls = []
+
+    def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
+        calls.append((base_url, symbol, audit.mexc_contract_symbol(symbol), start_ts, end_ts, interval, interval_seconds))
+        return [(start_ts, 1.0, 2.0, 0.5, 1.5)] if start_ts <= end_ts else []
+
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:BTCUSDT",), live_candle_backfill_minutes=1)
+    trader.init_live_candle_db(c.candles_db_path)
+    with sqlite3.connect(c.candles_db_path) as conn:
+        conn.execute("INSERT INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)", ("MEXC_FUT:BTCUSDT", 60, 1, 2, 0.5, 1.5))
+
+    assert trader.refresh_live_candles(c) == {"MEXC_FUT:BTCUSDT": 1}
+
+    assert calls == [("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", "BTC_USDT", 120, 180, "Min1", 60)]
+    with sqlite3.connect(c.candles_db_path) as conn:
+        rows = conn.execute("SELECT symbol, close_time FROM candles ORDER BY close_time").fetchall()
+    assert rows == [("MEXC_FUT:BTCUSDT", 60), ("MEXC_FUT:BTCUSDT", 120)]
+
+
+def test_refresh_live_candles_does_not_duplicate_existing_rows(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "refresh_live_candles", ORIGINAL_REFRESH_LIVE_CANDLES)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 120)
+    fetch_calls = []
+
+    def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
+        fetch_calls.append((start_ts, end_ts))
+        return [(60, 1.0, 2.0, 0.5, 1.5), (120, 1.5, 2.5, 1.0, 2.0)]
+
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:ETHUSDT",), live_candle_backfill_minutes=2)
+
+    assert trader.refresh_live_candles(c) == {"MEXC_FUT:ETHUSDT": 2}
+    assert trader.refresh_live_candles(c) == {"MEXC_FUT:ETHUSDT": 0}
+
+    assert fetch_calls == [(60, 120)]
+    with sqlite3.connect(c.candles_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM candles WHERE symbol='MEXC_FUT:ETHUSDT'").fetchone()[0] == 2
+
+
+def test_refresh_live_candles_uses_only_fully_closed_end(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "refresh_live_candles", ORIGINAL_REFRESH_LIVE_CANDLES)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 240)
+    observed = {}
+
+    def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
+        observed["range"] = (start_ts, end_ts)
+        return [(start_ts, 1.0, 2.0, 0.5, 1.5)]
+
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:SOLUSDT",), live_candle_backfill_minutes=1)
+
+    trader.refresh_live_candles(c)
+
+    assert observed["range"] == (240, 240)
+
+
+def test_run_once_fail_closed_when_candle_refresh_fails(tmp_path, monkeypatch):
+    c = cfg(tmp_path, live_trading_enabled=True, dry_run=False, allowed_symbols=("MEXC_FUT:BTCUSDT",))
+    client = FakeClient(positions=[])
+    called = {"plans": False}
+
+    def fail_refresh(config):
+        raise RuntimeError("mexc outage")
+
+    def forbidden_generate(config, exchange_client):
+        called["plans"] = True
+        return [plan()]
+
+    monkeypatch.setattr(trader, "refresh_live_candles", fail_refresh)
+    monkeypatch.setattr(trader, "generate_trade_plans", forbidden_generate)
+
+    assert trader.run_once(c, client) == ["CANDLE_REFRESH_ERROR"]
+    assert called["plans"] is False
+    assert client.orders == []
+    events = [json.loads(line) for line in c.decisions_log_path.read_text().splitlines()]
+    assert [event["event"] for event in events][-2:] == ["CANDLE_REFRESH_ERROR", "TRADING_BLOCKED"]
+    assert events[-1]["reason"] == "CANDLE_REFRESH_ERROR"
+
+
+
+def _write_warmup_candles(db_path, symbol="MEXC_FUT:BTCUSDT", start=60, gap_at=None, flat_count=None):
+    trader.init_live_candle_db(db_path)
+    if flat_count is not None:
+        rows = [(symbol, start + i * 60, 10000.0, 10000.0, 10000.0, 10000.0) for i in range(flat_count)]
+    else:
+        closes = [10000.0, 10100.0, 9800.0, 10200.0, 9500.0, 9900.0, 9600.0, 9700.0]
+        rows = []
+        for i, close in enumerate(closes):
+            ts = start + i * 60
+            if gap_at is not None and ts == gap_at:
+                continue
+            rows.append((symbol, ts, close, close, close, close))
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany("INSERT OR IGNORE INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)", rows)
+    return rows
+
+
+def test_warmup_empty_db_becomes_sufficient_after_refresh(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "refresh_live_candles", ORIGINAL_REFRESH_LIVE_CANDLES)
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 480)
+
+    def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
+        closes = [10000.0, 10100.0, 9800.0, 10200.0, 9500.0, 9900.0, 9600.0, 9700.0]
+        first = end_ts - (len(closes) - 1) * interval_seconds
+        return [(first + i * interval_seconds, close, close, close, close) for i, close in enumerate(closes)]
+
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
+    monkeypatch.setattr(trader, "generate_trade_plans", lambda config, exchange_client: [])
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:BTCUSDT",), live_candle_backfill_minutes=8)
+
+    assert trader.run_once(c, FakeClient()) == []
+
+    events = [json.loads(line) for line in c.decisions_log_path.read_text().splitlines()]
+    warmup = [event for event in events if event["event"] == "CANDLE_WARMUP_STATUS"][-1]
+    assert warmup["warmup_status"] == "OK"
+    assert warmup["available_candles"] == 8
+    assert warmup["required_candles"] == 7
+
+
+def test_warmup_insufficient_5000_flat_candles_fetches_more_then_reports_insufficient(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 5000 * 60)
+    older_calls = []
+
+    def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
+        older_calls.append((start_ts, end_ts))
+        return [(start_ts + i * interval_seconds, 10000.0, 10000.0, 10000.0, 10000.0) for i in range((end_ts - start_ts) // interval_seconds + 1)]
+
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:BTCUSDT",), live_candle_backfill_minutes=5000)
+    _write_warmup_candles(c.candles_db_path, flat_count=5000)
+
+    statuses = trader.ensure_live_candle_warmup(c)
+
+    assert older_calls == [(-299940, 0)]
+    assert statuses[0].available_candles == 10000
+    assert statuses[0].pnf_columns < statuses[0].required_pnf_columns
+    assert not statuses[0].ok
+
+
+def test_warmup_sufficient_history_passes_without_fetching_more(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 480)
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not fetch older history")))
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:BTCUSDT",))
+    _write_warmup_candles(c.candles_db_path)
+
+    statuses = trader.ensure_live_candle_warmup(c)
+
+    assert len(statuses) == 1
+    assert statuses[0].ok
+    assert statuses[0].available_candles == 8
+    assert statuses[0].pnf_columns >= statuses[0].required_pnf_columns
+
+
+def test_warmup_gap_in_history_fails_even_after_older_fetch(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 480)
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", lambda *args, **kwargs: [])
+    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:BTCUSDT",))
+    _write_warmup_candles(c.candles_db_path, gap_at=240)
+
+    statuses = trader.ensure_live_candle_warmup(c)
+
+    assert not statuses[0].contiguous
+    assert not statuses[0].ok
+
+
+def test_run_once_fail_closed_when_warmup_is_insufficient(tmp_path, monkeypatch):
+    c = cfg(tmp_path, live_trading_enabled=True, dry_run=False, allowed_symbols=("MEXC_FUT:BTCUSDT",))
+    client = FakeClient(positions=[])
+    called = {"plans": False}
+    status = trader.CandleWarmupStatus(
+        symbol="MEXC_FUT:BTCUSDT",
+        available_candles=5000,
+        required_candles=7,
+        earliest_ts=60,
+        latest_ts=300000,
+        contiguous=True,
+        pnf_columns=1,
+        required_pnf_columns=6,
+        latest_required_ts=300000,
+    )
+
+    def forbidden_generate(config, exchange_client):
+        called["plans"] = True
+        return [plan()]
+
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", lambda config: [status])
+    monkeypatch.setattr(trader, "generate_trade_plans", forbidden_generate)
+
+    assert trader.run_once(c, client) == ["CANDLE_WARMUP_INSUFFICIENT"]
+    assert called["plans"] is False
+    assert client.orders == []
+    events = [json.loads(line) for line in c.decisions_log_path.read_text().splitlines()]
+    assert "CANDLE_WARMUP_STATUS" in [event["event"] for event in events]
+    assert [event["event"] for event in events][-2:] == ["CANDLE_WARMUP_INSUFFICIENT", "TRADING_BLOCKED"]
+    assert events[-1]["reason"] == "CANDLE_WARMUP_INSUFFICIENT"
