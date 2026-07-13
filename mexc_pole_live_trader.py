@@ -880,7 +880,7 @@ def run_once(config: LiveConfig, client: ExchangeClient | None = None) -> list[s
     except Exception as exc:
         audit(config.decisions_log_path, "CANDLE_REFRESH_ERROR", {"candles_db_path": str(config.candles_db_path), "error": str(exc)})
         audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": "CANDLE_REFRESH_ERROR"})
-        return ["CANDLE_REFRESH_ERROR"]
+        raise
     sync_open_trades(config, client)
     if is_killed(config.state_db_path):
         audit(config.decisions_log_path, "TRADING_BLOCKED", {"reason": "KILL_SWITCH_ACTIVE"}); return ["KILL_SWITCH_ACTIVE"]

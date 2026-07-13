@@ -633,7 +633,8 @@ def test_run_once_fail_closed_when_candle_refresh_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(trader, "refresh_live_candles", fail_refresh)
     monkeypatch.setattr(trader, "generate_trade_plans", forbidden_generate)
 
-    assert trader.run_once(c, client) == ["CANDLE_REFRESH_ERROR"]
+    with pytest.raises(RuntimeError, match="mexc outage"):
+        trader.run_once(c, client)
     assert called["plans"] is False
     assert client.orders == []
     events = [json.loads(line) for line in c.decisions_log_path.read_text().splitlines()]
