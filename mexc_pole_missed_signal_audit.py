@@ -24,8 +24,9 @@ import mexc_pole_live_trader as live
 
 DEFAULT_AUDIT_ROOT = Path("exports/mexc_pole_missed_signal_audit")
 AUDIT_CACHE_DB = DEFAULT_AUDIT_ROOT / "audit_candles.sqlite3"
-MEXC_INTERVAL_SECONDS = 3600
-MEXC_INTERVAL_NAME = "Min60"
+MEXC_REQUIRED_INTERVAL_SECONDS = 60
+MEXC_INTERVAL_NAMES = {60: "Min1"}
+MEXC_KLINE_PAGE_LIMIT = 2000
 
 AUDIT_FIELDS = [
     "signal_time_utc",
@@ -72,6 +73,13 @@ class AuditRange:
         return int(self.end.timestamp())
 
 
+@dataclass(frozen=True)
+class CandleInterval:
+    seconds: int
+    mexc_name: str
+    storage_scales: dict[str, int]
+
+
 class ReadOnlySpecClient:
     """Contract-spec-only client for live plan generation; no order methods."""
 
@@ -96,7 +104,13 @@ def normalize_live_symbol(symbol: str) -> str:
 
 
 def mexc_contract_symbol(live_symbol: str) -> str:
-    return normalize_live_symbol(live_symbol).split(":", 1)[-1]
+    raw = normalize_live_symbol(live_symbol).split(":", 1)[-1]
+    if "_" in raw:
+        return raw
+    for suffix in ("USDT", "USDC", "USD"):
+        if raw.endswith(suffix) and len(raw) > len(suffix):
+            return f"{raw[:-len(suffix)]}_{suffix}"
+    return raw
 
 
 def candles_table_exists(db_path: Path) -> bool:
@@ -162,7 +176,7 @@ def _from_epoch_timestamp(value: int) -> datetime:
     return datetime.fromtimestamp(_to_epoch_seconds(value), UTC)
 
 
-def _closed_audit_end(end_ts: int, interval_seconds: int = MEXC_INTERVAL_SECONDS) -> int:
+def _closed_audit_end(end_ts: int, interval_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS) -> int:
     latest_closed = int(datetime.now(UTC).timestamp()) - interval_seconds
     return min(end_ts, latest_closed)
 
@@ -330,7 +344,35 @@ def _infer_expected_interval(conn: sqlite3.Connection, symbol: str, end_ts: int,
     return min(deltas)
 
 
-def validate_local_candle_coverage(db_path: Path, symbols: Sequence[str], audit_range: AuditRange) -> None:
+def detect_candle_interval(db_path: Path, symbols: Sequence[str], required_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS) -> CandleInterval:
+    """Detect and require the configured production candle interval per symbol."""
+    if not candles_table_exists(db_path):
+        raise RuntimeError(f"candles table not found in configured database: {db_path}")
+    storage_scales: dict[str, int] = {}
+    intervals: dict[str, int] = {}
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        for symbol in symbols:
+            norm_symbol = normalize_live_symbol(symbol)
+            row = conn.execute(
+                "SELECT MIN(close_time), MAX(close_time), COUNT(*) FROM candles WHERE symbol = ?",
+                (norm_symbol,),
+            ).fetchone()
+            if row is None or row[0] is None or row[1] is None or int(row[2] or 0) < 2:
+                raise RuntimeError(f"{norm_symbol}: at least two configured production candles are required to infer interval")
+            scale = _timestamp_scale(int(row[1]))
+            storage_scales[norm_symbol] = scale
+            interval = _infer_expected_interval(conn, norm_symbol, _to_epoch_seconds(int(row[1])), scale)
+            if interval is None:
+                raise RuntimeError(f"{norm_symbol}: could not infer configured production candle interval")
+            intervals[norm_symbol] = interval
+    bad = {symbol: interval for symbol, interval in intervals.items() if interval != required_seconds}
+    if bad:
+        detail = "; ".join(f"{symbol}: {interval}s" for symbol, interval in bad.items())
+        raise RuntimeError(f"configured production candle interval must be {required_seconds}s / Min1; detected {detail}")
+    return CandleInterval(required_seconds, MEXC_INTERVAL_NAMES[required_seconds], storage_scales)
+
+
+def validate_local_candle_coverage(db_path: Path, symbols: Sequence[str], audit_range: AuditRange, interval_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS) -> None:
     """Fail clearly if local candles do not cover the requested interval."""
     missing: list[str] = []
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
@@ -354,6 +396,9 @@ def validate_local_candle_coverage(db_path: Path, symbols: Sequence[str], audit_
                 continue
             interval = _infer_expected_interval(conn, symbol, audit_range.end_ts, scale)
             if interval is None:
+                continue
+            if interval != interval_seconds:
+                missing.append(f"{symbol}: configured production candle interval must be {interval_seconds}s / Min1; detected {interval}s")
                 continue
             expected_first_deadline = audit_range.start_ts + interval
             if times[0] > expected_first_deadline:
@@ -390,7 +435,7 @@ def missing_candle_ranges(
     db_paths: Sequence[Path],
     symbols: Sequence[str],
     audit_range: AuditRange,
-    interval_seconds: int = MEXC_INTERVAL_SECONDS,
+    interval_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS,
 ) -> dict[str, list[tuple[int, int]]]:
     end_ts = _closed_audit_end(audit_range.end_ts, interval_seconds)
     if end_ts <= audit_range.start_ts:
@@ -415,55 +460,87 @@ def missing_candle_ranges(
     return missing
 
 
-def fetch_mexc_public_candles(
+def _fetch_mexc_public_candle_page(
     base_url: str,
     symbol: str,
     start_ts: int,
     end_ts: int,
-    interval: str = MEXC_INTERVAL_NAME,
-) -> list[tuple[int, float, float, float, float]]:
-    """Fetch closed MEXC futures klines from public market data only."""
+    interval: str,
+) -> tuple[list[tuple[int, float, float, float, float]], Any]:
     query = urllib.parse.urlencode({"interval": interval, "start": start_ts, "end": end_ts})
     url = f"{base_url.rstrip('/')}/api/v1/contract/kline/{urllib.parse.quote(mexc_contract_symbol(symbol))}?{query}"
     with urllib.request.urlopen(url, timeout=20) as res:
         payload = json.loads(res.read().decode())
-    data = payload.get("data", payload)
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise RuntimeError(f"MEXC kline response for {symbol}: {payload!r}")
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
     if not isinstance(data, dict):
-        raise RuntimeError(f"unexpected MEXC kline response for {symbol}")
+        raise RuntimeError(f"unexpected MEXC kline response for {symbol}: {payload!r}")
     times = data.get("time") or []
     opens = data.get("open") or []
     highs = data.get("high") or []
     lows = data.get("low") or []
     closes = data.get("close") or []
     rows: list[tuple[int, float, float, float, float]] = []
-    latest_closed = _closed_audit_end(end_ts)
     for ts, open_, high, low, close in zip(times, opens, highs, lows, closes, strict=False):
         close_ts = int(ts)
-        if start_ts <= close_ts <= end_ts and close_ts <= latest_closed:
+        if start_ts <= close_ts <= end_ts:
             rows.append((close_ts, float(open_), float(high), float(low), float(close)))
-    return rows
+    return rows, payload
 
 
-def store_audit_candles(db_path: Path, symbol: str, rows: Iterable[tuple[int, float, float, float, float]]) -> None:
+def fetch_mexc_public_candles(
+    base_url: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    interval: str = MEXC_INTERVAL_NAMES[MEXC_REQUIRED_INTERVAL_SECONDS],
+    interval_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS,
+) -> list[tuple[int, float, float, float, float]]:
+    """Fetch every closed MEXC futures kline from public market data only."""
+    latest_closed = _closed_audit_end(end_ts, interval_seconds)
+    final_end = min(end_ts, latest_closed)
+    if final_end < start_ts:
+        return []
+    rows: dict[int, tuple[int, float, float, float, float]] = {}
+    last_payload: Any = None
+    cursor = start_ts
+    while cursor <= final_end:
+        page_end = min(final_end, cursor + interval_seconds * (MEXC_KLINE_PAGE_LIMIT - 1))
+        page_rows, last_payload = _fetch_mexc_public_candle_page(base_url, symbol, cursor, page_end, interval)
+        for row in page_rows:
+            if row[0] <= latest_closed:
+                rows[row[0]] = row
+        cursor = page_end + interval_seconds
+    expected = set(range(start_ts, final_end + 1, interval_seconds))
+    missing = sorted(expected.difference(rows))
+    if missing:
+        first_missing = datetime.fromtimestamp(missing[0], UTC).isoformat()
+        raise RuntimeError(f"MEXC kline response for {symbol}: {last_payload!r}; missing candle {first_missing}")
+    return [rows[ts] for ts in sorted(rows)]
+
+
+def store_audit_candles(db_path: Path, symbol: str, rows: Iterable[tuple[int, float, float, float, float]], storage_scale: int = 1) -> None:
     init_audit_cache(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.executemany(
             "INSERT OR IGNORE INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)",
-            [(normalize_live_symbol(symbol), ts, open_, high, low, close) for ts, open_, high, low, close in rows],
+            [(normalize_live_symbol(symbol), ts * storage_scale, open_, high, low, close) for ts, open_, high, low, close in rows],
         )
 
 
 def ensure_audit_candle_coverage(config: live.LiveConfig, audit_range: AuditRange, cache_db: Path = AUDIT_CACHE_DB) -> Path:
     """Verify configured DB first, then fetch only missing closed candles into audit cache."""
     symbols = tuple(normalize_live_symbol(symbol) for symbol in config.allowed_symbols)
+    interval = detect_candle_interval(config.candles_db_path, symbols)
     _ = inspect_candle_db(config.candles_db_path, symbols)
     init_audit_cache(cache_db)
-    missing = missing_candle_ranges([config.candles_db_path, cache_db], symbols, audit_range)
+    missing = missing_candle_ranges([config.candles_db_path, cache_db], symbols, audit_range, interval.seconds)
     for symbol, ranges in missing.items():
         for start_ts, end_ts in ranges:
-            rows = fetch_mexc_public_candles(config.mexc_base_url, symbol, start_ts, end_ts)
-            store_audit_candles(cache_db, symbol, rows)
-    remaining = missing_candle_ranges([config.candles_db_path, cache_db], symbols, audit_range)
+            rows = fetch_mexc_public_candles(config.mexc_base_url, symbol, start_ts, end_ts, interval.mexc_name, interval.seconds)
+            store_audit_candles(cache_db, symbol, rows, interval.storage_scales.get(symbol, 1))
+    remaining = missing_candle_ranges([config.candles_db_path, cache_db], symbols, audit_range, interval.seconds)
     if remaining:
         details = []
         for symbol, ranges in remaining.items():
@@ -484,9 +561,11 @@ def _copy_audit_source_candles(source_dbs: Sequence[Path], dest_db: Path, symbol
             symbol_list = list(symbols)
             placeholders = ",".join("?" for _ in symbol_list)
             with sqlite3.connect(f"file:{source_db}?mode=ro", uri=True) as src:
+                scale = _candle_db_timestamp_scale(src, symbol_list)
+                storage_close_time = close_time * scale
                 rows = src.execute(
                     f"SELECT symbol, close_time, open, high, low, close FROM candles WHERE symbol IN ({placeholders}) AND close_time <= ? ORDER BY close_time ASC",
-                    (*symbol_list, close_time),
+                    (*symbol_list, storage_close_time),
                 ).fetchall()
             dst.executemany(
                 "INSERT OR REPLACE INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)",
@@ -502,9 +581,10 @@ def _copy_candles_through(source_db: Path, dest_db: Path, symbols: Iterable[str]
         if ddl is None or not ddl[0]:
             raise RuntimeError(f"candles table not found in {source_db}")
         dst.execute(ddl[0])
+        scale = _candle_db_timestamp_scale(src, symbol_list)
         rows = src.execute(
             f"SELECT * FROM candles WHERE symbol IN ({placeholders}) AND close_time <= ? ORDER BY close_time ASC",
-            (*symbol_list, close_time),
+            (*symbol_list, close_time * scale),
         ).fetchall()
         columns = [info[1] for info in src.execute("PRAGMA table_info(candles)").fetchall()]
         dst.executemany(

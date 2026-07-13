@@ -12,7 +12,7 @@ import mexc_pole_missed_signal_audit as audit
 
 
 BASE = 1_700_000_000
-HOUR = 3600
+HOUR = 60
 
 
 def dt(ts: int) -> datetime:
@@ -85,9 +85,9 @@ def test_last_hours_range_uses_to_or_latest_closed_candle(tmp_path):
     explicit_to = audit.resolve_audit_range(c, to_utc=dt(times[4]), last_hours=2)
     latest_to = audit.resolve_audit_range(c, last_hours=1)
 
-    assert explicit_to.start == dt(times[2])
+    assert explicit_to.start == dt(times[4] - 2 * 3600)
     assert explicit_to.end == dt(times[4])
-    assert latest_to.start == dt(times[4])
+    assert latest_to.start == dt(times[5] - 3600)
     assert latest_to.end == dt(times[5])
 
 
@@ -222,3 +222,86 @@ def test_validate_local_candle_coverage_accepts_millisecond_timestamps(tmp_path)
 
     audit.validate_local_candle_coverage(c.candles_db_path, c.allowed_symbols, audit_range)
     assert audit.resolve_audit_range(c, last_hours=1).end == dt(times[-1])
+
+
+def test_detect_candle_interval_requires_min1_from_millisecond_timestamps(tmp_path):
+    c = cfg(tmp_path)
+    times = [BASE + 60 * i for i in range(4)]
+    write_candles(c.candles_db_path, [ts * 1000 for ts in times])
+
+    interval = audit.detect_candle_interval(c.candles_db_path, c.allowed_symbols)
+
+    assert interval.seconds == 60
+    assert interval.mexc_name == "Min1"
+    assert interval.storage_scales["MEXC_FUT:BTCUSDT"] == 1000
+
+
+def test_min1_api_requests_and_btcusdt_endpoint_mapping(monkeypatch):
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"success": True, "data": {"time": [BASE + 60], "open": ["1"], "high": ["2"], "low": ["0.5"], "close": ["1.5"]}}).encode()
+
+    def fake_urlopen(url, timeout):
+        requested.append(url)
+        return Response()
+
+    monkeypatch.setattr(audit.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
+
+    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", BASE + 60, BASE + 60)
+
+    assert rows == [(BASE + 60, 1.0, 2.0, 0.5, 1.5)]
+    assert "/api/v1/contract/kline/BTC_USDT?" in requested[0]
+    assert "interval=Min1" in requested[0]
+
+
+def test_minute_level_missing_range_detection(tmp_path, monkeypatch):
+    c = cfg(tmp_path)
+    times = [BASE, BASE + 60, BASE + 180]
+    write_candles(c.candles_db_path, times)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
+
+    ranges = audit.missing_candle_ranges([c.candles_db_path], c.allowed_symbols, audit.AuditRange(dt(BASE), dt(BASE + 180)), 60)
+
+    assert ranges == {"MEXC_FUT:BTCUSDT": [(BASE + 120, BASE + 120)]}
+
+
+def test_store_audit_candles_preserves_millisecond_cache_storage(tmp_path):
+    cache = tmp_path / "audit.sqlite3"
+
+    audit.store_audit_candles(cache, "MEXC_FUT:BTCUSDT", [(BASE + 60, 1.0, 2.0, 0.5, 1.5)], storage_scale=1000)
+
+    with sqlite3.connect(cache) as conn:
+        stored = conn.execute("SELECT symbol, close_time FROM candles").fetchone()
+    assert stored == ("MEXC_FUT:BTCUSDT", (BASE + 60) * 1000)
+
+
+def test_complete_contiguous_replay_coverage_from_primary_and_cache(tmp_path, monkeypatch):
+    c = cfg(tmp_path)
+    primary_times = [BASE, BASE + 60, BASE + 180]
+    write_candles(c.candles_db_path, [ts * 1000 for ts in primary_times])
+    cache = tmp_path / "audit_cache.sqlite3"
+    audit.store_audit_candles(cache, "MEXC_FUT:BTCUSDT", [(BASE + 120, 1.0, 1.0, 1.0, 1.0)], storage_scale=1000)
+    observed = []
+
+    def fake_live_generate_trade_plans(config, client):
+        with sqlite3.connect(config.candles_db_path) as conn:
+            max_ts = conn.execute("SELECT MAX(close_time) FROM candles").fetchone()[0]
+        observed.append(max_ts)
+        return [plan(max_ts // 1000, f"opp-{max_ts}")]
+
+    monkeypatch.setattr(audit.live, "generate_trade_plans", fake_live_generate_trade_plans)
+    monkeypatch.setattr(audit, "ensure_audit_candle_coverage", lambda config, audit_range: cache)
+
+    rows = audit.run_audit(c, tmp_path / "missed.csv", audit.AuditRange(dt(BASE), dt(BASE + 180)))
+
+    assert [row["opportunity_id"] for row in rows] == [f"opp-{ts * 1000}" for ts in (BASE + 60, BASE + 120, BASE + 180)]
+    assert observed == [(BASE + 60) * 1000, (BASE + 120) * 1000, (BASE + 180) * 1000]
