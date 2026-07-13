@@ -9,15 +9,23 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import sqlite3
 import tempfile
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import mexc_pole_live_trader as live
+
+DEFAULT_AUDIT_ROOT = Path("exports/mexc_pole_missed_signal_audit")
+AUDIT_CACHE_DB = DEFAULT_AUDIT_ROOT / "audit_candles.sqlite3"
+MEXC_INTERVAL_SECONDS = 3600
+MEXC_INTERVAL_NAME = "Min60"
 
 AUDIT_FIELDS = [
     "signal_time_utc",
@@ -74,6 +82,65 @@ class ReadOnlySpecClient:
         if name.startswith(("place_", "cancel_", "modify_", "replace_")):
             raise AssertionError(f"audit must not call exchange order method {name}")
         raise AttributeError(name)
+
+
+def normalize_live_symbol(symbol: str) -> str:
+    """Return the exact venue symbol form used by the live strategy.
+
+    The live trader passes configured symbols directly into
+    ``strategy._load_market_candles`` and strips only the optional venue prefix
+    for MEXC public/private endpoint parameters.  Keep that parity here instead
+    of inventing aliases.
+    """
+    return symbol.strip()
+
+
+def mexc_contract_symbol(live_symbol: str) -> str:
+    return normalize_live_symbol(live_symbol).split(":", 1)[-1]
+
+
+def candles_table_exists(db_path: Path) -> bool:
+    if not db_path.exists():
+        return False
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='candles'").fetchone())
+
+
+def inspect_candle_db(db_path: Path, symbols: Sequence[str]) -> dict[str, dict[str, int | None]]:
+    """Inspect existence, candles table, counts, and per-symbol time coverage."""
+    result: dict[str, dict[str, int | None]] = {
+        symbol: {"rows": 0, "min_close_time": None, "max_close_time": None} for symbol in symbols
+    }
+    if not candles_table_exists(db_path):
+        return result
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        for symbol in symbols:
+            row = conn.execute(
+                "SELECT COUNT(*), MIN(close_time), MAX(close_time) FROM candles WHERE symbol = ?",
+                (normalize_live_symbol(symbol),),
+            ).fetchone()
+            result[symbol] = {
+                "rows": int(row[0] or 0),
+                "min_close_time": None if row[1] is None else int(row[1]),
+                "max_close_time": None if row[2] is None else int(row[2]),
+            }
+    return result
+
+
+def init_audit_cache(db_path: Path = AUDIT_CACHE_DB) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS candles ("
+            "symbol TEXT NOT NULL, close_time INTEGER NOT NULL, open REAL NOT NULL, "
+            "high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, "
+            "PRIMARY KEY(symbol, close_time))"
+        )
+
+
+def _closed_audit_end(end_ts: int, interval_seconds: int = MEXC_INTERVAL_SECONDS) -> int:
+    latest_closed = int(datetime.now(UTC).timestamp()) - interval_seconds
+    return min(end_ts, latest_closed)
 
 
 def parse_utc_timestamp(value: str) -> datetime:
@@ -155,10 +222,15 @@ def resolve_audit_range(
     selected_starts = sum(value is not None for value in (from_utc, last_hours)) + int(since_last_bot_run)
     if selected_starts > 1:
         raise ValueError("--from-utc, --last-hours, and --since-last-bot-run are mutually exclusive")
-    latest_ts = latest_closed_candle_ts(config.candles_db_path, config.allowed_symbols)
-    if latest_ts is None:
-        raise ValueError(f"no local candles found for configured symbols: {', '.join(config.allowed_symbols)}")
-    end = to_utc or (datetime.now(UTC) if since_last_bot_run else datetime.fromtimestamp(latest_ts, UTC))
+    latest_ts = latest_closed_candle_ts(config.candles_db_path, config.allowed_symbols) if candles_table_exists(config.candles_db_path) else None
+    if to_utc is not None:
+        end = to_utc
+    elif since_last_bot_run:
+        end = datetime.now(UTC)
+    else:
+        if latest_ts is None:
+            raise ValueError(f"no local candles found for configured symbols: {', '.join(config.allowed_symbols)}")
+        end = datetime.fromtimestamp(latest_ts, UTC)
     if last_hours is not None:
         if last_hours <= 0:
             raise ValueError("--last-hours must be a positive integer")
@@ -190,6 +262,15 @@ def candle_times_in_gap(db_path: Path, symbols: Iterable[str], audit_range: Audi
             (*symbol_list, audit_range.start_ts, audit_range.end_ts),
         ).fetchall()
     return [int(row[0]) for row in rows]
+
+
+def candle_times_in_gap_from_sources(db_paths: Sequence[Path], symbols: Iterable[str], audit_range: AuditRange) -> list[int]:
+    times: set[int] = set()
+    for db_path in db_paths:
+        if not candles_table_exists(db_path):
+            continue
+        times.update(candle_times_in_gap(db_path, symbols, audit_range))
+    return sorted(times)
 
 
 def _symbol_candle_times(conn: sqlite3.Connection, symbol: str, start_ts: int, end_ts: int) -> list[int]:
@@ -250,6 +331,128 @@ def validate_local_candle_coverage(db_path: Path, symbols: Sequence[str], audit_
         raise RuntimeError("insufficient local candle data: " + "; ".join(missing))
 
 
+def _coverage_times(db_paths: Sequence[Path], symbol: str, start_ts: int, end_ts: int) -> set[int]:
+    times: set[int] = set()
+    for db_path in db_paths:
+        if not candles_table_exists(db_path):
+            continue
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            rows = conn.execute(
+                "SELECT close_time FROM candles WHERE symbol = ? AND close_time > ? AND close_time <= ?",
+                (symbol, start_ts, end_ts),
+            ).fetchall()
+        times.update(int(row[0]) for row in rows)
+    return times
+
+
+def missing_candle_ranges(
+    db_paths: Sequence[Path],
+    symbols: Sequence[str],
+    audit_range: AuditRange,
+    interval_seconds: int = MEXC_INTERVAL_SECONDS,
+) -> dict[str, list[tuple[int, int]]]:
+    end_ts = _closed_audit_end(audit_range.end_ts, interval_seconds)
+    if end_ts <= audit_range.start_ts:
+        return {symbol: [(audit_range.start_ts + interval_seconds, audit_range.end_ts)] for symbol in symbols}
+    missing: dict[str, list[tuple[int, int]]] = {}
+    for symbol in symbols:
+        expected = list(range(audit_range.start_ts + interval_seconds, end_ts + 1, interval_seconds))
+        present = _coverage_times(db_paths, symbol, audit_range.start_ts, end_ts)
+        absent = [ts for ts in expected if ts not in present]
+        if not absent:
+            continue
+        ranges: list[tuple[int, int]] = []
+        start = prev = absent[0]
+        for ts in absent[1:]:
+            if ts == prev + interval_seconds:
+                prev = ts
+                continue
+            ranges.append((start, prev))
+            start = prev = ts
+        ranges.append((start, prev))
+        missing[symbol] = ranges
+    return missing
+
+
+def fetch_mexc_public_candles(
+    base_url: str,
+    symbol: str,
+    start_ts: int,
+    end_ts: int,
+    interval: str = MEXC_INTERVAL_NAME,
+) -> list[tuple[int, float, float, float, float]]:
+    """Fetch closed MEXC futures klines from public market data only."""
+    query = urllib.parse.urlencode({"interval": interval, "start": start_ts, "end": end_ts})
+    url = f"{base_url.rstrip('/')}/api/v1/contract/kline/{urllib.parse.quote(mexc_contract_symbol(symbol))}?{query}"
+    with urllib.request.urlopen(url, timeout=20) as res:
+        payload = json.loads(res.read().decode())
+    data = payload.get("data", payload)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unexpected MEXC kline response for {symbol}")
+    times = data.get("time") or []
+    opens = data.get("open") or []
+    highs = data.get("high") or []
+    lows = data.get("low") or []
+    closes = data.get("close") or []
+    rows: list[tuple[int, float, float, float, float]] = []
+    latest_closed = _closed_audit_end(end_ts)
+    for ts, open_, high, low, close in zip(times, opens, highs, lows, closes, strict=False):
+        close_ts = int(ts)
+        if start_ts <= close_ts <= end_ts and close_ts <= latest_closed:
+            rows.append((close_ts, float(open_), float(high), float(low), float(close)))
+    return rows
+
+
+def store_audit_candles(db_path: Path, symbol: str, rows: Iterable[tuple[int, float, float, float, float]]) -> None:
+    init_audit_cache(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)",
+            [(normalize_live_symbol(symbol), ts, open_, high, low, close) for ts, open_, high, low, close in rows],
+        )
+
+
+def ensure_audit_candle_coverage(config: live.LiveConfig, audit_range: AuditRange, cache_db: Path = AUDIT_CACHE_DB) -> Path:
+    """Verify configured DB first, then fetch only missing closed candles into audit cache."""
+    symbols = tuple(normalize_live_symbol(symbol) for symbol in config.allowed_symbols)
+    _ = inspect_candle_db(config.candles_db_path, symbols)
+    init_audit_cache(cache_db)
+    missing = missing_candle_ranges([config.candles_db_path, cache_db], symbols, audit_range)
+    for symbol, ranges in missing.items():
+        for start_ts, end_ts in ranges:
+            rows = fetch_mexc_public_candles(config.mexc_base_url, symbol, start_ts, end_ts)
+            store_audit_candles(cache_db, symbol, rows)
+    remaining = missing_candle_ranges([config.candles_db_path, cache_db], symbols, audit_range)
+    if remaining:
+        details = []
+        for symbol, ranges in remaining.items():
+            for start_ts, end_ts in ranges:
+                details.append(f"{symbol}: {datetime.fromtimestamp(start_ts, UTC).isoformat()}..{datetime.fromtimestamp(end_ts, UTC).isoformat()}")
+        raise RuntimeError("exchange/local audit candle coverage missing: " + "; ".join(details))
+    return cache_db
+
+
+def _copy_audit_source_candles(source_dbs: Sequence[Path], dest_db: Path, symbols: Iterable[str], close_time: int) -> None:
+    with sqlite3.connect(dest_db) as dst:
+        dst.execute(
+            "CREATE TABLE IF NOT EXISTS candles (symbol TEXT, close_time INTEGER, open REAL, high REAL, low REAL, close REAL, PRIMARY KEY(symbol, close_time))"
+        )
+        for source_db in source_dbs:
+            if not candles_table_exists(source_db):
+                continue
+            symbol_list = list(symbols)
+            placeholders = ",".join("?" for _ in symbol_list)
+            with sqlite3.connect(f"file:{source_db}?mode=ro", uri=True) as src:
+                rows = src.execute(
+                    f"SELECT symbol, close_time, open, high, low, close FROM candles WHERE symbol IN ({placeholders}) AND close_time <= ? ORDER BY close_time ASC",
+                    (*symbol_list, close_time),
+                ).fetchall()
+            dst.executemany(
+                "INSERT OR REPLACE INTO candles(symbol, close_time, open, high, low, close) VALUES (?,?,?,?,?,?)",
+                rows,
+            )
+
+
 def _copy_candles_through(source_db: Path, dest_db: Path, symbols: Iterable[str], close_time: int) -> None:
     symbol_list = list(symbols)
     placeholders = ",".join("?" for _ in symbol_list)
@@ -269,12 +472,15 @@ def _copy_candles_through(source_db: Path, dest_db: Path, symbols: Iterable[str]
         )
 
 
-def live_plans_through(config: live.LiveConfig, close_time: int) -> list[live.TradePlan]:
+def live_plans_through(config: live.LiveConfig, close_time: int, candle_sources: Sequence[Path] | None = None) -> list[live.TradePlan]:
     """Generate plans with the exact live function against a read-only snapshot."""
     with tempfile.TemporaryDirectory(prefix="mexc_missed_signal_audit_") as tmp:
         tmpdir = Path(tmp)
         snapshot_db = tmpdir / "candles.sqlite3"
-        _copy_candles_through(config.candles_db_path, snapshot_db, config.allowed_symbols, close_time)
+        if candle_sources is None:
+            _copy_candles_through(config.candles_db_path, snapshot_db, config.allowed_symbols, close_time)
+        else:
+            _copy_audit_source_candles(candle_sources, snapshot_db, config.allowed_symbols, close_time)
         audit_config = live.LiveConfig(
             live_trading_enabled=False,
             dry_run=True,
@@ -311,14 +517,27 @@ def run_audit(
     output_md: Path | None = None,
 ) -> list[dict[str, Any]]:
     selected_range = audit_range or resolve_audit_range(config)
-    validate_local_candle_coverage(config.candles_db_path, config.allowed_symbols, selected_range)
+    symbols = tuple(normalize_live_symbol(symbol) for symbol in config.allowed_symbols)
+    candle_sources: Sequence[Path]
+    try:
+        validate_local_candle_coverage(config.candles_db_path, symbols, selected_range)
+        candle_sources = (config.candles_db_path,)
+    except RuntimeError as local_error:
+        try:
+            cache_db = ensure_audit_candle_coverage(config, selected_range)
+        except Exception as fetch_error:
+            raise RuntimeError(f"{local_error}; audit cache backfill failed: {fetch_error}") from fetch_error
+        candle_sources = (config.candles_db_path, cache_db)
     rows: list[dict[str, Any]] = []
     events = parse_decision_events(config.decisions_log_path)
     seen: set[str] = set()
-    candle_times = candle_times_in_gap(config.candles_db_path, config.allowed_symbols, selected_range)
+    candle_times = candle_times_in_gap_from_sources(candle_sources, symbols, selected_range)
     latest_snapshot_ids: set[str] = set()
     for candle_ts in candle_times:
-        plans = live_plans_through(config, candle_ts)
+        if len(inspect.signature(live_plans_through).parameters) >= 3:
+            plans = live_plans_through(config, candle_ts, candle_sources)
+        else:  # Backward-compatible with narrow test doubles.
+            plans = live_plans_through(config, candle_ts)  # type: ignore[misc]
         if candle_ts == candle_times[-1]:
             latest_snapshot_ids = {plan.opportunity_id for plan in plans}
         for plan in plans:
