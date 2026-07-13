@@ -203,3 +203,22 @@ def test_reconcile_blocked_reason_when_bot_was_running_near_signal(tmp_path, mon
             "not_executed_reason": "RECONCILE_BLOCKED",
         }
     ]
+
+
+def test_validate_local_candle_coverage_accepts_second_timestamps(tmp_path):
+    c = cfg(tmp_path)
+    times = [BASE + HOUR * i for i in range(4)]
+    write_candles(c.candles_db_path, times)
+    audit_range = audit.AuditRange(dt(times[0]), dt(times[-1]))
+
+    audit.validate_local_candle_coverage(c.candles_db_path, c.allowed_symbols, audit_range)
+
+
+def test_validate_local_candle_coverage_accepts_millisecond_timestamps(tmp_path):
+    c = cfg(tmp_path)
+    times = [BASE + HOUR * i for i in range(4)]
+    write_candles(c.candles_db_path, [ts * 1000 for ts in times])
+    audit_range = audit.AuditRange(dt(times[0]), dt(times[-1]))
+
+    audit.validate_local_candle_coverage(c.candles_db_path, c.allowed_symbols, audit_range)
+    assert audit.resolve_audit_range(c, last_hours=1).end == dt(times[-1])
