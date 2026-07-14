@@ -2,6 +2,7 @@ from .decision import Decision
 from .composite_evidence_source import CompositeEvidenceSource
 from .enums import DecisionType, ValidationOutcome
 from .evidence import Evidence
+from .evidence_scorer import EvidenceScoreResult, EvidenceScorer
 from .evidence_deduplicator import (
     ConflictingEvidenceError,
     EvidenceDeduplicationResult,
@@ -32,6 +33,8 @@ __all__ = (
     "CompositeEvidenceSource",
     "ConflictingEvidenceError",
     "Evidence",
+    "EvidenceScoreResult",
+    "EvidenceScorer",
     "EvidenceSource",
     "EvidenceDeduplicationResult",
     "EvidenceDeduplicator",
