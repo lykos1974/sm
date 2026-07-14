@@ -685,11 +685,45 @@ def test_warmup_empty_db_becomes_sufficient_after_refresh(tmp_path, monkeypatch)
     assert warmup["required_candles"] == 7
 
 
-def test_warmup_insufficient_5000_flat_candles_fetches_more_then_reports_insufficient(tmp_path, monkeypatch):
+def test_warmup_iteratively_fetches_until_structural_columns_complete(tmp_path, monkeypatch):
     import mexc_pole_missed_signal_audit as audit
 
     monkeypatch.setattr(trader, "ensure_live_candle_warmup", ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP)
-    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 5000 * 60)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 480)
+    older_calls = []
+
+    def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
+        older_calls.append((start_ts, end_ts))
+        if len(older_calls) == 1:
+            closes = [10000.0] * 8
+        else:
+            closes = [10000.0, 10100.0, 9800.0, 10200.0, 9500.0, 9900.0, 9600.0, 9700.0]
+        return [(start_ts + i * interval_seconds, close, close, close, close) for i, close in enumerate(closes)]
+
+    monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
+    c = cfg(
+        tmp_path,
+        candles_db_path=tmp_path / "mexc_live_candles.db",
+        allowed_symbols=("MEXC_FUT:BTCUSDT",),
+        live_candle_backfill_minutes=8,
+        max_live_backfill_minutes=16,
+        max_live_history_windows=2,
+    )
+    _write_warmup_candles(c.candles_db_path, flat_count=8)
+
+    statuses = trader.ensure_live_candle_warmup(c)
+
+    assert older_calls == [(-420, 0), (-900, -480)]
+    assert statuses[0].ok
+    assert statuses[0].available_candles == 24
+    assert statuses[0].pnf_columns >= statuses[0].required_pnf_columns
+
+
+def test_warmup_stops_at_configured_structural_backfill_limits(tmp_path, monkeypatch):
+    import mexc_pole_missed_signal_audit as audit
+
+    monkeypatch.setattr(trader, "ensure_live_candle_warmup", ORIGINAL_ENSURE_LIVE_CANDLE_WARMUP)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: 480)
     older_calls = []
 
     def fake_fetch(base_url, symbol, start_ts, end_ts, interval, interval_seconds):
@@ -697,13 +731,20 @@ def test_warmup_insufficient_5000_flat_candles_fetches_more_then_reports_insuffi
         return [(start_ts + i * interval_seconds, 10000.0, 10000.0, 10000.0, 10000.0) for i in range((end_ts - start_ts) // interval_seconds + 1)]
 
     monkeypatch.setattr(audit, "fetch_mexc_public_candles", fake_fetch)
-    c = cfg(tmp_path, candles_db_path=tmp_path / "mexc_live_candles.db", allowed_symbols=("MEXC_FUT:BTCUSDT",), live_candle_backfill_minutes=5000)
-    _write_warmup_candles(c.candles_db_path, flat_count=5000)
+    c = cfg(
+        tmp_path,
+        candles_db_path=tmp_path / "mexc_live_candles.db",
+        allowed_symbols=("MEXC_FUT:BTCUSDT",),
+        live_candle_backfill_minutes=8,
+        max_live_backfill_minutes=16,
+        max_live_history_windows=2,
+    )
+    _write_warmup_candles(c.candles_db_path, flat_count=8)
 
     statuses = trader.ensure_live_candle_warmup(c)
 
-    assert older_calls == [(-299940, 0)]
-    assert statuses[0].available_candles == 10000
+    assert older_calls == [(-420, 0), (-900, -480)]
+    assert statuses[0].available_candles == 24
     assert statuses[0].pnf_columns < statuses[0].required_pnf_columns
     assert not statuses[0].ok
 

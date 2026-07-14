@@ -39,6 +39,8 @@ MEXC_CREDENTIALS_FILE = Path("mexc_credentials.json")
 DEFAULT_ALLOWED_SYMBOLS = tuple(strategy.TARGET_SYMBOLS)
 DEFAULT_LIVE_CANDLES_DB = REPO_ROOT / "pnf_mvp" / "data" / "mexc_live_candles.db"
 DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES = 5000
+DEFAULT_MAX_LIVE_BACKFILL_MINUTES = DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES * 10
+DEFAULT_MAX_LIVE_HISTORY_WINDOWS = 10
 # Current MEXC Pole Strategy v1 needs enough PnF structure to evaluate both
 # pole directions: prior same-type column, candidate pole column, reversal
 # column, immediate confirmation column, and the next closed candle used by
@@ -70,6 +72,8 @@ class LiveConfig:
     allowed_symbols: tuple[str, ...] = DEFAULT_ALLOWED_SYMBOLS
     box_sizes: dict[str, float] | None = None
     live_candle_backfill_minutes: int = DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES
+    max_live_backfill_minutes: int = DEFAULT_MAX_LIVE_BACKFILL_MINUTES
+    max_live_history_windows: int = DEFAULT_MAX_LIVE_HISTORY_WINDOWS
 
     @classmethod
     def from_json(cls, path: Path) -> "LiveConfig":
@@ -92,6 +96,8 @@ class LiveConfig:
             allowed_symbols=symbols,
             box_sizes={k: float(v) for k, v in raw.get("box_sizes", {}).items()} or None,
             live_candle_backfill_minutes=int(raw.get("live_candle_backfill_minutes", DEFAULT_LIVE_CANDLE_BACKFILL_MINUTES)),
+            max_live_backfill_minutes=int(raw.get("max_live_backfill_minutes", DEFAULT_MAX_LIVE_BACKFILL_MINUTES)),
+            max_live_history_windows=int(raw.get("max_live_history_windows", DEFAULT_MAX_LIVE_HISTORY_WINDOWS)),
         )
 
 
@@ -453,17 +459,23 @@ def _warmup_status(config: LiveConfig, symbol: str, latest_required_ts: int, int
     )
 
 
-def _fetch_older_live_candles(config: LiveConfig, symbols: tuple[str, ...], interval_seconds: int) -> dict[str, int]:
+def _fetch_older_live_candles(
+    config: LiveConfig,
+    symbols: tuple[str, ...],
+    interval_seconds: int,
+    backfill_minutes: int | None = None,
+) -> dict[str, int]:
     from mexc_pole_missed_signal_audit import MEXC_INTERVAL_NAMES, fetch_mexc_public_candles
 
     inserted: dict[str, int] = {}
+    window_minutes = max(1, int(backfill_minutes if backfill_minutes is not None else config.live_candle_backfill_minutes))
     for symbol in symbols:
         earliest = _candle_times_for_symbol(config.candles_db_path, symbol)[:1]
         if not earliest:
             inserted[symbol] = 0
             continue
         end_ts = earliest[0] - interval_seconds
-        start_ts = end_ts - max(1, int(config.live_candle_backfill_minutes)) * interval_seconds + interval_seconds
+        start_ts = end_ts - window_minutes * interval_seconds + interval_seconds
         rows = fetch_mexc_public_candles(
             config.mexc_base_url,
             symbol,
@@ -476,17 +488,40 @@ def _fetch_older_live_candles(config: LiveConfig, symbols: tuple[str, ...], inte
     return inserted
 
 
+def _needs_structural_warmup(status: CandleWarmupStatus) -> bool:
+    return (
+        status.contiguous
+        and status.latest_ts is not None
+        and status.latest_ts >= status.latest_required_ts
+        and status.pnf_columns < status.required_pnf_columns
+    )
+
+
 def ensure_live_candle_warmup(config: LiveConfig) -> list[CandleWarmupStatus]:
     from mexc_pole_missed_signal_audit import MEXC_REQUIRED_INTERVAL_SECONDS, _closed_audit_end
 
     interval_seconds = MEXC_REQUIRED_INTERVAL_SECONDS
     latest_required = _closed_audit_end(int(time.time()), interval_seconds)
     statuses = [_warmup_status(config, symbol, latest_required, interval_seconds) for symbol in config.allowed_symbols]
-    insufficient = tuple(status.symbol for status in statuses if not status.ok)
-    if insufficient:
-        _fetch_older_live_candles(config, insufficient, interval_seconds)
+
+    windows_used = 0
+    minutes_used = 0
+    max_windows = max(0, int(config.max_live_history_windows))
+    max_minutes = max(0, int(config.max_live_backfill_minutes))
+    window_minutes = max(1, int(config.live_candle_backfill_minutes))
+
+    while True:
+        insufficient = tuple(status.symbol for status in statuses if _needs_structural_warmup(status))
+        if not insufficient or windows_used >= max_windows or minutes_used >= max_minutes:
+            return statuses
+
+        next_window_minutes = min(window_minutes, max_minutes - minutes_used)
+        inserted = _fetch_older_live_candles(config, insufficient, interval_seconds, next_window_minutes)
+        windows_used += 1
+        minutes_used += next_window_minutes
         statuses = [_warmup_status(config, symbol, latest_required, interval_seconds) for symbol in config.allowed_symbols]
-    return statuses
+        if not any(inserted.values()):
+            return statuses
 
 def generate_trade_plans(config: LiveConfig, client: ExchangeClient) -> list[TradePlan]:
     box_sizes = {**strategy.DEFAULT_BOX_SIZES, **(config.box_sizes or {})}
