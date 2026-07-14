@@ -503,11 +503,15 @@ def fetch_mexc_public_candles(
     if final_end < start_ts:
         return []
     rows: dict[int, tuple[int, float, float, float, float]] = {}
-    last_payload: Any = None
     cursor = start_ts
+    page_start = start_ts
+    page_end = final_end
+    pages_fetched = 0
     while cursor <= final_end:
+        page_start = cursor
         page_end = min(final_end, cursor + interval_seconds * (MEXC_KLINE_PAGE_LIMIT - 1))
-        page_rows, last_payload = _fetch_mexc_public_candle_page(base_url, symbol, cursor, page_end, interval)
+        page_rows, _payload = _fetch_mexc_public_candle_page(base_url, symbol, page_start, page_end, interval)
+        pages_fetched += 1
         for row in page_rows:
             if row[0] <= latest_closed:
                 rows[row[0]] = row
@@ -515,8 +519,27 @@ def fetch_mexc_public_candles(
     expected = set(range(start_ts, final_end + 1, interval_seconds))
     missing = sorted(expected.difference(rows))
     if missing:
-        first_missing = datetime.fromtimestamp(missing[0], UTC).isoformat()
-        raise RuntimeError(f"MEXC kline response for {symbol}: {last_payload!r}; missing candle {first_missing}")
+        returned_ts = sorted(rows)
+        first_missing_ts = missing[0]
+        previous_returned_ts = max((ts for ts in returned_ts if ts < first_missing_ts), default=None)
+        next_returned_ts = min((ts for ts in returned_ts if ts > first_missing_ts), default=None)
+        details = {
+            "symbol": symbol,
+            "requested_start_ts": start_ts,
+            "requested_end_ts": final_end,
+            "first_returned_ts": returned_ts[0] if returned_ts else None,
+            "last_returned_ts": returned_ts[-1] if returned_ts else None,
+            "expected_candle_count": len(expected),
+            "returned_unique_candle_count": len(returned_ts),
+            "first_missing_ts": first_missing_ts,
+            "previous_returned_ts": previous_returned_ts,
+            "next_returned_ts": next_returned_ts,
+            "current_page_start_ts": page_start,
+            "current_page_end_ts": page_end,
+            "pages_fetched": pages_fetched,
+        }
+        detail_text = ", ".join(f"{key}={value}" for key, value in details.items())
+        raise RuntimeError(f"MEXC kline response missing candle: {detail_text}")
     return [rows[ts] for ts in sorted(rows)]
 
 

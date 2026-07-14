@@ -305,3 +305,56 @@ def test_complete_contiguous_replay_coverage_from_primary_and_cache(tmp_path, mo
 
     assert [row["opportunity_id"] for row in rows] == [f"opp-{ts * 1000}" for ts in (BASE + 60, BASE + 120, BASE + 180)]
     assert observed == [(BASE + 60) * 1000, (BASE + 120) * 1000, (BASE + 180) * 1000]
+
+
+def test_mexc_missing_candle_error_includes_focused_diagnostics_without_payload(monkeypatch):
+    requested = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            payload = {
+                "success": True,
+                "data": {
+                    "time": [BASE, BASE + 120],
+                    "open": ["1", "3"],
+                    "high": ["2", "4"],
+                    "low": ["0.5", "2.5"],
+                    "close": ["1.5", "3.5"],
+                    "huge_payload_marker": "must-not-leak",
+                },
+            }
+            return json.dumps(payload).encode()
+
+    def fake_urlopen(url, timeout):
+        requested.append(url)
+        return Response()
+
+    monkeypatch.setattr(audit.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", BASE, BASE + 120)
+
+    message = str(excinfo.value)
+    assert "MEXC kline response missing candle" in message
+    assert f"symbol=MEXC_FUT:BTCUSDT" in message
+    assert f"requested_start_ts={BASE}" in message
+    assert f"requested_end_ts={BASE + 120}" in message
+    assert f"first_returned_ts={BASE}" in message
+    assert f"last_returned_ts={BASE + 120}" in message
+    assert "expected_candle_count=3" in message
+    assert "returned_unique_candle_count=2" in message
+    assert f"first_missing_ts={BASE + 60}" in message
+    assert f"previous_returned_ts={BASE}" in message
+    assert f"next_returned_ts={BASE + 120}" in message
+    assert f"current_page_start_ts={BASE}" in message
+    assert f"current_page_end_ts={BASE + 120}" in message
+    assert "pages_fetched=1" in message
+    assert "must-not-leak" not in message
+    assert requested
