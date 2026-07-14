@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import inspect
 import json
 import sqlite3
@@ -664,7 +665,19 @@ def live_plans_through(config: live.LiveConfig, close_time: int, candle_sources:
             allowed_symbols=config.allowed_symbols,
             box_sizes=config.box_sizes,
         )
-        return live.generate_trade_plans(audit_config, ReadOnlySpecClient())
+        try:
+            plans = live.generate_trade_plans(audit_config, ReadOnlySpecClient())
+        finally:
+            # The snapshot database lives inside ``TemporaryDirectory``. On Windows,
+            # any sqlite connection or cursor that survives until directory cleanup
+            # keeps ``candles.sqlite3`` locked and causes WinError 32. The live
+            # strategy currently closes its own connection, but force a collection
+            # barrier before leaving the temporary-directory context so any
+            # unreferenced sqlite cursors/connections created during plan generation
+            # are finalized before cleanup is attempted. Do not catch cleanup errors:
+            # a real surviving handle should still fail loudly.
+            gc.collect()
+        return plans
 
 
 def classify_not_executed(signal_ts: datetime, events: list[DecisionEvent]) -> tuple[bool, str]:
