@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -135,6 +136,54 @@ def test_full_gap_replay_not_latest_snapshot_only(tmp_path, monkeypatch):
 
     assert observed_snapshot_maxima == times[1:]
     assert [row["opportunity_id"] for row in rows] == [f"opp-{ts}" for ts in times[1:]]
+
+
+def test_live_plans_through_releases_temporary_snapshot_for_immediate_cleanup(tmp_path, monkeypatch):
+    c = cfg(tmp_path)
+    times = [BASE + 60 * i for i in range(3)]
+    write_candles(c.candles_db_path, times)
+    observed_tmpdirs = []
+    calls = []
+
+    real_temporary_directory = audit.tempfile.TemporaryDirectory
+
+    class TrackingTemporaryDirectory:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_temporary_directory(*args, **kwargs)
+            self.name = None
+
+        def __enter__(self):
+            self.name = self._inner.__enter__()
+            observed_tmpdirs.append(self.name)
+            return self.name
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._inner.__exit__(exc_type, exc, tb)
+
+    def fake_generate_trade_plans(config, client):
+        calls.append(config.candles_db_path)
+        conn = sqlite3.connect(config.candles_db_path)
+        cursor = conn.execute("SELECT MAX(close_time) FROM candles")
+        max_ts = int(cursor.fetchone()[0])
+        # Simulate a loader that leaves a temporary unreferenced sqlite cycle.
+        # ``live_plans_through`` must collect it before TemporaryDirectory cleanup,
+        # which is what Windows needs before deleting candles.sqlite3.
+        cycle = [conn, cursor]
+        cycle.append(cycle)
+        return [plan(max_ts, f"opp-{max_ts}")]
+
+    monkeypatch.setattr(audit.tempfile, "TemporaryDirectory", TrackingTemporaryDirectory)
+    monkeypatch.setattr(audit.live, "generate_trade_plans", fake_generate_trade_plans)
+
+    for _ in range(3):
+        plans = audit.live_plans_through(c, times[-1])
+        gc.collect()
+        assert [p.opportunity_id for p in plans] == [f"opp-{times[-1]}"]
+        tmpdir = audit.Path(observed_tmpdirs[-1])
+        assert not (tmpdir / "candles.sqlite3").exists()
+        assert not tmpdir.exists()
+
+    assert len(calls) == 3
 
 
 def test_audit_uses_exact_live_generate_trade_plans_and_preserves_live_files(tmp_path, monkeypatch):
