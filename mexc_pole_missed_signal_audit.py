@@ -176,9 +176,17 @@ def _from_epoch_timestamp(value: int) -> datetime:
     return datetime.fromtimestamp(_to_epoch_seconds(value), UTC)
 
 
+def _floor_to_interval(ts: int, interval_seconds: int) -> int:
+    return (int(ts) // interval_seconds) * interval_seconds
+
+
+def _ceil_to_interval(ts: int, interval_seconds: int) -> int:
+    return ((int(ts) + interval_seconds - 1) // interval_seconds) * interval_seconds
+
+
 def _closed_audit_end(end_ts: int, interval_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS) -> int:
-    latest_closed = int(datetime.now(UTC).timestamp()) - interval_seconds
-    return min(end_ts, latest_closed)
+    latest_closed = _floor_to_interval(int(datetime.now(UTC).timestamp()) - interval_seconds, interval_seconds)
+    return min(_floor_to_interval(end_ts, interval_seconds), latest_closed)
 
 
 def parse_utc_timestamp(value: str) -> datetime:
@@ -498,13 +506,14 @@ def fetch_mexc_public_candles(
     interval_seconds: int = MEXC_REQUIRED_INTERVAL_SECONDS,
 ) -> list[tuple[int, float, float, float, float]]:
     """Fetch every closed MEXC futures kline from public market data only."""
+    aligned_start = _ceil_to_interval(start_ts, interval_seconds)
     latest_closed = _closed_audit_end(end_ts, interval_seconds)
-    final_end = min(end_ts, latest_closed)
-    if final_end < start_ts:
+    final_end = min(_floor_to_interval(end_ts, interval_seconds), latest_closed)
+    if final_end < aligned_start:
         return []
     rows: dict[int, tuple[int, float, float, float, float]] = {}
-    cursor = start_ts
-    page_start = start_ts
+    cursor = aligned_start
+    page_start = aligned_start
     page_end = final_end
     pages_fetched = 0
     while cursor <= final_end:
@@ -512,11 +521,24 @@ def fetch_mexc_public_candles(
         page_end = min(final_end, cursor + interval_seconds * (MEXC_KLINE_PAGE_LIMIT - 1))
         page_rows, _payload = _fetch_mexc_public_candle_page(base_url, symbol, page_start, page_end, interval)
         pages_fetched += 1
-        for row in page_rows:
-            if row[0] <= latest_closed:
-                rows[row[0]] = row
-        cursor = page_end + interval_seconds
-    expected = set(range(start_ts, final_end + 1, interval_seconds))
+        valid_page_rows = [
+            row for row in page_rows
+            if cursor <= row[0] <= page_end and row[0] <= latest_closed and (row[0] - aligned_start) % interval_seconds == 0
+        ]
+        for row in valid_page_rows:
+            rows[row[0]] = row
+        returned_ts = sorted({row[0] for row in valid_page_rows})
+        if not returned_ts:
+            break
+        next_cursor = returned_ts[-1] + interval_seconds
+        if next_cursor <= cursor:
+            raise RuntimeError(
+                "MEXC kline pagination made no progress: "
+                f"symbol={symbol}, current_page_start_ts={page_start}, "
+                f"current_page_end_ts={page_end}, last_returned_ts={returned_ts[-1]}"
+            )
+        cursor = next_cursor
+    expected = set(range(aligned_start, final_end + 1, interval_seconds))
     missing = sorted(expected.difference(rows))
     if missing:
         returned_ts = sorted(rows)
@@ -525,7 +547,7 @@ def fetch_mexc_public_candles(
         next_returned_ts = min((ts for ts in returned_ts if ts > first_missing_ts), default=None)
         details = {
             "symbol": symbol,
-            "requested_start_ts": start_ts,
+            "requested_start_ts": aligned_start,
             "requested_end_ts": final_end,
             "first_returned_ts": returned_ts[0] if returned_ts else None,
             "last_returned_ts": returned_ts[-1] if returned_ts else None,

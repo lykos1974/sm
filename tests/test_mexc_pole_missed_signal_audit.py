@@ -12,6 +12,7 @@ import mexc_pole_missed_signal_audit as audit
 
 
 BASE = 1_700_000_000
+ALIGNED_BASE = ((BASE + 59) // 60) * 60
 HOUR = 60
 
 
@@ -247,7 +248,7 @@ def test_min1_api_requests_and_btcusdt_endpoint_mapping(monkeypatch):
             return False
 
         def read(self):
-            return json.dumps({"success": True, "data": {"time": [BASE + 60], "open": ["1"], "high": ["2"], "low": ["0.5"], "close": ["1.5"]}}).encode()
+            return json.dumps({"success": True, "data": {"time": [ALIGNED_BASE + 60], "open": ["1"], "high": ["2"], "low": ["0.5"], "close": ["1.5"]}}).encode()
 
     def fake_urlopen(url, timeout):
         requested.append(url)
@@ -256,9 +257,9 @@ def test_min1_api_requests_and_btcusdt_endpoint_mapping(monkeypatch):
     monkeypatch.setattr(audit.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
 
-    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", BASE + 60, BASE + 60)
+    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", ALIGNED_BASE + 60, ALIGNED_BASE + 60)
 
-    assert rows == [(BASE + 60, 1.0, 2.0, 0.5, 1.5)]
+    assert rows == [(ALIGNED_BASE + 60, 1.0, 2.0, 0.5, 1.5)]
     assert "/api/v1/contract/kline/BTC_USDT?" in requested[0]
     assert "interval=Min1" in requested[0]
 
@@ -321,7 +322,7 @@ def test_mexc_missing_candle_error_includes_focused_diagnostics_without_payload(
             payload = {
                 "success": True,
                 "data": {
-                    "time": [BASE, BASE + 120],
+                    "time": [ALIGNED_BASE, ALIGNED_BASE + 120],
                     "open": ["1", "3"],
                     "high": ["2", "4"],
                     "low": ["0.5", "2.5"],
@@ -339,22 +340,121 @@ def test_mexc_missing_candle_error_includes_focused_diagnostics_without_payload(
     monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
 
     with pytest.raises(RuntimeError) as excinfo:
-        audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", BASE, BASE + 120)
+        audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", ALIGNED_BASE, ALIGNED_BASE + 120)
 
     message = str(excinfo.value)
     assert "MEXC kline response missing candle" in message
     assert f"symbol=MEXC_FUT:BTCUSDT" in message
-    assert f"requested_start_ts={BASE}" in message
-    assert f"requested_end_ts={BASE + 120}" in message
-    assert f"first_returned_ts={BASE}" in message
-    assert f"last_returned_ts={BASE + 120}" in message
+    assert f"requested_start_ts={ALIGNED_BASE}" in message
+    assert f"requested_end_ts={ALIGNED_BASE + 120}" in message
+    assert f"first_returned_ts={ALIGNED_BASE}" in message
+    assert f"last_returned_ts={ALIGNED_BASE + 120}" in message
     assert "expected_candle_count=3" in message
     assert "returned_unique_candle_count=2" in message
-    assert f"first_missing_ts={BASE + 60}" in message
-    assert f"previous_returned_ts={BASE}" in message
-    assert f"next_returned_ts={BASE + 120}" in message
-    assert f"current_page_start_ts={BASE}" in message
-    assert f"current_page_end_ts={BASE + 120}" in message
+    assert f"first_missing_ts={ALIGNED_BASE + 60}" in message
+    assert f"previous_returned_ts={ALIGNED_BASE}" in message
+    assert f"next_returned_ts={ALIGNED_BASE + 120}" in message
+    assert f"current_page_start_ts={ALIGNED_BASE}" in message
+    assert f"current_page_end_ts={ALIGNED_BASE + 120}" in message
     assert "pages_fetched=1" in message
     assert "must-not-leak" not in message
     assert requested
+
+
+def test_mexc_fetch_aligns_unaligned_bounds_and_expected_timestamps(monkeypatch):
+    calls = []
+
+    def fake_page(base_url, symbol, start_ts, end_ts, interval):
+        calls.append((start_ts, end_ts))
+        return ([(ts, 1.0, 2.0, 0.5, 1.5) for ts in range(start_ts, end_ts + 1, 60)], {"success": True})
+
+    monkeypatch.setattr(audit, "_fetch_mexc_public_candle_page", fake_page)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: (end_ts // interval_seconds) * interval_seconds)
+
+    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", ALIGNED_BASE + 1, ALIGNED_BASE + 179)
+
+    assert [row[0] for row in rows] == [ALIGNED_BASE + 60, ALIGNED_BASE + 120]
+    assert calls == [(ALIGNED_BASE + 60, ALIGNED_BASE + 120)]
+
+
+def test_mexc_fetch_exact_5000_aligned_candle_range(monkeypatch):
+    calls = []
+    start = ALIGNED_BASE + 60
+    end = start + 4999 * 60
+
+    def fake_page(base_url, symbol, start_ts, end_ts, interval):
+        calls.append((start_ts, end_ts))
+        return ([(ts, 1.0, 2.0, 0.5, 1.5) for ts in range(start_ts, end_ts + 1, 60)], {"success": True})
+
+    monkeypatch.setattr(audit, "_fetch_mexc_public_candle_page", fake_page)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
+
+    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", start, end)
+
+    assert len(rows) == 5000
+    assert rows[0][0] == start
+    assert rows[-1][0] == end
+    assert calls == [
+        (start, start + 1999 * 60),
+        (start + 2000 * 60, start + 3999 * 60),
+        (start + 4000 * 60, end),
+    ]
+
+
+def test_mexc_fetch_multi_page_advances_from_last_returned_without_boundary_gap(monkeypatch):
+    calls = []
+    start = ALIGNED_BASE + 60
+    end = start + 2001 * 60
+
+    def fake_page(base_url, symbol, start_ts, end_ts, interval):
+        calls.append((start_ts, end_ts))
+        page_limit = start_ts + 1998 * 60 if len(calls) == 1 else end_ts
+        return ([(ts, 1.0, 2.0, 0.5, 1.5) for ts in range(start_ts, page_limit + 1, 60)], {"success": True})
+
+    monkeypatch.setattr(audit, "_fetch_mexc_public_candle_page", fake_page)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
+
+    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", start, end)
+
+    assert len(rows) == 2002
+    assert [row[0] for row in rows] == list(range(start, end + 1, 60))
+    assert calls == [(start, start + 1999 * 60), (start + 1999 * 60, end)]
+
+
+def test_mexc_fetch_deduplicates_and_keeps_only_closed_aligned_candles(monkeypatch):
+    start = ALIGNED_BASE + 60
+    end = ALIGNED_BASE + 240
+
+    def fake_page(base_url, symbol, start_ts, end_ts, interval):
+        return ([
+            (start, 1.0, 2.0, 0.5, 1.5),
+            (start, 9.0, 9.0, 9.0, 9.0),
+            (start + 30, 3.0, 3.0, 3.0, 3.0),
+            (start + 60, 2.0, 3.0, 1.5, 2.5),
+        ], {"success": True})
+
+    monkeypatch.setattr(audit, "_fetch_mexc_public_candle_page", fake_page)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: start + 60)
+
+    rows = audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", start, end)
+
+    assert rows == [(start, 9.0, 9.0, 9.0, 9.0), (start + 60, 2.0, 3.0, 1.5, 2.5)]
+
+
+def test_mexc_fetch_no_progress_protection_reports_missing(monkeypatch):
+    calls = []
+    start = ALIGNED_BASE + 60
+    end = ALIGNED_BASE + 180
+
+    def fake_page(base_url, symbol, start_ts, end_ts, interval):
+        calls.append((start_ts, end_ts))
+        return ([], {"success": True})
+
+    monkeypatch.setattr(audit, "_fetch_mexc_public_candle_page", fake_page)
+    monkeypatch.setattr(audit, "_closed_audit_end", lambda end_ts, interval_seconds=60: end_ts)
+
+    with pytest.raises(RuntimeError, match="MEXC kline response missing candle") as excinfo:
+        audit.fetch_mexc_public_candles("https://contract.mexc.com", "MEXC_FUT:BTCUSDT", start, end)
+
+    assert calls == [(start, end)]
+    assert "pages_fetched=1" in str(excinfo.value)
