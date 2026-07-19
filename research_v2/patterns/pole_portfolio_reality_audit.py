@@ -1,7 +1,7 @@
 """Research-only portfolio reality audit for the validated PnF pole execution baseline.
 
 This module intentionally keeps the execution baseline fixed:
-- NEXT_COLUMN_OPEN_ENTRY
+- PENDING_LIMIT_THROUGH_ENTRY_WITH_EXPIRY at the intended NEXT_COLUMN_OPEN_ENTRY price
 - fixed three-box stop
 - fixed 2.5R target
 - break-even stop after +2R
@@ -34,6 +34,13 @@ from research_v2.patterns.pole_core_motif_next_open_expectancy_audit import (
     ENTRY_CANDIDATE,
     _load_observations,
 )
+from research_v2.patterns.pole_next_open_limit_fill_reality_audit import (
+    LIMIT_FILL_MODEL,
+    _limit_touched,
+    _post_fill_observation,
+    _stop_touched,
+    _target_touched,
+)
 from research_v2.patterns.pole_core_motif_sl_c_candle_chronology import (
     _parse_candle_symbol,
 )
@@ -44,6 +51,7 @@ from research_v2.patterns.pole_core_motif_sl_candidates import (
 
 TARGET_R = 2.5
 BREAK_EVEN_TRIGGER_R = 2.0
+LIMIT_EXPIRY_CANDLES = 3
 RISK_PER_TRADE_R = 1.0
 COMBINED = "COMBINED"
 DEFAULT_INITIAL_CAPITAL_USDT = 1000.0
@@ -189,17 +197,80 @@ def _safe_median(values: list[float]) -> float | str:
     return _round(median(values)) if values else ""
 
 
+def _pending_limit_be_classify(
+    rep: Any, candles: list[Any], expiry_candles: int
+) -> tuple[str, float | None, int | None, int | None, str]:
+    if expiry_candles <= 0:
+        raise ValueError("expiry_candles must be positive")
+    if (
+        rep.geometry_status != "OBSERVABLE"
+        or rep.observable_entry_ts is None
+        or rep.entry is None
+        or rep.stop is None
+    ):
+        return rep.geometry_status, None, None, None, rep.geometry_details
+
+    eligible = [candle for candle in candles if candle.ts >= rep.observable_entry_ts]
+    if not eligible:
+        return (
+            "UNKNOWN_MISSING_CANDLES",
+            None,
+            None,
+            None,
+            "no candles exist at or after the intended next-open timestamp",
+        )
+
+    active_window = eligible[:expiry_candles]
+    first_fill = next(
+        (candle for candle in active_window if _limit_touched(candle, rep)), None
+    )
+    if first_fill is None:
+        return (
+            "MISSED_LIMIT_FILL",
+            None,
+            None,
+            None,
+            f"pending limit was cancelled after {expiry_candles} candle(s) and cannot fill later",
+        )
+
+    if _stop_touched(first_fill, rep):
+        return (
+            "SAME_CANDLE_FILL_STOP_CONSERVATIVE",
+            -1.0,
+            first_fill.ts,
+            first_fill.ts,
+            "fill candle also contains the stop level; conservative same-candle handling records a stop",
+        )
+    if _target_touched(first_fill, rep, TARGET_R):
+        return (
+            "SAME_CANDLE_FILL_TARGET_AMBIGUOUS",
+            None,
+            first_fill.ts,
+            first_fill.ts,
+            "fill candle also contains the target level; OHLC cannot prove target occurred after the limit fill",
+        )
+
+    post_fill = _post_fill_observation(rep, first_fill.ts, candles)
+    classification, result_r, exit_ts, details = _be_classify(
+        post_fill, candles, BREAK_EVEN_TRIGGER_R
+    )
+    return classification, result_r, first_fill.ts, exit_ts, details
+
+
 def _resolved_outcomes(
-    opportunities: list[Opportunity], candles_by_symbol: dict[str, Any]
+    opportunities: list[Opportunity],
+    candles_by_symbol: dict[str, Any],
+    expiry_candles: int = LIMIT_EXPIRY_CANDLES,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     outcomes: list[dict[str, Any]] = []
     flags: list[dict[str, str]] = []
     for opportunity in opportunities:
         rep = opportunity.representative
-        classification, result_r, exit_ts, details = _be_classify(
-            rep, candles_by_symbol[rep.symbol], BREAK_EVEN_TRIGGER_R
+        classification, result_r, entry_ts, exit_ts, details = (
+            _pending_limit_be_classify(
+                rep, candles_by_symbol[rep.symbol], expiry_candles
+            )
         )
-        entry_ts = rep.observable_entry_ts
         if result_r is None or exit_ts is None or entry_ts is None:
             flags.append(
                 {
@@ -1203,7 +1274,12 @@ def run(
         )
         handle.write("## Fixed execution baseline\n\n")
         handle.write(
-            "- Entry: `NEXT_COLUMN_OPEN_ENTRY`\n- Stop: fixed 3-box stop\n- Target: fixed 2.5R\n- Management: move stop to break-even after +2R\n- No TP1, TP2, trailing, scaling, or pyramiding\n\n"
+            f"- Entry: `{LIMIT_FILL_MODEL}` at the intended `{ENTRY_CANDIDATE}` price\n"
+            f"- Limit expiry: {LIMIT_EXPIRY_CANDLES} candle(s)\n"
+            "- Stop: fixed 3-box stop\n"
+            "- Target: fixed 2.5R\n"
+            "- Management: move stop to break-even after +2R after the limit fill\n"
+            "- No TP1, TP2, trailing, scaling, or pyramiding\n\n"
         )
         handle.write(f"## Verdict: **{verdict}**\n\n{reason}.\n\n")
         handle.write("## Equity curve metrics\n\n")
@@ -1258,6 +1334,8 @@ def run(
         "strategy_promotion": False,
         "production_modifications": False,
         "entry": ENTRY_CANDIDATE,
+        "execution_model": LIMIT_FILL_MODEL,
+        "limit_expiry_candles": LIMIT_EXPIRY_CANDLES,
         "stop": "fixed_3_box_stop",
         "target_R": TARGET_R,
         "break_even_after_R": BREAK_EVEN_TRIGGER_R,
