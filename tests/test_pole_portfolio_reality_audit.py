@@ -289,11 +289,12 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     candle_path.write_text(
         "close_time,open,high,low,close\n"
-        "22,100,106.1,100.1,101\n"
+        "22,100,106.1,99,101\n"
         "23,101,108,101,107\n"
         "24,106,108,100,107\n"
-        "52,100,106.1,100.1,101\n"
-        "53,101,102,100,100\n"
+        "52,100,105.5,99,101\n"
+        "53,101,106.5,100.5,105\n"
+        "54,105,105,100,100\n"
     )
     return label_path, column_path, candle_path
 
@@ -337,6 +338,8 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     assert manifest["production_modifications"] is False
     assert manifest["strategy_promotion"] is False
     assert manifest["entry"] == "NEXT_COLUMN_OPEN_ENTRY"
+    assert manifest["execution_model"] == "PENDING_LIMIT_THROUGH_ENTRY_WITH_EXPIRY"
+    assert manifest["limit_expiry_candles"] == 3
     assert manifest["stop"] == "fixed_3_box_stop"
     assert manifest["target_R"] == 2.5
     assert manifest["break_even_after_R"] == 2.0
