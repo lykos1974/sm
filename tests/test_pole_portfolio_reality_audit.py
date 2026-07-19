@@ -4,17 +4,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+from research_v2.patterns.pole_core_motif_entry_timing_audit import (
+    Candle,
+    EntryTimingObservation,
+)
+from research_v2.patterns.pole_next_open_limit_fill_reality_audit import (
+    _limit_fill_result,
+)
 from research_v2.patterns.pole_portfolio_reality_audit import (
     ALLOWED_VERDICTS,
     OUTPUT_NAMES,
     PortfolioTrade,
     _apply_one_position_per_symbol,
+    _build_portfolio_opportunities,
     _equity_curve,
     _exposure_summary,
     _money_equity_curve,
     _monthly_money_rows,
     _max_streak,
     _period_rows,
+    _pre_portfolio_stage_counts,
+    _resolved_outcomes,
     _risk_flags,
     _symbol_rows,
     _verdict,
@@ -45,6 +55,100 @@ def _trade(
         active_positions_at_entry=active,
         active_risk_r_at_entry=float(active),
     )
+
+
+def _portfolio_obs(
+    symbol: str, row_number: int, ts: int, entry: float = 100.0, stop: float = 97.0
+) -> EntryTimingObservation:
+    return EntryTimingObservation(
+        symbol=symbol,
+        row_number=row_number,
+        direction="LONG",
+        entry_candidate="NEXT_COLUMN_OPEN_ENTRY",
+        pole_idx=0,
+        reversal_idx=1,
+        confirmation_idx=2,
+        box_size=1.0,
+        entry=entry,
+        stop=stop,
+        observable_entry_ts=ts,
+        replay_includes_anchor=True,
+        candles_in_replay=3,
+        geometry_status="OBSERVABLE",
+        geometry_details="synthetic",
+    )
+
+
+def test_portfolio_pre_execution_identity_is_symbol_and_row_scoped() -> None:
+    observations = [
+        _portfolio_obs("BTC", 7, 1000, entry=100.0, stop=97.0),
+        _portfolio_obs("ETH", 7, 1000, entry=200.0, stop=197.0),
+        _portfolio_obs("SOL", 7, 1000, entry=300.0, stop=297.0),
+    ]
+
+    opportunities = _build_portfolio_opportunities(observations)
+
+    assert len(opportunities) == 3
+    assert [opp.key for opp in opportunities] == [
+        ("BTC", 7, "LONG", 1000),
+        ("ETH", 7, "LONG", 1000),
+        ("SOL", 7, "LONG", 1000),
+    ]
+    assert [opp.representative.symbol for opp in opportunities] == ["BTC", "ETH", "SOL"]
+
+
+def test_integrated_pending_limit_stage_matches_standalone_before_portfolio() -> None:
+    observations = [
+        _portfolio_obs("BTC", 7, 1000, entry=100.0, stop=97.0),
+        _portfolio_obs("ETH", 7, 1000, entry=200.0, stop=197.0),
+        _portfolio_obs("SOL", 8, 1000, entry=300.0, stop=297.0),
+        _portfolio_obs("BTC", 9, 2000, entry=110.0, stop=107.0),
+    ]
+    candles_by_symbol = {
+        "BTC": [
+            Candle(1000, 101.0, 102.0, 99.5, 101.0),
+            Candle(1001, 101.0, 108.0, 100.5, 107.0),
+            Candle(2000, 111.0, 112.0, 110.5, 111.0),
+            Candle(2001, 111.0, 112.0, 110.5, 111.0),
+            Candle(2002, 111.0, 112.0, 110.5, 111.0),
+        ],
+        "ETH": [
+            Candle(1000, 201.0, 202.0, 199.5, 201.0),
+            Candle(1001, 201.0, 208.0, 200.5, 207.0),
+        ],
+        "SOL": [
+            Candle(1000, 301.0, 302.0, 299.5, 301.0),
+            Candle(1001, 301.0, 308.0, 300.5, 307.0),
+        ],
+    }
+
+    standalone = [
+        _limit_fill_result(row, candles_by_symbol[row.symbol], expiry_candles=3)
+        for row in observations
+    ]
+    opportunities = _build_portfolio_opportunities(observations)
+    outcomes, unresolved_flags = _resolved_outcomes(opportunities, candles_by_symbol)
+    trades, overlap_flags = _apply_one_position_per_symbol(outcomes)
+    counts = _pre_portfolio_stage_counts(
+        opportunities, candles_by_symbol, outcomes, overlap_flags
+    )
+
+    assert len(standalone) == 4
+    assert sum(result.fill_status == "FILLED" for result in standalone) == 3
+    assert sum(result.fill_status == "CANCELLED_EXPIRED" for result in standalone) == 1
+    assert counts == {
+        "raw_observations": 4,
+        "motif_eligible": 4,
+        "deduplicated": 4,
+        "pending_orders": 4,
+        "filled": 3,
+        "cancelled": 1,
+        "portfolio_accepted": 3,
+        "overlap_skipped": 0,
+    }
+    assert len(unresolved_flags) == 1
+    assert "MISSED_LIMIT_FILL" in unresolved_flags[0]["details"]
+    assert [trade.symbol for trade in trades] == ["BTC", "ETH", "SOL"]
 
 
 def test_equity_curve_construction_and_max_drawdown() -> None:
