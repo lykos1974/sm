@@ -26,10 +26,10 @@ from statistics import mean, median
 from typing import Any, Iterable
 
 from research_v2.patterns.pole_be_research_audit import _be_classify
-from research_v2.patterns.pole_core_motif_execution_reality_audit import (
-    Opportunity,
-    _build_opportunities,
+from research_v2.patterns.pole_core_motif_entry_timing_audit import (
+    EntryTimingObservation,
 )
+from research_v2.patterns.pole_core_motif_execution_reality_audit import Opportunity
 from research_v2.patterns.pole_core_motif_next_open_expectancy_audit import (
     ENTRY_CANDIDATE,
     _load_observations,
@@ -108,6 +108,7 @@ SYMBOL_FIELDS = [
 ]
 PERIOD_FIELDS = ["period", "trades", "total_R", "win_rate", "max_losing_streak"]
 FLAG_FIELDS = ["flag", "severity", "details"]
+PORTFOLIO_OPPORTUNITY_ID_METHOD = "symbol+row_number+direction+observable_entry_ts"
 MONEY_OUTPUT_NAMES = ("equity_curve_usdt.csv", "monthly_returns_usdt.csv")
 COST_OUTPUT_NAMES = ("cost_adjusted_equity_curve_usdt.csv",)
 TRADE_SEQUENCE_MONEY_OUTPUT_NAMES = (
@@ -257,6 +258,46 @@ def _pending_limit_be_classify(
     return classification, result_r, first_fill.ts, exit_ts, details
 
 
+def _portfolio_opportunity_key(row: EntryTimingObservation) -> tuple[Any, ...]:
+    """Return the portfolio execution identity for one raw motif observation.
+
+    The portfolio audit must first reproduce the standalone pending-limit execution
+    audit one observation at a time.  Portfolio overlap/sequencing may reduce the
+    accepted trade sequence later, but pre-portfolio identity is intentionally
+    symbol-scoped and row-scoped so equal row numbers/timestamps on different
+    markets cannot overwrite each other.
+    """
+    return (row.symbol, row.row_number, row.direction, row.observable_entry_ts)
+
+
+def _build_portfolio_opportunities(
+    observations: list[EntryTimingObservation],
+) -> list[Opportunity]:
+    opportunities: list[Opportunity] = []
+    for ordinal, row in enumerate(
+        sorted(
+            observations,
+            key=lambda item: (
+                item.symbol,
+                item.row_number,
+                item.direction,
+                -1 if item.observable_entry_ts is None else item.observable_entry_ts,
+            ),
+        ),
+        start=1,
+    ):
+        key = _portfolio_opportunity_key(row)
+        opportunities.append(
+            Opportunity(
+                f"OPP-{ordinal:06d}",
+                key,
+                (row,),
+                row,
+            )
+        )
+    return opportunities
+
+
 def _resolved_outcomes(
     opportunities: list[Opportunity],
     candles_by_symbol: dict[str, Any],
@@ -294,6 +335,56 @@ def _resolved_outcomes(
             }
         )
     return outcomes, flags
+
+
+def _pre_portfolio_stage_counts(
+    opportunities: list[Opportunity],
+    candles_by_symbol: dict[str, Any],
+    outcomes: list[dict[str, Any]],
+    overlap_flags: list[dict[str, str]] | None = None,
+    expiry_candles: int = LIMIT_EXPIRY_CANDLES,
+) -> dict[str, int]:
+    pending_orders = 0
+    filled = 0
+    cancelled = 0
+    for opportunity in opportunities:
+        rep = opportunity.representative
+        if (
+            rep.geometry_status != "OBSERVABLE"
+            or rep.observable_entry_ts is None
+            or rep.entry is None
+            or rep.stop is None
+        ):
+            continue
+        pending_orders += 1
+        candles = candles_by_symbol[rep.symbol]
+        active_window = [
+            candle for candle in candles if candle.ts >= rep.observable_entry_ts
+        ][:expiry_candles]
+        if any(_limit_touched(candle, rep) for candle in active_window):
+            filled += 1
+        else:
+            cancelled += 1
+    return {
+        "raw_observations": sum(
+            len(opportunity.observations) for opportunity in opportunities
+        ),
+        "motif_eligible": len(opportunities),
+        "deduplicated": len(opportunities),
+        "pending_orders": pending_orders,
+        "filled": filled,
+        "cancelled": cancelled,
+        "portfolio_accepted": len(outcomes),
+        "overlap_skipped": (
+            0
+            if overlap_flags is None
+            else sum(
+                1
+                for flag in overlap_flags
+                if flag["flag"] == "SAME_SYMBOL_OVERLAP_SKIPPED"
+            )
+        ),
+    }
 
 
 def _apply_one_position_per_symbol(
@@ -1220,9 +1311,13 @@ def run(
             f"refusing to overwrite existing portfolio reality output(s): {', '.join(existing)}"
         )
 
-    opportunities = _build_opportunities(observations)
+    opportunities = _build_portfolio_opportunities(observations)
     outcomes, unresolved_flags = _resolved_outcomes(opportunities, candles_by_symbol)
     trades, overlap_flags = _apply_one_position_per_symbol(outcomes)
+    stage_counts = _pre_portfolio_stage_counts(
+        opportunities, candles_by_symbol, outcomes, overlap_flags
+    )
+    stage_counts["portfolio_accepted"] = len(trades)
     trade_fixed_risk_usdt = money_config[1] if money_config else None
     trade_rows = _trade_rows(trades, trade_fixed_risk_usdt)
     equity_rows, equity = _equity_curve(trades)
@@ -1373,6 +1468,8 @@ def run(
         "input_observations": len(observations),
         "unique_opportunities": len(opportunities),
         "resolved_portfolio_trades": len(trades),
+        "portfolio_opportunity_id_method": PORTFOLIO_OPPORTUNITY_ID_METHOD,
+        "pipeline_stage_counts": stage_counts,
         "allowed_verdicts": list(ALLOWED_VERDICTS),
         "verdict": verdict,
         "verdict_reason": reason,
