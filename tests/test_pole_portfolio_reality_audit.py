@@ -461,6 +461,55 @@ def test_cli_outputs_research_only_artifacts_and_preserves_production_isolation(
     assert "strategy_historical_backfill" not in source
 
 
+def test_cli_debug_overlap_trace_is_output_only(tmp_path: Path) -> None:
+    labels, columns, candles = _write_fixture(tmp_path)
+    baseline_output = tmp_path / "baseline"
+    debug_output = tmp_path / "debug"
+    base_command = [
+        sys.executable,
+        "-m",
+        "research_v2.patterns.pole_portfolio_reality_audit",
+        "--symbol-input",
+        f"BTC={labels}",
+        "--columns-input",
+        f"BTC={columns}",
+        "--candles-input",
+        f"BTC={candles}",
+    ]
+
+    subprocess.run([*base_command, "--output-root", str(baseline_output)], check=True)
+    subprocess.run(
+        [
+            *base_command,
+            "--output-root",
+            str(debug_output),
+            "--debug-overlap-trace",
+        ],
+        check=True,
+    )
+
+    assert "portfolio_overlap_trace.csv" not in {
+        path.name for path in baseline_output.iterdir()
+    }
+    assert {path.name for path in debug_output.iterdir()} == {
+        *OUTPUT_NAMES,
+        "portfolio_overlap_trace.csv",
+    }
+    assert (baseline_output / "portfolio_reality_trade_sequence.csv").read_text() == (
+        debug_output / "portfolio_reality_trade_sequence.csv"
+    ).read_text()
+    assert (baseline_output / "portfolio_reality_flags.csv").read_text() == (
+        debug_output / "portfolio_reality_flags.csv"
+    ).read_text()
+
+    trace_rows = list(
+        csv.DictReader((debug_output / "portfolio_overlap_trace.csv").open())
+    )
+    assert [row["decision"] for row in trace_rows] == ["ACCEPTED", "ACCEPTED"]
+    assert [row["blocking_trade_id"] for row in trace_rows] == ["", ""]
+    assert [row["skip_reason"] for row in trace_rows] == ["", ""]
+
+
 def test_cli_money_simulation_adds_usdt_artifacts_without_changing_research_outputs(
     tmp_path: Path,
 ) -> None:

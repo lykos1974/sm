@@ -117,6 +117,24 @@ TRADE_SEQUENCE_MONEY_OUTPUT_NAMES = (
 )
 TRADE_SEQUENCE_COST_OUTPUT_NAMES = ("cost_adjusted_equity_curve.csv",)
 TRADE_SEQUENCE_SIZING_OUTPUT_NAME = "portfolio_reality_trade_sequence_sizing.csv"
+OVERLAP_TRACE_OUTPUT_NAME = "portfolio_overlap_trace.csv"
+OVERLAP_TRACE_FIELDS = [
+    "opportunity_id",
+    "symbol",
+    "row_number",
+    "direction",
+    "observable_entry_ts",
+    "fill_ts",
+    "exit_ts",
+    "decision",
+    "skip_reason",
+    "blocking_trade_id",
+    "blocking_symbol",
+    "blocking_fill_ts",
+    "blocking_exit_ts",
+    "active_positions_before",
+    "active_positions_after",
+]
 MONEY_EQUITY_FIELDS = [
     "sequence",
     "exit_timestamp",
@@ -387,26 +405,55 @@ def _pre_portfolio_stage_counts(
     }
 
 
-def _apply_one_position_per_symbol(
+def _overlap_trace_row(
+    outcome: dict[str, Any],
+    decision: str,
+    skip_reason: str,
+    blocking_trade: PortfolioTrade | None,
+    active_positions_before: int,
+    active_positions_after: int,
+) -> dict[str, Any]:
+    rep = getattr(outcome["opportunity"], "representative", None)
+    return {
+        "opportunity_id": outcome["opportunity"].opportunity_id,
+        "symbol": outcome["symbol"],
+        "row_number": "" if rep is None else rep.row_number,
+        "direction": outcome["direction"],
+        "observable_entry_ts": "" if rep is None else rep.observable_entry_ts,
+        "fill_ts": outcome["entry_ts"],
+        "exit_ts": outcome["exit_ts"],
+        "decision": decision,
+        "skip_reason": skip_reason,
+        "blocking_trade_id": "" if blocking_trade is None else blocking_trade.trade_id,
+        "blocking_symbol": "" if blocking_trade is None else blocking_trade.symbol,
+        "blocking_fill_ts": "" if blocking_trade is None else blocking_trade.entry_ts,
+        "blocking_exit_ts": "" if blocking_trade is None else blocking_trade.exit_ts,
+        "active_positions_before": active_positions_before,
+        "active_positions_after": active_positions_after,
+    }
+
+
+def _apply_one_position_per_symbol_with_trace(
     outcomes: list[dict[str, Any]],
-) -> tuple[list[PortfolioTrade], list[dict[str, str]]]:
+) -> tuple[list[PortfolioTrade], list[dict[str, str]], list[dict[str, Any]]]:
     flags: list[dict[str, str]] = []
+    trace_rows: list[dict[str, Any]] = []
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for outcome in outcomes:
         grouped[outcome["entry_ts"]].append(outcome)
 
-    active_until_by_symbol: dict[str, int] = {}
+    active_by_symbol: dict[str, PortfolioTrade] = {}
     selected: list[PortfolioTrade] = []
     ordinal = 1
     for entry_ts in sorted(grouped):
-        active_until_by_symbol = {
-            symbol: exit_ts
-            for symbol, exit_ts in active_until_by_symbol.items()
-            if exit_ts > entry_ts
+        active_by_symbol = {
+            symbol: trade
+            for symbol, trade in active_by_symbol.items()
+            if trade.exit_ts > entry_ts
         }
-        active_positions = len(active_until_by_symbol)
+        active_positions = len(active_by_symbol)
         active_risk = active_positions * RISK_PER_TRADE_R
-        pending_additions: dict[str, int] = {}
+        pending_additions: dict[str, PortfolioTrade] = {}
         for outcome in sorted(
             grouped[entry_ts],
             key=lambda row: (
@@ -416,7 +463,11 @@ def _apply_one_position_per_symbol(
             ),
         ):
             symbol = outcome["symbol"]
-            if symbol in active_until_by_symbol or symbol in pending_additions:
+            active_positions_before = len(active_by_symbol) + len(pending_additions)
+            blocking_trade = active_by_symbol.get(symbol) or pending_additions.get(
+                symbol
+            )
+            if blocking_trade is not None:
                 flags.append(
                     {
                         "flag": "SAME_SYMBOL_OVERLAP_SKIPPED",
@@ -424,28 +475,53 @@ def _apply_one_position_per_symbol(
                         "details": f"{outcome['opportunity'].opportunity_id} {symbol} entry {entry_ts} skipped by one-position-per-symbol rule",
                     }
                 )
+                trace_rows.append(
+                    _overlap_trace_row(
+                        outcome,
+                        "SKIPPED",
+                        "SAME_SYMBOL_OVERLAP_SKIPPED",
+                        blocking_trade,
+                        active_positions_before,
+                        active_positions_before,
+                    )
+                )
                 continue
-            selected.append(
-                PortfolioTrade(
-                    trade_id=f"TRADE-{ordinal:06d}",
-                    opportunity_id=outcome["opportunity"].opportunity_id,
-                    symbol=symbol,
-                    direction=outcome["direction"],
-                    entry_ts=entry_ts,
-                    exit_ts=outcome["exit_ts"],
-                    classification=outcome["classification"],
-                    result_r=outcome["result_r"],
-                    active_positions_at_entry=active_positions,
-                    active_risk_r_at_entry=active_risk,
-                    entry_price=outcome.get("entry_price"),
-                    stop_price=outcome.get("stop_price"),
+            trade = PortfolioTrade(
+                trade_id=f"TRADE-{ordinal:06d}",
+                opportunity_id=outcome["opportunity"].opportunity_id,
+                symbol=symbol,
+                direction=outcome["direction"],
+                entry_ts=entry_ts,
+                exit_ts=outcome["exit_ts"],
+                classification=outcome["classification"],
+                result_r=outcome["result_r"],
+                active_positions_at_entry=active_positions,
+                active_risk_r_at_entry=active_risk,
+                entry_price=outcome.get("entry_price"),
+                stop_price=outcome.get("stop_price"),
+            )
+            selected.append(trade)
+            pending_additions[symbol] = trade
+            trace_rows.append(
+                _overlap_trace_row(
+                    outcome,
+                    "ACCEPTED",
+                    "",
+                    None,
+                    active_positions_before,
+                    active_positions_before + 1,
                 )
             )
-            pending_additions[symbol] = outcome["exit_ts"]
             ordinal += 1
-        active_until_by_symbol.update(pending_additions)
-    return selected, flags
+        active_by_symbol.update(pending_additions)
+    return selected, flags, trace_rows
 
+
+def _apply_one_position_per_symbol(
+    outcomes: list[dict[str, Any]],
+) -> tuple[list[PortfolioTrade], list[dict[str, str]]]:
+    selected, flags, _trace_rows = _apply_one_position_per_symbol_with_trace(outcomes)
+    return selected, flags
 
 def _risk_sizing_values(
     trade: PortfolioTrade, fixed_risk_usdt: float
@@ -1289,6 +1365,7 @@ def run(
     fixed_position_size_usdt: float | None = None,
     fee_bps: float | None = None,
     slippage_bps: float | None = None,
+    debug_overlap_trace: bool = False,
 ) -> None:
     symbols, observations, candles_by_symbol = _load_observations(
         symbol_inputs, columns_inputs, candles_inputs, candle_symbols or {}
@@ -1300,9 +1377,13 @@ def run(
             *OUTPUT_NAMES,
             *MONEY_OUTPUT_NAMES,
             *(COST_OUTPUT_NAMES if cost_config else ()),
+            *((OVERLAP_TRACE_OUTPUT_NAME,) if debug_overlap_trace else ()),
         )
         if money_config
-        else OUTPUT_NAMES
+        else (
+            *OUTPUT_NAMES,
+            *((OVERLAP_TRACE_OUTPUT_NAME,) if debug_overlap_trace else ()),
+        )
     )
     output_root.mkdir(parents=True, exist_ok=True)
     existing = [name for name in output_names if (output_root / name).exists()]
@@ -1313,7 +1394,9 @@ def run(
 
     opportunities = _build_portfolio_opportunities(observations)
     outcomes, unresolved_flags = _resolved_outcomes(opportunities, candles_by_symbol)
-    trades, overlap_flags = _apply_one_position_per_symbol(outcomes)
+    trades, overlap_flags, overlap_trace_rows = (
+        _apply_one_position_per_symbol_with_trace(outcomes)
+    )
     stage_counts = _pre_portfolio_stage_counts(
         opportunities, candles_by_symbol, outcomes, overlap_flags
     )
@@ -1421,6 +1504,12 @@ def run(
         )
     if cost_config:
         _write_csv(output_root / COST_OUTPUT_NAMES[0], COST_EQUITY_FIELDS, cost_rows)
+    if debug_overlap_trace:
+        _write_csv(
+            output_root / OVERLAP_TRACE_OUTPUT_NAME,
+            OVERLAP_TRACE_FIELDS,
+            overlap_trace_rows,
+        )
     manifest = {
         "created_at_utc": datetime.now(UTC).isoformat(),
         "stage": "pole_portfolio_reality_audit",
@@ -1478,6 +1567,7 @@ def run(
             *OUTPUT_NAMES[:-1],
             *(MONEY_OUTPUT_NAMES if money_config else ()),
             *(COST_OUTPUT_NAMES if cost_config else ()),
+            *((OVERLAP_TRACE_OUTPUT_NAME,) if debug_overlap_trace else ()),
         ],
     }
     if money_config:
@@ -1563,6 +1653,11 @@ def main() -> None:
         default=None,
         help="Optional slippage cost in basis points for cost-adjusted money simulation",
     )
+    parser.add_argument(
+        "--debug-overlap-trace",
+        action="store_true",
+        help="Emit portfolio_overlap_trace.csv with accepted/skipped same-symbol overlap decisions",
+    )
     args = parser.parse_args()
     try:
         if args.trade_sequence is not None:
@@ -1593,6 +1688,7 @@ def main() -> None:
             args.fixed_position_size,
             args.fee_bps,
             args.slippage_bps,
+            args.debug_overlap_trace,
         )
     except (FileExistsError, OSError, sqlite3.Error, ValueError) as exc:
         parser.error(str(exc))
