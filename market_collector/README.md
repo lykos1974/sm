@@ -37,3 +37,27 @@ Five tests each cover Binance and MEXC: provisional bootstrap/final poll, latest
 Δεν χρειάζεται διαγραφή/επαναδημιουργία βάσης ή πολύωρο backfill. Το `updated N rows` μετρά upserts, επομένως μπορεί να επαναλαμβάνεται ενημέρωση του τελευταίου candle χωρίς νέο λεπτό. Μια υγιής ένδειξη λειτουργίας δεν πιστοποιεί ακόμη την ποιότητα όλου του παλιού ιστορικού.
 
 Rollback του κώδικα: κλείσε τον collector και επανάφερε το αντίγραφο ως `collector.py`. Αυτό δεν αναιρεί candle updates που ήδη γράφτηκαν. Η παλιά έκδοση έχει το γνωστό finality bug και η επαναφορά δεν σημαίνει ότι τα δεδομένα γίνονται αξιόπιστα.
+
+## Optional BTCUSDT microstructure collector
+
+`microstructure_collector.py` is a separate read-only forward evidence tool. It
+listens only to the public Binance Spot `btcusdt@bookTicker` and
+`btcusdt@aggTrade` streams. It has no API key, sends no orders, and never opens
+`market_data.db`.
+
+Install its dependency and start it from this directory:
+
+```text
+python -m pip install -r requirements-microstructure.txt
+python microstructure_collector.py
+```
+
+The dedicated default database is `microstructure_btcusdt.db`. It records local
+wall/monotonic receive time, raw JSON, connection sessions, best bid/ask, and
+aggregate trades. Possible aggregate-trade ID gaps are recorded in
+`stream_anomalies`. Jumps in `bookTicker.updateId` are not called gaps because
+the stream publishes best-quote changes, not every order-book update.
+
+This evidence does not prove a hypothetical limit fill: it contains neither
+queue position nor private order acknowledgements. It must remain separate from
+strategy and validation until its quality is independently checked.
