@@ -74,7 +74,7 @@ class Store:
         self.path = Path(path).resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.symbol = symbol
-        self.conn = sqlite3.connect(self.path, timeout=30)
+        self.conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -233,11 +233,23 @@ class Store:
         if len(self.pending) >= max_events or time.monotonic() - self.last_flush >= max_seconds:
             self.flush()
 
-    def flush(self) -> None:
-        if not self.pending:
+    def flush_due(self, max_events: int, max_seconds: float) -> bool:
+        return bool(self.pending) and (
+            len(self.pending) >= max_events
+            or time.monotonic() - self.last_flush >= max_seconds
+        )
+
+    def detach_pending(self) -> list[tuple[str, tuple[Any, ...]]]:
+        events, self.pending = self.pending, []
+        return events
+
+    def restore_pending(self, events: list[tuple[str, tuple[Any, ...]]]) -> None:
+        self.pending = events + self.pending
+
+    def write_batch(self, events: list[tuple[str, tuple[Any, ...]]]) -> None:
+        if not events:
             self.last_flush = time.monotonic()
             return
-        events = self.pending
         flush_started_ns = time.monotonic_ns()
         with self.conn:
             for kind, row in events:
@@ -270,8 +282,18 @@ class Store:
                     (self.active_session_id, time.time_ns(), "SLOW_SQLITE_FLUSH",
                      flush_duration_ms, None, len(events), "{}"),
                 )
-        self.pending = []
         self.last_flush = time.monotonic()
+
+    def flush(self) -> None:
+        if not self.pending:
+            self.last_flush = time.monotonic()
+            return
+        events = self.detach_pending()
+        try:
+            self.write_batch(events)
+        except BaseException:
+            self.restore_pending(events)
+            raise
 
     def counts(self) -> tuple[int, int, int]:
         return tuple(int(self.conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
@@ -282,12 +304,66 @@ class Store:
         self.conn.close()
 
 
+class AsyncFlusher:
+    """Keep SQLite writes off the WebSocket event loop, one atomic batch at a time."""
+
+    def __init__(self, store: Store):
+        self.store = store
+        self.task: asyncio.Task[None] | None = None
+        self.inflight: list[tuple[str, tuple[Any, ...]]] | None = None
+
+    def _finish_completed(self) -> None:
+        if self.task is None or not self.task.done():
+            return
+        try:
+            self.task.result()
+        except BaseException:
+            if self.inflight:
+                self.store.restore_pending(self.inflight)
+            self.task = None
+            self.inflight = None
+            raise
+        self.task = None
+        self.inflight = None
+
+    def submit_if_due(self, max_events: int, max_seconds: float) -> None:
+        self._finish_completed()
+        if self.task is not None or not self.store.flush_due(max_events, max_seconds):
+            return
+        self.inflight = self.store.detach_pending()
+        self.task = asyncio.create_task(
+            asyncio.to_thread(self.store.write_batch, self.inflight)
+        )
+
+    async def flush_all(self) -> None:
+        if self.task is not None:
+            try:
+                await self.task
+            except BaseException:
+                if self.inflight:
+                    self.store.restore_pending(self.inflight)
+                self.task = None
+                self.inflight = None
+                raise
+            self.task = None
+            self.inflight = None
+        events = self.store.detach_pending()
+        if events:
+            try:
+                await asyncio.to_thread(self.store.write_batch, events)
+            except BaseException:
+                self.store.restore_pending(events)
+                raise
+
+
 def stream_url(endpoint: str = ENDPOINT, symbol: str = SYMBOL) -> str:
     name = symbol.lower()
     return endpoint.rstrip("/") + f"/stream?streams={name}@bookTicker/{name}@aggTrade"
 
 
-async def collect_session(store: Store, args: argparse.Namespace, stop: asyncio.Event) -> None:
+async def collect_session(
+    store: Store, flusher: AsyncFlusher, args: argparse.Namespace, stop: asyncio.Event
+) -> None:
     url = stream_url(args.endpoint, args.symbol)
     session_id = store.start_session(url)
     started, reason = time.monotonic(), "normal_stop"
@@ -318,7 +394,7 @@ async def collect_session(store: Store, args: argparse.Namespace, stop: asyncio.
                     wait_started_ns = time.monotonic_ns()
                     raw = await asyncio.wait_for(socket.recv(), timeout=1)
                 except asyncio.TimeoutError:
-                    store.flush_if_due(args.flush_events, args.flush_seconds)
+                    flusher.submit_if_due(args.flush_events, args.flush_seconds)
                     continue
                 if not isinstance(raw, str):
                     raise ValueError("unexpected binary message")
@@ -326,7 +402,7 @@ async def collect_session(store: Store, args: argparse.Namespace, stop: asyncio.
                 store.queue(
                     session_id, parse_combined(raw, args.symbol, socket_wait_ms)
                 )
-                store.flush_if_due(args.flush_events, args.flush_seconds)
+                flusher.submit_if_due(args.flush_events, args.flush_seconds)
     except BaseException as exc:
         reason = f"{type(exc).__name__}: {exc}"
         raise
@@ -335,6 +411,7 @@ async def collect_session(store: Store, args: argparse.Namespace, stop: asyncio.
             monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await monitor_task
+        await flusher.flush_all()
         store.end_session(session_id, reason)
         print(f"SESSION_CLOSED session={session_id} reason={reason}", flush=True)
 
@@ -356,10 +433,11 @@ async def run(args: argparse.Namespace) -> None:
 
         auto_stop_task = asyncio.create_task(stop_after_delay())
     store, backoff = Store(args.database, args.symbol), 1.0
+    flusher = AsyncFlusher(store)
     try:
         while not stop.is_set():
             try:
-                await collect_session(store, args, stop)
+                await collect_session(store, flusher, args, stop)
                 backoff = 1.0
             except asyncio.CancelledError:
                 raise
@@ -374,6 +452,7 @@ async def run(args: argparse.Namespace) -> None:
     finally:
         if auto_stop_task is not None:
             auto_stop_task.cancel()
+        await flusher.flush_all()
         counts = store.counts()
         store.close()
         print(f"STOPPED database={store.path} books={counts[0]} trades={counts[1]} anomalies={counts[2]}", flush=True)

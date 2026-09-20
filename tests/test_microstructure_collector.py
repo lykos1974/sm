@@ -1,8 +1,10 @@
 import importlib.util
+import asyncio
 import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -149,6 +151,58 @@ class CollectorTests(unittest.TestCase):
             "SELECT diagnostic_type,socket_wait_ms FROM runtime_diagnostics"
         ).fetchone()
         self.assertEqual(row, ("STALE_AGG_TRADE", 0.25))
+
+    def test_async_flusher_keeps_atomic_failure_retryable(self):
+        self.store.queue(self.session, self.message("btcusdt@bookTicker", self.quote()))
+        self.store.conn.execute(
+            "CREATE TRIGGER async_fail BEFORE INSERT ON book_ticker "
+            "BEGIN SELECT RAISE(ABORT,'fault'); END"
+        )
+        self.store.conn.commit()
+
+        async def scenario():
+            flusher = MODULE.AsyncFlusher(self.store)
+            flusher.submit_if_due(1, 1)
+            with self.assertRaises(sqlite3.IntegrityError):
+                await flusher.flush_all()
+
+        asyncio.run(scenario())
+        self.assertEqual(len(self.store.pending), 1)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM book_ticker").fetchone()[0], 0)
+        self.store.conn.execute("DROP TRIGGER async_fail")
+        self.store.conn.commit()
+        self.store.flush()
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM book_ticker").fetchone()[0], 1)
+
+    def test_async_flusher_does_not_block_event_loop(self):
+        self.store.queue(self.session, self.message("btcusdt@bookTicker", self.quote()))
+        started, release = threading.Event(), threading.Event()
+        original = self.store.write_batch
+
+        def slow_write(events):
+            started.set()
+            release.wait(timeout=1)
+            original(events)
+
+        async def scenario():
+            flusher = MODULE.AsyncFlusher(self.store)
+            with patch.object(self.store, "write_batch", side_effect=slow_write):
+                flusher.submit_if_due(1, 1)
+                await asyncio.to_thread(started.wait, 1)
+                ticked = False
+
+                async def ticker():
+                    nonlocal ticked
+                    await asyncio.sleep(0.01)
+                    ticked = True
+
+                await ticker()
+                self.assertTrue(ticked)
+                release.set()
+                await flusher.flush_all()
+
+        asyncio.run(scenario())
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM book_ticker").fetchone()[0], 1)
 
 
 if __name__ == "__main__":
