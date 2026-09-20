@@ -46,6 +46,15 @@ SPECS = {
         "r.socket_wait_ms,r.pending_events,r.details FROM runtime_diagnostics r "
         "JOIN sessions s ON s.id=r.session_id ORDER BY r.id"
     ),
+    "quality_intervals": (
+        "SELECT r.id,s.session_key,"
+        "CAST(r.receive_wall_ns-(r.duration_ms*1000000) AS INTEGER) AS start_wall_ns,"
+        "r.receive_wall_ns AS end_wall_ns,r.diagnostic_type AS reason,"
+        "r.duration_ms,r.details FROM runtime_diagnostics r "
+        "JOIN sessions s ON s.id=r.session_id "
+        "WHERE r.diagnostic_type IN ('STALE_AGG_TRADE','EVENT_LOOP_STALL') "
+        "ORDER BY r.receive_wall_ns,r.id"
+    ),
 }
 
 
@@ -152,6 +161,8 @@ def _quality_summary(conn: sqlite3.Connection) -> dict[str, object]:
         "trade_stale_threshold_ms": 250,
         "book_ticker_exchange_timestamp_available": False,
         "book_ticker_timestamp_note": "receive time only; uncertain during local or upstream buffering",
+        "quality_intervals_table": "quality_intervals.parquet",
+        "fill_rule": "any hypothetical fill overlapping a quality interval is indeterminate",
         "session_totals": totals,
         "sessions": sessions,
     }

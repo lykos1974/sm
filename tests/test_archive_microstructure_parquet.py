@@ -46,6 +46,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(compact.read_bytes(), before)
             self.assertEqual(report["tables"]["book_ticker"]["rows"], 1)
             self.assertEqual(report["tables"]["agg_trades"]["rows"], 1)
+            self.assertEqual(report["tables"]["quality_intervals"]["rows"], 1)
             quality = report["quality"]["sessions"][session]
             self.assertEqual(quality["quality_status"], "CONTAINS_INDETERMINATE_INTERVALS")
             self.assertTrue(quality["requires_interval_filtering"])
@@ -55,6 +56,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertTrue(verified["manifest_sealed"])
             self.assertEqual(verified["verified_tables"]["book_ticker"]["rows"], 1)
             self.assertEqual(verified["latest_trade"]["agg_trade_id"], 5)
+            self.assertEqual(verified["verified_tables"]["quality_intervals"]["rows"], 1)
             self.assertEqual(
                 verified["quality"]["sessions"][session]["quality_status"],
                 "CONTAINS_INDETERMINATE_INTERVALS",
