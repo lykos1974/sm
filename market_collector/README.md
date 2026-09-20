@@ -61,3 +61,9 @@ the stream publishes best-quote changes, not every order-book update.
 This evidence does not prove a hypothetical limit fill: it contains neither
 queue position nor private order acknowledgements. It must remain separate from
 strategy and validation until its quality is independently checked.
+
+After a bounded collection run, audit the database without modifying it:
+
+```text
+python check_microstructure_db.py
+```
