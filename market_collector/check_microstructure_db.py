@@ -145,6 +145,21 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
         )
         if max_clock_span > 250:
             timing_warnings.append("local wall clock moved by more than 250 ms within a session")
+        runtime_table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_diagnostics'"
+        ).fetchone() is not None
+        runtime_by_type = {}
+        stale_socket_waits: list[float] = []
+        if runtime_table_exists:
+            for kind, count, maximum in conn.execute(
+                "SELECT diagnostic_type,COUNT(*),MAX(duration_ms) "
+                "FROM runtime_diagnostics GROUP BY diagnostic_type"
+            ):
+                runtime_by_type[kind] = {"count": count, "max_duration_ms": maximum}
+            stale_socket_waits = [row[0] for row in conn.execute(
+                "SELECT socket_wait_ms FROM runtime_diagnostics "
+                "WHERE diagnostic_type='STALE_AGG_TRADE' AND socket_wait_ms IS NOT NULL"
+            )]
         worst_latency_rows = []
         for latency, agg_id, session_id, receive_ns, event_ms, trade_ms in sorted(
             latency_rows, reverse=True
@@ -188,6 +203,15 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
                 "max_offset_span_ms": max_clock_span,
                 "max_adjacent_step_ms": max_clock_step,
                 "sessions": clock_by_session,
+            },
+            "runtime_diagnostics": {
+                "available": runtime_table_exists,
+                "by_type": runtime_by_type,
+                "stale_trade_socket_wait_ms": {
+                    "p50": percentile(stale_socket_waits, 0.50),
+                    "p95": percentile(stale_socket_waits, 0.95),
+                    "max": percentile(stale_socket_waits, 1),
+                },
             },
             "timing_warnings": timing_warnings,
         }

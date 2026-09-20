@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import signal
 import sqlite3
@@ -38,6 +39,7 @@ class ReceivedMessage:
     stream: str
     payload: dict[str, Any]
     raw_json: str
+    socket_wait_ms: float | None = None
 
 
 def _decimal_text(value: Any, field: str, allow_zero: bool = False) -> str:
@@ -51,7 +53,9 @@ def _decimal_text(value: Any, field: str, allow_zero: bool = False) -> str:
     return text
 
 
-def parse_combined(raw: str, expected_symbol: str = SYMBOL) -> ReceivedMessage:
+def parse_combined(
+    raw: str, expected_symbol: str = SYMBOL, socket_wait_ms: float | None = None
+) -> ReceivedMessage:
     wall_ns, monotonic_ns = time.time_ns(), time.monotonic_ns()
     outer = json.loads(raw)
     payload = outer.get("data")
@@ -60,7 +64,8 @@ def parse_combined(raw: str, expected_symbol: str = SYMBOL) -> ReceivedMessage:
     if str(payload.get("s") or "").upper() != expected_symbol:
         raise ValueError("unexpected symbol")
     return ReceivedMessage(
-        wall_ns, monotonic_ns, str(outer.get("stream") or ""), payload, raw
+        wall_ns, monotonic_ns, str(outer.get("stream") or ""), payload, raw,
+        socket_wait_ms,
     )
 
 
@@ -75,6 +80,7 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
         self.pending: list[tuple[str, tuple[Any, ...]]] = []
+        self.active_session_id: str | None = None
         self.last_flush = time.monotonic()
         row = self.conn.execute(
             "SELECT MAX(agg_trade_id) FROM agg_trades WHERE symbol=?", (symbol,)
@@ -121,6 +127,13 @@ class Store:
                     receive_wall_ns INTEGER NOT NULL, anomaly_type TEXT NOT NULL,
                     previous_id INTEGER, current_id INTEGER, details TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id));
+                CREATE TABLE IF NOT EXISTS runtime_diagnostics(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL, receive_wall_ns INTEGER NOT NULL,
+                    diagnostic_type TEXT NOT NULL, duration_ms REAL NOT NULL,
+                    socket_wait_ms REAL, pending_events INTEGER NOT NULL,
+                    details TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id));
                 """
             )
             current = self.conn.execute(
@@ -138,6 +151,7 @@ class Store:
 
     def start_session(self, endpoint: str) -> str:
         session_id = uuid.uuid4().hex
+        self.active_session_id = session_id
         with self.conn:
             self.conn.execute(
                 "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)",
@@ -145,6 +159,15 @@ class Store:
                  time.monotonic_ns(), None, None, "OPEN"),
             )
         return session_id
+
+    def record_runtime(
+        self, session_id: str, kind: str, duration_ms: float,
+        socket_wait_ms: float | None = None, details: str = "{}",
+    ) -> None:
+        self.pending.append(("runtime", (
+            session_id, time.time_ns(), kind, duration_ms, socket_wait_ms,
+            len(self.pending), details,
+        )))
 
     def end_session(self, session_id: str, reason: str) -> None:
         self.flush()
@@ -154,6 +177,8 @@ class Store:
                 "WHERE session_id=? AND status='OPEN'",
                 (time.time_ns(), reason[:1000], session_id),
             )
+        if self.active_session_id == session_id:
+            self.active_session_id = None
 
     def queue(self, session_id: str, msg: ReceivedMessage) -> None:
         data, stream = msg.payload, msg.stream.lower()
@@ -172,6 +197,13 @@ class Store:
         if not stream.endswith("@aggtrade"):
             raise ValueError("unexpected stream")
         agg_id = int(data["a"])
+        event_latency_ms = msg.receive_wall_ns / 1_000_000 - int(data["E"])
+        if event_latency_ms > 250:
+            self.record_runtime(
+                session_id, "STALE_AGG_TRADE", event_latency_ms,
+                msg.socket_wait_ms,
+                json.dumps({"agg_trade_id": agg_id}, separators=(",", ":")),
+            )
         if self.last_agg_id is not None and agg_id > self.last_agg_id + 1:
             details = json.dumps(
                 {"missing_first": self.last_agg_id + 1, "missing_last": agg_id - 1},
@@ -206,6 +238,7 @@ class Store:
             self.last_flush = time.monotonic()
             return
         events = self.pending
+        flush_started_ns = time.monotonic_ns()
         with self.conn:
             for kind, row in events:
                 if kind == "book":
@@ -217,11 +250,26 @@ class Store:
                     self.conn.execute(
                         "INSERT OR IGNORE INTO agg_trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         row)
-                else:
+                elif kind == "anomaly":
                     self.conn.execute(
                         "INSERT INTO stream_anomalies(session_id,symbol,receive_wall_ns,"
                         "anomaly_type,previous_id,current_id,details) VALUES(?,?,?,?,?,?,?)",
                         row)
+                else:
+                    self.conn.execute(
+                        "INSERT INTO runtime_diagnostics(session_id,receive_wall_ns,"
+                        "diagnostic_type,duration_ms,socket_wait_ms,pending_events,details) "
+                        "VALUES(?,?,?,?,?,?,?)", row)
+        flush_duration_ms = (time.monotonic_ns() - flush_started_ns) / 1_000_000
+        if flush_duration_ms > 50 and self.active_session_id is not None:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO runtime_diagnostics(session_id,receive_wall_ns,"
+                    "diagnostic_type,duration_ms,socket_wait_ms,pending_events,details) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (self.active_session_id, time.time_ns(), "SLOW_SQLITE_FLUSH",
+                     flush_duration_ms, None, len(events), "{}"),
+                )
         self.pending = []
         self.last_flush = time.monotonic()
 
@@ -243,29 +291,50 @@ async def collect_session(store: Store, args: argparse.Namespace, stop: asyncio.
     url = stream_url(args.endpoint, args.symbol)
     session_id = store.start_session(url)
     started, reason = time.monotonic(), "normal_stop"
+    monitor_task = None
     try:
         async with websockets.connect(
             url, open_timeout=20, close_timeout=10, ping_interval=None,
             max_queue=100_000, max_size=1_000_000,
         ) as socket:
             print(f"CONNECTED session={session_id} symbol={args.symbol}", flush=True)
+
+            async def monitor_event_loop() -> None:
+                expected = time.monotonic() + 0.1
+                while not stop.is_set():
+                    await asyncio.sleep(0.1)
+                    now = time.monotonic()
+                    lag_ms = max(0.0, (now - expected) * 1000)
+                    if lag_ms > 50:
+                        store.record_runtime(session_id, "EVENT_LOOP_STALL", lag_ms)
+                    expected = now + 0.1
+
+            monitor_task = asyncio.create_task(monitor_event_loop())
             while not stop.is_set():
                 if time.monotonic() - started >= args.rotate_seconds:
                     reason = "proactive_24h_rotation"
                     return
                 try:
+                    wait_started_ns = time.monotonic_ns()
                     raw = await asyncio.wait_for(socket.recv(), timeout=1)
                 except asyncio.TimeoutError:
                     store.flush_if_due(args.flush_events, args.flush_seconds)
                     continue
                 if not isinstance(raw, str):
                     raise ValueError("unexpected binary message")
-                store.queue(session_id, parse_combined(raw, args.symbol))
+                socket_wait_ms = (time.monotonic_ns() - wait_started_ns) / 1_000_000
+                store.queue(
+                    session_id, parse_combined(raw, args.symbol, socket_wait_ms)
+                )
                 store.flush_if_due(args.flush_events, args.flush_seconds)
     except BaseException as exc:
         reason = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        if monitor_task is not None:
+            monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor_task
         store.end_session(session_id, reason)
         print(f"SESSION_CLOSED session={session_id} reason={reason}", flush=True)
 

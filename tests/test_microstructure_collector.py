@@ -136,6 +136,20 @@ class CollectorTests(unittest.TestCase):
         )
         self.assertNotIn("apiKey", url)
 
+    def test_stale_trade_records_socket_wait_diagnostic(self):
+        data = self.trade(60)
+        data["E"] = 1
+        with patch.object(MODULE.time, "time_ns", return_value=1_000_000_000):
+            message = MODULE.parse_combined(
+                raw("btcusdt@aggTrade", data), socket_wait_ms=0.25
+            )
+        self.store.queue(self.session, message)
+        self.store.flush()
+        row = self.store.conn.execute(
+            "SELECT diagnostic_type,socket_wait_ms FROM runtime_diagnostics"
+        ).fetchone()
+        self.assertEqual(row, ("STALE_AGG_TRADE", 0.25))
+
 
 if __name__ == "__main__":
     unittest.main()
