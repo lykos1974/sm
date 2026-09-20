@@ -234,7 +234,7 @@ def archive(
         if not version or version[0] != "2":
             raise RuntimeError("only verified compact schema version 2 can be archived")
         open_sessions = conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE status!='CLOSED' OR ended_wall_ns IS NULL"
+            "SELECT COUNT(*) FROM sessions WHERE status='OPEN' OR ended_wall_ns IS NULL"
         ).fetchone()[0]
         if open_sessions:
             raise RuntimeError("open session present; archive refused")
