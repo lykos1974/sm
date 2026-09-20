@@ -21,6 +21,7 @@ def load(name, path):
 COLLECTOR = load("collector_for_archive", ROOT / "market_collector" / "microstructure_collector.py")
 COMPACTOR = load("compactor_for_archive", ROOT / "market_collector" / "compact_microstructure_db.py")
 ARCHIVER = load("microstructure_archiver", ROOT / "market_collector" / "archive_microstructure_parquet.py")
+VERIFIER = load("microstructure_verifier", ROOT / "market_collector" / "verify_microstructure_archive.py")
 
 
 class ArchiveTests(unittest.TestCase):
@@ -46,6 +47,11 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(report["tables"]["book_ticker"]["rows"], 1)
             self.assertEqual(report["tables"]["agg_trades"]["rows"], 1)
             self.assertTrue((Path(report["archive"]) / "manifest.json").is_file())
+            self.assertTrue((Path(report["archive"]) / "manifest.sha256").is_file())
+            verified = VERIFIER.verify(report["archive"], report["manifest_sha256"])
+            self.assertTrue(verified["manifest_sealed"])
+            self.assertEqual(verified["verified_tables"]["book_ticker"]["rows"], 1)
+            self.assertEqual(verified["latest_trade"]["agg_trade_id"], 5)
             with self.assertRaises(FileExistsError):
                 ARCHIVER.archive(compact, root / "archive", chunk_rows=1)
 

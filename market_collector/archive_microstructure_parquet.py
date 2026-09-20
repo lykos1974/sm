@@ -181,6 +181,9 @@ def archive(
                 json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
             )
             manifest["manifest_sha256"] = _file_sha256(manifest_path)
+            (building / "manifest.sha256").write_text(
+                manifest["manifest_sha256"] + "  manifest.json\n", encoding="ascii"
+            )
             total_bytes = sum(path.stat().st_size for path in building.iterdir())
             manifest["archive_bytes"] = total_bytes
             os.replace(building, final_dir)
