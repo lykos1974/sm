@@ -204,6 +204,26 @@ class CollectorTests(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM book_ticker").fetchone()[0], 1)
 
+    def test_compact_store_preserves_structured_evidence(self):
+        compact_path = Path(self.tmp.name) / "compact-live.db"
+        compact = MODULE.CompactStore(compact_path)
+        session = compact.start_session("test")
+        compact.queue(session, self.message("btcusdt@bookTicker", self.quote()))
+        compact.queue(session, self.message("btcusdt@aggTrade", self.trade(70)))
+        compact.end_session(session, "normal_stop")
+        self.assertEqual(compact.counts(), (1, 1, 0))
+        self.assertEqual(
+            compact.conn.execute(
+                "SELECT bid_price,ask_price FROM book_ticker"
+            ).fetchone(),
+            ("100.10", "100.20"),
+        )
+        self.assertEqual(
+            compact.conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],
+            "2",
+        )
+        compact.close()
+
 
 if __name__ == "__main__":
     unittest.main()

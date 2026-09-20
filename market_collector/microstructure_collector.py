@@ -304,6 +304,207 @@ class Store:
         self.conn.close()
 
 
+class CompactStore(Store):
+    """Schema-v2 writer: normalized sessions and no redundant raw quote JSON."""
+
+    def __init__(self, path: str | Path, symbol: str = SYMBOL):
+        self.path = Path(path).resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.symbol = symbol
+        self.conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
+        self.pending = []
+        self.active_session_id = None
+        self.active_session_db_id: int | None = None
+        self.session_refs: dict[str, int] = {}
+        self.last_flush = time.monotonic()
+        row = self.conn.execute("SELECT MAX(agg_trade_id) FROM agg_trades").fetchone()
+        self.last_agg_id = int(row[0]) if row and row[0] is not None else None
+
+    def _init_schema(self) -> None:
+        with self.conn:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS metadata(
+                    key TEXT PRIMARY KEY,value TEXT NOT NULL) WITHOUT ROWID;
+                CREATE TABLE IF NOT EXISTS sessions(
+                    id INTEGER PRIMARY KEY,session_key TEXT NOT NULL UNIQUE,
+                    symbol TEXT NOT NULL,endpoint TEXT NOT NULL,
+                    started_wall_ns INTEGER NOT NULL,started_monotonic_ns INTEGER NOT NULL,
+                    ended_wall_ns INTEGER,end_reason TEXT,status TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS book_ticker(
+                    id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL,
+                    update_id INTEGER NOT NULL,receive_wall_ns INTEGER NOT NULL,
+                    receive_monotonic_ns INTEGER NOT NULL,bid_price TEXT NOT NULL,
+                    bid_qty TEXT NOT NULL,ask_price TEXT NOT NULL,ask_qty TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id));
+                CREATE INDEX IF NOT EXISTS idx_book_receive ON book_ticker(receive_wall_ns);
+                CREATE TABLE IF NOT EXISTS agg_trades(
+                    agg_trade_id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL,
+                    event_time_ms INTEGER NOT NULL,trade_time_ms INTEGER NOT NULL,
+                    first_trade_id INTEGER NOT NULL,last_trade_id INTEGER NOT NULL,
+                    price TEXT NOT NULL,quantity TEXT NOT NULL,buyer_is_maker INTEGER NOT NULL,
+                    receive_wall_ns INTEGER NOT NULL,receive_monotonic_ns INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,FOREIGN KEY(session_id) REFERENCES sessions(id));
+                CREATE INDEX IF NOT EXISTS idx_trade_time ON agg_trades(trade_time_ms);
+                CREATE TABLE IF NOT EXISTS stream_anomalies(
+                    id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL,
+                    receive_wall_ns INTEGER NOT NULL,anomaly_type TEXT NOT NULL,
+                    previous_id INTEGER,current_id INTEGER,details TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id));
+                CREATE TABLE IF NOT EXISTS runtime_diagnostics(
+                    id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL,
+                    receive_wall_ns INTEGER NOT NULL,diagnostic_type TEXT NOT NULL,
+                    duration_ms REAL NOT NULL,socket_wait_ms REAL,
+                    pending_events INTEGER NOT NULL,details TEXT NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id));
+                """
+            )
+            current = self.conn.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            if current and current[0] != "2":
+                raise RuntimeError("compact database schema mismatch")
+            self.conn.execute("INSERT OR IGNORE INTO metadata VALUES('schema_version','2')")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO metadata VALUES('scope','public_data_no_orders')"
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO metadata VALUES"
+                "('book_raw_json','omitted_structured_fields_preserved')"
+            )
+
+    def start_session(self, endpoint: str) -> str:
+        key = uuid.uuid4().hex
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO sessions(session_key,symbol,endpoint,started_wall_ns,"
+                "started_monotonic_ns,ended_wall_ns,end_reason,status) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (key, self.symbol, endpoint, time.time_ns(), time.monotonic_ns(),
+                 None, None, "OPEN"),
+            )
+        db_id = int(cursor.lastrowid)
+        self.session_refs[key] = db_id
+        self.active_session_id, self.active_session_db_id = key, db_id
+        return key
+
+    def end_session(self, session_id: str, reason: str) -> None:
+        self.flush()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET ended_wall_ns=?,end_reason=?,status='CLOSED' "
+                "WHERE session_key=? AND status='OPEN'",
+                (time.time_ns(), reason[:1000], session_id),
+            )
+        if self.active_session_id == session_id:
+            self.active_session_id = None
+            self.active_session_db_id = None
+
+    def _session_ref(self, session_id: str) -> int:
+        if session_id not in self.session_refs:
+            row = self.conn.execute(
+                "SELECT id FROM sessions WHERE session_key=?", (session_id,)
+            ).fetchone()
+            if not row:
+                raise RuntimeError("unknown compact session")
+            self.session_refs[session_id] = int(row[0])
+        return self.session_refs[session_id]
+
+    def record_runtime(
+        self, session_id: str, kind: str, duration_ms: float,
+        socket_wait_ms: float | None = None, details: str = "{}",
+    ) -> None:
+        self.pending.append(("runtime", (
+            self._session_ref(session_id), time.time_ns(), kind, duration_ms,
+            socket_wait_ms, len(self.pending), details,
+        )))
+
+    def queue(self, session_id: str, msg: ReceivedMessage) -> None:
+        ref = self._session_ref(session_id)
+        data, stream = msg.payload, msg.stream.lower()
+        if stream.endswith("@bookticker"):
+            bid = _decimal_text(data.get("b"), "bid")
+            ask = _decimal_text(data.get("a"), "ask")
+            if float(bid) > float(ask):
+                raise ValueError("crossed bookTicker")
+            self.pending.append(("book", (
+                ref, int(data["u"]), msg.receive_wall_ns, msg.receive_monotonic_ns,
+                bid, _decimal_text(data.get("B"), "bid_qty", True), ask,
+                _decimal_text(data.get("A"), "ask_qty", True),
+            )))
+            return
+        if not stream.endswith("@aggtrade"):
+            raise ValueError("unexpected stream")
+        agg_id = int(data["a"])
+        event_latency_ms = msg.receive_wall_ns / 1_000_000 - int(data["E"])
+        if event_latency_ms > 250:
+            self.record_runtime(
+                session_id, "STALE_AGG_TRADE", event_latency_ms, msg.socket_wait_ms,
+                json.dumps({"agg_trade_id": agg_id}, separators=(",", ":")),
+            )
+        if self.last_agg_id is not None and agg_id > self.last_agg_id + 1:
+            details = json.dumps(
+                {"missing_first": self.last_agg_id + 1, "missing_last": agg_id - 1},
+                separators=(",", ":"),
+            )
+            self.pending.append(("anomaly", (
+                ref, msg.receive_wall_ns, "POSSIBLE_AGG_TRADE_ID_GAP",
+                self.last_agg_id, agg_id, details,
+            )))
+        elif self.last_agg_id is not None and agg_id <= self.last_agg_id:
+            self.pending.append(("anomaly", (
+                ref, msg.receive_wall_ns, "DUPLICATE_OR_OUT_OF_ORDER_AGG_TRADE",
+                self.last_agg_id, agg_id, "{}",
+            )))
+        self.last_agg_id = max(agg_id, self.last_agg_id or agg_id)
+        self.pending.append(("trade", (
+            agg_id, ref, int(data["E"]), int(data["T"]), int(data["f"]),
+            int(data["l"]), _decimal_text(data.get("p"), "price"),
+            _decimal_text(data.get("q"), "quantity"),
+            1 if bool(data.get("m")) else 0, msg.receive_wall_ns,
+            msg.receive_monotonic_ns, msg.raw_json,
+        )))
+
+    def write_batch(self, events: list[tuple[str, tuple[Any, ...]]]) -> None:
+        if not events:
+            self.last_flush = time.monotonic()
+            return
+        flush_started_ns = time.monotonic_ns()
+        with self.conn:
+            for kind, row in events:
+                if kind == "book":
+                    self.conn.execute(
+                        "INSERT INTO book_ticker(session_id,update_id,receive_wall_ns,"
+                        "receive_monotonic_ns,bid_price,bid_qty,ask_price,ask_qty) "
+                        "VALUES(?,?,?,?,?,?,?,?)", row)
+                elif kind == "trade":
+                    self.conn.execute("INSERT OR IGNORE INTO agg_trades VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", row)
+                elif kind == "anomaly":
+                    self.conn.execute(
+                        "INSERT INTO stream_anomalies(session_id,receive_wall_ns,anomaly_type,"
+                        "previous_id,current_id,details) VALUES(?,?,?,?,?,?)", row)
+                else:
+                    self.conn.execute(
+                        "INSERT INTO runtime_diagnostics(session_id,receive_wall_ns,"
+                        "diagnostic_type,duration_ms,socket_wait_ms,pending_events,details) "
+                        "VALUES(?,?,?,?,?,?,?)", row)
+        duration = (time.monotonic_ns() - flush_started_ns) / 1_000_000
+        if duration > 50 and self.active_session_db_id is not None:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO runtime_diagnostics(session_id,receive_wall_ns,"
+                    "diagnostic_type,duration_ms,socket_wait_ms,pending_events,details) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (self.active_session_db_id, time.time_ns(), "SLOW_SQLITE_FLUSH",
+                     duration, None, len(events), "{}"),
+                )
+        self.last_flush = time.monotonic()
+
+
 class AsyncFlusher:
     """Keep SQLite writes off the WebSocket event loop, one atomic batch at a time."""
 
@@ -432,7 +633,8 @@ async def run(args: argparse.Namespace) -> None:
             stop.set()
 
         auto_stop_task = asyncio.create_task(stop_after_delay())
-    store, backoff = Store(args.database, args.symbol), 1.0
+    store_class = CompactStore if args.storage_format == "compact" else Store
+    store, backoff = store_class(args.database, args.symbol), 1.0
     flusher = AsyncFlusher(store)
     try:
         while not stop.is_set():
@@ -461,7 +663,8 @@ async def run(args: argparse.Namespace) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbol", default=SYMBOL)
-    parser.add_argument("--database", default="microstructure_btcusdt.db")
+    parser.add_argument("--database")
+    parser.add_argument("--storage-format", choices=("compact", "legacy"), default="compact")
     parser.add_argument("--endpoint", default=ENDPOINT)
     parser.add_argument("--flush-events", type=int, default=500)
     parser.add_argument("--flush-seconds", type=float, default=1.0)
@@ -474,6 +677,12 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.symbol = args.symbol.upper()
+    if args.database is None:
+        args.database = (
+            "microstructure_btcusdt_live.db"
+            if args.storage_format == "compact"
+            else "microstructure_btcusdt.db"
+        )
     if args.symbol != SYMBOL:
         parser.error("this first reviewed collector is locked to BTCUSDT")
     if min(args.flush_events, args.flush_seconds, args.rotate_seconds) <= 0:
