@@ -110,6 +110,7 @@ def verify(path: str | Path, expected_manifest_sha: str | None = None) -> dict[s
         "manifest_sealed": sealed_sha is not None,
         "expected_manifest_verified": expected_manifest_sha is not None,
         "symbol": manifest["symbol"], "utc_date": manifest["utc_date"],
+        "quality": manifest["quality"],
         "verified_tables": verified, "latest_quote": latest_quote,
         "latest_trade": latest_trade, "trade_latency_by_session": latency,
     }

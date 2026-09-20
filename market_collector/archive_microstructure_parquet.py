@@ -78,6 +78,85 @@ def _event_day(conn: sqlite3.Connection) -> tuple[str, int, int]:
     return first.isoformat(), int(row[0]), int(row[1])
 
 
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def _quality_summary(conn: sqlite3.Connection) -> dict[str, object]:
+    sessions = {
+        row[0]: {
+            "status": row[1], "book_rows": 0, "trade_rows": 0,
+            "trade_latency_ms": {}, "trades_over_250ms": 0,
+            "session_start_gaps": 0, "in_session_anomalies": 0,
+            "event_loop_stalls": 0, "recorded_stale_trades": 0,
+        }
+        for row in conn.execute("SELECT session_key,status FROM sessions")
+    }
+    for key, count in conn.execute(
+        "SELECT s.session_key,COUNT(*) FROM book_ticker b "
+        "JOIN sessions s ON s.id=b.session_id GROUP BY s.session_key"
+    ):
+        sessions[key]["book_rows"] = count
+    latency_values: dict[str, list[float]] = {key: [] for key in sessions}
+    for key, receive_ns, event_ms in conn.execute(
+        "SELECT s.session_key,t.receive_wall_ns,t.event_time_ms FROM agg_trades t "
+        "JOIN sessions s ON s.id=t.session_id ORDER BY t.agg_trade_id"
+    ):
+        latency_values[key].append(receive_ns / 1_000_000 - event_ms)
+    for key, values in latency_values.items():
+        sessions[key]["trade_rows"] = len(values)
+        sessions[key]["trades_over_250ms"] = sum(value > 250 for value in values)
+        sessions[key]["trade_latency_ms"] = {
+            "p50": _percentile(values, 0.50), "p95": _percentile(values, 0.95),
+            "p99": _percentile(values, 0.99), "max": _percentile(values, 1),
+        }
+    for key, kind, current_id, first_id in conn.execute(
+        "SELECT s.session_key,a.anomaly_type,a.current_id,"
+        "(SELECT MIN(t.agg_trade_id) FROM agg_trades t WHERE t.session_id=a.session_id) "
+        "FROM stream_anomalies a JOIN sessions s ON s.id=a.session_id"
+    ):
+        if kind == "POSSIBLE_AGG_TRADE_ID_GAP" and current_id == first_id:
+            sessions[key]["session_start_gaps"] += 1
+        else:
+            sessions[key]["in_session_anomalies"] += 1
+    for key, kind, count in conn.execute(
+        "SELECT s.session_key,r.diagnostic_type,COUNT(*) FROM runtime_diagnostics r "
+        "JOIN sessions s ON s.id=r.session_id GROUP BY s.session_key,r.diagnostic_type"
+    ):
+        if kind == "EVENT_LOOP_STALL":
+            sessions[key]["event_loop_stalls"] = count
+        elif kind == "STALE_AGG_TRADE":
+            sessions[key]["recorded_stale_trades"] = count
+    totals = {"observation_complete": 0, "contains_indeterminate_intervals": 0,
+              "structurally_incomplete": 0}
+    for details in sessions.values():
+        if details["status"] != "CLOSED" or details["in_session_anomalies"]:
+            quality = "STRUCTURALLY_INCOMPLETE"
+            totals["structurally_incomplete"] += 1
+        elif details["trades_over_250ms"] or details["event_loop_stalls"]:
+            quality = "CONTAINS_INDETERMINATE_INTERVALS"
+            totals["contains_indeterminate_intervals"] += 1
+        else:
+            quality = "OBSERVATION_COMPLETE"
+            totals["observation_complete"] += 1
+        details["quality_status"] = quality
+        details["requires_interval_filtering"] = quality != "OBSERVATION_COMPLETE"
+    return {
+        "trade_stale_threshold_ms": 250,
+        "book_ticker_exchange_timestamp_available": False,
+        "book_ticker_timestamp_note": "receive time only; uncertain during local or upstream buffering",
+        "session_totals": totals,
+        "sessions": sessions,
+    }
+
+
 def _write_table(
     conn: sqlite3.Connection, name: str, query: str, path: Path, chunk_rows: int
 ) -> dict[str, object]:
@@ -174,6 +253,7 @@ def archive(
                 "source_database": source.name,
                 "source_bytes": source.stat().st_size,
                 "parquet_compression": "zstd",
+                "quality": _quality_summary(conn),
                 "tables": tables,
             }
             manifest_path = building / "manifest.json"
