@@ -61,6 +61,25 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
                 raw_mismatches += int(int(payload["a"]) != agg_id)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 raw_mismatches += 1
+        anomaly_details = []
+        in_session_anomalies = 0
+        for kind, session_id, previous_id, current_id, first_id in conn.execute(
+            "SELECT a.anomaly_type,a.session_id,a.previous_id,a.current_id,"
+            "(SELECT MIN(t.agg_trade_id) FROM agg_trades t WHERE t.session_id=a.session_id) "
+            "FROM stream_anomalies a ORDER BY a.id"
+        ):
+            at_session_start = current_id is not None and current_id == first_id
+            classification = "SESSION_START_GAP" if (
+                kind == "POSSIBLE_AGG_TRADE_ID_GAP" and at_session_start
+            ) else "IN_SESSION_ANOMALY"
+            in_session_anomalies += classification == "IN_SESSION_ANOMALY"
+            anomaly_details.append({
+                "type": kind,
+                "classification": classification,
+                "session_id": session_id,
+                "previous_id": previous_id,
+                "current_id": current_id,
+            })
         if integrity != "ok":
             failures.append("SQLite integrity_check failed")
         if counts["book_ticker"] == 0 or counts["agg_trades"] == 0:
@@ -73,6 +92,8 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
             failures.append("invalid or inconsistent aggregate trade row found")
         if negative_latency:
             failures.append("exchange event time is ahead of local receive clock")
+        if in_session_anomalies:
+            failures.append("stream anomaly occurred after a session had started receiving trades")
         report: dict[str, object] = {
             "database": str(database),
             "integrity": integrity,
@@ -83,6 +104,11 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
             "bad_trades": bad_trades,
             "raw_trade_mismatches": raw_mismatches,
             "negative_latency_rows": negative_latency,
+            "anomalies": {
+                "session_start_gaps": len(anomaly_details) - in_session_anomalies,
+                "in_session": in_session_anomalies,
+                "details": anomaly_details,
+            },
             "trade_event_latency_ms": {
                 "min": percentile(latencies, 0),
                 "p50": percentile(latencies, 0.50),
