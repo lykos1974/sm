@@ -66,6 +66,7 @@ class CheckerTests(unittest.TestCase):
             self.assertIn(
                 "trade receive latency maximum exceeds 5000 ms", report["timing_warnings"]
             )
+            self.assertTrue(report["latest_session_timing_warnings"])
             self.assertEqual(report["trade_event_latency_ms"]["over_5000ms"], 1)
 
     def test_restart_gap_is_not_mislabeled_as_live_loss(self):

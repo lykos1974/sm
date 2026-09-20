@@ -49,6 +49,7 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
         ).fetchone()[0])
         negative_latency = 0
         latencies: list[float] = []
+        latencies_by_session: dict[str, list[float]] = {}
         latency_rows = []
         for agg_id, session_id, receive_ns, event_ms, trade_ms in conn.execute(
             "SELECT agg_trade_id,session_id,receive_wall_ns,event_time_ms,trade_time_ms "
@@ -56,6 +57,7 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
         ):
             latency = receive_ns / 1_000_000 - event_ms
             latencies.append(latency)
+            latencies_by_session.setdefault(session_id, []).append(latency)
             latency_rows.append((latency, agg_id, session_id, receive_ns, event_ms, trade_ms))
             negative_latency += latency < 0
         raw_mismatches = 0
@@ -106,6 +108,28 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
             timing_warnings.append("trade receive latency p95 exceeds 500 ms")
         if latency_max is not None and latency_max > 5_000:
             timing_warnings.append("trade receive latency maximum exceeds 5000 ms")
+        latest_session_row = conn.execute(
+            "SELECT session_id FROM sessions ORDER BY started_wall_ns DESC LIMIT 1"
+        ).fetchone()
+        latest_session_id = latest_session_row[0] if latest_session_row else None
+        session_latency = {}
+        for session_id, values in latencies_by_session.items():
+            session_latency[session_id] = {
+                "count": len(values),
+                "p50": percentile(values, 0.50),
+                "p95": percentile(values, 0.95),
+                "p99": percentile(values, 0.99),
+                "max": percentile(values, 1),
+                "over_250ms": sum(value > 250 for value in values),
+                "over_1000ms": sum(value > 1_000 for value in values),
+                "over_5000ms": sum(value > 5_000 for value in values),
+            }
+        latest_timing_warnings = []
+        latest_latency = session_latency.get(latest_session_id)
+        if latest_latency and float(latest_latency["p95"]) > 500:
+            latest_timing_warnings.append("latest session trade receive latency p95 exceeds 500 ms")
+        if latest_latency and float(latest_latency["max"]) > 5_000:
+            latest_timing_warnings.append("latest session trade receive latency maximum exceeds 5000 ms")
         clock_rows = conn.execute(
             "SELECT session_id,receive_monotonic_ns,receive_wall_ns FROM book_ticker "
             "UNION ALL "
@@ -199,6 +223,11 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
                 "over_5000ms": sum(value > 5_000 for value in latencies),
                 "worst_rows": worst_latency_rows,
             },
+            "session_trade_event_latency_ms": {
+                "latest_session_id": latest_session_id,
+                "latest": latest_latency,
+                "sessions": session_latency,
+            },
             "dual_clock_diagnostics": {
                 "max_offset_span_ms": max_clock_span,
                 "max_adjacent_step_ms": max_clock_step,
@@ -214,6 +243,7 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
                 },
             },
             "timing_warnings": timing_warnings,
+            "latest_session_timing_warnings": latest_timing_warnings,
         }
         return report, failures
     finally:
@@ -233,8 +263,11 @@ def main() -> int:
     if failures:
         print("AUDIT_FAIL " + "; ".join(failures))
         return 1
+    if report["latest_session_timing_warnings"]:
+        print("AUDIT_WARN read_only=true; " + "; ".join(report["latest_session_timing_warnings"]))
+        return 0
     if report["timing_warnings"]:
-        print("AUDIT_WARN read_only=true; " + "; ".join(report["timing_warnings"]))
+        print("AUDIT_PASS_LATEST read_only=true historical_timing_warnings=true")
         return 0
     print("AUDIT_PASS read_only=true")
     return 0
