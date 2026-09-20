@@ -106,6 +106,45 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
             timing_warnings.append("trade receive latency p95 exceeds 500 ms")
         if latency_max is not None and latency_max > 5_000:
             timing_warnings.append("trade receive latency maximum exceeds 5000 ms")
+        clock_rows = conn.execute(
+            "SELECT session_id,receive_monotonic_ns,receive_wall_ns FROM book_ticker "
+            "UNION ALL "
+            "SELECT session_id,receive_monotonic_ns,receive_wall_ns FROM agg_trades "
+            "ORDER BY session_id,receive_monotonic_ns"
+        )
+        clock_by_session: dict[str, dict[str, float | int]] = {}
+        previous_session = None
+        previous_offset = None
+        for session_id, monotonic_ns, wall_ns in clock_rows:
+            offset_ms = (wall_ns - monotonic_ns) / 1_000_000
+            stats = clock_by_session.setdefault(session_id, {
+                "rows": 0,
+                "min_offset_ms": offset_ms,
+                "max_offset_ms": offset_ms,
+                "max_adjacent_step_ms": 0.0,
+            })
+            stats["rows"] = int(stats["rows"]) + 1
+            stats["min_offset_ms"] = min(float(stats["min_offset_ms"]), offset_ms)
+            stats["max_offset_ms"] = max(float(stats["max_offset_ms"]), offset_ms)
+            if session_id == previous_session and previous_offset is not None:
+                stats["max_adjacent_step_ms"] = max(
+                    float(stats["max_adjacent_step_ms"]), abs(offset_ms - previous_offset)
+                )
+            previous_session, previous_offset = session_id, offset_ms
+        for stats in clock_by_session.values():
+            stats["offset_span_ms"] = (
+                float(stats["max_offset_ms"]) - float(stats["min_offset_ms"])
+            )
+        max_clock_span = max(
+            (float(stats["offset_span_ms"]) for stats in clock_by_session.values()),
+            default=0.0,
+        )
+        max_clock_step = max(
+            (float(stats["max_adjacent_step_ms"]) for stats in clock_by_session.values()),
+            default=0.0,
+        )
+        if max_clock_span > 250:
+            timing_warnings.append("local wall clock moved by more than 250 ms within a session")
         worst_latency_rows = []
         for latency, agg_id, session_id, receive_ns, event_ms, trade_ms in sorted(
             latency_rows, reverse=True
@@ -144,6 +183,11 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
                 "over_1000ms": sum(value > 1_000 for value in latencies),
                 "over_5000ms": sum(value > 5_000 for value in latencies),
                 "worst_rows": worst_latency_rows,
+            },
+            "dual_clock_diagnostics": {
+                "max_offset_span_ms": max_clock_span,
+                "max_adjacent_step_ms": max_clock_step,
+                "sessions": clock_by_session,
             },
             "timing_warnings": timing_warnings,
         }

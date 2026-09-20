@@ -43,6 +43,7 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual(report["integrity"], "ok")
             self.assertEqual(report["counts"]["agg_trades"], 1)
             self.assertEqual(report["timing_warnings"], [])
+            self.assertIn("dual_clock_diagnostics", report)
 
     def test_high_latency_is_reported_as_quality_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,7 +60,12 @@ class CheckerTests(unittest.TestCase):
             store.close()
             report, failures = CHECKER.audit(path)
             self.assertEqual(failures, [])
-            self.assertEqual(len(report["timing_warnings"]), 2)
+            self.assertIn(
+                "trade receive latency p95 exceeds 500 ms", report["timing_warnings"]
+            )
+            self.assertIn(
+                "trade receive latency maximum exceeds 5000 ms", report["timing_warnings"]
+            )
             self.assertEqual(report["trade_event_latency_ms"]["over_5000ms"], 1)
 
     def test_restart_gap_is_not_mislabeled_as_live_loss(self):
