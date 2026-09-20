@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -48,11 +49,14 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
         ).fetchone()[0])
         negative_latency = 0
         latencies: list[float] = []
-        for receive_ns, event_ms in conn.execute(
-            "SELECT receive_wall_ns,event_time_ms FROM agg_trades"
+        latency_rows = []
+        for agg_id, session_id, receive_ns, event_ms, trade_ms in conn.execute(
+            "SELECT agg_trade_id,session_id,receive_wall_ns,event_time_ms,trade_time_ms "
+            "FROM agg_trades"
         ):
             latency = receive_ns / 1_000_000 - event_ms
             latencies.append(latency)
+            latency_rows.append((latency, agg_id, session_id, receive_ns, event_ms, trade_ms))
             negative_latency += latency < 0
         raw_mismatches = 0
         for agg_id, raw in conn.execute("SELECT agg_trade_id,raw_json FROM agg_trades"):
@@ -94,6 +98,27 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
             failures.append("exchange event time is ahead of local receive clock")
         if in_session_anomalies:
             failures.append("stream anomaly occurred after a session had started receiving trades")
+        latency_p95 = percentile(latencies, 0.95)
+        latency_p99 = percentile(latencies, 0.99)
+        latency_max = percentile(latencies, 1)
+        timing_warnings = []
+        if latency_p95 is not None and latency_p95 > 500:
+            timing_warnings.append("trade receive latency p95 exceeds 500 ms")
+        if latency_max is not None and latency_max > 5_000:
+            timing_warnings.append("trade receive latency maximum exceeds 5000 ms")
+        worst_latency_rows = []
+        for latency, agg_id, session_id, receive_ns, event_ms, trade_ms in sorted(
+            latency_rows, reverse=True
+        )[:10]:
+            worst_latency_rows.append({
+                "agg_trade_id": agg_id,
+                "session_id": session_id,
+                "receive_utc": datetime.fromtimestamp(
+                    receive_ns / 1_000_000_000, tz=timezone.utc
+                ).isoformat(timespec="milliseconds"),
+                "receive_minus_event_ms": latency,
+                "event_minus_trade_ms": event_ms - trade_ms,
+            })
         report: dict[str, object] = {
             "database": str(database),
             "integrity": integrity,
@@ -112,10 +137,15 @@ def audit(path: str | Path) -> tuple[dict[str, object], list[str]]:
             "trade_event_latency_ms": {
                 "min": percentile(latencies, 0),
                 "p50": percentile(latencies, 0.50),
-                "p95": percentile(latencies, 0.95),
-                "p99": percentile(latencies, 0.99),
-                "max": percentile(latencies, 1),
+                "p95": latency_p95,
+                "p99": latency_p99,
+                "max": latency_max,
+                "over_250ms": sum(value > 250 for value in latencies),
+                "over_1000ms": sum(value > 1_000 for value in latencies),
+                "over_5000ms": sum(value > 5_000 for value in latencies),
+                "worst_rows": worst_latency_rows,
             },
+            "timing_warnings": timing_warnings,
         }
         return report, failures
     finally:
@@ -135,6 +165,9 @@ def main() -> int:
     if failures:
         print("AUDIT_FAIL " + "; ".join(failures))
         return 1
+    if report["timing_warnings"]:
+        print("AUDIT_WARN read_only=true; " + "; ".join(report["timing_warnings"]))
+        return 0
     print("AUDIT_PASS read_only=true")
     return 0
 

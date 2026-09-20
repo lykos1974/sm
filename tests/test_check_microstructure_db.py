@@ -42,6 +42,25 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual(failures, [])
             self.assertEqual(report["integrity"], "ok")
             self.assertEqual(report["counts"]["agg_trades"], 1)
+            self.assertEqual(report["timing_warnings"], [])
+
+    def test_high_latency_is_reported_as_quality_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "evidence.db"
+            store = COLLECTOR.Store(path)
+            session = store.start_session("test")
+            self._queue_quote(store, session)
+            data = {"E": 1_000, "s": "BTCUSDT", "a": 1, "p": "100", "q": "1",
+                    "f": 1, "l": 1, "T": 999, "m": False}
+            raw = json.dumps({"stream": "btcusdt@aggTrade", "data": data})
+            with patch.object(COLLECTOR.time, "time_ns", return_value=7_100_000_000):
+                store.queue(session, COLLECTOR.parse_combined(raw))
+            store.end_session(session, "normal_stop")
+            store.close()
+            report, failures = CHECKER.audit(path)
+            self.assertEqual(failures, [])
+            self.assertEqual(len(report["timing_warnings"]), 2)
+            self.assertEqual(report["trade_event_latency_ms"]["over_5000ms"], 1)
 
     def test_restart_gap_is_not_mislabeled_as_live_loss(self):
         with tempfile.TemporaryDirectory() as tmp:
