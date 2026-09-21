@@ -61,8 +61,9 @@ Commit `a24730d` completed the checkpoint failure regression stage:
 ## Confirmed critical findings still open
 
 1. `pnf_mvp/strategy_validation.py::_resolve_long_after_tp1` and `_resolve_short_after_tp1`
-   - If BE and TP2 occur in the same candle, TP2 wins optimistically.
-   - Required rule: conservative/ambiguous handling must be explicitly approved before changing behavior.
+   - Approved policy: for historical OHLC, when BE was already armed before the candle and both BE and TP2 are touched, resolve conservatively at BE.
+   - Live timestamped execution remains event-ordered: the first actual fill wins.
+   - Implementation must be isolated to after-TP1 resolution and covered by LONG/SHORT regression tests.
 
 2. `pnf_mvp/strategy_validation.py::_should_activate`
    - Activation is based on candle close, not limit touch/trade-through.
@@ -90,12 +91,14 @@ Commit `a24730d` completed the checkpoint failure regression stage:
 
 ## Next smallest safe stage
 
-No execution-policy change is authorized yet:
+Approved execution-policy implementation only:
 
-1. Keep BE+TP2 same-candle behavior unchanged and explicitly unresolved.
-2. Prepare a methodology decision fixture comparing TP2-first, BE-first, and AMBIGUOUS classification without modifying production behavior.
-3. Keep close-based activation versus touch/trade-through as a separate unresolved execution-model choice.
-4. Do not run broad recomputation or install on Windows until one consolidated package and procedure are verified.
+1. Add LONG and SHORT regression fixtures for already-armed BE with same-candle BE+TP2 touches.
+2. Historical OHLC must resolve BE-first; exact boundary equality counts as a touch.
+3. Single-touch and no-touch outcomes must remain unchanged.
+4. Live timestamped paths must continue to use the first actual execution event and must not be routed through OHLC ambiguity logic.
+5. Apply the smallest isolated resolver change; do not change strategy parameters, entry/SL/TP/RR, promotion rules, baseline, validation enablement, or alerts.
+6. Publish and verify GitHub; do not request Windows installation yet.
 
 ## Recommended model routing
 
