@@ -32,8 +32,9 @@ Pull request: `#350`
 | `58304ed` | Live/historical eligibility alignment; `REJECT` excluded; closed final historical candle retained | 6 targeted tests passed |
 | `5983dd8` | Detached PnF signal snapshots and causality/immutability tests | 3 targeted tests passed |
 | `8181a7d` | Activation-candle outcome, exact three-candle pending expiry, causal per-candle batch validation | 15 targeted validation/regression checks passed; remote tree verified byte-for-byte |
+| `a24730d` | Observer and validation complete and flush before scanner checkpoint persistence | 25 targeted checks passed; observer/validation/flush failures do not advance checkpoint; remote tree verified |
 
-Remote branch head expected before this handoff update: `8181a7decb6ac81770254905af113dcc8bb7f4dc`.
+Remote branch head expected before this final handoff update: `a24730d5227cca6239416ceba9641219b3e44aad`.
 
 ## Completed safe stage: validation chronology
 
@@ -46,6 +47,17 @@ Commit `8181a7d` completed the prior diagnostics-first stage:
 - Strategy parameters, entry/SL/TP/RR, promotion rules, alerts, and the protected long-only baseline were unchanged.
 - Validation and alerts remain OFF.
 
+## Completed safe stage: checkpoint ordering
+
+Commit `a24730d` completed the checkpoint failure regression stage:
+
+- Observer evaluation runs before validation.
+- Validation is explicitly flushed before checkpoint persistence.
+- Observer, validation, or validation-flush failure propagates and does not advance the scanner checkpoint.
+- In-memory scanner watermark/state is updated only after the checkpoint succeeds.
+- No strategy parameters, entry/SL/TP/RR, promotion rules, alert rules, or protected long-only baseline behavior changed.
+- Validation and alerts remain OFF.
+
 ## Confirmed critical findings still open
 
 1. `pnf_mvp/strategy_validation.py::_resolve_long_after_tp1` and `_resolve_short_after_tp1`
@@ -55,10 +67,6 @@ Commit `8181a7d` completed the prior diagnostics-first stage:
 2. `pnf_mvp/strategy_validation.py::_should_activate`
    - Activation is based on candle close, not limit touch/trade-through.
    - Impact: this path is not equivalent to the stated execution model.
-
-3. `pnf_mvp/app.py::_refresh_incremental_once`
-   - Checkpoint persistence occurs before observer/validation completion.
-   - Impact: a downstream failure can advance the watermark and permanently skip work on retry.
 
 ## High-risk reproducibility gaps
 
@@ -77,19 +85,17 @@ Commit `8181a7d` completed the prior diagnostics-first stage:
 
 ## Test limitations
 
-- The `8181a7d` stage passed 15 targeted validation/regression checks; earlier targeted `unittest` and manual persistence checks passed as listed above.
+- The `8181a7d` stage passed 15 targeted validation/regression checks. The `a24730d` stage passed those 15 plus 10 focused scanner/checkpoint checks; earlier manual persistence checks passed as listed above.
 - The audit runtime lacks `pytest` and `pyarrow`; therefore no claim of a clean full-suite run has been made.
 
 ## Next smallest safe stage
 
-Diagnostics/tests first; do not change execution policy:
+No execution-policy change is authorized yet:
 
-1. Independently review commit `8181a7d` for chronology regressions and protected-behavior risk.
-2. Add a focused regression test proving checkpoint ordering and retry behavior when observer or validation fails.
-3. Correct checkpoint ordering only if the test independently demonstrates watermark advancement before downstream completion.
-4. Keep BE+TP2 same-candle behavior unchanged and report it as an unresolved execution-policy choice.
-5. Run targeted tests and publish the verified consolidated result to GitHub.
-6. Only then prepare one Windows update/install procedure.
+1. Keep BE+TP2 same-candle behavior unchanged and explicitly unresolved.
+2. Prepare a methodology decision fixture comparing TP2-first, BE-first, and AMBIGUOUS classification without modifying production behavior.
+3. Keep close-based activation versus touch/trade-through as a separate unresolved execution-model choice.
+4. Do not run broad recomputation or install on Windows until one consolidated package and procedure are verified.
 
 ## Recommended model routing
 
