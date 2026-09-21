@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import sys
 import tempfile
@@ -48,6 +49,38 @@ class DailyRunnerTests(unittest.TestCase):
                 self.assertIsNotNone(row[2])
             finally:
                 conn.close()
+
+    def test_bounded_midnight_rollover_archives_verifies_and_retains_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "live" / "BTCUSDT" / "2026-09-20.db"
+            archive_root = root / "archive"
+            store = COLLECTOR.CompactStore(database)
+            session = store.start_session("test")
+            boundary_ns = int(
+                datetime(2026, 9, 21, tzinfo=timezone.utc).timestamp() * 1_000_000_000
+            )
+            quote = {"u": 1, "s": "BTCUSDT", "b": "99.10", "B": "1.20",
+                     "a": "99.20", "A": "2.30"}
+            for update_id, wall_ns in ((1, boundary_ns - 1), (2, boundary_ns + 200_000_000)):
+                payload = {**quote, "u": update_id}
+                raw = json.dumps(
+                    {"stream": "btcusdt@bookTicker", "data": payload},
+                    separators=(",", ":"),
+                )
+                store.queue(session, COLLECTOR.ReceivedMessage(
+                    wall_ns, update_id, "btcusdt@bookTicker", payload, raw, 0.0,
+                ))
+            store.write_batch(store.detach_pending())
+            store.end_session(session, "normal_stop")
+            store.close()
+
+            result = RUNNER.archive_and_verify(database, archive_root, 1.0)
+
+            self.assertTrue(result["verified"])
+            self.assertTrue(result["source_retained"])
+            self.assertTrue(database.is_file())
+            self.assertTrue((Path(result["archive"]) / "manifest.json").is_file())
 
 
 if __name__ == "__main__":
