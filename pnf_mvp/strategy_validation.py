@@ -641,19 +641,25 @@ class StrategyValidationStore:
     def _resolve_long_after_tp1(self, low_price, high_price, close_price, be_price, tp2):
         hit_be = low_price <= be_price
         hit_tp2 = tp2 is not None and high_price >= tp2
-        if hit_tp2:
-            return RESOLUTION_TP2, tp2, "tp2_hit_after_tp1"
+        # Historical OHLC cannot order intrabar touches; approved policy is BE-first.
+        if hit_be and hit_tp2:
+            return RESOLUTION_TP1_PARTIAL_THEN_BE, be_price, "same_candle_be_and_tp2_be_first"
         if hit_be:
             return RESOLUTION_TP1_PARTIAL_THEN_BE, be_price, "tp1_partial_then_breakeven"
+        if hit_tp2:
+            return RESOLUTION_TP2, tp2, "tp2_hit_after_tp1"
         return None, None, None
 
     def _resolve_short_after_tp1(self, low_price, high_price, close_price, be_price, tp2):
         hit_be = high_price >= be_price
         hit_tp2 = tp2 is not None and low_price <= tp2
-        if hit_tp2:
-            return RESOLUTION_TP2, tp2, "tp2_hit_after_tp1"
+        # Historical OHLC cannot order intrabar touches; approved policy is BE-first.
+        if hit_be and hit_tp2:
+            return RESOLUTION_TP1_PARTIAL_THEN_BE, be_price, "same_candle_be_and_tp2_be_first"
         if hit_be:
             return RESOLUTION_TP1_PARTIAL_THEN_BE, be_price, "tp1_partial_then_breakeven"
+        if hit_tp2:
+            return RESOLUTION_TP2, tp2, "tp2_hit_after_tp1"
         return None, None, None
 
     def update_pending_with_candle(

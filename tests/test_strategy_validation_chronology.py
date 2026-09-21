@@ -108,7 +108,7 @@ class StrategyValidationChronologyTests(TestCase):
         self.assertEqual(expired["resolution_status"], "EXPIRED")
         self.assertEqual(expired["resolved_ts"], 4)
 
-    def test_be_and_tp2_same_candle_records_current_policy_diagnostic(self):
+    def test_long_already_armed_be_wins_same_candle_be_and_tp2_touch(self):
         temp_dir, _db_path, store = self._store()
         try:
             be_price = store._breakeven_price("LONG", 100.0)
@@ -123,9 +123,161 @@ class StrategyValidationChronologyTests(TestCase):
             store._conn.close()
             temp_dir.cleanup()
 
-        # Diagnostic lock only: TP2-first is the current policy. Changing it
-        # requires an explicit execution-model decision, not a chronology fix.
-        self.assertEqual(result, ("TP2", 106.0, "tp2_hit_after_tp1"))
+        self.assertEqual(
+            result,
+            ("TP1_PARTIAL_THEN_BE", be_price, "same_candle_be_and_tp2_be_first"),
+        )
+
+    def test_short_already_armed_be_wins_same_candle_be_and_tp2_touch(self):
+        temp_dir, _db_path, store = self._store()
+        try:
+            be_price = store._breakeven_price("SHORT", 100.0)
+            result = store._resolve_short_after_tp1(
+                low_price=93.5,
+                high_price=be_price + 0.5,
+                close_price=97.0,
+                be_price=be_price,
+                tp2=94.0,
+            )
+        finally:
+            store._conn.close()
+            temp_dir.cleanup()
+
+        self.assertEqual(
+            result,
+            ("TP1_PARTIAL_THEN_BE", be_price, "same_candle_be_and_tp2_be_first"),
+        )
+
+    def test_after_tp1_boundary_touches_and_single_touch_outcomes(self):
+        temp_dir, _db_path, store = self._store()
+        try:
+            long_be = store._breakeven_price("LONG", 100.0)
+            short_be = store._breakeven_price("SHORT", 100.0)
+            cases = [
+                (
+                    store._resolve_long_after_tp1(long_be, 106.0, 103.0, long_be, 106.0),
+                    ("TP1_PARTIAL_THEN_BE", long_be, "same_candle_be_and_tp2_be_first"),
+                ),
+                (
+                    store._resolve_short_after_tp1(94.0, short_be, 97.0, short_be, 94.0),
+                    ("TP1_PARTIAL_THEN_BE", short_be, "same_candle_be_and_tp2_be_first"),
+                ),
+                (
+                    store._resolve_long_after_tp1(long_be, 105.0, 102.0, long_be, 106.0),
+                    ("TP1_PARTIAL_THEN_BE", long_be, "tp1_partial_then_breakeven"),
+                ),
+                (
+                    store._resolve_long_after_tp1(long_be + 0.5, 106.0, 105.0, long_be, 106.0),
+                    ("TP2", 106.0, "tp2_hit_after_tp1"),
+                ),
+                (
+                    store._resolve_short_after_tp1(95.0, short_be, 98.0, short_be, 94.0),
+                    ("TP1_PARTIAL_THEN_BE", short_be, "tp1_partial_then_breakeven"),
+                ),
+                (
+                    store._resolve_short_after_tp1(94.0, short_be - 0.5, 95.0, short_be, 94.0),
+                    ("TP2", 94.0, "tp2_hit_after_tp1"),
+                ),
+                (
+                    store._resolve_long_after_tp1(long_be + 0.5, 105.0, 103.0, long_be, 106.0),
+                    (None, None, None),
+                ),
+                (
+                    store._resolve_short_after_tp1(95.0, short_be - 0.5, 97.0, short_be, 94.0),
+                    (None, None, None),
+                ),
+            ]
+        finally:
+            store._conn.close()
+            temp_dir.cleanup()
+
+        for actual, expected in cases:
+            self.assertEqual(actual, expected)
+
+    def test_same_ohlc_extremes_are_not_reordered_by_close(self):
+        temp_dir, _db_path, store = self._store()
+        try:
+            be_price = store._breakeven_price("LONG", 100.0)
+            outcomes = {
+                store._resolve_long_after_tp1(
+                    be_price - 0.5, 106.5, close_price, be_price, 106.0
+                )
+                for close_price in (98.0, 103.0, 107.0)
+            }
+        finally:
+            store._conn.close()
+            temp_dir.cleanup()
+
+        self.assertEqual(
+            outcomes,
+            {("TP1_PARTIAL_THEN_BE", be_price, "same_candle_be_and_tp2_be_first")},
+        )
+
+    def test_already_armed_trade_persists_be_first_resolution_end_to_end(self):
+        scenarios = {
+            "LONG": {
+                "invalidation": 98.0,
+                "tp1": 104.0,
+                "tp2": 106.0,
+                "tp1_candle": (104.5, 100.5, 104.0),
+                "both_candle": (106.5, 99.5, 103.0),
+            },
+            "SHORT": {
+                "invalidation": 102.0,
+                "tp1": 96.0,
+                "tp2": 94.0,
+                "tp1_candle": (99.5, 95.5, 96.0),
+                "both_candle": (100.5, 93.5, 97.0),
+            },
+        }
+
+        for side, values in scenarios.items():
+            with self.subTest(side=side):
+                temp_dir, db_path, store = self._store()
+                try:
+                    item = setup()
+                    item.update(
+                        side=side,
+                        invalidation=values["invalidation"],
+                        tp1=values["tp1"],
+                        tp2=values["tp2"],
+                    )
+                    setup_id = store.register_setup("BTCUSDT", item, STRUCTURE, 1)
+                    store.update_pending_with_candle("BTCUSDT", 2, 101.0, 99.0, 100.0)
+                    store.update_pending_with_candle(
+                        "BTCUSDT", 3, *values["tp1_candle"]
+                    )
+                    armed = fetch_row(db_path, setup_id)
+                    store.update_pending_with_candle(
+                        "BTCUSDT", 4, *values["both_candle"]
+                    )
+                    store.flush()
+                    resolved = fetch_row(db_path, setup_id)
+                    be_price = store._breakeven_price(side, 100.0)
+                finally:
+                    store.flush()
+                    store._conn.close()
+                    temp_dir.cleanup()
+
+                self.assertEqual(armed["tp1_hit"], 1)
+                self.assertEqual(armed["resolution_status"], "PENDING")
+                self.assertEqual(resolved["resolution_status"], "TP1_PARTIAL_THEN_BE")
+                self.assertEqual(resolved["resolved_ts"], 4)
+                self.assertAlmostEqual(resolved["resolved_price"], be_price)
+                self.assertEqual(
+                    resolved["resolution_note"], "same_candle_be_and_tp2_be_first"
+                )
+
+    def test_historical_ohlc_resolver_is_not_used_by_live_traders(self):
+        for relative_path in (
+            "live_binance_forward_trader.py",
+            "live_mexc_forward_trader.py",
+            "mexc_pole_live_trader.py",
+        ):
+            source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertNotIn("StrategyValidationStore", source)
+            self.assertNotIn("_resolve_long_after_tp1", source)
+            self.assertNotIn("_resolve_short_after_tp1", source)
 
 
 if __name__ == "__main__":
