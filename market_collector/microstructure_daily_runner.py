@@ -62,8 +62,13 @@ def recover_aborted_sessions(database: Path) -> int:
         conn.close()
 
 
-def archive_and_verify(database: Path, archive_root: Path) -> dict[str, object]:
-    report = archive(database, archive_root)
+def archive_and_verify(
+    database: Path, archive_root: Path, max_boundary_spill_seconds: float,
+) -> dict[str, object]:
+    report = archive(
+        database, archive_root,
+        max_boundary_spill_seconds=max_boundary_spill_seconds,
+    )
     checked = verify(report["archive"], report["manifest_sha256"])
     return {
         "database": str(database),
@@ -163,7 +168,10 @@ async def run(args: argparse.Namespace) -> None:
         reached_midnight = wait_seconds == until_midnight and utc_day() != day
         reached_limit = remaining_total is not None and wait_seconds == remaining_total
         if reached_midnight:
-            result = await asyncio.to_thread(archive_and_verify, database, archive_root)
+            result = await asyncio.to_thread(
+                archive_and_verify, database, archive_root,
+                args.max_boundary_spill_seconds,
+            )
             print("DAILY_ARCHIVE_VERIFIED " + json.dumps(result, separators=(",", ":")), flush=True)
         if reached_limit:
             shutdown.set()
@@ -180,11 +188,12 @@ def main() -> int:
     parser.add_argument("--flush-events", type=int, default=500)
     parser.add_argument("--flush-seconds", type=float, default=1.0)
     parser.add_argument("--rotate-seconds", type=float, default=86100.0)
+    parser.add_argument("--max-boundary-spill-seconds", type=float, default=5.0)
     args = parser.parse_args()
     if min(args.max_storage_gb, args.flush_events, args.flush_seconds, args.rotate_seconds) <= 0:
         parser.error("storage, flush, and rotation values must be positive")
-    if args.max_seconds < 0:
-        parser.error("max-seconds cannot be negative")
+    if args.max_seconds < 0 or args.max_boundary_spill_seconds < 0:
+        parser.error("max-seconds and boundary spill tolerance cannot be negative")
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:

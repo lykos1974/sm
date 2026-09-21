@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -72,7 +72,9 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _event_day(conn: sqlite3.Connection) -> tuple[str, int, int]:
+def _event_day(
+    conn: sqlite3.Connection, max_boundary_spill_seconds: float = 0.0,
+) -> tuple[str, int, int, dict[str, object]]:
     row = conn.execute(
         "SELECT MIN(ts),MAX(ts) FROM ("
         "SELECT receive_wall_ns AS ts FROM book_ticker UNION ALL "
@@ -80,11 +82,43 @@ def _event_day(conn: sqlite3.Connection) -> tuple[str, int, int]:
     ).fetchone()
     if not row or row[0] is None:
         raise RuntimeError("no market evidence to archive")
-    first = datetime.fromtimestamp(row[0] / 1_000_000_000, timezone.utc).date()
-    last = datetime.fromtimestamp(row[1] / 1_000_000_000, timezone.utc).date()
+    first_ns, last_ns = int(row[0]), int(row[1])
+    # Integer seconds avoid float rounding a timestamp just before midnight
+    # into the following UTC date.
+    first = datetime.fromtimestamp(first_ns // 1_000_000_000, timezone.utc).date()
+    last = datetime.fromtimestamp(last_ns // 1_000_000_000, timezone.utc).date()
+    boundary = datetime.combine(
+        first + timedelta(days=1), datetime.min.time(), timezone.utc
+    )
+    boundary_ns = int(boundary.timestamp() * 1_000_000_000)
+    spill_ns = max(0, last_ns - boundary_ns)
     if first != last:
-        raise RuntimeError("source spans multiple UTC dates; daily archive refused")
-    return first.isoformat(), int(row[0]), int(row[1])
+        allowed_ns = int(max_boundary_spill_seconds * 1_000_000_000)
+        if last != first + timedelta(days=1) or spill_ns > allowed_ns:
+            raise RuntimeError(
+                "source spans multiple UTC dates; daily archive refused "
+                f"(boundary_spill_ms={spill_ns / 1_000_000:.3f}, "
+                f"allowed_ms={allowed_ns / 1_000_000:.3f})"
+            )
+    spill_counts = {
+        "book_ticker": conn.execute(
+            "SELECT COUNT(*) FROM book_ticker WHERE receive_wall_ns>=?", (boundary_ns,)
+        ).fetchone()[0],
+        "agg_trades": conn.execute(
+            "SELECT COUNT(*) FROM agg_trades WHERE receive_wall_ns>=?", (boundary_ns,)
+        ).fetchone()[0],
+    }
+    boundary_spill = {
+        "present": first != last,
+        "boundary_utc": boundary.isoformat().replace("+00:00", "Z"),
+        "duration_ms": spill_ns / 1_000_000 if first != last else 0.0,
+        "rows": spill_counts,
+        "note": (
+            "Rows retain exact timestamps; archive partition is named for the first UTC date."
+            if first != last else "No rows crossed the UTC partition boundary."
+        ),
+    }
+    return first.isoformat(), first_ns, last_ns, boundary_spill
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -219,7 +253,7 @@ def _write_table(
 
 def archive(
     source: str | Path, destination_root: str | Path = "microstructure_archive",
-    chunk_rows: int = 100_000,
+    chunk_rows: int = 100_000, max_boundary_spill_seconds: float = 0.0,
 ) -> dict[str, object]:
     source = Path(source).resolve()
     if not source.is_file():
@@ -238,7 +272,9 @@ def archive(
         ).fetchone()[0]
         if open_sessions:
             raise RuntimeError("open session present; archive refused")
-        day, first_ns, last_ns = _event_day(conn)
+        day, first_ns, last_ns, boundary_spill = _event_day(
+            conn, max_boundary_spill_seconds
+        )
         symbol = conn.execute("SELECT DISTINCT symbol FROM sessions").fetchall()
         if len(symbol) != 1:
             raise RuntimeError("archive must contain exactly one symbol")
@@ -261,6 +297,7 @@ def archive(
                 "utc_date": day,
                 "first_receive_wall_ns": first_ns,
                 "last_receive_wall_ns": last_ns,
+                "boundary_spill": boundary_spill,
                 "source_database": source.name,
                 "source_bytes": source.stat().st_size,
                 "parquet_compression": "zstd",
@@ -291,11 +328,15 @@ def main() -> int:
     parser.add_argument("source", nargs="?", default="microstructure_btcusdt_compact.db")
     parser.add_argument("--destination-root", default="microstructure_archive")
     parser.add_argument("--chunk-rows", type=int, default=100_000)
+    parser.add_argument("--max-boundary-spill-seconds", type=float, default=0.0)
     args = parser.parse_args()
-    if args.chunk_rows <= 0:
-        parser.error("chunk-rows must be positive")
+    if args.chunk_rows <= 0 or args.max_boundary_spill_seconds < 0:
+        parser.error("chunk-rows must be positive and spill tolerance non-negative")
     try:
-        report = archive(args.source, args.destination_root, args.chunk_rows)
+        report = archive(
+            args.source, args.destination_root, args.chunk_rows,
+            args.max_boundary_spill_seconds,
+        )
     except (FileNotFoundError, FileExistsError, RuntimeError, sqlite3.Error) as exc:
         print(f"ARCHIVE_FAIL {type(exc).__name__}: {exc}")
         return 1
