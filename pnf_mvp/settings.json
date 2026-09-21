@@ -76,5 +76,19 @@
     "allowed_symbols": [
       "ALL"
     ]
+  },
+  "scanner_recovery_mode": true,
+  "strategy_validation_enabled": false,
+  "operational_alerts_enabled": false,
+  "ideal_entry_observer": {
+    "enabled": true,
+    "database_path": "data/ideal_entry_observer.sqlite3",
+    "symbols": [
+      "BTCUSDT"
+    ],
+    "statuses": [
+      "CANDIDATE"
+    ],
+    "minimum_quality_score": 65
   }
 }

@@ -1,3 +1,4 @@
+import copy
 import gc
 import json
 import sys
@@ -17,6 +18,7 @@ from pnf_engine import PnFProfile, PnFEngine, PnFColumn
 from storage import Storage
 from structure_engine import build_structure_state
 from strategy_engine import evaluate_pullback_retest_long, evaluate_pullback_retest_short
+from strategy_setup_observer import StrategySetupObserver
 from strategy_validation import StrategyValidationStore
 
 APP_TITLE = "PnF MVP - Scanner"
@@ -71,7 +73,20 @@ class App(tk.Tk):
             self.settings = json.load(f)
 
         self.storage = Storage(self.settings["database_path"])
-        self.validation_store = StrategyValidationStore(self.settings.get("strategy_validation_db_path", "strategy_validation.db"))
+        self.validation_store = (StrategyValidationStore(self.settings.get("strategy_validation_db_path", "strategy_validation.db"))
+                                 if self.settings.get("strategy_validation_enabled", True) else None)
+        observer_config = self.settings.get("ideal_entry_observer", {})
+        self.setup_observer = (
+            StrategySetupObserver(
+                observer_config.get("database_path", "data/ideal_entry_observer.sqlite3"),
+                observer_config.get("symbols", ["BTCUSDT"]),
+                observer_config.get("statuses", ["CANDIDATE"]),
+                observer_config.get("minimum_quality_score", 65),
+            )
+            if observer_config.get("enabled", False) else None
+        )
+        if self.settings.get("scanner_recovery_mode", False):
+            self.title("PnF - DATA MONITORING - validation / alerts OFF")
 
         self.profiles = {}
         for symbol in self.settings["symbols"]:
@@ -134,17 +149,29 @@ class App(tk.Tk):
 
         self._build_ui()
         self._setup_signal_tags()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._log("Scanner started (persisted-state incremental mode).")
         self._log(f"Reading DB: {self.settings['database_path']}")
         self._log(f"Alert filters loaded: {self.alert_filters}")
-        self._log(f"Strategy validation DB: {self.validation_store.db_path}")
+        self._log(f"Strategy validation DB: {(self.validation_store.db_path if self.validation_store is not None else 'DISABLED')}")
+        self._log(
+            "Ideal-entry observer DB: "
+            f"{(self.setup_observer.database_path if self.setup_observer is not None else 'DISABLED')}"
+        )
 
         threading.Thread(target=self._bootstrap_from_db_once, daemon=True).start()
         self.after(REFRESH_MS, self._schedule_refresh)
 
     def _get_profile(self, symbol: str) -> PnFProfile:
         return self.profiles[symbol]
+
+    def _on_close(self):
+        try:
+            if self.setup_observer is not None:
+                self.setup_observer.close("SCANNER_NORMAL_STOP")
+        finally:
+            self.destroy()
 
     def _build_ui(self):
         self.columnconfigure(1, weight=1)
@@ -748,6 +775,8 @@ class App(tk.Tk):
         )
 
     def _append_filtered_alert_if_needed(self, symbol: str, sig: dict, snapshot: dict):
+        if not self.settings.get("operational_alerts_enabled", True):
+            return
         if not self._passes_alert_filters(symbol, sig, snapshot):
             return
         key = self._signal_alert_key(symbol, sig)
@@ -909,25 +938,28 @@ class App(tk.Tk):
 
     def _save_engine_snapshot(self, symbol: str, engine: PnFEngine, last_processed_close_ts: int | None, snapshot: dict):
         profile = self._get_profile(symbol)
-        state = engine.state_dict()
-        state["last_processed_close_ts"] = last_processed_close_ts
-        self.storage.save_state(symbol, profile, state)
-        self.storage.replace_columns(symbol, profile, engine.columns)
-        self.storage.upsert_scanner_snapshot(
-            symbol,
-            profile.name,
-            snapshot["state"],
-            snapshot["signal"],
-            float(engine.last_price or 0.0),
-            int(snapshot["score"]),
-            snapshot["updated"],
-        )
+        state = copy.deepcopy(engine.state_dict())
+        state['last_processed_close_ts'] = last_processed_close_ts
+        self.storage.save_checkpoint(symbol, profile, state, engine.columns, engine.signals, snapshot)
+
+    def _validate_recovery_candles(self, symbol, candles, last_processed):
+        if not self.settings.get('scanner_recovery_mode', False):
+            return
+        if last_processed is None:
+            raise ValueError('Recovery watermark missing: ' + symbol)
+        expected = int(last_processed) + 60000
+        for candle in candles:
+            if int(candle['close_time']) != expected:
+                raise ValueError('Candle gap/order error: ' + symbol + ' at ' + str(expected))
+            expected += 60000
 
     def _load_stateful_engine(self, symbol: str):
         profile = self._get_profile(symbol)
         engine = PnFEngine(profile)
         state = self.storage.load_state(symbol, profile.name)
         columns = self.storage.load_columns(symbol, profile.name)
+        if self.settings.get("scanner_recovery_mode", False) and (not state or not columns or state.get("last_processed_close_ts") is None):
+            raise ValueError("Recovered state missing: " + symbol)
         if not columns:
             return engine, None, False
 
@@ -1037,6 +1069,7 @@ class App(tk.Tk):
 
                 if loaded_from_cache:
                     delta_candles = self._load_new_closed_candles(symbol, last_processed)
+                    self._validate_recovery_candles(symbol, delta_candles, last_processed)
                     source_label = f"cache+delta({len(delta_candles)})"
                 else:
                     full_candles = self._load_all_closed_candles(symbol)
@@ -1133,6 +1166,8 @@ class App(tk.Tk):
                         self.last_processed_close_ts_by_symbol[symbol] = last_processed
 
                     last_processed = self.last_processed_close_ts_by_symbol.get(symbol)
+                    engine = copy.deepcopy(engine)
+                    symbol_signals = []
                     stage_log(
                         "REFRESH_LOAD_BEGIN "
                         f"symbol={symbol} last_processed={self._format_refresh_ts(last_processed)}"
@@ -1172,6 +1207,7 @@ class App(tk.Tk):
                     )
                     stage_log(f"REFRESH_FILTER_BEGIN symbol={symbol} rows={len(raw_new_candles)}")
                     new_candles, dropped_open_candle = self._closed_candles_for_refresh(raw_new_candles, now_ms)
+                    self._validate_recovery_candles(symbol, new_candles, last_processed)
                     eligible_closed_count = len(new_candles)
                     stage_log(
                         "REFRESH_FILTER_END "
@@ -1221,15 +1257,13 @@ class App(tk.Tk):
                         if result["new_signal"]:
                             event_snapshot = self._build_snapshot(symbol, engine)
                             for sig in result["new_signals"]:
-                                new_signal_objects.append((symbol, sig, event_snapshot))
-                                self.storage.insert_signal(symbol, self._get_profile(symbol), sig)
+                                symbol_signals.append((symbol, sig, event_snapshot))
                     stage_log(
                         "REFRESH_APPLY_END "
                         f"symbol={symbol} newest_processed_close_time={self._format_refresh_ts(last_processed)} "
                         f"last_price={float(engine.last_price or 0.0)}"
                     )
 
-                    self.last_processed_close_ts_by_symbol[symbol] = last_processed
                     snapshot = self._build_snapshot(symbol, engine)
                     post_process_lag_candles = self._count_eligible_closed_after(symbol, last_processed, now_ms)
                     snapshot = self._add_freshness_to_snapshot(
@@ -1238,10 +1272,16 @@ class App(tk.Tk):
                         last_processed_close_time=last_processed,
                         lag_candles=post_process_lag_candles,
                     )
-                    new_snapshots[symbol] = snapshot
                     stage_log(f"REFRESH_SAVE_BEGIN symbol={symbol}")
                     self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
+                    self.engines[symbol] = engine
+                    self.last_processed_close_ts_by_symbol[symbol] = last_processed
+                    new_snapshots[symbol] = snapshot
+                    new_signal_objects.extend(symbol_signals)
                     stage_log(f"REFRESH_SAVE_END symbol={symbol}")
+                    self._observe_ideal_entry_setups(
+                        symbol, engine, new_candles, last_processed, stage_log
+                    )
                     refresh_logs.append(
                         "REFRESH_STATE_PERSIST "
                         f"symbol={symbol} "
@@ -1772,6 +1812,8 @@ class App(tk.Tk):
 
 
     def _refresh_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list, stage_log):
+        if self.validation_store is None:
+            return {}
         eligible_closed_count = len(new_candles)
         if eligible_closed_count == 0:
             stage_log(f"REFRESH_VALIDATION_SKIPPED symbol={symbol} reason=no_new_closed_candles")
@@ -1807,6 +1849,8 @@ class App(tk.Tk):
         return validation_breakdown
 
     def _run_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list):
+        if self.validation_store is None:
+            return {}
         metrics = {
             "update_pending_elapsed_ms": 0,
             "evaluate_strategy_setups_elapsed_ms": 0,
@@ -1850,6 +1894,28 @@ class App(tk.Tk):
             )
         metrics["register_setup_elapsed_ms"] = int((time.perf_counter() - register_started) * 1000)
         return metrics
+
+    def _observe_ideal_entry_setups(self, symbol, engine, new_candles, reference_ts, stage_log):
+        if (self.setup_observer is None or symbol.upper() not in self.setup_observer.symbols
+                or not new_candles or reference_ts is None):
+            return
+        try:
+            structure, setups = self._evaluate_strategy_setups(symbol, engine)
+            result = self.setup_observer.observe(
+                symbol=symbol,
+                reference_close_ms=int(reference_ts),
+                setups=setups,
+                structure=structure,
+                observed_wall_ns=time.time_ns(),
+                observed_monotonic_ns=time.monotonic_ns(),
+            )
+            stage_log(
+                "IDEAL_ENTRY_OBSERVER "
+                f"symbol={symbol} opened={result['opened']} "
+                f"continued={result['continued']} withdrawn={result['withdrawn']}"
+            )
+        except Exception as exc:
+            stage_log(f"IDEAL_ENTRY_OBSERVER_ERROR symbol={symbol} error={exc}")
 
     def _structure_panel_field_value(self, field: str, value, profile: PnFProfile) -> str:
         if value is None:
@@ -2881,6 +2947,9 @@ class App(tk.Tk):
             pass
 
     def _rebuild_selected(self):
+        if self.settings.get("scanner_recovery_mode", False):
+            self._log("Full rebuild disabled: older history is not certified.")
+            return
         symbol = self.active_symbol
         profile = self._get_profile(symbol)
 
