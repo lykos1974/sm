@@ -167,9 +167,18 @@ def split_symbols(settings: dict, symbols_arg: str | None) -> List[str]:
 
 
 
-def load_all_closed_candles(storage: Storage, symbol: str) -> List[dict]:
+def load_all_closed_candles(
+    storage: Storage, symbol: str, now_ms: int | None = None
+) -> List[dict]:
     candles = storage.load_recent_candles(symbol, None)
-    return candles[:-1] if len(candles) > 1 else []
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    close_cutoff_ms = int(now_ms) - 5000
+    return [
+        candle
+        for candle in candles
+        if int(candle["close_time"]) <= close_cutoff_ms
+    ]
 
 
 def _shadow_normalize_structure(value: Any) -> Any:
