@@ -1168,6 +1168,7 @@ class App(tk.Tk):
                     last_processed = self.last_processed_close_ts_by_symbol.get(symbol)
                     engine = copy.deepcopy(engine)
                     symbol_signals = []
+                    validation_engine_steps = []
                     stage_log(
                         "REFRESH_LOAD_BEGIN "
                         f"symbol={symbol} last_processed={self._format_refresh_ts(last_processed)}"
@@ -1245,6 +1246,8 @@ class App(tk.Tk):
                         candle_close_ts = int(candle["close_time"])
                         before_last_price = engine.last_price
                         result = engine.update_from_price(candle_close_ts, candle["close"])
+                        if self.validation_store is not None:
+                            validation_engine_steps.append(copy.deepcopy(engine))
                         last_processed = candle_close_ts
                         refresh_logs.append(
                             "REFRESH_ENGINE_UPDATE "
@@ -1288,7 +1291,13 @@ class App(tk.Tk):
                         f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
                         f"last_price={float(engine.last_price or 0.0)}"
                     )
-                    self._refresh_validation_for_symbol(symbol, engine, new_candles, stage_log)
+                    self._refresh_validation_for_symbol(
+                        symbol,
+                        engine,
+                        new_candles,
+                        stage_log,
+                        engine_steps=validation_engine_steps,
+                    )
                     refresh_logs.append(
                         "REFRESH_SYMBOL_UPDATED "
                         f"symbol={symbol} processed={len(new_candles)} "
@@ -1811,7 +1820,14 @@ class App(tk.Tk):
             return {"status": "NONE", "setup": None}
 
 
-    def _refresh_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list, stage_log):
+    def _refresh_validation_for_symbol(
+        self,
+        symbol: str,
+        engine: PnFEngine,
+        new_candles: list,
+        stage_log,
+        engine_steps: list | None = None,
+    ):
         if self.validation_store is None:
             return {}
         eligible_closed_count = len(new_candles)
@@ -1825,7 +1841,9 @@ class App(tk.Tk):
 
         validation_perf_before = self._validation_perf_snapshot(symbol)
         stage_log(f"REFRESH_VALIDATION_BEGIN symbol={symbol} eligible_closed_count={eligible_closed_count}")
-        validation_breakdown = self._run_validation_for_symbol(symbol, engine, new_candles) or {}
+        validation_breakdown = self._run_validation_for_symbol(
+            symbol, engine, new_candles, engine_steps=engine_steps
+        ) or {}
         validation_perf_after = self._validation_perf_snapshot(symbol)
         validation_delta = self._validation_perf_delta(validation_perf_before, validation_perf_after)
         stage_log(
@@ -1848,7 +1866,13 @@ class App(tk.Tk):
         stage_log(f"REFRESH_VALIDATION_END symbol={symbol}")
         return validation_breakdown
 
-    def _run_validation_for_symbol(self, symbol: str, engine: PnFEngine, new_candles: list):
+    def _run_validation_for_symbol(
+        self,
+        symbol: str,
+        engine: PnFEngine,
+        new_candles: list,
+        engine_steps: list | None = None,
+    ):
         if self.validation_store is None:
             return {}
         metrics = {
@@ -1859,8 +1883,13 @@ class App(tk.Tk):
         if engine is None or not engine.columns:
             return metrics
 
-        update_started = time.perf_counter()
-        for candle in new_candles:
+        if engine_steps is None:
+            engine_steps = [engine] if len(new_candles) == 1 else []
+        if len(engine_steps) != len(new_candles):
+            raise ValueError("validation requires one causal engine snapshot per candle")
+
+        for candle, candle_engine in zip(new_candles, engine_steps):
+            update_started = time.perf_counter()
             close_ts = int(candle.get("close_time") or 0)
             close_price = float(candle.get("close") or 0.0)
             high_price = float(candle.get("high", close_price) or close_price)
@@ -1872,27 +1901,28 @@ class App(tk.Tk):
                 low_price=low_price,
                 close_price=close_price,
             )
-        metrics["update_pending_elapsed_ms"] = int((time.perf_counter() - update_started) * 1000)
+            metrics["update_pending_elapsed_ms"] += int((time.perf_counter() - update_started) * 1000)
 
-        evaluate_started = time.perf_counter()
-        structure, setups = self._evaluate_strategy_setups(symbol, engine)
-        metrics["evaluate_strategy_setups_elapsed_ms"] = int((time.perf_counter() - evaluate_started) * 1000)
-        reference_ts = self.last_processed_close_ts_by_symbol.get(symbol)
-        if reference_ts is None:
-            return metrics
-
-        register_started = time.perf_counter()
-        for setup in setups:
-            status = str(setup.get("status") or "").upper()
-            if status not in VALIDATION_ELIGIBLE_STATUSES:
-                continue
-            self.validation_store.register_setup(
-                symbol=symbol,
-                setup=setup,
-                structure_state=structure,
-                reference_ts=int(reference_ts),
+            evaluate_started = time.perf_counter()
+            structure, setups = self._evaluate_strategy_setups(symbol, candle_engine)
+            metrics["evaluate_strategy_setups_elapsed_ms"] += int(
+                (time.perf_counter() - evaluate_started) * 1000
             )
-        metrics["register_setup_elapsed_ms"] = int((time.perf_counter() - register_started) * 1000)
+
+            register_started = time.perf_counter()
+            for setup in setups:
+                status = str(setup.get("status") or "").upper()
+                if status not in VALIDATION_ELIGIBLE_STATUSES:
+                    continue
+                self.validation_store.register_setup(
+                    symbol=symbol,
+                    setup=setup,
+                    structure_state=structure,
+                    reference_ts=close_ts,
+                )
+            metrics["register_setup_elapsed_ms"] += int(
+                (time.perf_counter() - register_started) * 1000
+            )
         return metrics
 
     def _observe_ideal_entry_setups(self, symbol, engine, new_candles, reference_ts, stage_log):

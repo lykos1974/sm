@@ -134,12 +134,13 @@ class ValidationRefreshDummy:
     _refresh_validation_for_symbol = App._refresh_validation_for_symbol
 
     def __init__(self):
+        self.validation_store = object()
         self.run_calls = []
         self.snapshot_calls = []
         self.delta_calls = []
 
-    def _run_validation_for_symbol(self, symbol, engine, new_candles):
-        self.run_calls.append((symbol, engine, list(new_candles)))
+    def _run_validation_for_symbol(self, symbol, engine, new_candles, engine_steps=None):
+        self.run_calls.append((symbol, engine, list(new_candles), engine_steps))
         return {
             "update_pending_elapsed_ms": 1,
             "evaluate_strategy_setups_elapsed_ms": 2,
@@ -188,10 +189,12 @@ def test_new_candles_run_refresh_validation_metrics_path():
     candle = {"close_time": 123, "close": 10.0}
     engine = object()
 
-    metrics = dummy._refresh_validation_for_symbol("ETHUSDT", engine, [candle], logs.append)
+    metrics = dummy._refresh_validation_for_symbol(
+        "ETHUSDT", engine, [candle], logs.append, engine_steps=[engine]
+    )
 
     assert metrics["register_setup_elapsed_ms"] == 3
-    assert dummy.run_calls == [("ETHUSDT", engine, [candle])]
+    assert dummy.run_calls == [("ETHUSDT", engine, [candle], [engine])]
     assert dummy.snapshot_calls == ["ETHUSDT", "ETHUSDT"]
     assert len(dummy.delta_calls) == 1
     assert logs[0] == "REFRESH_VALIDATION_BEGIN symbol=ETHUSDT eligible_closed_count=1"
@@ -205,7 +208,7 @@ def test_refresh_persists_pnf_state_before_validation_skip():
 
     save_index = source.index("self._save_engine_snapshot(symbol, engine, last_processed, snapshot)")
     persist_index = source.index("REFRESH_STATE_PERSIST")
-    validation_index = source.index("self._refresh_validation_for_symbol(symbol, engine, new_candles, stage_log)")
+    validation_index = source.index("self._refresh_validation_for_symbol(")
 
     assert save_index < persist_index < validation_index
 
@@ -217,3 +220,52 @@ def test_refresh_validation_change_does_not_touch_strategy_logic():
     assert "evaluate_pullback_retest_short" in source
     assert "def _run_validation_for_symbol" in source
     assert "REFRESH_VALIDATION_SKIPPED symbol={symbol} reason=no_new_closed_candles" in source
+
+
+class BatchChronologyStore:
+    def __init__(self):
+        self.events = []
+
+    def update_pending_with_candle(self, **kwargs):
+        self.events.append(("update", kwargs["close_ts"]))
+
+    def register_setup(self, *, reference_ts, **_kwargs):
+        self.events.append(("register", reference_ts))
+
+
+class BatchChronologyDummy:
+    _run_validation_for_symbol = App._run_validation_for_symbol
+
+    def __init__(self):
+        self.validation_store = BatchChronologyStore()
+
+    def _evaluate_strategy_setups(self, _symbol, engine):
+        return {"engine_step": engine}, [{"status": "CANDIDATE"}]
+
+
+class BatchEngine:
+    def __init__(self, name):
+        self.name = name
+        self.columns = [name]
+
+
+def test_batch_validation_matches_one_candle_chronology():
+    candles = [
+        {"close_time": 10, "close": 100.0, "high": 101.0, "low": 99.0},
+        {"close_time": 20, "close": 101.0, "high": 102.0, "low": 100.0},
+    ]
+    batch = BatchChronologyDummy()
+    single = BatchChronologyDummy()
+    first = BatchEngine("first")
+    second = BatchEngine("second")
+
+    batch._run_validation_for_symbol("BTCUSDT", second, candles, engine_steps=[first, second])
+    single._run_validation_for_symbol("BTCUSDT", first, [candles[0]], engine_steps=[first])
+    single._run_validation_for_symbol("BTCUSDT", second, [candles[1]], engine_steps=[second])
+
+    assert batch.validation_store.events == single.validation_store.events == [
+        ("update", 10),
+        ("register", 10),
+        ("update", 20),
+        ("register", 20),
+    ]

@@ -72,7 +72,7 @@ class StrategyValidationNoopUpdateTests(TestCase):
     def _sql_updates(self, store, symbol="BTCUSDT"):
         return store.get_perf_snapshot()["update_pending"].get(symbol, {}).get("sql_update_count", 0)
 
-    def test_pending_not_activated_receives_no_sql_update(self):
+    def test_pending_not_activated_persists_expiry_progress(self):
         temp_dir, db_path, store = self._store()
         try:
             setup_id = store.register_setup("BTCUSDT", make_setup(ideal_entry=100.0), BASE_STRUCTURE, 1)
@@ -87,14 +87,14 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
-        self.assertEqual(after - before, 0)
+        self.assertEqual(after - before, 1)
         self.assertEqual(row["activation_status"], "PENDING")
-        self.assertEqual(row["bars_observed"], 0)
+        self.assertEqual(row["bars_observed"], 1)
         self.assertIsNone(row["first_outcome_ts"])
-        self.assertEqual(perf["noop_skipped_count"], 1)
+        self.assertEqual(perf["update_pending_progress_pending_not_activated"], 1)
         self.assertEqual(perf["trades_scanned"], 1)
 
-    def test_activation_writes_exactly_one_meaningful_update(self):
+    def test_activation_and_same_candle_evaluation_are_both_persisted(self):
         temp_dir, db_path, store = self._store()
         try:
             setup_id = store.register_setup("BTCUSDT", make_setup(ideal_entry=100.0), BASE_STRUCTURE, 1)
@@ -109,7 +109,7 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
-        self.assertEqual(after - before, 1)
+        self.assertEqual(after - before, 2)
         self.assertEqual(row["activation_status"], "ACTIVE")
         self.assertEqual(row["activated_ts"], 2)
         self.assertEqual(perf["lifecycle_update_count"], 1)

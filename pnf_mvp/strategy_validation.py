@@ -36,6 +36,7 @@ RESOLUTION_STOPPED = "STOPPED"
 RESOLUTION_TP2 = "TP2"
 RESOLUTION_TP1_PARTIAL_THEN_BE = "TP1_PARTIAL_THEN_BE"
 RESOLUTION_AMBIGUOUS = "AMBIGUOUS"
+RESOLUTION_EXPIRED = "EXPIRED"
 
 ACTIVATION_PENDING = "PENDING"
 ACTIVATION_ACTIVE = "ACTIVE"
@@ -47,6 +48,7 @@ BE_MODE = True
 BE_TRIGGER_R = 1.5
 
 DEFAULT_COMMIT_EVERY = 1000
+PENDING_EXPIRY_CANDLES = 3
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -857,24 +859,51 @@ class StrategyValidationStore:
                         row["activated_price"] = activated_price
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
-                        still_pending.append(row)
+                        activation_status = ACTIVATION_ACTIVE
                         _mark_dirty_profiled()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
                         _record_update_diagnostic(event_key="update_pending_event_activation")
+                    else:
+                        expired = bars_observed >= PENDING_EXPIRY_CANDLES
+                        _execute_update_profiled(
+                            """
+                            UPDATE strategy_setups
+                            SET updated_ts = ?,
+                                bars_observed = ?,
+                                resolution_status = ?,
+                                resolved_ts = ?,
+                                resolution_note = ?
+                            WHERE setup_id = ?
+                            """,
+                            (
+                                close_ts,
+                                bars_observed,
+                                RESOLUTION_EXPIRED if expired else RESOLUTION_PENDING,
+                                close_ts if expired else None,
+                                "pending_not_activated_within_three_candles" if expired else None,
+                                row["setup_id"],
+                            ),
+                        )
+                        row["updated_ts"] = close_ts
+                        row["bars_observed"] = bars_observed
+                        if expired:
+                            row["resolution_status"] = RESOLUTION_EXPIRED
+                            row["resolved_ts"] = close_ts
+                            row["resolution_note"] = "pending_not_activated_within_three_candles"
+                            profile["rows_removed"] += 1
+                            self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
+                            _record_update_diagnostic(event_key="update_pending_event_timeout_expiry")
+                        else:
+                            still_pending.append(row)
+                            _record_update_diagnostic(
+                                progress_key="update_pending_progress_pending_not_activated"
+                            )
+                        _mark_dirty_profiled()
+                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         _print_progress()
                         _print_slow_row(row, _elapsed_ms(row_started))
                         continue
-
-                    still_pending.append(row)
-                    profile["rows_skipped"] += 1
-                    _record_noop_skipped(
-                        progress_key="update_pending_progress_pending_not_activated",
-                        noop_candidate=True,
-                    )
-                    _print_progress()
-                    _print_slow_row(row, _elapsed_ms(row_started))
-                    continue
 
                 if activation_status != ACTIVATION_ACTIVE:
                     still_pending.append(row)
