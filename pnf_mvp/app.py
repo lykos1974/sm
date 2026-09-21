@@ -957,8 +957,7 @@ class App(tk.Tk):
     def _load_stateful_engine(self, symbol: str):
         profile = self._get_profile(symbol)
         engine = PnFEngine(profile)
-        state = self.storage.load_state(symbol, profile.name)
-        columns = self.storage.load_columns(symbol, profile.name)
+        state, columns = self.storage.load_checkpoint(symbol, profile.name)
         if self.settings.get("scanner_recovery_mode", False) and (not state or not columns or state.get("last_processed_close_ts") is None):
             raise ValueError("Recovered state missing: " + symbol)
         if not columns:
