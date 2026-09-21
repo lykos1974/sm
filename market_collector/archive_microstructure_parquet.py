@@ -47,13 +47,22 @@ SPECS = {
         "JOIN sessions s ON s.id=r.session_id ORDER BY r.id"
     ),
     "quality_intervals": (
+        "WITH ordered_sessions AS ("
+        "SELECT id,session_key,started_wall_ns,ended_wall_ns,"
+        "LAG(ended_wall_ns) OVER (ORDER BY started_wall_ns,id) AS previous_end "
+        "FROM sessions) "
         "SELECT r.id,s.session_key,"
         "CAST(r.receive_wall_ns-(r.duration_ms*1000000) AS INTEGER) AS start_wall_ns,"
         "r.receive_wall_ns AS end_wall_ns,r.diagnostic_type AS reason,"
         "r.duration_ms,r.details FROM runtime_diagnostics r "
         "JOIN sessions s ON s.id=r.session_id "
         "WHERE r.diagnostic_type IN ('STALE_AGG_TRADE','EVENT_LOOP_STALL') "
-        "ORDER BY r.receive_wall_ns,r.id"
+        "UNION ALL SELECT -id,session_key,previous_end,started_wall_ns,"
+        "'SESSION_OBSERVATION_GAP',"
+        "CAST((started_wall_ns-previous_end)/1000000.0 AS REAL),"
+        "'{\"source\":\"session_boundaries\"}' FROM ordered_sessions "
+        "WHERE previous_end IS NOT NULL AND started_wall_ns>previous_end "
+        "ORDER BY 3,1"
     ),
 }
 
