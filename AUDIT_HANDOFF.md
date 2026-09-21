@@ -33,8 +33,9 @@ Pull request: `#350`
 | `5983dd8` | Detached PnF signal snapshots and causality/immutability tests | 3 targeted tests passed |
 | `8181a7d` | Activation-candle outcome, exact three-candle pending expiry, causal per-candle batch validation | 15 targeted validation/regression checks passed; remote tree verified byte-for-byte |
 | `a24730d` | Observer and validation complete and flush before scanner checkpoint persistence | 25 targeted checks passed; observer/validation/flush failures do not advance checkpoint; remote tree verified |
+| `b1c8c09` | Approved conservative BE-first for already-armed historical OHLC dual touches | 27 targeted checks passed; LONG/SHORT unit and end-to-end coverage; live trader paths isolated |
 
-Remote branch head expected before this final handoff update: `a24730d5227cca6239416ceba9641219b3e44aad`.
+Remote branch head expected before this policy-completion handoff update: `b1c8c097afb6cf4e69f1d525237fed93aae28ec2`.
 
 ## Completed safe stage: validation chronology
 
@@ -58,14 +59,21 @@ Commit `a24730d` completed the checkpoint failure regression stage:
 - No strategy parameters, entry/SL/TP/RR, promotion rules, alert rules, or protected long-only baseline behavior changed.
 - Validation and alerts remain OFF.
 
+## Completed safe stage: conservative BE-first OHLC policy
+
+Commit `b1c8c09` implements the approved isolated policy:
+
+- For historical OHLC only, if BE was already armed before the candle and both BE and TP2 are touched, LONG and SHORT resolve at BE.
+- Exact equality at BE or TP2 counts as a touch.
+- BE-only, TP2-only, and no-touch behavior is unchanged.
+- Candle close does not infer intrabar order.
+- Live timestamped trader paths do not use the historical OHLC resolvers; their rule remains first actual execution event wins.
+- No strategy parameters, entry/SL/TP/RR, promotion rules, baseline, validation enablement, or alert behavior changed.
+- Validation and alerts remain OFF.
+
 ## Confirmed critical findings still open
 
-1. `pnf_mvp/strategy_validation.py::_resolve_long_after_tp1` and `_resolve_short_after_tp1`
-   - Approved policy: for historical OHLC, when BE was already armed before the candle and both BE and TP2 are touched, resolve conservatively at BE.
-   - Live timestamped execution remains event-ordered: the first actual fill wins.
-   - Implementation must be isolated to after-TP1 resolution and covered by LONG/SHORT regression tests.
-
-2. `pnf_mvp/strategy_validation.py::_should_activate`
+1. `pnf_mvp/strategy_validation.py::_should_activate`
    - Activation is based on candle close, not limit touch/trade-through.
    - Impact: this path is not equivalent to the stated execution model.
 
@@ -86,19 +94,17 @@ Commit `a24730d` completed the checkpoint failure regression stage:
 
 ## Test limitations
 
-- The `8181a7d` stage passed 15 targeted validation/regression checks. The `a24730d` stage passed those 15 plus 10 focused scanner/checkpoint checks; earlier manual persistence checks passed as listed above.
+- The `8181a7d` stage passed 15 targeted validation/regression checks. The `a24730d` stage passed those 15 plus 10 focused scanner/checkpoint checks. The `b1c8c09` stage passed 20 validation tests plus 7 focused scanner/checkpoint checks; earlier manual persistence checks passed as listed above.
 - The audit runtime lacks `pytest` and `pyarrow`; therefore no claim of a clean full-suite run has been made.
 
 ## Next smallest safe stage
 
-Approved execution-policy implementation only:
+Stop after the approved isolated policy stage:
 
-1. Add LONG and SHORT regression fixtures for already-armed BE with same-candle BE+TP2 touches.
-2. Historical OHLC must resolve BE-first; exact boundary equality counts as a touch.
-3. Single-touch and no-touch outcomes must remain unchanged.
-4. Live timestamped paths must continue to use the first actual execution event and must not be routed through OHLC ambiguity logic.
-5. Apply the smallest isolated resolver change; do not change strategy parameters, entry/SL/TP/RR, promotion rules, baseline, validation enablement, or alerts.
-6. Publish and verify GitHub; do not request Windows installation yet.
+1. Keep validation and alerts OFF.
+2. Do not run broad historical recomputation yet; the statistical impact is limited to already-armed dual-touch rows but has not been quantified on a frozen exact-baseline dataset.
+3. Treat close-based activation versus limit touch/trade-through as the next separate execution-model decision.
+4. Do not request Windows installation until one consolidated package and procedure are verified.
 
 ## Recommended model routing
 
