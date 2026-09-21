@@ -34,6 +34,8 @@ class ObserverToolsTests(unittest.TestCase):
             report = CHECKER.check(database)
             self.assertTrue(report["pass"])
             self.assertEqual(report["lifecycle_counts"], {"WITHDRAWN": 1})
+            self.assertEqual(report["duplicate_setup_keys"], 0)
+            self.assertEqual(report["exceeded_scheduled_expiry"], 0)
             self.assertEqual(EXPORTER.export_orders(database, output, "0.01"), 1)
             with output.open(encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))

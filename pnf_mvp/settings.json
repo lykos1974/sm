@@ -89,6 +89,7 @@
     "statuses": [
       "CANDIDATE"
     ],
-    "minimum_quality_score": 65
+    "minimum_quality_score": 65,
+    "maximum_lifetime_candles": 3
   }
 }

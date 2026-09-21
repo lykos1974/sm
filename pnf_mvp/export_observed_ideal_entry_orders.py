@@ -27,7 +27,7 @@ def export_orders(database_path, output_path, tick_size) -> int:
     try:
         rows = conn.execute(
             "SELECT occurrence_id,symbol,side,available_wall_ns,expires_wall_ns,ideal_entry "
-            "FROM setup_occurrences WHERE lifecycle IN ('WITHDRAWN','INTERRUPTED') "
+            "FROM setup_occurrences WHERE lifecycle IN ('WITHDRAWN','INTERRUPTED','EXPIRED') "
             "AND expires_wall_ns IS NOT NULL AND expires_wall_ns>available_wall_ns "
             "ORDER BY available_wall_ns,occurrence_id"
         ).fetchall()

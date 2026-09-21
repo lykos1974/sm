@@ -82,6 +82,7 @@ class App(tk.Tk):
                 observer_config.get("symbols", ["BTCUSDT"]),
                 observer_config.get("statuses", ["CANDIDATE"]),
                 observer_config.get("minimum_quality_score", 65),
+                observer_config.get("maximum_lifetime_candles", 3),
             )
             if observer_config.get("enabled", False) else None
         )
@@ -1912,7 +1913,8 @@ class App(tk.Tk):
             stage_log(
                 "IDEAL_ENTRY_OBSERVER "
                 f"symbol={symbol} opened={result['opened']} "
-                f"continued={result['continued']} withdrawn={result['withdrawn']}"
+                f"continued={result['continued']} withdrawn={result['withdrawn']} "
+                f"expired={result['expired']}"
             )
         except Exception as exc:
             stage_log(f"IDEAL_ENTRY_OBSERVER_ERROR symbol={symbol} error={exc}")

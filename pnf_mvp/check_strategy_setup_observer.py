@@ -36,6 +36,20 @@ def check(database_path: str | Path) -> dict[str, object]:
             "SELECT COUNT(*) FROM setup_occurrences WHERE lifecycle='OPEN' "
             "AND expires_wall_ns IS NOT NULL"
         ).fetchone()[0]
+        duplicate_setup_keys = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT symbol,setup_key,COUNT(*) AS n "
+            "FROM setup_occurrences GROUP BY symbol,setup_key HAVING n>1)"
+        ).fetchone()[0]
+        invalid_scheduled_expiry = conn.execute(
+            "SELECT COUNT(*) FROM setup_occurrences "
+            "WHERE scheduled_expires_wall_ns IS NULL "
+            "OR scheduled_expires_wall_ns<=available_wall_ns"
+        ).fetchone()[0]
+        exceeded_scheduled_expiry = conn.execute(
+            "SELECT COUNT(*) FROM setup_occurrences WHERE expires_wall_ns IS NOT NULL "
+            "AND scheduled_expires_wall_ns IS NOT NULL "
+            "AND expires_wall_ns>scheduled_expires_wall_ns"
+        ).fetchone()[0]
         latest = conn.execute(
             "SELECT occurrence_id,symbol,side,status,quality_score,reference_close_ms,"
             "available_wall_ns,expires_wall_ns,lifecycle,ideal_entry,close_reason "
@@ -49,13 +63,18 @@ def check(database_path: str | Path) -> dict[str, object]:
             "total_occurrences": total, "lifecycle_counts": lifecycle,
             "invalid_windows": invalid_windows,
             "duplicate_open_keys": duplicate_open_keys,
+            "duplicate_setup_keys": duplicate_setup_keys,
             "invalid_open_expiry": invalid_open_expiry,
+            "invalid_scheduled_expiry": invalid_scheduled_expiry,
+            "exceeded_scheduled_expiry": exceeded_scheduled_expiry,
             "latest_occurrences": [dict(zip(columns, row)) for row in latest],
             "read_only": True,
         }
         report["pass"] = (
             integrity == "ok" and invalid_windows == 0 and
-            duplicate_open_keys == 0 and invalid_open_expiry == 0
+            duplicate_open_keys == 0 and duplicate_setup_keys == 0 and
+            invalid_open_expiry == 0 and invalid_scheduled_expiry == 0 and
+            exceeded_scheduled_expiry == 0
         )
         return report
     finally:
