@@ -203,14 +203,144 @@ def test_new_candles_run_refresh_validation_metrics_path():
     assert logs[2] == "REFRESH_VALIDATION_END symbol=ETHUSDT"
 
 
-def test_refresh_persists_pnf_state_before_validation_skip():
+def test_refresh_checkpoint_follows_observer_and_validation():
     source = Path(ROOT / "pnf_mvp" / "app.py").read_text()
+    start = source.index("def _run_downstream_before_checkpoint")
+    end = source.index("def _observe_ideal_entry_setups", start)
+    downstream = source[start:end]
 
-    save_index = source.index("self._save_engine_snapshot(symbol, engine, last_processed, snapshot)")
-    persist_index = source.index("REFRESH_STATE_PERSIST")
-    validation_index = source.index("self._refresh_validation_for_symbol(")
+    observer_index = downstream.index("self._observe_ideal_entry_setups(")
+    validation_index = downstream.index("self._refresh_validation_for_symbol(")
+    flush_index = downstream.index("self.validation_store.flush()")
+    save_index = downstream.index("self._save_engine_snapshot(symbol, engine, last_processed, snapshot)")
 
-    assert save_index < persist_index < validation_index
+    assert observer_index < validation_index < flush_index < save_index
+
+
+class CheckpointValidationStore:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def flush(self):
+        self.owner.events.append("validation_flush")
+        if self.owner.fail_at == "validation_flush":
+            raise RuntimeError("validation flush failed")
+
+
+class CheckpointOrderingDummy:
+    _run_downstream_before_checkpoint = App._run_downstream_before_checkpoint
+
+    def __init__(self, fail_at=None):
+        self.fail_at = fail_at
+        self.events = []
+        self.validation_store = CheckpointValidationStore(self)
+
+    def _observe_ideal_entry_setups(self, *_args):
+        self.events.append("observer")
+        if self.fail_at == "observer":
+            raise RuntimeError("observer failed")
+
+    def _refresh_validation_for_symbol(self, *_args, **_kwargs):
+        self.events.append("validation")
+        if self.fail_at == "validation":
+            raise RuntimeError("validation failed")
+
+    def _save_engine_snapshot(self, *_args):
+        self.events.append("checkpoint")
+
+
+def run_checkpoint_stages(dummy):
+    dummy._run_downstream_before_checkpoint(
+        symbol="BTCUSDT",
+        engine=object(),
+        new_candles=[{"close_time": 1}],
+        last_processed=1,
+        snapshot={},
+        validation_engine_steps=[object()],
+        stage_log=lambda _message: None,
+    )
+
+
+def test_observer_failure_does_not_advance_checkpoint():
+    dummy = CheckpointOrderingDummy(fail_at="observer")
+
+    try:
+        run_checkpoint_stages(dummy)
+    except RuntimeError as exc:
+        assert str(exc) == "observer failed"
+    else:
+        raise AssertionError("observer failure did not propagate")
+
+    assert dummy.events == ["observer"]
+
+
+def test_validation_failure_does_not_advance_checkpoint():
+    dummy = CheckpointOrderingDummy(fail_at="validation")
+
+    try:
+        run_checkpoint_stages(dummy)
+    except RuntimeError as exc:
+        assert str(exc) == "validation failed"
+    else:
+        raise AssertionError("validation failure did not propagate")
+
+    assert dummy.events == ["observer", "validation"]
+
+
+def test_validation_flush_failure_does_not_advance_checkpoint():
+    dummy = CheckpointOrderingDummy(fail_at="validation_flush")
+
+    try:
+        run_checkpoint_stages(dummy)
+    except RuntimeError as exc:
+        assert str(exc) == "validation flush failed"
+    else:
+        raise AssertionError("validation flush failure did not propagate")
+
+    assert dummy.events == ["observer", "validation", "validation_flush"]
+
+
+def test_checkpoint_advances_after_observer_and_validation_succeed():
+    dummy = CheckpointOrderingDummy()
+
+    run_checkpoint_stages(dummy)
+
+    assert dummy.events == ["observer", "validation", "validation_flush", "checkpoint"]
+
+
+class RaisingObserver:
+    symbols = {"BTCUSDT"}
+
+    def observe(self, **_kwargs):
+        raise RuntimeError("observer database failed")
+
+
+class ObserverFailureDummy:
+    _observe_ideal_entry_setups = App._observe_ideal_entry_setups
+
+    def __init__(self):
+        self.setup_observer = RaisingObserver()
+
+    def _evaluate_strategy_setups(self, _symbol, _engine):
+        return {}, []
+
+
+def test_observer_error_is_logged_and_propagated_before_checkpoint():
+    dummy = ObserverFailureDummy()
+    logs = []
+
+    try:
+        dummy._observe_ideal_entry_setups(
+            "BTCUSDT", object(), [{"close_time": 1}], 1, logs.append
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "observer database failed"
+    else:
+        raise AssertionError("observer error did not propagate")
+
+    assert logs == [
+        "IDEAL_ENTRY_OBSERVER_ERROR symbol=BTCUSDT error=observer database failed"
+    ]
 
 
 def test_refresh_validation_change_does_not_touch_strategy_logic():

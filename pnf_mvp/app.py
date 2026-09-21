@@ -1275,28 +1275,24 @@ class App(tk.Tk):
                         last_processed_close_time=last_processed,
                         lag_candles=post_process_lag_candles,
                     )
-                    stage_log(f"REFRESH_SAVE_BEGIN symbol={symbol}")
-                    self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
+                    self._run_downstream_before_checkpoint(
+                        symbol=symbol,
+                        engine=engine,
+                        new_candles=new_candles,
+                        last_processed=last_processed,
+                        snapshot=snapshot,
+                        validation_engine_steps=validation_engine_steps,
+                        stage_log=stage_log,
+                    )
                     self.engines[symbol] = engine
                     self.last_processed_close_ts_by_symbol[symbol] = last_processed
                     new_snapshots[symbol] = snapshot
                     new_signal_objects.extend(symbol_signals)
-                    stage_log(f"REFRESH_SAVE_END symbol={symbol}")
-                    self._observe_ideal_entry_setups(
-                        symbol, engine, new_candles, last_processed, stage_log
-                    )
                     refresh_logs.append(
                         "REFRESH_STATE_PERSIST "
                         f"symbol={symbol} "
                         f"last_processed_close_ts={self._format_refresh_ts(last_processed)} "
                         f"last_price={float(engine.last_price or 0.0)}"
-                    )
-                    self._refresh_validation_for_symbol(
-                        symbol,
-                        engine,
-                        new_candles,
-                        stage_log,
-                        engine_steps=validation_engine_steps,
                     )
                     refresh_logs.append(
                         "REFRESH_SYMBOL_UPDATED "
@@ -1925,6 +1921,33 @@ class App(tk.Tk):
             )
         return metrics
 
+    def _run_downstream_before_checkpoint(
+        self,
+        *,
+        symbol: str,
+        engine: PnFEngine,
+        new_candles: list,
+        last_processed: int | None,
+        snapshot: dict,
+        validation_engine_steps: list,
+        stage_log,
+    ):
+        self._observe_ideal_entry_setups(
+            symbol, engine, new_candles, last_processed, stage_log
+        )
+        self._refresh_validation_for_symbol(
+            symbol,
+            engine,
+            new_candles,
+            stage_log,
+            engine_steps=validation_engine_steps,
+        )
+        if self.validation_store is not None:
+            self.validation_store.flush()
+        stage_log(f"REFRESH_SAVE_BEGIN symbol={symbol}")
+        self._save_engine_snapshot(symbol, engine, last_processed, snapshot)
+        stage_log(f"REFRESH_SAVE_END symbol={symbol}")
+
     def _observe_ideal_entry_setups(self, symbol, engine, new_candles, reference_ts, stage_log):
         if (self.setup_observer is None or symbol.upper() not in self.setup_observer.symbols
                 or not new_candles or reference_ts is None):
@@ -1947,6 +1970,7 @@ class App(tk.Tk):
             )
         except Exception as exc:
             stage_log(f"IDEAL_ENTRY_OBSERVER_ERROR symbol={symbol} error={exc}")
+            raise
 
     def _structure_panel_field_value(self, field: str, value, profile: PnFProfile) -> str:
         if value is None:
