@@ -65,6 +65,19 @@ class StrategySetupObserver:
                 self._conn.execute(
                     "ALTER TABLE setup_occurrences ADD COLUMN scheduled_expires_wall_ns INTEGER"
                 )
+            lifetime_ms = self.maximum_lifetime_candles * self.candle_interval_ms
+            self._conn.execute(
+                "UPDATE setup_occurrences SET scheduled_expires_wall_ns="
+                "(reference_close_ms+?)*1000000 WHERE scheduled_expires_wall_ns IS NULL",
+                (lifetime_ms,),
+            )
+            self._conn.execute(
+                "UPDATE setup_occurrences SET lifecycle='EXPIRED',"
+                "expires_wall_ns=scheduled_expires_wall_ns,"
+                "close_reason='MIGRATED_THREE_CANDLE_CAP' "
+                "WHERE expires_wall_ns IS NOT NULL AND scheduled_expires_wall_ns IS NOT NULL "
+                "AND expires_wall_ns>scheduled_expires_wall_ns"
+            )
 
     def _interrupt_open_occurrences(self):
         now = time.time_ns()

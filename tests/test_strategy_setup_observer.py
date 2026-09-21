@@ -107,5 +107,41 @@ class StrategySetupObserverTests(unittest.TestCase):
             self.assertEqual(rows, [("EXPIRED", scheduled, "THREE_CANDLE_EXPIRY")])
             conn.close()
 
+    def test_legacy_window_is_migrated_to_three_candle_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observer.db"
+            observer = OBSERVER.StrategySetupObserver(path, ["BTCUSDT"], ["CANDIDATE"], 65)
+            close_ms, wall_ns = live_clock()
+            observer.observe(
+                "BTCUSDT", close_ms, [candidate()], {"current_column_index": 7}, wall_ns, 1
+            )
+            observer.observe(
+                "BTCUSDT", close_ms + 60_000, [], {"current_column_index": 7},
+                wall_ns + 1, 2,
+            )
+            observer.close()
+            scheduled = (close_ms + 180_000) * 1_000_000
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "UPDATE setup_occurrences SET scheduled_expires_wall_ns=NULL,"
+                "expires_wall_ns=?,lifecycle='WITHDRAWN',close_reason='OLD_BEHAVIOR'",
+                (scheduled + 60_000_000_000,),
+            )
+            conn.commit()
+            conn.close()
+            migrated = OBSERVER.StrategySetupObserver(
+                path, ["BTCUSDT"], ["CANDIDATE"], 65
+            )
+            migrated.close()
+            conn = sqlite3.connect(path)
+            row = conn.execute(
+                "SELECT scheduled_expires_wall_ns,expires_wall_ns,lifecycle,close_reason "
+                "FROM setup_occurrences"
+            ).fetchone()
+            self.assertEqual(
+                row, (scheduled, scheduled, "EXPIRED", "MIGRATED_THREE_CANDLE_CAP")
+            )
+            conn.close()
+
 if __name__ == "__main__":
     unittest.main()
