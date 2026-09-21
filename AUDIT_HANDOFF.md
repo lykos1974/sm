@@ -31,32 +31,32 @@ Pull request: `#350`
 | `c4f2628` | Canonical atomic checkpoint, monotonic watermark guard, consistent checkpoint read | Manual round-trip/stale-write tests passed |
 | `58304ed` | Live/historical eligibility alignment; `REJECT` excluded; closed final historical candle retained | 6 targeted tests passed |
 | `5983dd8` | Detached PnF signal snapshots and causality/immutability tests | 3 targeted tests passed |
+| `8181a7d` | Activation-candle outcome, exact three-candle pending expiry, causal per-candle batch validation | 15 targeted validation/regression checks passed; remote tree verified byte-for-byte |
 
-Remote branch head expected: `5983dd8d8c3f384909aa810f3764416b4a96248c`.
+Remote branch head expected before this handoff update: `8181a7decb6ac81770254905af113dcc8bb7f4dc`.
+
+## Completed safe stage: validation chronology
+
+Commit `8181a7d` completed the prior diagnostics-first stage:
+
+- Activation candles are now evaluated for stop/target outcomes.
+- Unactivated pending setups persist progress and expire after exactly three eligible candles.
+- Multi-candle refresh validation now preserves causal `update -> evaluate/register` ordering and matches one-candle processing.
+- BE+TP2 same-candle behavior was locked by a diagnostic test only; its optimistic TP2-first policy was not changed.
+- Strategy parameters, entry/SL/TP/RR, promotion rules, alerts, and the protected long-only baseline were unchanged.
+- Validation and alerts remain OFF.
 
 ## Confirmed critical findings still open
 
-1. `pnf_mvp/strategy_validation.py::update_pending_with_candle`
-   - The activation candle is not evaluated for stop/target after activation.
-   - Impact: an immediate loss or ambiguous candle can survive and later become a win.
-
-2. `pnf_mvp/strategy_validation.py::update_pending_with_candle`
-   - Pending rows do not implement the declared three-candle expiry; `bars_observed` is not persisted while unactivated.
-   - Impact: orders can activate after their legal lifetime.
-
-3. `pnf_mvp/strategy_validation.py::_resolve_long_after_tp1` and `_resolve_short_after_tp1`
+1. `pnf_mvp/strategy_validation.py::_resolve_long_after_tp1` and `_resolve_short_after_tp1`
    - If BE and TP2 occur in the same candle, TP2 wins optimistically.
-   - Required rule: conservative/ambiguous handling must be specified and tested before changing production behavior.
+   - Required rule: conservative/ambiguous handling must be explicitly approved before changing behavior.
 
-4. `pnf_mvp/strategy_validation.py::_should_activate`
+2. `pnf_mvp/strategy_validation.py::_should_activate`
    - Activation is based on candle close, not limit touch/trade-through.
    - Impact: this path is not equivalent to the stated execution model.
 
-5. `pnf_mvp/app.py::_refresh_incremental_once` and `_run_validation_for_symbol`
-   - A batch updates the PnF engine through all new candles, replays pending outcomes, then evaluates setups only at the final state.
-   - Impact: intermediate opportunities are missing and a final setup is registered after its possible lifetime candles were already replayed.
-
-6. `pnf_mvp/app.py::_refresh_incremental_once`
+3. `pnf_mvp/app.py::_refresh_incremental_once`
    - Checkpoint persistence occurs before observer/validation completion.
    - Impact: a downstream failure can advance the watermark and permanently skip work on retry.
 
@@ -77,19 +77,19 @@ Remote branch head expected: `5983dd8d8c3f384909aa810f3764416b4a96248c`.
 
 ## Test limitations
 
-- Targeted `unittest` and manual persistence checks passed as listed above.
+- The `8181a7d` stage passed 15 targeted validation/regression checks; earlier targeted `unittest` and manual persistence checks passed as listed above.
 - The audit runtime lacks `pytest` and `pyarrow`; therefore no claim of a clean full-suite run has been made.
 
 ## Next smallest safe stage
 
-Diagnostics/tests first; do not immediately rewrite validation:
+Diagnostics/tests first; do not change execution policy:
 
-1. Add minimal regression tests for activation-candle outcome, three-candle expiry, BE+TP2 same candle, and one-candle-versus-batch equivalence.
-2. Demonstrate each current failure independently.
-3. Separate pure chronology corrections from execution-model choices.
-4. Apply only chronology corrections whose expected behavior is already explicit.
-5. Run targeted tests and publish one consolidated GitHub commit.
-6. Only then provide a single Windows update/install procedure.
+1. Independently review commit `8181a7d` for chronology regressions and protected-behavior risk.
+2. Add a focused regression test proving checkpoint ordering and retry behavior when observer or validation fails.
+3. Correct checkpoint ordering only if the test independently demonstrates watermark advancement before downstream completion.
+4. Keep BE+TP2 same-candle behavior unchanged and report it as an unresolved execution-policy choice.
+5. Run targeted tests and publish the verified consolidated result to GitHub.
+6. Only then prepare one Windows update/install procedure.
 
 ## Recommended model routing
 
