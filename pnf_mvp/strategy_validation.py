@@ -27,6 +27,7 @@ import sqlite3
 import threading
 import time
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -49,6 +50,7 @@ BE_TRIGGER_R = 1.5
 
 DEFAULT_COMMIT_EVERY = 1000
 PENDING_EXPIRY_CANDLES = 3
+HISTORICAL_ACTIVATION_MODEL = "historical_ohlc_one_tick_trade_through_v1"
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -79,6 +81,7 @@ class StrategyValidationStore:
         db_path: str = "strategy_validation.db",
         allow_multiple_trades_per_symbol: Optional[bool] = None,
         commit_every: int = DEFAULT_COMMIT_EVERY,
+        symbol_tick_provenance: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         self.db_path = str(Path(db_path))
         self.allow_multiple_trades_per_symbol = (
@@ -88,6 +91,23 @@ class StrategyValidationStore:
         )
         self._commit_every = max(1, int(commit_every))
         self._dirty_writes = 0
+        self._symbol_tick_provenance: dict[str, dict[str, Any]] = {}
+        for symbol, provenance in dict(symbol_tick_provenance or {}).items():
+            if not isinstance(provenance, dict):
+                raise ValueError(f"tick provenance for {symbol} must be an object")
+            try:
+                configured_tick = float(provenance.get("tick_size"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"tick provenance for {symbol} requires a positive tick_size") from exc
+            configured_source = str(provenance.get("source") or "").strip()
+            if configured_tick <= 0 or not configured_source:
+                raise ValueError(
+                    f"tick provenance for {symbol} requires positive tick_size and source"
+                )
+            self._symbol_tick_provenance[str(symbol)] = {
+                "tick_size": configured_tick,
+                "source": configured_source,
+            }
 
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -325,6 +345,10 @@ class StrategyValidationStore:
         self._ensure_column("strategy_setups", "tp1_price", "REAL")
         self._ensure_column("strategy_setups", "current_column_index", "INTEGER")
         self._ensure_column("strategy_setups", "snapshot_path", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_size", "REAL")
+        self._ensure_column("strategy_setups", "activation_tick_source", "TEXT")
+        self._ensure_column("strategy_setups", "ambiguous_pessimistic_r", "REAL")
+        self._ensure_column("strategy_setups", "ambiguous_optimistic_r", "REAL")
 
     def _make_setup_id(self, symbol: str, setup: Dict[str, Any], structure_state: Dict[str, Any], reference_ts: int) -> str:
         payload = {
@@ -592,15 +616,81 @@ class StrategyValidationStore:
             _print_register_summary(inserted=inserted, duplicate=duplicate)
             return setup_id
 
-    def _should_activate(self, side: str, close_price: float, ideal_entry: Optional[float]) -> bool:
+    def _should_activate(
+        self,
+        side: str,
+        high_price: float,
+        low_price: float,
+        ideal_entry: Optional[float],
+        tick_size: float,
+    ) -> bool:
         if ideal_entry is None:
             return False
+        try:
+            entry = Decimal(str(ideal_entry))
+            tick = Decimal(str(tick_size))
+            high = Decimal(str(high_price))
+            low = Decimal(str(low_price))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("historical activation requires an explicit positive tick_size") from exc
+        if not tick.is_finite() or tick <= 0:
+            raise ValueError("historical activation requires an explicit positive tick_size")
         side = str(side or "").upper()
         if side == "LONG":
-            return float(close_price) <= float(ideal_entry)
+            return low <= entry - tick
         if side == "SHORT":
-            return float(close_price) >= float(ideal_entry)
+            return high >= entry + tick
         return False
+
+    def _activation_candle_outcome(
+        self,
+        side: str,
+        low_price: float,
+        high_price: float,
+        entry_price: float,
+        invalidation: Optional[float],
+        tp1: Optional[float],
+        tp2: Optional[float],
+    ) -> tuple[Optional[str], Optional[float], Optional[str], Optional[float], Optional[float]]:
+        side = str(side or "").upper()
+        if side == "LONG":
+            hit_stop = invalidation is not None and low_price <= invalidation
+            hit_tp1 = tp1 is not None and high_price >= tp1
+            hit_tp2 = tp2 is not None and high_price >= tp2
+        elif side == "SHORT":
+            hit_stop = invalidation is not None and high_price >= invalidation
+            hit_tp1 = tp1 is not None and low_price <= tp1
+            hit_tp2 = tp2 is not None and low_price <= tp2
+        else:
+            return None, None, None, None, None
+
+        if hit_stop:
+            return (
+                RESOLUTION_STOPPED,
+                invalidation,
+                "activation_candle_stop_touch",
+                None,
+                None,
+            )
+        if hit_tp1 or hit_tp2:
+            optimistic_price = tp2 if hit_tp2 else tp1
+            optimistic_r = None
+            if optimistic_price is not None and invalidation is not None:
+                risk = abs(float(entry_price) - float(invalidation))
+                if risk > 0:
+                    if side == "LONG":
+                        optimistic_r = (float(optimistic_price) - float(entry_price)) / risk
+                    else:
+                        optimistic_r = (float(entry_price) - float(optimistic_price)) / risk
+            target_name = "tp2" if hit_tp2 else "tp1"
+            return (
+                RESOLUTION_AMBIGUOUS,
+                None,
+                f"activation_candle_target_touch_without_stop:{target_name}",
+                -1.0,
+                optimistic_r,
+            )
+        return None, None, None, None, None
 
     def _breakeven_price(self, side: str, entry_price: float) -> float:
         side = str(side or "").upper()
@@ -669,12 +759,26 @@ class StrategyValidationStore:
         high_price: float,
         low_price: float,
         close_price: float,
+        tick_size: Optional[float] = None,
+        tick_size_source: Optional[str] = None,
     ):
         started = time.perf_counter()
         close_ts = int(close_ts)
         high_price = float(high_price)
         low_price = float(low_price)
         close_price = float(close_price)
+        configured_tick = self._symbol_tick_provenance.get(symbol) or {}
+        effective_tick_size = tick_size if tick_size is not None else configured_tick.get("tick_size")
+        effective_tick_source = tick_size_source if tick_size_source is not None else configured_tick.get("source")
+        try:
+            normalized_tick_size = float(effective_tick_size) if effective_tick_size is not None else None
+        except (TypeError, ValueError) as exc:
+            raise ValueError("historical activation requires an explicit positive tick_size") from exc
+        if normalized_tick_size is None or normalized_tick_size <= 0:
+            raise ValueError("historical activation requires an explicit positive tick_size")
+        normalized_tick_source = str(effective_tick_source or "").strip()
+        if not normalized_tick_source:
+            raise ValueError("historical activation requires an explicit tick_size_source")
 
         with self._lock:
             print(
@@ -822,6 +926,7 @@ class StrategyValidationStore:
                 tp2 = _safe_float(row.get("tp2"))
                 activation_status = str(row.get("activation_status") or ACTIVATION_PENDING).upper()
                 tp1_hit = bool(int(row.get("tp1_hit") or 0))
+                activated_this_candle = False
 
                 max_fav = _safe_float(row.get("max_favorable_excursion"))
                 max_adv = _safe_float(row.get("max_adverse_excursion"))
@@ -830,7 +935,13 @@ class StrategyValidationStore:
 
                 if activation_status == ACTIVATION_PENDING:
                     activation_started = time.perf_counter()
-                    should_activate = self._should_activate(side=side, close_price=close_price, ideal_entry=ideal_entry)
+                    should_activate = self._should_activate(
+                        side=side,
+                        high_price=high_price,
+                        low_price=low_price,
+                        ideal_entry=ideal_entry,
+                        tick_size=normalized_tick_size,
+                    )
                     profile["activation_checks"] += 1
                     profile["activation_elapsed_ms"] += _elapsed_ms(activation_started)
                     if should_activate:
@@ -843,6 +954,8 @@ class StrategyValidationStore:
                                 activation_status = ?,
                                 activated_ts = ?,
                                 activated_price = ?,
+                                activation_tick_size = ?,
+                                activation_tick_source = ?,
                                 first_outcome_ts = ?,
                                 last_outcome_ts = ?
                             WHERE setup_id = ?
@@ -853,6 +966,8 @@ class StrategyValidationStore:
                                 ACTIVATION_ACTIVE,
                                 close_ts,
                                 activated_price,
+                                normalized_tick_size,
+                                normalized_tick_source,
                                 first_outcome_ts,
                                 last_outcome_ts,
                                 row["setup_id"],
@@ -863,9 +978,12 @@ class StrategyValidationStore:
                         row["activation_status"] = ACTIVATION_ACTIVE
                         row["activated_ts"] = close_ts
                         row["activated_price"] = activated_price
+                        row["activation_tick_size"] = normalized_tick_size
+                        row["activation_tick_source"] = normalized_tick_source
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         activation_status = ACTIVATION_ACTIVE
+                        activated_this_candle = True
                         _mark_dirty_profiled()
                         self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
                         self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
@@ -939,6 +1057,87 @@ class StrategyValidationStore:
                 resolution_status = None
                 resolved_price = None
                 resolution_note = None
+
+                if activated_this_candle and entry_price is not None:
+                    (
+                        resolution_status,
+                        resolved_price,
+                        resolution_note,
+                        ambiguous_pessimistic_r,
+                        ambiguous_optimistic_r,
+                    ) = self._activation_candle_outcome(
+                        side=side,
+                        low_price=low_price,
+                        high_price=high_price,
+                        entry_price=entry_price,
+                        invalidation=invalidation,
+                        tp1=tp1,
+                        tp2=tp2,
+                    )
+                    if resolution_status is not None:
+                        _execute_update_profiled(
+                            """
+                            UPDATE strategy_setups
+                            SET updated_ts = ?,
+                                bars_observed = ?,
+                                max_favorable_excursion = ?,
+                                max_adverse_excursion = ?,
+                                resolution_status = ?,
+                                resolved_ts = ?,
+                                resolved_price = ?,
+                                resolution_note = ?,
+                                ambiguous_pessimistic_r = ?,
+                                ambiguous_optimistic_r = ?,
+                                first_outcome_ts = ?,
+                                last_outcome_ts = ?
+                            WHERE setup_id = ?
+                            """,
+                            (
+                                close_ts,
+                                bars_observed,
+                                max_fav,
+                                max_adv,
+                                resolution_status,
+                                close_ts,
+                                resolved_price,
+                                resolution_note,
+                                ambiguous_pessimistic_r,
+                                ambiguous_optimistic_r,
+                                first_outcome_ts,
+                                last_outcome_ts,
+                                row["setup_id"],
+                            ),
+                        )
+                        row["updated_ts"] = close_ts
+                        row["bars_observed"] = bars_observed
+                        row["max_favorable_excursion"] = max_fav
+                        row["max_adverse_excursion"] = max_adv
+                        row["resolution_status"] = resolution_status
+                        row["resolved_ts"] = close_ts
+                        row["resolved_price"] = resolved_price
+                        row["resolution_note"] = resolution_note
+                        row["ambiguous_pessimistic_r"] = ambiguous_pessimistic_r
+                        row["ambiguous_optimistic_r"] = ambiguous_optimistic_r
+                        row["first_outcome_ts"] = first_outcome_ts
+                        row["last_outcome_ts"] = last_outcome_ts
+                        _mark_dirty_profiled()
+                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                        self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
+                        if resolution_status == RESOLUTION_STOPPED:
+                            self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
+                            self._perf_inc(
+                                "update_pending", "update_pending_event_stop_loss", 1, symbol=symbol
+                            )
+                        else:
+                            self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
+                        _record_update_diagnostic(
+                            event_key="update_pending_event_final_resolution",
+                            excursion=True,
+                        )
+                        profile["rows_removed"] += 1
+                        _print_progress()
+                        _print_slow_row(row, _elapsed_ms(row_started))
+                        continue
 
                 if not tp1_hit:
                     if BE_MODE and entry_price is not None:

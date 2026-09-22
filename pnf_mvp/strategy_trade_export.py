@@ -120,6 +120,10 @@ def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
             "resolution_note",
             "max_favorable_excursion",
             "max_adverse_excursion",
+            "activation_tick_size",
+            "activation_tick_source",
+            "ambiguous_pessimistic_r",
+            "ambiguous_optimistic_r",
             "raw_setup_json",
         ]
 
@@ -181,6 +185,10 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "realized_return_pct",
         "realized_r_multiple",
         "outcome_r_multiple_proxy",
+        "activation_tick_size",
+        "activation_tick_source",
+        "ambiguous_pessimistic_r",
+        "ambiguous_optimistic_r",
         "consistency_flag",
         "bars_observed",
         "trend_state",
@@ -203,6 +211,16 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["quality_score"] = pd.to_numeric(out["quality_score"], errors="coerce")
     out["active_leg_boxes"] = pd.to_numeric(out["active_leg_boxes"], errors="coerce")
     out["is_extended_move"] = out["is_extended_move"].fillna(0).astype(int)
+    for col in (
+        "activation_tick_size",
+        "ambiguous_pessimistic_r",
+        "ambiguous_optimistic_r",
+    ):
+        if col not in out.columns:
+            out[col] = None
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "activation_tick_source" not in out.columns:
+        out["activation_tick_source"] = None
 
     def lifecycle(row: pd.Series) -> str:
         if str(row["activation_status"]).upper() not in ("ACTIVE",):
@@ -249,7 +267,6 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "TP2": 3.0,
         "STOPPED": -1.0,
         "EXPIRED": 0.0,
-        "AMBIGUOUS": 0.0,
         "TP1_PARTIAL_THEN_BE": 1.0,
     }
 
@@ -260,6 +277,12 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     def consistency_flag(row: pd.Series) -> str:
         status = str(row["resolution_status"]).upper()
         realized_r = row["realized_r_multiple"]
+        if status == "AMBIGUOUS":
+            if pd.notna(row["ambiguous_pessimistic_r"]) and pd.notna(
+                row["ambiguous_optimistic_r"]
+            ):
+                return "OK"
+            return "INCONSISTENT_AMBIGUOUS_MISSING_BOUNDS"
         if pd.isna(realized_r):
             return "NO_PRICE_METRIC"
         if status in ("TP1", "TP2", "TP1_PARTIAL_THEN_BE") and realized_r < 0:
@@ -386,6 +409,17 @@ def build_summary_all_resolved(df: pd.DataFrame) -> dict:
 
 
 def build_summary_activated_only(df: pd.DataFrame) -> dict:
+    empty_bound_metrics = {
+        "headline_outcome_rows": 0,
+        "ambiguous_bound_rows": 0,
+        "ambiguous_missing_bound_rows": 0,
+        "win_rate_pessimistic_bound": 0.0,
+        "win_rate_optimistic_bound": 0.0,
+        "avg_realized_r_pessimistic_bound": 0.0,
+        "avg_realized_r_optimistic_bound": 0.0,
+        "total_realized_r_pessimistic_bound": 0.0,
+        "total_realized_r_optimistic_bound": 0.0,
+    }
     if df.empty or "trade_lifecycle" not in df.columns:
         return {
             "activated_rows": 0,
@@ -403,6 +437,7 @@ def build_summary_activated_only(df: pd.DataFrame) -> dict:
             "avg_outcome_r_proxy": 0.0,
             "total_outcome_r_proxy": 0.0,
             "inconsistent_rows": 0,
+            **empty_bound_metrics,
         }
 
     active = df[df["trade_lifecycle"] != "NEVER_ACTIVATED"].copy()
@@ -423,6 +458,7 @@ def build_summary_activated_only(df: pd.DataFrame) -> dict:
             "avg_outcome_r_proxy": 0.0,
             "total_outcome_r_proxy": 0.0,
             "inconsistent_rows": 0,
+            **empty_bound_metrics,
         }
 
     wins = int((active["resolution_status"] == "TP2").sum())
@@ -432,6 +468,40 @@ def build_summary_activated_only(df: pd.DataFrame) -> dict:
     expired = int((active["resolution_status"] == "EXPIRED").sum())
     wl_den = wins + partial_be + losses
     inconsistent = int((active["consistency_flag"] != "OK").sum())
+
+    headline_statuses = {"TP1", "TP2", "STOPPED", "TP1_PARTIAL_THEN_BE", "AMBIGUOUS"}
+    headline = active[active["resolution_status"].isin(headline_statuses)].copy()
+    headline_outcome_rows = int(len(headline))
+    ambiguous_rows = headline[headline["resolution_status"] == "AMBIGUOUS"]
+    bounded_ambiguous = ambiguous_rows[
+        ambiguous_rows["ambiguous_pessimistic_r"].notna()
+        & ambiguous_rows["ambiguous_optimistic_r"].notna()
+    ]
+    ambiguous_bound_rows = int(len(bounded_ambiguous))
+    ambiguous_missing_bound_rows = int(len(ambiguous_rows) - ambiguous_bound_rows)
+    known = headline[headline["resolution_status"] != "AMBIGUOUS"]
+    known_missing_r_rows = int(known["realized_r_multiple"].isna().sum())
+    bounds_complete = ambiguous_missing_bound_rows == 0 and known_missing_r_rows == 0
+    if headline_outcome_rows and bounds_complete:
+        known_total_r = float(known["realized_r_multiple"].sum())
+        total_r_pessimistic = known_total_r + float(
+            bounded_ambiguous["ambiguous_pessimistic_r"].sum()
+        )
+        total_r_optimistic = known_total_r + float(
+            bounded_ambiguous["ambiguous_optimistic_r"].sum()
+        )
+        avg_r_pessimistic = total_r_pessimistic / headline_outcome_rows
+        avg_r_optimistic = total_r_optimistic / headline_outcome_rows
+    elif headline_outcome_rows:
+        total_r_pessimistic = None
+        total_r_optimistic = None
+        avg_r_pessimistic = None
+        avg_r_optimistic = None
+    else:
+        total_r_pessimistic = 0.0
+        total_r_optimistic = 0.0
+        avg_r_pessimistic = 0.0
+        avg_r_optimistic = 0.0
 
     return {
         "activated_rows": int(len(active)),
@@ -449,6 +519,23 @@ def build_summary_activated_only(df: pd.DataFrame) -> dict:
         "avg_outcome_r_proxy": float(active["outcome_r_multiple_proxy"].dropna().mean()) if active["outcome_r_multiple_proxy"].notna().any() else 0.0,
         "total_outcome_r_proxy": float(active["outcome_r_multiple_proxy"].dropna().sum()) if active["outcome_r_multiple_proxy"].notna().any() else 0.0,
         "inconsistent_rows": inconsistent,
+        "headline_outcome_rows": headline_outcome_rows,
+        "ambiguous_bound_rows": ambiguous_bound_rows,
+        "ambiguous_missing_bound_rows": ambiguous_missing_bound_rows,
+        "win_rate_pessimistic_bound": (
+            float((wins + partial_be) / headline_outcome_rows)
+            if headline_outcome_rows
+            else 0.0
+        ),
+        "win_rate_optimistic_bound": (
+            float((wins + partial_be + ambiguous) / headline_outcome_rows)
+            if headline_outcome_rows
+            else 0.0
+        ),
+        "avg_realized_r_pessimistic_bound": avg_r_pessimistic,
+        "avg_realized_r_optimistic_bound": avg_r_optimistic,
+        "total_realized_r_pessimistic_bound": total_r_pessimistic,
+        "total_realized_r_optimistic_bound": total_r_optimistic,
     }
 
 

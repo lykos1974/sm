@@ -69,6 +69,7 @@ def basic_stats(df: pd.DataFrame) -> dict:
     losses = resolved[resolved["resolution_status"] == "STOPPED"]
     ambiguous = resolved[resolved["resolution_status"] == "AMBIGUOUS"]
     expired = resolved[resolved["resolution_status"] == "EXPIRED"]
+    headline_outcomes = len(wins) + len(losses) + len(ambiguous)
 
     return {
         "total_setups": int(total),
@@ -78,6 +79,15 @@ def basic_stats(df: pd.DataFrame) -> dict:
         "loss_rate_resolved": (len(losses) / len(resolved)) if len(resolved) else 0.0,
         "ambiguous_rate_resolved": (len(ambiguous) / len(resolved)) if len(resolved) else 0.0,
         "expired_rate_resolved": (len(expired) / len(resolved)) if len(resolved) else 0.0,
+        "headline_outcome_rows": int(headline_outcomes),
+        "win_rate_pessimistic_bound": (
+            len(wins) / headline_outcomes if headline_outcomes else 0.0
+        ),
+        "win_rate_optimistic_bound": (
+            (len(wins) + len(ambiguous)) / headline_outcomes
+            if headline_outcomes
+            else 0.0
+        ),
     }
 
 
@@ -131,10 +141,21 @@ def expectancy_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
         "TP2": 3.0,
         "TP1": 2.0,
         "STOPPED": -1.0,
-        "AMBIGUOUS": 0.0,
         "EXPIRED": 0.0,
     }
-    resolved["r_multiple_proxy"] = resolved["resolution_status"].map(rr_map).fillna(0.0)
+    resolved["r_multiple_proxy"] = resolved["resolution_status"].map(rr_map)
+    if "ambiguous_pessimistic_r" not in resolved.columns:
+        resolved["ambiguous_pessimistic_r"] = None
+    if "ambiguous_optimistic_r" not in resolved.columns:
+        resolved["ambiguous_optimistic_r"] = None
+    resolved["r_pessimistic_bound"] = resolved["r_multiple_proxy"].where(
+        resolved["resolution_status"] != "AMBIGUOUS",
+        resolved["ambiguous_pessimistic_r"],
+    )
+    resolved["r_optimistic_bound"] = resolved["r_multiple_proxy"].where(
+        resolved["resolution_status"] != "AMBIGUOUS",
+        resolved["ambiguous_optimistic_r"],
+    )
 
     out = (
         resolved.groupby(field, dropna=False)
@@ -143,6 +164,9 @@ def expectancy_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
             avg_quality_score=("quality_score", "mean"),
             avg_rr1=("rr1", "mean"),
             avg_r_multiple_proxy=("r_multiple_proxy", "mean"),
+            avg_r_pessimistic_bound=("r_pessimistic_bound", "mean"),
+            avg_r_optimistic_bound=("r_optimistic_bound", "mean"),
+            ambiguous_rows=("resolution_status", lambda values: (values == "AMBIGUOUS").sum()),
         )
         .sort_values(["avg_r_multiple_proxy", "resolved_total"], ascending=[False, False])
     )
