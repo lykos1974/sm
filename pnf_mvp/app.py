@@ -19,7 +19,7 @@ from storage import Storage
 from structure_engine import build_structure_state
 from strategy_engine import evaluate_pullback_retest_long, evaluate_pullback_retest_short
 from strategy_setup_observer import StrategySetupObserver
-from strategy_validation import StrategyValidationStore
+from strategy_validation import HISTORICAL_ACTIVATION_MODEL, StrategyValidationStore
 
 APP_TITLE = "PnF MVP - Scanner"
 
@@ -73,8 +73,25 @@ class App(tk.Tk):
             self.settings = json.load(f)
 
         self.storage = Storage(self.settings["database_path"])
-        self.validation_store = (StrategyValidationStore(self.settings.get("strategy_validation_db_path", "strategy_validation.db"))
-                                 if self.settings.get("strategy_validation_enabled", True) else None)
+        validation_execution = self.settings.get("strategy_validation_execution", {})
+        validation_ticks = validation_execution.get("symbol_ticks", {})
+        if self.settings.get("strategy_validation_enabled", True):
+            if validation_execution.get("activation_model") != HISTORICAL_ACTIVATION_MODEL:
+                raise ValueError(
+                    f"strategy validation requires activation_model={HISTORICAL_ACTIVATION_MODEL}"
+                )
+            missing_ticks = [symbol for symbol in self.settings["symbols"] if symbol not in validation_ticks]
+            if missing_ticks:
+                raise ValueError(
+                    "strategy validation requires explicit per-symbol tick provenance: "
+                    + ", ".join(missing_ticks)
+                )
+            self.validation_store = StrategyValidationStore(
+                self.settings.get("strategy_validation_db_path", "strategy_validation.db"),
+                symbol_tick_provenance=validation_ticks,
+            )
+        else:
+            self.validation_store = None
         observer_config = self.settings.get("ideal_entry_observer", {})
         self.setup_observer = (
             StrategySetupObserver(

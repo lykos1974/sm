@@ -21,7 +21,7 @@ from pnf_engine import PnFProfile, PnFEngine
 from storage import Storage
 from structure_engine import build_structure_state
 from strategy_engine import evaluate_pullback_retest_long, evaluate_pullback_retest_short
-from strategy_validation import StrategyValidationStore
+from strategy_validation import HISTORICAL_ACTIVATION_MODEL, StrategyValidationStore
 
 # BE module (ready for future integration)
 from trade_management_be import BE_MODE, BE_TRIGGER_R
@@ -853,12 +853,25 @@ def main() -> None:
 
     storage = Storage(settings["database_path"])
     allow_multiple_trades_per_symbol = bool(settings.get("allow_multiple_trades_per_symbol", False))
+    validation_execution = settings.get("strategy_validation_execution", {})
+    validation_ticks = validation_execution.get("symbol_ticks", {})
+    if validation_execution.get("activation_model") != HISTORICAL_ACTIVATION_MODEL:
+        raise ValueError(
+            f"historical validation requires activation_model={HISTORICAL_ACTIVATION_MODEL}"
+        )
     validation_store = StrategyValidationStore(
         validation_db_path,
         allow_multiple_trades_per_symbol=allow_multiple_trades_per_symbol,
+        symbol_tick_provenance=validation_ticks,
     )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)
+    missing_ticks = [symbol for symbol in symbols if symbol not in validation_ticks]
+    if missing_ticks:
+        raise ValueError(
+            "historical validation requires explicit per-symbol tick provenance: "
+            + ", ".join(missing_ticks)
+        )
     if args.continuation_execution_v1:
         for profile in profiles.values():
             setattr(profile, "continuation_execution_v1_enabled", True)

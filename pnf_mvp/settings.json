@@ -80,6 +80,10 @@
   "scanner_recovery_mode": true,
   "strategy_validation_enabled": false,
   "operational_alerts_enabled": false,
+  "strategy_validation_execution": {
+    "activation_model": "historical_ohlc_one_tick_trade_through_v1",
+    "symbol_ticks": {}
+  },
   "ideal_entry_observer": {
     "enabled": true,
     "database_path": "data/ideal_entry_observer.sqlite3",
