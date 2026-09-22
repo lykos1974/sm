@@ -13,12 +13,14 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
 $ExpectedFiles = [ordered]@{
-    "pnf_mvp/app.py" = "009cc0ef62c747817ab0c17d7c23b701336d5c918f4790642c349f7e2783f3e6"
+    "pnf_mvp/app.py" = "4a87189086d5af387cfa5bb194a7c801c93cb3da1c7a47ab7c3ad35f9ec2b453"
     "pnf_mvp/pnf_engine.py" = "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e"
     "pnf_mvp/storage.py" = "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e"
-    "pnf_mvp/strategy_historical_backfill.py" = "a26f00d8489d7e2945102758967165e40b456c208531b1e95aaa0c71d4169315"
+    "pnf_mvp/strategy_historical_backfill.py" = "3c004707e211aed88e97f868b119a7a7cd73f4eb82a0b78f9208fa4039673caa"
     "pnf_mvp/strategy_setup_observer.py" = "60ae21e82266b9c371261dbcb83634d301447224b8bf66ab82b6a04ccdab5289"
-    "pnf_mvp/strategy_validation.py" = "e77ec32948e3a7f2172c828cf72247f68be6a20177b7a1e1d9d7dc52e522cb71"
+    "pnf_mvp/strategy_validation.py" = "c3402295b2f9fd2ffdfa3117019c8f8385c2aa0efb45572cca5455f14486f2e7"
+    "pnf_mvp/strategy_trade_export.py" = "4dde92fb4e91075af3188bca2961f7daa65df11ec827a5cf475c0c34b495fbc1"
+    "pnf_mvp/strategy_evaluator.py" = "627a89183877135e1cb870e975fd9aa13b28677eda63ba29415ea5a183affb91"
 }
 
 function Resolve-FullPath([string]$PathValue) {
