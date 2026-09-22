@@ -158,7 +158,7 @@ class StrategyValidationNoopUpdateTests(TestCase):
         self.assertEqual(row["resolution_status"], "TP2")
         self.assertEqual(row["tp1_hit"], 1)
 
-    def test_active_row_with_unchanged_excursion_does_not_write(self):
+    def test_active_row_with_unchanged_excursion_persists_only_candle_watermark(self):
         temp_dir, db_path, store = self._store()
         try:
             setup_id = store.register_setup("BTCUSDT", make_setup(ideal_entry=100.0, tp1=110.0, tp2=120.0), BASE_STRUCTURE, 1)
@@ -174,11 +174,12 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
-        self.assertEqual(after - before, 0)
+        self.assertEqual(after - before, 1)
         self.assertEqual(row["resolution_status"], "PENDING")
         self.assertEqual(row["max_favorable_excursion"], 2.0)
         self.assertEqual(row["max_adverse_excursion"], 1.5)
-        self.assertGreaterEqual(perf["noop_skipped_count"], 1)
+        self.assertEqual(row["last_evaluated_candle_ts"], 4)
+        self.assertGreaterEqual(perf["update_pending_only_timestamp_updates"], 1)
 
     def test_lifecycle_semantics_preserved_through_activation_tp1_and_tp2(self):
         temp_dir, db_path, store = self._store()

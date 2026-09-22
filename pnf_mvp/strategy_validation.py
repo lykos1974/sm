@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -75,6 +76,16 @@ def _elapsed_ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 3)
 
 
+def _require_finite_positive_tick(value: Any, context: str) -> float:
+    try:
+        tick_size = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} requires a finite positive tick_size") from exc
+    if not math.isfinite(tick_size) or tick_size <= 0:
+        raise ValueError(f"{context} requires a finite positive tick_size")
+    return tick_size
+
+
 class StrategyValidationStore:
     def __init__(
         self,
@@ -95,14 +106,18 @@ class StrategyValidationStore:
         for symbol, provenance in dict(symbol_tick_provenance or {}).items():
             if not isinstance(provenance, dict):
                 raise ValueError(f"tick provenance for {symbol} must be an object")
-            try:
-                configured_tick = float(provenance.get("tick_size"))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"tick provenance for {symbol} requires a positive tick_size") from exc
-            configured_source = str(provenance.get("source") or "").strip()
-            if configured_tick <= 0 or not configured_source:
+            configured_symbol = provenance.get("symbol")
+            if configured_symbol is not None and str(configured_symbol) != str(symbol):
                 raise ValueError(
-                    f"tick provenance for {symbol} requires positive tick_size and source"
+                    f"tick provenance symbol mismatch: key={symbol} value={configured_symbol}"
+                )
+            configured_tick = _require_finite_positive_tick(
+                provenance.get("tick_size"), f"tick provenance for {symbol}"
+            )
+            configured_source = str(provenance.get("source") or "").strip()
+            if not configured_source:
+                raise ValueError(
+                    f"tick provenance for {symbol} requires a non-empty source"
                 )
             self._symbol_tick_provenance[str(symbol)] = {
                 "tick_size": configured_tick,
@@ -295,6 +310,9 @@ class StrategyValidationStore:
                     activation_status TEXT NOT NULL DEFAULT 'PENDING',
                     activated_ts INTEGER,
                     activated_price REAL,
+                    activation_tick_size REAL,
+                    activation_tick_source TEXT,
+                    last_evaluated_candle_ts INTEGER,
 
                     tp1_hit INTEGER NOT NULL DEFAULT 0,
                     tp1_hit_ts INTEGER,
@@ -307,6 +325,8 @@ class StrategyValidationStore:
                     resolved_ts INTEGER,
                     resolved_price REAL,
                     resolution_note TEXT,
+                    ambiguous_pessimistic_r REAL,
+                    ambiguous_optimistic_r REAL,
 
                     first_outcome_ts INTEGER,
                     last_outcome_ts INTEGER,
@@ -318,6 +338,23 @@ class StrategyValidationStore:
                 )
                 """
             )
+
+        # Legacy columns must exist before indexes reference them.
+        self._ensure_column("strategy_setups", "activation_status", "TEXT NOT NULL DEFAULT 'PENDING'")
+        self._ensure_column("strategy_setups", "activated_ts", "INTEGER")
+        self._ensure_column("strategy_setups", "activated_price", "REAL")
+        self._ensure_column("strategy_setups", "tp1_hit", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("strategy_setups", "tp1_hit_ts", "INTEGER")
+        self._ensure_column("strategy_setups", "tp1_price", "REAL")
+        self._ensure_column("strategy_setups", "current_column_index", "INTEGER")
+        self._ensure_column("strategy_setups", "snapshot_path", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_size", "REAL")
+        self._ensure_column("strategy_setups", "activation_tick_source", "TEXT")
+        self._ensure_column("strategy_setups", "last_evaluated_candle_ts", "INTEGER")
+        self._ensure_column("strategy_setups", "ambiguous_pessimistic_r", "REAL")
+        self._ensure_column("strategy_setups", "ambiguous_optimistic_r", "REAL")
+
+        with self._lock, self._conn:
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_strategy_setups_pending
@@ -336,19 +373,6 @@ class StrategyValidationStore:
                 ON strategy_setups(symbol, activation_status, resolution_status, reference_ts)
                 """
             )
-
-        self._ensure_column("strategy_setups", "activation_status", "TEXT NOT NULL DEFAULT 'PENDING'")
-        self._ensure_column("strategy_setups", "activated_ts", "INTEGER")
-        self._ensure_column("strategy_setups", "activated_price", "REAL")
-        self._ensure_column("strategy_setups", "tp1_hit", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column("strategy_setups", "tp1_hit_ts", "INTEGER")
-        self._ensure_column("strategy_setups", "tp1_price", "REAL")
-        self._ensure_column("strategy_setups", "current_column_index", "INTEGER")
-        self._ensure_column("strategy_setups", "snapshot_path", "TEXT")
-        self._ensure_column("strategy_setups", "activation_tick_size", "REAL")
-        self._ensure_column("strategy_setups", "activation_tick_source", "TEXT")
-        self._ensure_column("strategy_setups", "ambiguous_pessimistic_r", "REAL")
-        self._ensure_column("strategy_setups", "ambiguous_optimistic_r", "REAL")
 
     def _make_setup_id(self, symbol: str, setup: Dict[str, Any], structure_state: Dict[str, Any], reference_ts: int) -> str:
         payload = {
@@ -496,6 +520,11 @@ class StrategyValidationStore:
                 if active_column_index is not None
                 else _safe_int(structure_state.get("current_column_index"))
             )
+            frozen_tick = self._symbol_tick_provenance.get(symbol)
+            if frozen_tick is None:
+                raise ValueError(
+                    f"setup registration requires explicit tick provenance for symbol {symbol}"
+                )
 
             row = {
                 "setup_id": setup_id,
@@ -537,6 +566,9 @@ class StrategyValidationStore:
                 "activation_status": ACTIVATION_PENDING,
                 "activated_ts": None,
                 "activated_price": None,
+                "activation_tick_size": frozen_tick["tick_size"],
+                "activation_tick_source": frozen_tick["source"],
+                "last_evaluated_candle_ts": None,
                 "tp1_hit": 0,
                 "tp1_hit_ts": None,
                 "tp1_price": None,
@@ -568,6 +600,7 @@ class StrategyValidationStore:
                     pullback_quality, risk_quality, reward_quality, quality_score, quality_grade,
                     reason, reject_reason,
                     activation_status, activated_ts, activated_price,
+                    activation_tick_size, activation_tick_source, last_evaluated_candle_ts,
                     tp1_hit, tp1_hit_ts, tp1_price,
                     max_favorable_excursion, max_adverse_excursion,
                     resolution_status, resolved_ts, resolved_price, resolution_note,
@@ -585,6 +618,7 @@ class StrategyValidationStore:
                     :pullback_quality, :risk_quality, :reward_quality, :quality_score, :quality_grade,
                     :reason, :reject_reason,
                     :activation_status, :activated_ts, :activated_price,
+                    :activation_tick_size, :activation_tick_source, :last_evaluated_candle_ts,
                     :tp1_hit, :tp1_hit_ts, :tp1_price,
                     :max_favorable_excursion, :max_adverse_excursion,
                     :resolution_status, :resolved_ts, :resolved_price, :resolution_note,
@@ -767,18 +801,20 @@ class StrategyValidationStore:
         high_price = float(high_price)
         low_price = float(low_price)
         close_price = float(close_price)
-        configured_tick = self._symbol_tick_provenance.get(symbol) or {}
-        effective_tick_size = tick_size if tick_size is not None else configured_tick.get("tick_size")
-        effective_tick_source = tick_size_source if tick_size_source is not None else configured_tick.get("source")
-        try:
-            normalized_tick_size = float(effective_tick_size) if effective_tick_size is not None else None
-        except (TypeError, ValueError) as exc:
-            raise ValueError("historical activation requires an explicit positive tick_size") from exc
-        if normalized_tick_size is None or normalized_tick_size <= 0:
-            raise ValueError("historical activation requires an explicit positive tick_size")
-        normalized_tick_source = str(effective_tick_source or "").strip()
-        if not normalized_tick_source:
-            raise ValueError("historical activation requires an explicit tick_size_source")
+        override_requested = tick_size is not None or tick_size_source is not None
+        normalized_override_tick: Optional[float] = None
+        normalized_override_source: Optional[str] = None
+        if override_requested:
+            if symbol not in self._symbol_tick_provenance:
+                raise ValueError(f"unknown-symbol override rejected for {symbol}")
+            normalized_override_tick = _require_finite_positive_tick(
+                tick_size, "historical activation override"
+            )
+            normalized_override_source = str(tick_size_source or "").strip()
+            if not normalized_override_source:
+                raise ValueError(
+                    "historical activation override requires a non-empty tick_size_source"
+                )
 
         with self._lock:
             print(
@@ -833,6 +869,29 @@ class StrategyValidationStore:
                 self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
                 _print_validation_summary()
                 return
+
+            frozen_ticks: dict[str, tuple[float, str]] = {}
+            for pending_row in pending:
+                setup_id = str(pending_row.get("setup_id") or "")
+                frozen_tick = _require_finite_positive_tick(
+                    pending_row.get("activation_tick_size"),
+                    f"setup {setup_id} frozen tick provenance",
+                )
+                frozen_source = str(
+                    pending_row.get("activation_tick_source") or ""
+                ).strip()
+                if not frozen_source:
+                    raise ValueError(
+                        f"setup {setup_id} requires frozen tick provenance source"
+                    )
+                if override_requested and (
+                    normalized_override_tick != frozen_tick
+                    or normalized_override_source != frozen_source
+                ):
+                    raise ValueError(
+                        f"historical activation override does not match frozen provenance for setup {setup_id}"
+                    )
+                frozen_ticks[setup_id] = (frozen_tick, frozen_source)
 
             still_pending: list[dict[str, Any]] = []
 
@@ -911,7 +970,16 @@ class StrategyValidationStore:
                 row_started = time.perf_counter()
                 self._perf_inc("update_pending", "trades_scanned", 1, symbol=symbol)
                 profile["rows_scanned"] += 1
-                if int(row.get("reference_ts") or 0) >= close_ts:
+                last_evaluated_candle_ts = _safe_int(
+                    row.get("last_evaluated_candle_ts")
+                )
+                if (
+                    int(row.get("reference_ts") or 0) >= close_ts
+                    or (
+                        last_evaluated_candle_ts is not None
+                        and close_ts <= last_evaluated_candle_ts
+                    )
+                ):
                     still_pending.append(row)
                     profile["rows_skipped"] += 1
                     _print_progress()
@@ -927,6 +995,9 @@ class StrategyValidationStore:
                 activation_status = str(row.get("activation_status") or ACTIVATION_PENDING).upper()
                 tp1_hit = bool(int(row.get("tp1_hit") or 0))
                 activated_this_candle = False
+                normalized_tick_size, normalized_tick_source = frozen_ticks[
+                    str(row.get("setup_id") or "")
+                ]
 
                 max_fav = _safe_float(row.get("max_favorable_excursion"))
                 max_adv = _safe_float(row.get("max_adverse_excursion"))
@@ -954,8 +1025,7 @@ class StrategyValidationStore:
                                 activation_status = ?,
                                 activated_ts = ?,
                                 activated_price = ?,
-                                activation_tick_size = ?,
-                                activation_tick_source = ?,
+                                last_evaluated_candle_ts = ?,
                                 first_outcome_ts = ?,
                                 last_outcome_ts = ?
                             WHERE setup_id = ?
@@ -966,8 +1036,7 @@ class StrategyValidationStore:
                                 ACTIVATION_ACTIVE,
                                 close_ts,
                                 activated_price,
-                                normalized_tick_size,
-                                normalized_tick_source,
+                                close_ts,
                                 first_outcome_ts,
                                 last_outcome_ts,
                                 row["setup_id"],
@@ -978,8 +1047,7 @@ class StrategyValidationStore:
                         row["activation_status"] = ACTIVATION_ACTIVE
                         row["activated_ts"] = close_ts
                         row["activated_price"] = activated_price
-                        row["activation_tick_size"] = normalized_tick_size
-                        row["activation_tick_source"] = normalized_tick_source
+                        row["last_evaluated_candle_ts"] = close_ts
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         activation_status = ACTIVATION_ACTIVE
@@ -997,7 +1065,8 @@ class StrategyValidationStore:
                                 bars_observed = ?,
                                 resolution_status = ?,
                                 resolved_ts = ?,
-                                resolution_note = ?
+                                resolution_note = ?,
+                                last_evaluated_candle_ts = ?
                             WHERE setup_id = ?
                             """,
                             (
@@ -1006,11 +1075,13 @@ class StrategyValidationStore:
                                 RESOLUTION_EXPIRED if expired else RESOLUTION_PENDING,
                                 close_ts if expired else None,
                                 "pending_not_activated_within_three_candles" if expired else None,
+                                close_ts,
                                 row["setup_id"],
                             ),
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
+                        row["last_evaluated_candle_ts"] = close_ts
                         if expired:
                             row["resolution_status"] = RESOLUTION_EXPIRED
                             row["resolved_ts"] = close_ts
@@ -1088,6 +1159,7 @@ class StrategyValidationStore:
                                 resolution_note = ?,
                                 ambiguous_pessimistic_r = ?,
                                 ambiguous_optimistic_r = ?,
+                                last_evaluated_candle_ts = ?,
                                 first_outcome_ts = ?,
                                 last_outcome_ts = ?
                             WHERE setup_id = ?
@@ -1103,6 +1175,7 @@ class StrategyValidationStore:
                                 resolution_note,
                                 ambiguous_pessimistic_r,
                                 ambiguous_optimistic_r,
+                                close_ts,
                                 first_outcome_ts,
                                 last_outcome_ts,
                                 row["setup_id"],
@@ -1118,6 +1191,7 @@ class StrategyValidationStore:
                         row["resolution_note"] = resolution_note
                         row["ambiguous_pessimistic_r"] = ambiguous_pessimistic_r
                         row["ambiguous_optimistic_r"] = ambiguous_optimistic_r
+                        row["last_evaluated_candle_ts"] = close_ts
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         _mark_dirty_profiled()
@@ -1178,11 +1252,12 @@ class StrategyValidationStore:
                                 tp1_price = ?,
                                 max_favorable_excursion = ?,
                                 max_adverse_excursion = ?,
+                                last_evaluated_candle_ts = ?,
                                 first_outcome_ts = ?,
                                 last_outcome_ts = ?
                             WHERE setup_id = ?
                             """,
-                            (close_ts, bars_observed, close_ts, tp1, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                            (close_ts, bars_observed, close_ts, tp1, max_fav, max_adv, close_ts, first_outcome_ts, last_outcome_ts, row["setup_id"]),
                         )
                         row["updated_ts"] = close_ts
                         row["bars_observed"] = bars_observed
@@ -1191,6 +1266,7 @@ class StrategyValidationStore:
                         row["tp1_price"] = tp1
                         row["max_favorable_excursion"] = max_fav
                         row["max_adverse_excursion"] = max_adv
+                        row["last_evaluated_candle_ts"] = close_ts
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         still_pending.append(row)
@@ -1220,6 +1296,7 @@ class StrategyValidationStore:
                                 resolved_ts = ?,
                                 resolved_price = ?,
                                 resolution_note = ?,
+                                last_evaluated_candle_ts = ?,
                                 first_outcome_ts = ?,
                                 last_outcome_ts = ?
                             WHERE setup_id = ?
@@ -1235,6 +1312,7 @@ class StrategyValidationStore:
                                 close_ts,
                                 resolved_price,
                                 resolution_note,
+                                close_ts,
                                 first_outcome_ts,
                                 last_outcome_ts,
                                 row["setup_id"],
@@ -1251,6 +1329,7 @@ class StrategyValidationStore:
                         row["resolved_ts"] = close_ts
                         row["resolved_price"] = resolved_price
                         row["resolution_note"] = resolution_note
+                        row["last_evaluated_candle_ts"] = close_ts
                         row["first_outcome_ts"] = first_outcome_ts
                         row["last_outcome_ts"] = last_outcome_ts
                         _mark_dirty_profiled()
@@ -1301,11 +1380,25 @@ class StrategyValidationStore:
                         or _floats_meaningfully_different(_safe_float(row.get("max_adverse_excursion")), max_adv)
                     )
                     if not excursion_changed:
+                        _execute_update_profiled(
+                            """
+                            UPDATE strategy_setups
+                            SET updated_ts = ?,
+                                bars_observed = ?,
+                                last_evaluated_candle_ts = ?
+                            WHERE setup_id = ?
+                            """,
+                            (close_ts, bars_observed, close_ts, row["setup_id"]),
+                        )
+                        row["updated_ts"] = close_ts
+                        row["bars_observed"] = bars_observed
+                        row["last_evaluated_candle_ts"] = close_ts
                         still_pending.append(row)
-                        profile["rows_skipped"] += 1
-                        _record_noop_skipped(
+                        _mark_dirty_profiled()
+                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
+                        _record_update_diagnostic(
                             progress_key="update_pending_progress_unresolved_active",
-                            noop_candidate=True,
+                            only_timestamp=True,
                         )
                         _print_progress()
                         _print_slow_row(row, _elapsed_ms(row_started))
@@ -1318,16 +1411,18 @@ class StrategyValidationStore:
                             bars_observed = ?,
                             max_favorable_excursion = ?,
                             max_adverse_excursion = ?,
+                            last_evaluated_candle_ts = ?,
                             first_outcome_ts = ?,
                             last_outcome_ts = ?
                         WHERE setup_id = ?
                         """,
-                        (close_ts, bars_observed, max_fav, max_adv, first_outcome_ts, last_outcome_ts, row["setup_id"]),
+                        (close_ts, bars_observed, max_fav, max_adv, close_ts, first_outcome_ts, last_outcome_ts, row["setup_id"]),
                     )
                     row["updated_ts"] = close_ts
                     row["bars_observed"] = bars_observed
                     row["max_favorable_excursion"] = max_fav
                     row["max_adverse_excursion"] = max_adv
+                    row["last_evaluated_candle_ts"] = close_ts
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
                     still_pending.append(row)
@@ -1352,6 +1447,7 @@ class StrategyValidationStore:
                             resolved_ts = ?,
                             resolved_price = ?,
                             resolution_note = ?,
+                            last_evaluated_candle_ts = ?,
                             first_outcome_ts = ?,
                             last_outcome_ts = ?
                         WHERE setup_id = ?
@@ -1365,6 +1461,7 @@ class StrategyValidationStore:
                             close_ts,
                             resolved_price,
                             resolution_note,
+                            close_ts,
                             first_outcome_ts,
                             last_outcome_ts,
                             row["setup_id"],
@@ -1378,6 +1475,7 @@ class StrategyValidationStore:
                     row["resolved_ts"] = close_ts
                     row["resolved_price"] = resolved_price
                     row["resolution_note"] = resolution_note
+                    row["last_evaluated_candle_ts"] = close_ts
                     row["first_outcome_ts"] = first_outcome_ts
                     row["last_outcome_ts"] = last_outcome_ts
                     _mark_dirty_profiled()

@@ -250,6 +250,53 @@ class TickFreezeTests(TestCase):
             finally:
                 close_store(configured)
 
+    def test_legacy_pending_row_without_frozen_tick_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "validation.db"
+            store = StrategyValidationStore(
+                str(db_path),
+                allow_multiple_trades_per_symbol=True,
+                commit_every=1,
+                symbol_tick_provenance=provenance(),
+            )
+            setup_id = self._register(store)
+            close_store(store)
+
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE strategy_setups
+                    SET activation_tick_size = NULL,
+                        activation_tick_source = NULL
+                    WHERE setup_id = ?
+                    """,
+                    (setup_id,),
+                )
+
+            reopened = StrategyValidationStore(
+                str(db_path),
+                allow_multiple_trades_per_symbol=True,
+                commit_every=1,
+                symbol_tick_provenance=provenance(),
+            )
+            try:
+                before = fetch_row(db_path, setup_id)
+                changes_before = reopened._conn.total_changes
+                with self.assertRaisesRegex(
+                    ValueError, "frozen tick provenance requires a finite positive"
+                ):
+                    self._update(
+                        reopened,
+                        close_ts=2,
+                        high_price=101.0,
+                        low_price=99.99,
+                        close_price=100.0,
+                    )
+                self.assertEqual(reopened._conn.total_changes, changes_before)
+                self.assertEqual(fetch_row(db_path, setup_id), before)
+            finally:
+                close_store(reopened)
+
 
 if __name__ == "__main__":
     import unittest

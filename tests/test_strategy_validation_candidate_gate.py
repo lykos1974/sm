@@ -71,7 +71,12 @@ class StrategyValidationCandidateGateTests(TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "validation.db"
             store = StrategyValidationStore(
-                str(db_path), allow_multiple_trades_per_symbol=False, commit_every=1
+                str(db_path),
+                allow_multiple_trades_per_symbol=False,
+                commit_every=1,
+                symbol_tick_provenance={
+                    "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+                },
             )
             try:
                 watch_id = store.register_setup(
@@ -99,7 +104,12 @@ class StrategyValidationCandidateGateTests(TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "validation.db"
             store = StrategyValidationStore(
-                str(db_path), allow_multiple_trades_per_symbol=False, commit_every=1
+                str(db_path),
+                allow_multiple_trades_per_symbol=False,
+                commit_every=1,
+                symbol_tick_provenance={
+                    "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+                },
             )
             try:
                 first_candidate_id = store.register_setup(
@@ -127,7 +137,12 @@ class StrategyValidationCandidateGateTests(TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "validation.db"
             store = StrategyValidationStore(
-                str(db_path), allow_multiple_trades_per_symbol=False, commit_every=1
+                str(db_path),
+                allow_multiple_trades_per_symbol=False,
+                commit_every=1,
+                symbol_tick_provenance={
+                    "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+                },
             )
             try:
                 first_watch_id = store.register_setup(

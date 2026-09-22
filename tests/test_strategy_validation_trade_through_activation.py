@@ -62,7 +62,12 @@ def fetch_row(db_path, setup_id):
 class TradeThroughActivationTests(TestCase):
     def _store(self, db_path):
         return StrategyValidationStore(
-            str(db_path), allow_multiple_trades_per_symbol=True, commit_every=1
+            str(db_path),
+            allow_multiple_trades_per_symbol=True,
+            commit_every=1,
+            symbol_tick_provenance={
+                "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+            },
         )
 
     def _register(self, store, side):
@@ -73,8 +78,6 @@ class TradeThroughActivationTests(TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             store.update_pending_with_candle(
                 "BTCUSDT",
-                tick_size=0.01,
-                tick_size_source="test:BTCUSDT",
                 **candle,
             )
 
@@ -168,17 +171,15 @@ class TradeThroughActivationTests(TestCase):
 
     def test_missing_or_invalid_tick_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            store = self._store(Path(temp_dir) / "validation.db")
+            store = StrategyValidationStore(
+                str(Path(temp_dir) / "validation.db"),
+                allow_multiple_trades_per_symbol=True,
+                commit_every=1,
+                symbol_tick_provenance={},
+            )
             try:
-                self._register(store, "LONG")
-                for tick_size in (None, 0, -0.01):
-                    with self.subTest(tick_size=tick_size), self.assertRaisesRegex(
-                        ValueError, "explicit positive tick_size"
-                    ):
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            store.update_pending_with_candle(
-                                "BTCUSDT", 2, 101.0, 99.99, 101.0, tick_size=tick_size
-                            )
+                with self.assertRaisesRegex(ValueError, "explicit tick provenance"):
+                    self._register(store, "LONG")
             finally:
                 store._conn.close()
 

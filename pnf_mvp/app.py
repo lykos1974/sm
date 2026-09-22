@@ -23,6 +23,32 @@ from strategy_validation import HISTORICAL_ACTIVATION_MODEL, StrategyValidationS
 
 APP_TITLE = "PnF MVP - Scanner"
 
+
+def _build_validation_store(settings):
+    if not settings.get("strategy_validation_enabled", True):
+        return None
+
+    validation_execution = settings.get("strategy_validation_execution")
+    if not isinstance(validation_execution, dict):
+        raise ValueError("strategy validation execution configuration must be an object")
+    validation_ticks = validation_execution.get("symbol_ticks")
+    if not isinstance(validation_ticks, dict):
+        raise ValueError("strategy validation symbol_ticks must be an object")
+    if validation_execution.get("activation_model") != HISTORICAL_ACTIVATION_MODEL:
+        raise ValueError(
+            f"strategy validation requires activation_model={HISTORICAL_ACTIVATION_MODEL}"
+        )
+    missing_ticks = [symbol for symbol in settings["symbols"] if symbol not in validation_ticks]
+    if missing_ticks:
+        raise ValueError(
+            "strategy validation requires explicit per-symbol tick provenance: "
+            + ", ".join(missing_ticks)
+        )
+    return StrategyValidationStore(
+        settings.get("strategy_validation_db_path", "strategy_validation.db"),
+        symbol_tick_provenance=validation_ticks,
+    )
+
 TELEGRAM_ENABLED = True
 TELEGRAM_TOKEN = "8408323454:AAH4bpkEF5YFJQGSs_wlceH_zxG3DdlquUs"
 TELEGRAM_CHAT_ID = "-1003200939539"
@@ -73,25 +99,7 @@ class App(tk.Tk):
             self.settings = json.load(f)
 
         self.storage = Storage(self.settings["database_path"])
-        validation_execution = self.settings.get("strategy_validation_execution", {})
-        validation_ticks = validation_execution.get("symbol_ticks", {})
-        if self.settings.get("strategy_validation_enabled", True):
-            if validation_execution.get("activation_model") != HISTORICAL_ACTIVATION_MODEL:
-                raise ValueError(
-                    f"strategy validation requires activation_model={HISTORICAL_ACTIVATION_MODEL}"
-                )
-            missing_ticks = [symbol for symbol in self.settings["symbols"] if symbol not in validation_ticks]
-            if missing_ticks:
-                raise ValueError(
-                    "strategy validation requires explicit per-symbol tick provenance: "
-                    + ", ".join(missing_ticks)
-                )
-            self.validation_store = StrategyValidationStore(
-                self.settings.get("strategy_validation_db_path", "strategy_validation.db"),
-                symbol_tick_provenance=validation_ticks,
-            )
-        else:
-            self.validation_store = None
+        self.validation_store = _build_validation_store(self.settings)
         observer_config = self.settings.get("ideal_entry_observer", {})
         self.setup_observer = (
             StrategySetupObserver(
