@@ -39,6 +39,11 @@ Pull request: `#350`
 | `2f5cc97` | Final policy-stage handoff | Approved behavior and remaining limitation recorded; no runtime code change |
 | `184e7a9` | Windows updater portability fixes | Late `SourceRoot` resolution plus strict UTF-8 CRLF/LF canonical verification; backups/rollback/settings guards preserved |
 | `45e76b3` | Diagnostic activation and updater portability regression suites | 13 activation diagnostics plus 5 updater portability tests passed; no strategy runtime change |
+| `ff40ae4` | Isolated trade-through activation and metric-denominator regressions | Added before runtime implementation; covers LONG/SHORT tick boundaries, activation-candle outcomes, provenance, expiry, live isolation, and AMBIGUOUS metric bounds |
+| `8df34e9` | Historical trade-through outcomes and metric bounds | Explicit tick trade-through, activation-candle STOPPED/AMBIGUOUS persistence, and pessimistic/optimistic headline metrics |
+| `839ab0d` | Fail-closed tick provenance configuration | Historical scanner validation/backfill require explicit per-symbol tick plus source; flags remain OFF |
+| `933c691` | Complete activation regression coverage | Updated chronology, restart, diagnostic, and updater tests for the approved contract |
+| `484c6da` | Consolidated updater manifest | Pins the eight approved runtime files while preserving canonical verification, backup, rollback, and settings safety |
 
 Clean-checkout verification base: `2f5cc971c93028725d7624dcabc2a5cdd59cb363`.
 
@@ -76,20 +81,12 @@ Commit `b1c8c09` implements the approved isolated policy:
 - No strategy parameters, entry/SL/TP/RR, promotion rules, baseline, validation enablement, or alert behavior changed.
 - Validation and alerts remain OFF.
 
-## Confirmed critical findings still open
+## Confirmed critical finding still open
 
-1. `pnf_mvp/strategy_validation.py::_should_activate`
-   - LONG activates only when `close <= ideal_entry`; SHORT only when `close >= ideal_entry`.
-   - Equality of the **close** activates. Equality/touch by low or high alone does not.
-   - `open` is neither loaded nor accepted by `update_pending_with_candle`, so gap-open policy cannot be represented.
-   - On activation, `activated_price` is always `ideal_entry`, not the close or open.
-   - The complete activation candle H/L range is immediately reused for stop/target resolution even though extrema may have occurred before close-based activation.
-   - Touch-only candles count toward the exact three-candle expiry and can expire a setup that an OHLC limit-touch model would have filled.
-   - Impact: this path is not equivalent to either H/L limit touch or timestamped trade-through.
-2. `live_mexc_forward_trader.py`
+1. `live_mexc_forward_trader.py`
    - The legacy MEXC forward path treats `ORDER_SENT` as open for exit evaluation without first proving an exchange fill.
    - Binance live execution and `mexc_pole_live_trader.py` instead require exchange `FILLED`/executed-volume or open-position evidence.
-   - This separate live-path finding was diagnosed only and was not changed in this stage.
+   - This separate live-path finding remains open and was not changed or combined with the historical activation stage.
 
 ## High-risk reproducibility gaps
 
@@ -120,7 +117,7 @@ Starting from a new checkout at exact commit `2f5cc97`:
 
 No strategy runtime file, strategy parameter, entry/SL/TP/RR rule, promotion rule, protected baseline, or enablement flag was changed during this verification.
 
-`WINDOWS_AUDIT_UPDATE.ps1` is the single Windows procedure. It pins SHA-256 hashes for the six approved runtime files, refuses apply unless services are declared stopped, backs up code/settings/relevant SQLite files, verifies copy/import/byte-compilation, automatically restores code after an apply failure, and supports explicit rollback. It never starts a service and never enables validation or alerts.
+`WINDOWS_AUDIT_UPDATE.ps1` is the single Windows procedure. It now pins SHA-256 hashes for the eight approved runtime files, refuses apply unless services are declared stopped, backs up code/settings/relevant SQLite files, verifies copy/import/byte-compilation, automatically restores code after an apply failure, and supports explicit rollback. It never starts a service and never enables validation or alerts.
 
 ## Completed safe stage: Windows installation and bootstrap
 
@@ -151,31 +148,40 @@ Updater portability:
 
 Verification: `47` direct `unittest` checks plus `17` dependency-free checkpoint/scanner checks passed (`64` total), followed by repository byte-compilation and `git diff --check`. `pnf_mvp/strategy_validation.py` and every strategy/runtime parameter remained unchanged.
 
-### Exact execution-policy decision awaiting approval
+## Completed safe stage: conservative historical-OHLC trade-through activation
 
-Recommended conservative historical-OHLC contract, not yet implemented:
+The user approved the contract with the mandatory requirement that AMBIGUOUS outcomes remain visible in headline denominators. Remote commits `ff40ae4`, `8df34e9`, `839ab0d`, `933c691`, and `484c6da` implement it test-first:
 
-1. A pending LONG fills only after trade-through by at least one known tick (`low <= ideal_entry - tick`); SHORT symmetrically requires `high >= ideal_entry + tick`. Equality-only is **not** fill proof.
-2. A gap through the limit fills at `ideal_entry` (no favorable open-price improvement in reported results).
-3. On the activation candle, any stop touch resolves conservatively as STOPPED; target touch without a stop is AMBIGUOUS/excluded because OHLC cannot prove it occurred after the fill; otherwise the trade becomes active.
-4. Unfilled orders still expire after exactly three eligible closed candles.
-5. Timestamped live data remains authoritative: the first actual exchange fill/execution event wins.
+- LONG activates only at `low <= ideal_entry - tick`; SHORT only at `high >= ideal_entry + tick`. Equality and sub-tick penetration do not fill.
+- Every tick must be explicit per symbol, positive, and paired with a non-empty provenance source. The exact tick and source are persisted on activation. There is no universal default.
+- Gap-through candles fill at `ideal_entry`; no favorable price improvement is credited.
+- Any stop touch on the activation candle resolves as `STOPPED`, including candles that also touch a target.
+- A target touch without a stop on the activation candle is persisted as `AMBIGUOUS`, with `resolved_price=NULL`, pessimistic `-1R`, and optimistic TP1/TP2 R derived from the unchanged entry/invalidation/target prices.
+- AMBIGUOUS has no arbitrary `0R`. Its count remains in the headline denominator, and the export reports pessimistic/optimistic win-rate and realized-R bounds. Missing legacy bounds cause R-bound metrics to report unavailable rather than silently substitute zero.
+- Exact three-eligible-candle expiry is unchanged.
+- Timestamped live traders remain isolated and retain first actual exchange fill/event semantics.
+- Additive SQLite migrations only; no database reset or deletion.
 
-Approval of this complete contract—or an explicit choice of inclusive H/L touch instead of one-tick trade-through—is required before changing `_should_activate`, candle inputs, or outcome handling.
+The configured `symbol_ticks` map is intentionally empty while validation is OFF. Historical validation and backfill now fail closed unless authoritative per-symbol tick values and provenance sources are supplied; no tick was guessed.
+
+Verification: `60` direct `unittest` checks plus `20` dependency-free checkpoint/scanner checks passed (`80` targeted checks), followed by repository byte-compilation and `git diff --check`. No broad recomputation was run. Validation and alerts remain OFF.
+
+Expected result-changing scope once explicitly configured and enabled: historical validation/backfill activation membership, activation timestamps, activation-candle STOPPED/AMBIGUOUS outcomes, and their reported headline metric bounds. Signal generation, setup promotion, entry/SL/TP/RR values, post-activation management, operational alerts, live exchange execution, and the protected long-only baseline logic are unchanged.
 
 ## Test limitations
 
-- The latest stage passed `64` targeted checks, plus byte-compilation and diff validation.
+- The latest stage passed `80` targeted checks, plus byte-compilation and diff validation.
 - The audit runtime still lacks `pytest`, `pyarrow`, and PowerShell. Pytest-style targeted tests were invoked through a dependency-free harness; the revised portability logic received static and behavioral cross-platform tests but has not yet had a native-Windows rerun. No clean full-suite claim is made.
 
 ## Next smallest safe stage
 
-Stop after the diagnostic activation/portability stage:
+Stop after the isolated activation-policy stage:
 
 1. Keep validation and alerts OFF.
 2. Do not run broad historical recomputation.
-3. Do not change activation behavior until the complete historical-OHLC execution contract above is explicitly approved.
-4. Treat the legacy MEXC `ORDER_SENT` lifecycle as a separate fail-closed audit stage; do not combine it with activation-policy work.
+3. Independently obtain and verify authoritative exchange tick sizes for the intended historical symbols, then record each value and source in the explicit provenance map. Do not enable validation or backfill during that metadata-only stage.
+4. After tick provenance is reviewed, run one small frozen-fixture validation before any broader historical work.
+5. Treat the legacy MEXC `ORDER_SENT` lifecycle as a separate fail-closed audit stage; do not combine it with activation-policy work.
 
 ## Recommended model routing
 
@@ -185,4 +191,4 @@ Stop after the diagnostic activation/portability stage:
 
 ## Prompt for the next chat
 
-> Read the latest `AUDIT_HANDOFF.md` from branch `feature/binance-microstructure-collector` in `lykos1974/sm`. Continue only the “Next smallest safe stage”. Keep validation and alerts OFF and preserve all strategy parameters and the protected long-only baseline. Do not change `_should_activate` until the historical-OHLC execution contract is explicitly approved. Keep updates concise and maintain GitHub.
+> Read the latest `AUDIT_HANDOFF.md` from branch `feature/binance-microstructure-collector` in `lykos1974/sm`. Continue only the “Next smallest safe stage”. Diagnostics-first, independently source explicit tick size and provenance per intended symbol, but keep validation and alerts OFF and do not run backfill or broad recomputation. Preserve all strategy parameters and the protected long-only baseline. Keep updates concise and maintain GitHub.
