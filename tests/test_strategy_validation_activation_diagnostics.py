@@ -78,7 +78,12 @@ def close_store(store):
 class StrategyValidationActivationDiagnosticTests(TestCase):
     def _store(self, db_path):
         return StrategyValidationStore(
-            str(db_path), allow_multiple_trades_per_symbol=True, commit_every=1
+            str(db_path),
+            allow_multiple_trades_per_symbol=True,
+            commit_every=1,
+            symbol_tick_provenance={
+                "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+            },
         )
 
     def _register(self, store, side):
@@ -89,53 +94,51 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             store.update_pending_with_candle("BTCUSDT", **candle)
 
-    def test_long_close_activation_is_inclusive_but_touch_only_is_ignored(self):
+    def test_long_activation_uses_one_tick_trade_through_not_close(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self._store(Path(temp_dir) / "validation.db")
             try:
-                self.assertTrue(store._should_activate("LONG", 100.0, 100.0))
-                self.assertTrue(store._should_activate("LONG", 99.0, 100.0))
-                self.assertFalse(store._should_activate("LONG", 101.0, 100.0))
-
-                low, close = 100.0, 101.0
-                self.assertTrue(low <= 100.0, "inclusive buy-limit touch")
-                self.assertFalse(low < 100.0, "no strict trade-through at equality")
-                self.assertFalse(store._should_activate("LONG", close, 100.0))
+                self.assertFalse(store._should_activate("LONG", 101.0, 100.0, 100.0, 0.01))
+                self.assertFalse(store._should_activate("LONG", 101.0, 99.995, 100.0, 0.01))
+                self.assertTrue(store._should_activate("LONG", 101.0, 99.99, 100.0, 0.01))
             finally:
                 close_store(store)
 
-    def test_short_close_activation_is_inclusive_but_touch_only_is_ignored(self):
+    def test_short_activation_uses_one_tick_trade_through_not_close(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = self._store(Path(temp_dir) / "validation.db")
             try:
-                self.assertTrue(store._should_activate("SHORT", 100.0, 100.0))
-                self.assertTrue(store._should_activate("SHORT", 101.0, 100.0))
-                self.assertFalse(store._should_activate("SHORT", 99.0, 100.0))
-
-                high, close = 100.0, 99.0
-                self.assertTrue(high >= 100.0, "inclusive sell-limit touch")
-                self.assertFalse(high > 100.0, "no strict trade-through at equality")
-                self.assertFalse(store._should_activate("SHORT", close, 100.0))
+                self.assertFalse(store._should_activate("SHORT", 100.0, 99.0, 100.0, 0.01))
+                self.assertFalse(store._should_activate("SHORT", 100.005, 99.0, 100.0, 0.01))
+                self.assertTrue(store._should_activate("SHORT", 100.01, 99.0, 100.0, 0.01))
             finally:
                 close_store(store)
 
-    def test_candle_api_has_no_open_and_cannot_apply_gap_fill_policy(self):
+    def test_candle_api_requires_tick_provenance_and_needs_no_open_improvement(self):
         parameters = inspect.signature(
             StrategyValidationStore.update_pending_with_candle
         ).parameters
         self.assertEqual(
             list(parameters),
-            ["self", "symbol", "close_ts", "high_price", "low_price", "close_price"],
+            [
+                "self",
+                "symbol",
+                "close_ts",
+                "high_price",
+                "low_price",
+                "close_price",
+                "tick_size",
+                "tick_size_source",
+            ],
         )
         self.assertNotIn("open_price", parameters)
 
-    def test_long_gap_below_limit_is_missed_when_close_finishes_above(self):
+    def test_long_gap_through_activates_at_ideal_when_close_finishes_above(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "validation.db"
             store = self._store(db_path)
             try:
                 setup_id = self._register(store, "LONG")
-                # Hypothetical open=99.0 is intentionally absent from the API.
                 self._update(
                     store,
                     dict(close_ts=2, high_price=101.0, low_price=98.5, close_price=101.0),
@@ -143,16 +146,16 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
                 observed = row(db_path, setup_id)
             finally:
                 close_store(store)
-        self.assertEqual(observed["activation_status"], "PENDING")
+        self.assertEqual(observed["activation_status"], "ACTIVE")
+        self.assertEqual(observed["activated_price"], 100.0)
         self.assertEqual(observed["bars_observed"], 1)
 
-    def test_short_gap_above_limit_is_missed_when_close_finishes_below(self):
+    def test_short_gap_through_activates_at_ideal_when_close_finishes_below(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "validation.db"
             store = self._store(db_path)
             try:
                 setup_id = self._register(store, "SHORT")
-                # Hypothetical open=101.0 is intentionally absent from the API.
                 self._update(
                     store,
                     dict(close_ts=2, high_price=101.5, low_price=99.0, close_price=99.0),
@@ -160,16 +163,17 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
                 observed = row(db_path, setup_id)
             finally:
                 close_store(store)
-        self.assertEqual(observed["activation_status"], "PENDING")
+        self.assertEqual(observed["activation_status"], "ACTIVE")
+        self.assertEqual(observed["activated_price"], 100.0)
         self.assertEqual(observed["bars_observed"], 1)
 
-    def test_close_cross_activates_at_ideal_entry_not_observed_close(self):
+    def test_close_cross_without_trade_through_does_not_activate(self):
         scenarios = {
             "LONG": dict(
-                close_ts=2, high_price=101.0, low_price=98.5, close_price=99.0
+                close_ts=2, high_price=101.0, low_price=100.0, close_price=99.0
             ),
             "SHORT": dict(
-                close_ts=2, high_price=101.5, low_price=99.0, close_price=101.0
+                close_ts=2, high_price=100.0, low_price=99.0, close_price=101.0
             ),
         }
         for side, candle in scenarios.items():
@@ -182,9 +186,8 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
                     observed = row(db_path, setup_id)
                 finally:
                     close_store(store)
-                self.assertEqual(observed["activation_status"], "ACTIVE")
-                self.assertEqual(observed["activated_price"], 100.0)
-                self.assertNotEqual(observed["activated_price"], candle["close_price"])
+                self.assertEqual(observed["activation_status"], "PENDING")
+                self.assertIsNone(observed["activated_price"])
 
     def test_long_activation_candle_reuses_full_ohlc_for_outcome(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -328,7 +331,7 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
                     {field: restarted[field] for field in fields},
                 )
 
-    def test_research_and_scanner_share_close_model_but_live_fill_paths_are_isolated(self):
+    def test_historical_and_live_execution_paths_remain_isolated(self):
         app_source = (PNF_MVP_ROOT / "app.py").read_text(encoding="utf-8")
         backfill_source = (PNF_MVP_ROOT / "strategy_historical_backfill.py").read_text(
             encoding="utf-8"
@@ -348,6 +351,8 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
 
         self.assertIn("validation_store.update_pending_with_candle", app_source)
         self.assertIn("validation_store.update_pending_with_candle", backfill_source)
+        self.assertIn("strategy_validation_execution", app_source)
+        self.assertIn("strategy_validation_execution", backfill_source)
         self.assertNotIn("StrategyValidationStore", binance_source)
         self.assertNotIn("StrategyValidationStore", mexc_pole_source)
         self.assertIn('entry_status == "FILLED"', binance_source)

@@ -56,7 +56,7 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
 
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
         pinned = expected_files(self.script)
-        self.assertEqual(len(pinned), 6)
+        self.assertEqual(len(pinned), 8)
         for relative_path, expected in pinned.items():
             with self.subTest(relative_path=relative_path):
                 payload = (ROOT / relative_path).read_bytes()

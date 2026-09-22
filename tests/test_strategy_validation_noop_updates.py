@@ -66,7 +66,14 @@ class StrategyValidationNoopUpdateTests(TestCase):
     def _store(self):
         temp_dir = tempfile.TemporaryDirectory()
         db_path = Path(temp_dir.name) / "validation.db"
-        store = StrategyValidationStore(str(db_path), allow_multiple_trades_per_symbol=True, commit_every=1)
+        store = StrategyValidationStore(
+            str(db_path),
+            allow_multiple_trades_per_symbol=True,
+            commit_every=1,
+            symbol_tick_provenance={
+                "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+            },
+        )
         return temp_dir, db_path, store
 
     def _sql_updates(self, store, symbol="BTCUSDT"):
