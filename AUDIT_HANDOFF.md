@@ -148,7 +148,7 @@ Updater portability:
 
 Verification: `47` direct `unittest` checks plus `17` dependency-free checkpoint/scanner checks passed (`64` total), followed by repository byte-compilation and `git diff --check`. `pnf_mvp/strategy_validation.py` and every strategy/runtime parameter remained unchanged.
 
-## Completed safe stage: conservative historical-OHLC trade-through activation
+## Completed activation contract implementation
 
 The user approved the contract with the mandatory requirement that AMBIGUOUS outcomes remain visible in headline denominators. Remote commits `ff40ae4`, `8df34e9`, `839ab0d`, `933c691`, and `484c6da` implement it test-first:
 
