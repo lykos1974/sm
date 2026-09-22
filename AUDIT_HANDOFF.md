@@ -44,6 +44,8 @@ Pull request: `#350`
 | `839ab0d` | Fail-closed tick provenance configuration | Historical scanner validation/backfill require explicit per-symbol tick plus source; flags remain OFF |
 | `933c691` | Complete activation regression coverage | Updated chronology, restart, diagnostic, and updater tests for the approved contract |
 | `484c6da` | Consolidated updater manifest | Pins the eight approved runtime files while preserving canonical verification, backup, rollback, and settings safety |
+| `6348aea` | Validation causality/state-integrity regressions | Test-first coverage for candle replay/restart/retry, frozen tick provenance, migration ordering, and disabled configuration isolation |
+| `09a027d` | Validation causality and frozen provenance implementation | Persists per-setup candle watermarks and registration-time tick provenance; fixes migration order and OFF-path configuration isolation |
 
 Clean-checkout verification base: `2f5cc971c93028725d7624dcabc2a5cdd59cb363`.
 
@@ -168,20 +170,39 @@ Verification: `60` direct `unittest` checks plus `20` dependency-free checkpoint
 
 Expected result-changing scope once explicitly configured and enabled: historical validation/backfill activation membership, activation timestamps, activation-candle STOPPED/AMBIGUOUS outcomes, and their reported headline metric bounds. Signal generation, setup promotion, entry/SL/TP/RR values, post-activation management, operational alerts, live exchange execution, and the protected long-only baseline logic are unchanged.
 
+## Completed causality/state-integrity stage
+
+Remote commits `6348aea01321beaa62cdc24ee8ca1ef62583dc11` and `09a027d77ec3cdf536e9933983ff7908fb3b8208` complete this isolated stage test-first:
+
+- Each setup now persists `last_evaluated_candle_ts`. A repeated or older eligible candle performs no state transition, bar increment, activation, TP1/BE arming, resolution, or SQL write. Coverage includes LONG/SHORT, pending, activation, armed TP1/BE, resolved, batch, per-candle, restart, retry, and validation-flush-success followed by scanner-checkpoint failure.
+- Tick size and source are validated and frozen when the setup is registered, then retained through PENDING, ACTIVE, EXPIRED, AMBIGUOUS, and final resolution. Restart or later settings changes cannot alter an existing setup's tick.
+- Missing, non-finite, zero, negative, mismatched-symbol, and unknown-symbol provenance fails closed. No universal tick or another symbol's tick is inferred. Legacy pending rows without frozen provenance also fail closed without a write.
+- Additive legacy columns are created before indexes that reference them. Empty, immediately previous, and pre-`activation_status` schemas preserve existing rows, pass repeated startup, and return `PRAGMA integrity_check=ok`.
+- When `strategy_validation_enabled=false`, scanner startup returns before parsing or dereferencing `strategy_validation_execution`; missing, null, and malformed values are covered.
+- Clean-checkout verification at remote `09a027d` passed `71` direct regressions plus `20` dependency-free checkpoint/scanner checks (`91` targeted checks), repository byte-compilation, and `git diff --check`.
+- Runtime files changed: `pnf_mvp/strategy_validation.py` and `pnf_mvp/app.py` only. Strategy parameters, entry/SL/TP/RR, promotion rules, AMBIGUOUS/R-bound/export behavior, activation-candle policy, live traders, protected long-only baseline, and enablement flags are unchanged.
+- No broad recomputation or Windows installation package was prepared. `WINDOWS_AUDIT_UPDATE.ps1` was intentionally not updated and must not be used to install this stage.
+
+Remaining findings and gates:
+
+1. Obtain a clean independent re-audit of remote HEAD before any next stage, enablement, recomputation, or installation work.
+2. Existing legacy setups with no registration-time tick provenance cannot be reconstructed safely and now fail closed; their disposition requires a separate reviewed migration decision with no inferred tick.
+3. The configured per-symbol tick map remains empty while validation is OFF; authoritative values and sources are still required before validation can be enabled.
+4. The legacy MEXC `ORDER_SENT`-without-fill lifecycle issue remains open and was not combined with this stage.
+
 ## Test limitations
 
-- The latest stage passed `80` targeted checks, plus byte-compilation and diff validation.
+- The latest stage passed `91` targeted checks, plus byte-compilation and diff validation, from a clean checkout of the pushed remote commit.
 - The audit runtime still lacks `pytest`, `pyarrow`, and PowerShell. Pytest-style targeted tests were invoked through a dependency-free harness; the revised portability logic received static and behavioral cross-platform tests but has not yet had a native-Windows rerun. No clean full-suite claim is made.
 
 ## Next smallest safe stage
 
-Stop after the isolated activation-policy stage:
+Stop after the isolated causality/state-integrity stage:
 
-1. Keep validation and alerts OFF.
-2. Do not run broad historical recomputation.
-3. Independently obtain and verify authoritative exchange tick sizes for the intended historical symbols, then record each value and source in the explicit provenance map. Do not enable validation or backfill during that metadata-only stage.
-4. After tick provenance is reviewed, run one small frozen-fixture validation before any broader historical work.
-5. Treat the legacy MEXC `ORDER_SENT` lifecycle as a separate fail-closed audit stage; do not combine it with activation-policy work.
+1. Keep validation and alerts OFF; do not run broad historical recomputation or prepare a Windows installation.
+2. Require a clean independent re-audit of remote HEAD, including exact remote file bytes and the new targeted regressions, before proceeding.
+3. Treat legacy rows without frozen tick provenance as an explicit fail-closed migration question; never infer or substitute a tick.
+4. Keep the legacy MEXC `ORDER_SENT` lifecycle as a separate audit stage.
 
 ## Recommended model routing
 
@@ -191,4 +212,4 @@ Stop after the isolated activation-policy stage:
 
 ## Prompt for the next chat
 
-> Read the latest `AUDIT_HANDOFF.md` from branch `feature/binance-microstructure-collector` in `lykos1974/sm`. Continue only the “Next smallest safe stage”. Diagnostics-first, independently source explicit tick size and provenance per intended symbol, but keep validation and alerts OFF and do not run backfill or broad recomputation. Preserve all strategy parameters and the protected long-only baseline. Keep updates concise and maintain GitHub.
+> Read the latest `AUDIT_HANDOFF.md` from branch `feature/binance-microstructure-collector` in `lykos1974/sm`. Independently re-audit the completed causality/state-integrity stage at remote HEAD before any further implementation, enablement, recomputation, or Windows installation. Verify exact remote bytes, per-setup candle idempotency, registration-time frozen tick provenance, migration ordering, and disabled-validation startup isolation. Keep validation and alerts OFF; preserve all strategy parameters and the protected long-only baseline. Report remaining findings before proposing the next stage.
