@@ -67,6 +67,13 @@ def ticks(size=0.01, source="test:BTCUSDT"):
     }
 
 
+def identities():
+    return {"BTCUSDT": {
+        "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+        "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+    }}
+
+
 def fetch_row(db_path, setup_id):
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -103,6 +110,7 @@ class CandleIdempotencyTests(TestCase):
             allow_multiple_trades_per_symbol=True,
             commit_every=1,
             symbol_tick_provenance=provenance or ticks(),
+            symbol_identity_allowlist=identities(),
         )
 
     def _register(self, store, side, reference_ts=1):

@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 from strategy_trade_export import (
+    ECONOMIC_CHRONOLOGY_SQL,
     build_accounting_breakdown,
     build_accounting_summary,
     compute_trade_metrics,
@@ -61,7 +62,9 @@ def load_data(db_path: str = DB_PATH) -> pd.DataFrame:
                 f"Table '{TABLE_NAME}' was not found in {db_file.name}. Existing tables: {known}"
             )
 
-        df = pd.read_sql_query(f"SELECT * FROM {TABLE_NAME}", conn)
+        df = pd.read_sql_query(
+            f"SELECT * FROM {TABLE_NAME} ORDER BY {ECONOMIC_CHRONOLOGY_SQL}", conn
+        )
         return df
     finally:
         conn.close()

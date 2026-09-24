@@ -34,6 +34,9 @@ def _build_validation_store(settings):
     validation_ticks = validation_execution.get("symbol_ticks")
     if not isinstance(validation_ticks, dict):
         raise ValueError("strategy validation symbol_ticks must be an object")
+    validation_identities = validation_execution.get("symbol_identities")
+    if not isinstance(validation_identities, dict):
+        raise ValueError("strategy validation symbol_identities must be an object")
     if validation_execution.get("activation_model") != HISTORICAL_ACTIVATION_MODEL:
         raise ValueError(
             f"strategy validation requires activation_model={HISTORICAL_ACTIVATION_MODEL}"
@@ -47,6 +50,7 @@ def _build_validation_store(settings):
     return StrategyValidationStore(
         settings.get("strategy_validation_db_path", "strategy_validation.db"),
         symbol_tick_provenance=validation_ticks,
+        symbol_identity_allowlist=validation_identities,
     )
 
 TELEGRAM_ENABLED = True

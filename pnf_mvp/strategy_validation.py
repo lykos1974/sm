@@ -57,6 +57,13 @@ STRUCTURED_TICK_FIELDS = (
     "provenance_timestamp",
     "provenance_version",
 )
+SYMBOL_IDENTITY_FIELDS = (
+    "provider",
+    "venue",
+    "instrument_type",
+    "native_symbol",
+    "source_symbol",
+)
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -91,7 +98,39 @@ def _require_finite_positive_tick(value: Any, context: str) -> float:
     return tick_size
 
 
-def _normalize_tick_provenance(symbol: str, provenance: Any) -> dict[str, Any]:
+def _normalize_identity_allowlist(allowlist: Any) -> dict[str, dict[str, str]]:
+    if allowlist is None:
+        return {}
+    if not isinstance(allowlist, dict):
+        raise ValueError("symbol identity allowlist must be an object")
+    normalized_allowlist: dict[str, dict[str, str]] = {}
+    for symbol, identity in allowlist.items():
+        symbol = str(symbol).strip()
+        if not symbol or not isinstance(identity, dict):
+            raise ValueError("symbol identity allowlist entries must be named objects")
+        normalized_identity: dict[str, str] = {}
+        for field in SYMBOL_IDENTITY_FIELDS:
+            value = str(identity.get(field) or "").strip()
+            if not value:
+                raise ValueError(
+                    f"symbol identity allowlist for {symbol} requires field {field}"
+                )
+            normalized_identity[field] = value
+        if normalized_identity["source_symbol"] != symbol:
+            raise ValueError(
+                f"symbol identity allowlist key/source mismatch for {symbol}"
+            )
+        normalized_allowlist[symbol] = normalized_identity
+    return normalized_allowlist
+
+
+def _normalize_tick_provenance(
+    symbol: str,
+    provenance: Any,
+    allowed_identity: Optional[Dict[str, str]] = None,
+) -> dict[str, Any]:
+    if allowed_identity is None:
+        raise ValueError(f"unknown configured symbol rejected: {symbol}")
     if not isinstance(provenance, dict):
         raise ValueError(f"tick provenance for {symbol} must be an object")
     normalized: dict[str, Any] = {}
@@ -102,15 +141,15 @@ def _normalize_tick_provenance(symbol: str, provenance: Any) -> dict[str, Any]:
                 f"tick provenance for {symbol} requires structured field {field}"
             )
         normalized[field] = value
-    expected_native_symbol = str(symbol).split(":", 1)[-1]
-    if (
-        normalized["source_symbol"] != str(symbol)
-        or normalized["native_symbol"] != expected_native_symbol
-    ):
+    mismatched = [
+        field
+        for field in SYMBOL_IDENTITY_FIELDS
+        if normalized[field] != allowed_identity[field]
+    ]
+    if mismatched:
         raise ValueError(
             "tick provenance symbol identity mismatch: "
-            f"registered={symbol} source_symbol={normalized['source_symbol']} "
-            f"native_symbol={normalized['native_symbol']}"
+            f"registered={symbol} fields={','.join(mismatched)}"
         )
     normalized["tick_size"] = _require_finite_positive_tick(
         provenance.get("tick_size"), f"tick provenance for {symbol}"
@@ -126,6 +165,7 @@ class StrategyValidationStore:
         allow_multiple_trades_per_symbol: Optional[bool] = None,
         commit_every: int = DEFAULT_COMMIT_EVERY,
         symbol_tick_provenance: Optional[Dict[str, Dict[str, Any]]] = None,
+        symbol_identity_allowlist: Optional[Dict[str, Dict[str, str]]] = None,
     ):
         self.db_path = str(Path(db_path))
         self.allow_multiple_trades_per_symbol = (
@@ -136,10 +176,16 @@ class StrategyValidationStore:
         self._commit_every = max(1, int(commit_every))
         self._dirty_writes = 0
         self._candle_transaction_active = False
+        self._symbol_identity_allowlist = _normalize_identity_allowlist(
+            symbol_identity_allowlist
+        )
         self._symbol_tick_provenance: dict[str, dict[str, Any]] = {}
         for symbol, provenance in dict(symbol_tick_provenance or {}).items():
+            symbol = str(symbol)
             self._symbol_tick_provenance[str(symbol)] = _normalize_tick_provenance(
-                str(symbol), provenance
+                symbol,
+                provenance,
+                self._symbol_identity_allowlist.get(symbol),
             )
 
         self._lock = threading.RLock()
@@ -835,7 +881,11 @@ class StrategyValidationStore:
             "source": row.get("activation_tick_source"),
         }
         try:
-            return _normalize_tick_provenance(symbol, values)
+            return _normalize_tick_provenance(
+                symbol,
+                values,
+                self._symbol_identity_allowlist.get(symbol),
+            )
         except ValueError as exc:
             raise ValueError(f"legacy incomplete provenance for setup {setup_id}: {exc}") from exc
 

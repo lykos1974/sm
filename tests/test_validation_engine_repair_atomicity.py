@@ -64,6 +64,13 @@ def provenance():
     }
 
 
+def identities():
+    return {"BTCUSDT": {
+        "provider": "BINANCE", "venue": "BINANCE_SPOT", "instrument_type": "SPOT",
+        "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+    }}
+
+
 def canonical_state(db_path):
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -87,6 +94,7 @@ def open_store(db_path, commit_every=1):
         allow_multiple_trades_per_symbol=True,
         commit_every=commit_every,
         symbol_tick_provenance=provenance(),
+        symbol_identity_allowlist=identities(),
     )
 
 

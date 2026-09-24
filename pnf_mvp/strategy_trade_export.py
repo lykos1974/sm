@@ -27,6 +27,21 @@ CSV_PATH = "strategy_trades_export.csv"
 TP2_REVIEW_PATH = "strategy_tp2_review.csv"
 STOPPED_REVIEW_PATH = "strategy_stopped_review.csv"
 DIAG_BREAKDOWNS_PATH = "strategy_diagnostics_breakdowns.csv"
+ECONOMIC_CHRONOLOGY_COLUMNS = ("created_ts", "setup_id")
+ECONOMIC_CHRONOLOGY_SQL = "created_ts ASC, setup_id ASC"
+
+
+def order_economic_chronology(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    missing = [column for column in ECONOMIC_CHRONOLOGY_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "economic chronology requires columns: " + ", ".join(missing)
+        )
+    return df.sort_values(
+        list(ECONOMIC_CHRONOLOGY_COLUMNS), kind="mergesort", na_position="last"
+    ).reset_index(drop=True)
 
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -128,7 +143,7 @@ def load_validation_rows(db_path: str = DB_PATH) -> pd.DataFrame:
             SELECT
                 {", ".join(select_expr)}
             FROM {TABLE_NAME}
-            ORDER BY created_ts ASC, setup_id ASC
+            ORDER BY {ECONOMIC_CHRONOLOGY_SQL}
         """
         return pd.read_sql_query(query, conn)
     finally:
@@ -198,7 +213,7 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=cols)
 
-    out = df.copy()
+    out = order_economic_chronology(df)
 
     out["activation_status"] = out["activation_status"].fillna("UNKNOWN")
     out["tp1_hit"] = pd.to_numeric(out["tp1_hit"], errors="coerce").fillna(0).astype(int)
@@ -394,6 +409,18 @@ def _max_drawdown(values: list[float]) -> float:
     return maximum
 
 
+def _max_losing_streak(values: list[float]) -> int:
+    current = 0
+    maximum = 0
+    for value in values:
+        if float(value) < 0:
+            current += 1
+            maximum = max(maximum, current)
+        else:
+            current = 0
+    return maximum
+
+
 def build_accounting_summary(df: pd.DataFrame) -> dict:
     if df.empty:
         return {
@@ -413,9 +440,11 @@ def build_accounting_summary(df: pd.DataFrame) -> dict:
             "win_rate_optimistic": 0.0,
             "max_drawdown_r_pessimistic": 0.0,
             "max_drawdown_r_optimistic": 0.0,
+            "max_losing_streak_pessimistic": 0,
+            "max_losing_streak_optimistic": 0,
         }
 
-    work = df.copy()
+    work = order_economic_chronology(df)
     statuses = work["resolution_status"].fillna("PENDING").astype(str).str.upper()
     activation = work.get(
         "activation_status", pd.Series("PENDING", index=work.index)
@@ -442,16 +471,20 @@ def build_accounting_summary(df: pd.DataFrame) -> dict:
         win_upper = float((upper > 0).sum() / denominator)
         drawdown_lower = _max_drawdown(lower.tolist())
         drawdown_upper = _max_drawdown(upper.tolist())
+        losing_streak_lower = _max_losing_streak(lower.tolist())
+        losing_streak_upper = _max_losing_streak(upper.tolist())
     elif denominator:
         total_lower = total_upper = None
         expectancy_lower = expectancy_upper = None
         win_lower = win_upper = None
         drawdown_lower = drawdown_upper = None
+        losing_streak_lower = losing_streak_upper = None
     else:
         total_lower = total_upper = 0.0
         expectancy_lower = expectancy_upper = 0.0
         win_lower = win_upper = 0.0
         drawdown_lower = drawdown_upper = 0.0
+        losing_streak_lower = losing_streak_upper = 0
 
     return {
         "registered_rows": int(len(work)),
@@ -470,6 +503,8 @@ def build_accounting_summary(df: pd.DataFrame) -> dict:
         "win_rate_optimistic": win_upper,
         "max_drawdown_r_pessimistic": drawdown_lower,
         "max_drawdown_r_optimistic": drawdown_upper,
+        "max_losing_streak_pessimistic": losing_streak_lower,
+        "max_losing_streak_optimistic": losing_streak_upper,
     }
 
 

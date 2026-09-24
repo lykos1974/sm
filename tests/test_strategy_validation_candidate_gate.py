@@ -83,6 +83,10 @@ class StrategyValidationCandidateGateTests(TestCase):
                         "provenance_version": "test-v1", "source": "test:BTCUSDT",
                     }
                 },
+                symbol_identity_allowlist={"BTCUSDT": {
+                    "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+                }},
             )
             try:
                 watch_id = store.register_setup(
@@ -122,6 +126,10 @@ class StrategyValidationCandidateGateTests(TestCase):
                         "provenance_version": "test-v1", "source": "test:BTCUSDT",
                     }
                 },
+                symbol_identity_allowlist={"BTCUSDT": {
+                    "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+                }},
             )
             try:
                 first_candidate_id = store.register_setup(
@@ -161,6 +169,10 @@ class StrategyValidationCandidateGateTests(TestCase):
                         "provenance_version": "test-v1", "source": "test:BTCUSDT",
                     }
                 },
+                symbol_identity_allowlist={"BTCUSDT": {
+                    "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+                }},
             )
             try:
                 first_watch_id = store.register_setup(

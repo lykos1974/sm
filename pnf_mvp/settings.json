@@ -82,6 +82,7 @@
   "operational_alerts_enabled": false,
   "strategy_validation_execution": {
     "activation_model": "historical_ohlc_one_tick_trade_through_v1",
+    "symbol_identities": {},
     "symbol_ticks": {}
   },
   "ideal_entry_observer": {

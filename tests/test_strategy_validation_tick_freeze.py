@@ -63,6 +63,13 @@ def provenance(size=0.01, source="exchange-info:BTCUSDT", symbol=None):
     return {"BTCUSDT": item}
 
 
+def identities():
+    return {"BTCUSDT": {
+        "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+        "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+    }}
+
+
 def fetch_row(db_path, setup_id):
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -107,6 +114,7 @@ class TickFreezeTests(TestCase):
                     allow_multiple_trades_per_symbol=True,
                     commit_every=1,
                     symbol_tick_provenance=provenance(),
+                    symbol_identity_allowlist=identities(),
                 )
                 try:
                     setup_id = self._register(store)
@@ -144,6 +152,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance=provenance(0.01, "v1:BTCUSDT"),
+                symbol_identity_allowlist=identities(),
             )
             setup_id = self._register(original)
             close_store(original)
@@ -153,6 +162,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance=provenance(0.1, "v2:BTCUSDT"),
+                symbol_identity_allowlist=identities(),
             )
             try:
                 self._update(
@@ -180,6 +190,7 @@ class TickFreezeTests(TestCase):
                     StrategyValidationStore(
                         str(Path(temp_dir) / f"invalid-{index}.db"),
                         symbol_tick_provenance=provenance(value),
+                        symbol_identity_allowlist=identities(),
                     )
 
     def test_source_symbol_mismatch_and_unknown_symbol_registration_are_rejected(self):
@@ -188,11 +199,13 @@ class TickFreezeTests(TestCase):
                 StrategyValidationStore(
                     str(Path(temp_dir) / "mismatch.db"),
                     symbol_tick_provenance=provenance(symbol="ETHUSDT"),
+                    symbol_identity_allowlist=identities(),
                 )
 
             store = StrategyValidationStore(
                 str(Path(temp_dir) / "unknown.db"),
                 symbol_tick_provenance=provenance(),
+                symbol_identity_allowlist=identities(),
             )
             try:
                 with self.assertRaisesRegex(ValueError, "explicit tick provenance"):
@@ -208,6 +221,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance=provenance(),
+                symbol_identity_allowlist=identities(),
             )
             setup_id = self._register(original)
             close_store(original)
@@ -217,6 +231,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance={},
+                symbol_identity_allowlist=identities(),
             )
             try:
                 before = fetch_row(db_path, setup_id)
@@ -246,6 +261,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance=provenance(),
+                symbol_identity_allowlist=identities(),
             )
             try:
                 for tick_size, source in (
@@ -276,6 +292,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance=provenance(),
+                symbol_identity_allowlist=identities(),
             )
             setup_id = self._register(store)
             close_store(store)
@@ -296,6 +313,7 @@ class TickFreezeTests(TestCase):
                 allow_multiple_trades_per_symbol=True,
                 commit_every=1,
                 symbol_tick_provenance=provenance(),
+                symbol_identity_allowlist=identities(),
             )
             try:
                 before = fetch_row(db_path, setup_id)

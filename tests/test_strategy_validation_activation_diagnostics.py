@@ -94,6 +94,13 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
                     "source": "test:BTCUSDT",
                 }
             },
+            symbol_identity_allowlist={
+                "BTCUSDT": {
+                    "provider": "TEST", "venue": "TEST_SPOT",
+                    "instrument_type": "SPOT", "native_symbol": "BTCUSDT",
+                    "source_symbol": "BTCUSDT",
+                }
+            },
         )
 
     def _register(self, store, side):

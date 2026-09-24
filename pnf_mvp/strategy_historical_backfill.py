@@ -855,6 +855,7 @@ def main() -> None:
     allow_multiple_trades_per_symbol = bool(settings.get("allow_multiple_trades_per_symbol", False))
     validation_execution = settings.get("strategy_validation_execution", {})
     validation_ticks = validation_execution.get("symbol_ticks", {})
+    validation_identities = validation_execution.get("symbol_identities", {})
     if validation_execution.get("activation_model") != HISTORICAL_ACTIVATION_MODEL:
         raise ValueError(
             f"historical validation requires activation_model={HISTORICAL_ACTIVATION_MODEL}"
@@ -863,6 +864,7 @@ def main() -> None:
         validation_db_path,
         allow_multiple_trades_per_symbol=allow_multiple_trades_per_symbol,
         symbol_tick_provenance=validation_ticks,
+        symbol_identity_allowlist=validation_identities,
     )
     profiles = build_profiles(settings)
     symbols = split_symbols(settings, args.symbols)

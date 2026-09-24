@@ -38,6 +38,7 @@ class FakeValidationStore:
         *,
         allow_multiple_trades_per_symbol=False,
         symbol_tick_provenance=None,
+        symbol_identity_allowlist=None,
     ):
         self.db_path = db_path
         self.allow_multiple_trades_per_symbol = allow_multiple_trades_per_symbol

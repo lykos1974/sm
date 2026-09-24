@@ -78,6 +78,10 @@ class TradeThroughActivationTests(TestCase):
                     "source": "test:BTCUSDT",
                 }
             },
+            symbol_identity_allowlist={"BTCUSDT": {
+                "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+                "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+            }},
         )
 
     def _register(self, store, side):
@@ -204,7 +208,12 @@ class TradeThroughActivationTests(TestCase):
             ):
                 with self.subTest(provenance=provenance), self.assertRaises(ValueError):
                     StrategyValidationStore(
-                        str(db_path), symbol_tick_provenance=provenance
+                        str(db_path),
+                        symbol_tick_provenance=provenance,
+                        symbol_identity_allowlist={"BTCUSDT": {
+                            "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+                            "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+                        }},
                     )
 
     def test_exact_three_candle_expiry_is_unchanged(self):

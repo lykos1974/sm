@@ -209,6 +209,7 @@ class StructuredProvenanceTests(TestCase):
                     StrategyValidationStore(
                         str(Path(temp_dir) / f"missing-{index}.db"),
                         symbol_tick_provenance={"BTCUSDT": value},
+                        symbol_identity_allowlist=identities(),
                     )
             for index, value in enumerate((None, math.nan, math.inf, -math.inf, 0, -0.01)):
                 with self.subTest(tick=value), self.assertRaisesRegex(
@@ -217,6 +218,7 @@ class StructuredProvenanceTests(TestCase):
                     StrategyValidationStore(
                         str(Path(temp_dir) / f"tick-{index}.db"),
                         symbol_tick_provenance=provenance(tick_size=value),
+                        symbol_identity_allowlist=identities(),
                     )
 
     def test_symbol_identity_mismatch_is_rejected_despite_free_form_label(self):
@@ -232,13 +234,16 @@ class StructuredProvenanceTests(TestCase):
                     StrategyValidationStore(
                         str(Path(temp_dir) / f"mismatch-{index}.db"),
                         symbol_tick_provenance=provenance(**mismatch),
+                        symbol_identity_allowlist=identities(),
                     )
 
     def test_registration_freezes_every_structured_field(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "validation.db"
             store = StrategyValidationStore(
-                str(db_path), symbol_tick_provenance=provenance()
+                str(db_path),
+                symbol_tick_provenance=provenance(),
+                symbol_identity_allowlist=identities(),
             )
             with contextlib.redirect_stdout(io.StringIO()):
                 setup_id = store.register_setup(
@@ -266,6 +271,7 @@ class ActivationBranchChronologyTests(TestCase):
             allow_multiple_trades_per_symbol=True,
             commit_every=1,
             symbol_tick_provenance=provenance(),
+            symbol_identity_allowlist=identities(),
         )
         with contextlib.redirect_stdout(io.StringIO()):
             setup_id = store.register_setup("BTCUSDT", setup(side), STRUCTURE, 1)
@@ -350,6 +356,7 @@ class ActivationBranchChronologyTests(TestCase):
                     allow_multiple_trades_per_symbol=True,
                     commit_every=1,
                     symbol_tick_provenance=provenance(),
+                    symbol_identity_allowlist=identities(),
                 )
                 configured = setup(side, tp1_r=2.0, tp2_r=4.0)
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -382,6 +389,7 @@ class ActivationBranchChronologyTests(TestCase):
                     allow_multiple_trades_per_symbol=True,
                     commit_every=1,
                     symbol_tick_provenance=provenance(),
+                    symbol_identity_allowlist=identities(),
                 )
                 configured = setup(side, tp1_r=2.0, tp2_r=4.0)
                 with contextlib.redirect_stdout(io.StringIO()):
