@@ -246,6 +246,7 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             notional_usdt REAL NOT NULL,
             exchange_order_id TEXT,
             status TEXT NOT NULL,
+            confirmed_fill_ts INTEGER,
             exit_time INTEGER,
             exit_price REAL,
             realized_r REAL,
@@ -264,6 +265,8 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    if "confirmed_fill_ts" not in {row[1] for row in conn.execute("PRAGMA table_info(live_trades)")}:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN confirmed_fill_ts INTEGER")
     conn.commit()
 
 
@@ -561,16 +564,36 @@ def build_reduce_only_close_order(
     )
 
 
+def confirm_exchange_fill(
+    conn: sqlite3.Connection, trade_id: int, exchange_confirmed_fill_ts: int, *, status: str = "FILLED"
+) -> bool:
+    """Persist a timestamp supplied by verified exchange fill reconciliation.
+
+    This function does not fetch or infer fills; callers must verify exchange evidence.
+    """
+    if status not in {"FILLED", "OPEN_POSITION"} or type(exchange_confirmed_fill_ts) is not int or exchange_confirmed_fill_ts <= 0:
+        raise ValueError("explicit positive exchange-confirmed fill timestamp required")
+    cursor = conn.execute(
+        """UPDATE live_trades SET status = ?, confirmed_fill_ts = ?
+           WHERE id = ? AND status = 'ORDER_SENT' AND confirmed_fill_ts IS NULL""",
+        (status, exchange_confirmed_fill_ts, trade_id),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
 def update_open_trade_exits(conn: sqlite3.Connection, client: MexcFuturesClient, *, live_enabled: bool) -> None:
     rows = conn.execute(
         """
-        SELECT id, symbol, side, entry_time, entry_price, stop_price, tp1_price, tp2_price, raw_order_response
+        SELECT id, symbol, side, confirmed_fill_ts, entry_price, stop_price, tp1_price, tp2_price, raw_order_response
         FROM live_trades
         WHERE status IN ('FILLED','OPEN_POSITION')
         """
     ).fetchall()
     for row in rows:
-        trade_id, symbol, side, entry_time, entry, stop, _tp1, tp2, raw_order_response = row
+        trade_id, symbol, side, fill_ts, entry, stop, _tp1, tp2, raw_order_response = row
+        if type(fill_ts) is not int or fill_ts <= 0:
+            continue
         candles = conn.execute(
             """
             SELECT close_time, high, low
@@ -578,7 +601,7 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: MexcFuturesClient,
             WHERE symbol = ? AND interval = '1m' AND close_time > ?
             ORDER BY close_time ASC
             """,
-            (symbol, int(entry_time)),
+            (symbol, fill_ts + 60000),
         ).fetchall()
         for close_time, high, low in candles:
             exit_price = None
