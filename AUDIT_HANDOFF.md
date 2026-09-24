@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Stop after this consolidated release. Keep validation and alerts OFF. Require an independent clean re-audit of the final remote commit and exact remote bytes before considering any installation, enablement, or recomputation.
+Tick-provenance snapshot generator and isolated regressions are complete. The accepted output path is `pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json`; no snapshot was created because the official MEXC metadata endpoint returned `Site Unavailable` from the execution environment, and the generator failed closed. Retry only the read-only generator from an environment with official MEXC API access. Keep validation and alerts OFF.
