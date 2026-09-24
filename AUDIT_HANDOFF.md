@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Validation bootstrap now loads tick provenance only from the accepted snapshot after the shared read-only preflight passes; OFF startup does not read or require the snapshot, and ON failures occur before validation DB access. Targeted OFF/PASS/fail-closed tests pass; validation and alerts remain OFF. The next gate is an independent audit of this loading boundary only.
+Independently audit the MEXC exit gate: `ORDER_SENT` and all unverified order states must remain ineligible for exits until explicit exchange fill evidence is verified and a `FILLED`/`OPEN_POSITION` state is persisted. Fill reconciliation is a separate gate before live use. Validation and alerts remain OFF.

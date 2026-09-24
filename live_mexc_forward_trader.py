@@ -566,7 +566,7 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: MexcFuturesClient,
         """
         SELECT id, symbol, side, entry_time, entry_price, stop_price, tp1_price, tp2_price, raw_order_response
         FROM live_trades
-        WHERE status IN ('OPEN','ORDER_SENT','POSITION_OPEN','EXIT_PENDING')
+        WHERE status IN ('FILLED','OPEN_POSITION')
         """
     ).fetchall()
     for row in rows:
