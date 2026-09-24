@@ -12,10 +12,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$PackageSourceCommit = "ea257e43ca168b5e7e70f900a896c4434fb3fbc9"
+$PackageSourceCommit = "803cb4895e9ab62db3e12c0c1ed508e2257215de"
 
 $ExpectedFiles = [ordered]@{
-    "pnf_mvp/app.py" = "58158acef33892de298c97560b6314dfd8d934682770cf70047c87fec3092eb7"
+    "pnf_mvp/app.py" = "e6e4686922e38a0c5588c3b44a22be93e751384232740b9fb435cc7cd5b7a6c9"
     "pnf_mvp/pnf_engine.py" = "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e"
     "pnf_mvp/storage.py" = "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e"
     "pnf_mvp/strategy_historical_backfill.py" = "14c58e6983b74c7c1fee9e7f6817438fb48a54964552f566b930ea70319963fd"
@@ -23,6 +23,8 @@ $ExpectedFiles = [ordered]@{
     "pnf_mvp/strategy_validation.py" = "089b847ac55feacb8537b48ab3df90d2eed7768ea51874ddf1d866c4c290f3d2"
     "pnf_mvp/strategy_trade_export.py" = "6b039c473c31453d4afeb185d9e7c15050387f2a2eca5d61fd7d6a4501499383"
     "pnf_mvp/strategy_evaluator.py" = "37bf22f9bf42fbd8546b8aaddfe1b91ae3780371550736d63c75d894b331c467"
+    "pnf_mvp/validation_tick_provenance_preflight.py" = "d16c7ab4a755dd60b1a8dac60d30510fb1ccc1d4d5ec62e1b93e37d1589b0e7c"
+    "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json" = "8ad27ceb2d89d2e9ab57b954240189982fdbaa5ceb02f99d474f540ea2dfa562"
 }
 
 function Resolve-FullPath([string]$PathValue) {
@@ -56,26 +58,6 @@ function Get-CanonicalTextSha256([string]$PathValue) {
     }
 }
 
-function Get-PythonCommand {
-    $python = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($python) {
-        return @{ Executable = $python.Source; Prefix = @() }
-    }
-    $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
-    if ($launcher) {
-        return @{ Executable = $launcher.Source; Prefix = @("-3") }
-    }
-    throw "Existing Python runtime not found; no package was changed."
-}
-
-function Invoke-Python([hashtable]$Python, [string[]]$Arguments) {
-    $allArguments = @($Python.Prefix) + $Arguments
-    & $Python.Executable @allArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python verification failed with exit code $LASTEXITCODE."
-    }
-}
-
 function Assert-SettingsOff([string]$SettingsPath) {
     if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
         throw "Missing settings file: $SettingsPath"
@@ -90,7 +72,7 @@ function Assert-SettingsOff([string]$SettingsPath) {
     return $settings
 }
 
-function Assert-Package([string]$Root, [hashtable]$Python) {
+function Assert-Package([string]$Root) {
     foreach ($entry in $ExpectedFiles.GetEnumerator()) {
         $path = Get-RelativeFile $Root $entry.Key
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -103,17 +85,12 @@ function Assert-Package([string]$Root, [hashtable]$Python) {
     }
     $settingsPath = Join-Path $Root "pnf_mvp\settings.json"
     [void](Assert-SettingsOff $settingsPath)
-    $env:AUDIT_PNF_ROOT = Join-Path $Root "pnf_mvp"
-    try {
-        Invoke-Python $Python @("-m", "compileall", "-q", $env:AUDIT_PNF_ROOT)
-        Invoke-Python $Python @(
-            "-c",
-            "import os,sys;sys.path.insert(0,os.environ['AUDIT_PNF_ROOT']);import app,storage,pnf_engine,structure_engine,strategy_engine,strategy_validation,strategy_setup_observer,strategy_historical_backfill"
-        )
-    }
-    finally {
-        Remove-Item Env:AUDIT_PNF_ROOT -ErrorAction SilentlyContinue
-    }
+}
+
+function Write-CanonicalLfFile([string]$PathValue) {
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $text = $utf8.GetString([IO.File]::ReadAllBytes($PathValue))
+    [IO.File]::WriteAllBytes($PathValue, $utf8.GetBytes($text.Replace("`r`n", "`n")))
 }
 
 function Resolve-DatabasePath([string]$Value, [string]$PnfRoot) {
@@ -159,9 +136,39 @@ function Restore-Code([object]$Manifest, [string]$Target) {
             $parent = Split-Path -Parent $destination
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
             Copy-Item -LiteralPath ([string]$file.backup_path) -Destination $destination -Force
+            if ((Get-Sha256 $destination) -ne [string]$file.before_sha256) {
+                throw "Rollback byte verification failed: $($file.relative_path)"
+            }
         }
         elseif (Test-Path -LiteralPath $destination) {
             Remove-Item -LiteralPath $destination -Force
+        }
+        if (-not [bool]$file.existed -and (Test-Path -LiteralPath $destination)) {
+            throw "Rollback failed to remove new file: $($file.relative_path)"
+        }
+    }
+}
+
+function Assert-Backups([object]$Manifest, [string]$BackupRoot, [string]$Target) {
+    if ((Resolve-FullPath ([string]$Manifest.target_root)) -ne $Target) {
+        throw "Rollback target does not match the manifest target."
+    }
+    if (@($Manifest.files).Count -ne $ExpectedFiles.Count) {
+        throw "Rollback manifest file count mismatch."
+    }
+    foreach ($entry in $ExpectedFiles.GetEnumerator()) {
+        $files = @($Manifest.files | Where-Object { $_.relative_path -eq $entry.Key })
+        if ($files.Count -ne 1 -or [string]$files[0].expected_sha256 -ne $entry.Value) {
+            throw "Rollback manifest mismatch: $($entry.Key)"
+        }
+        $file = $files[0]
+        $expectedBackup = Get-RelativeFile (Join-Path $BackupRoot "code") $entry.Key
+        if ((Resolve-FullPath ([string]$file.backup_path)) -ne (Resolve-FullPath $expectedBackup)) {
+            throw "Rollback backup path mismatch: $($entry.Key)"
+        }
+        if ([bool]$file.existed -and ((-not (Test-Path -LiteralPath $expectedBackup -PathType Leaf)) -or
+                (Get-Sha256 $expectedBackup) -ne [string]$file.before_sha256)) {
+            throw "Rollback backup hash mismatch: $($entry.Key)"
         }
     }
 }
@@ -198,8 +205,7 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
 $SourceRoot = Resolve-FullPath $SourceRoot
 
 if ($Mode -eq "Validate") {
-    $pythonCommand = Get-PythonCommand
-    Assert-Package $SourceRoot $pythonCommand
+    Assert-Package $SourceRoot
     Write-Host "VALIDATED: consolidated audit package; validation and alerts remain OFF."
     exit 0
 }
@@ -223,14 +229,17 @@ if ($Mode -eq "Rollback") {
         throw "Rollback manifest not found: $manifestPath"
     }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ((Resolve-FullPath ([string]$manifest.target_root)) -ne $TargetRoot) {
-        throw "Rollback target does not match the manifest target."
-    }
+    [void](Assert-SettingsOff (Join-Path $TargetRoot "pnf_mvp\settings.json"))
+    Assert-Backups $manifest $BackupPath $TargetRoot
+    $rollbackSettingsHash = Get-Sha256 (Join-Path $TargetRoot "pnf_mvp\settings.json")
     Restore-Code $manifest $TargetRoot
     if ($RestoreDatabases) {
         Restore-Databases $manifest
     }
     [void](Assert-SettingsOff (Join-Path $TargetRoot "pnf_mvp\settings.json"))
+    if ((Get-Sha256 (Join-Path $TargetRoot "pnf_mvp\settings.json")) -ne $rollbackSettingsHash) {
+        throw "Operator settings changed during Rollback."
+    }
     Write-Host "ROLLED BACK: code restored from $BackupPath"
     if (-not $RestoreDatabases) {
         Write-Host "Database backups retained; add -RestoreDatabases only when loss of post-update data is acceptable."
@@ -241,13 +250,13 @@ if ($Mode -eq "Rollback") {
 if ($SourceRoot -eq $TargetRoot) {
     throw "SourceRoot and TargetRoot must be different for a reversible update."
 }
-$pythonCommand = Get-PythonCommand
-Assert-Package $SourceRoot $pythonCommand
+Assert-Package $SourceRoot
 $targetSettingsPath = Join-Path $TargetRoot "pnf_mvp\settings.json"
 $targetSettings = Assert-SettingsOff $targetSettingsPath
+$settingsHash = Get-Sha256 $targetSettingsPath
 
 $backupRoot = Join-Path $TargetRoot "_audit_update_backups"
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss_fffffff") + "_" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $BackupPath = Join-Path $backupRoot $stamp
 $codeBackup = Join-Path $BackupPath "code"
 $databaseBackup = Join-Path $BackupPath "databases"
@@ -300,6 +309,7 @@ $manifest = [ordered]@{
     created_utc = [DateTime]::UtcNow.ToString("o")
     source_root = $SourceRoot
     target_root = $TargetRoot
+    settings_sha256 = $settingsHash
     files = $fileManifest
     databases = $databaseManifest
 }
@@ -317,6 +327,12 @@ try {
         if ((Get-CanonicalTextSha256 $temporary) -ne $entry.Value) {
             throw "Temporary copy verification failed: $($entry.Key)"
         }
+        if ($entry.Key -eq "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json") {
+            Write-CanonicalLfFile $temporary
+            if ((Get-Sha256 $temporary) -ne $entry.Value) {
+                throw "Snapshot raw SHA-256 verification failed: $($entry.Key)"
+            }
+        }
         Move-Item -LiteralPath $temporary -Destination $target -Force
     }
     foreach ($entry in $ExpectedFiles.GetEnumerator()) {
@@ -326,22 +342,14 @@ try {
         }
     }
     [void](Assert-SettingsOff $targetSettingsPath)
-    $targetPnfRoot = Join-Path $TargetRoot "pnf_mvp"
-    $env:AUDIT_PNF_ROOT = $targetPnfRoot
-    try {
-        Invoke-Python $pythonCommand @("-m", "compileall", "-q", $targetPnfRoot)
-        Invoke-Python $pythonCommand @(
-            "-c",
-            "import os,sys;sys.path.insert(0,os.environ['AUDIT_PNF_ROOT']);import app,storage,pnf_engine,structure_engine,strategy_engine,strategy_validation,strategy_setup_observer,strategy_historical_backfill"
-        )
-    }
-    finally {
-        Remove-Item Env:AUDIT_PNF_ROOT -ErrorAction SilentlyContinue
+    if ((Get-Sha256 $targetSettingsPath) -ne $settingsHash) {
+        throw "Operator settings changed during Apply."
     }
 }
 catch {
     $savedError = $_
     $loadedManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    Assert-Backups $loadedManifest $BackupPath $TargetRoot
     Restore-Code $loadedManifest $TargetRoot
     throw "Update failed and code was restored automatically. Backup: $BackupPath. Error: $savedError"
 }

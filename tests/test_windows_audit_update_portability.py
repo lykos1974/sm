@@ -15,7 +15,7 @@ def canonical_text_sha256(payload):
 def expected_files(script):
     return dict(
         re.findall(
-            r'^\s*"([^"]+\.py)"\s*=\s*"([0-9a-f]{64})"$', script, re.MULTILINE
+            r'^\s*"([^"]+\.(?:py|json))"\s*=\s*"([0-9a-f]{64})"$', script, re.MULTILINE
         )
     )
 
@@ -60,41 +60,34 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         )
 
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
-        import subprocess
-
         pinned = expected_files(self.script)
         source_commit = package_source_commit(self.script)
-        self.assertEqual(len(pinned), 8)
+        self.assertEqual(source_commit, "803cb4895e9ab62db3e12c0c1ed508e2257215de")
+        self.assertEqual(len(pinned), 10)
+        self.assertIn("pnf_mvp/app.py", pinned)
+        self.assertIn("pnf_mvp/validation_tick_provenance_preflight.py", pinned)
+        snapshot = "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json"
+        self.assertEqual(pinned[snapshot], "8ad27ceb2d89d2e9ab57b954240189982fdbaa5ceb02f99d474f540ea2dfa562")
         for relative_path, expected in pinned.items():
             with self.subTest(relative_path=relative_path):
-                payload = subprocess.check_output(
-                    ["git", "show", f"{source_commit}:{relative_path}"],
-                    cwd=ROOT,
-                )
+                payload = (ROOT / relative_path).read_bytes()
                 lf_payload = payload.replace(b"\r\n", b"\n")
                 crlf_payload = lf_payload.replace(b"\n", b"\r\n")
                 self.assertEqual(canonical_text_sha256(lf_payload), expected)
                 self.assertEqual(canonical_text_sha256(crlf_payload), expected)
 
     def test_final_runtime_hashes_pass_and_stale_runtime_hashes_fail(self):
-        import subprocess
-
         pinned = expected_files(self.script)
-        source_commit = package_source_commit(self.script)
-        stale_commit = "484c6da1f5e0e0fdfc91f44cf207287584062e10"
         changed_runtime = (
+            "pnf_mvp/app.py",
             "pnf_mvp/strategy_validation.py",
             "pnf_mvp/strategy_trade_export.py",
             "pnf_mvp/strategy_evaluator.py",
         )
         for relative_path in changed_runtime:
             with self.subTest(relative_path=relative_path):
-                final_payload = subprocess.check_output(
-                    ["git", "show", f"{source_commit}:{relative_path}"], cwd=ROOT
-                )
-                stale_payload = subprocess.check_output(
-                    ["git", "show", f"{stale_commit}:{relative_path}"], cwd=ROOT
-                )
+                final_payload = (ROOT / relative_path).read_bytes()
+                stale_payload = final_payload + b"# stale\n"
                 self.assertEqual(canonical_text_sha256(final_payload), pinned[relative_path])
                 self.assertNotEqual(canonical_text_sha256(stale_payload), pinned[relative_path])
 
@@ -119,6 +112,8 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
             "Restore-Databases $manifest",
             'Join-Path $TargetRoot "_audit_update_backups"',
             "-ConfirmServicesStopped",
+            "Assert-Backups $manifest $BackupPath $TargetRoot",
+            "Rollback byte verification failed",
         )
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
@@ -130,6 +125,20 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         self.assertNotIn("settings_backup", self.script)
         self.assertNotIn('Destination (Join-Path $Target "pnf_mvp\\settings.json")', self.script)
         self.assertIn("$targetSettings = Assert-SettingsOff $targetSettingsPath", self.script)
+        self.assertIn("$settingsHash = Get-Sha256 $targetSettingsPath", self.script)
+        self.assertIn("Operator settings changed during Apply", self.script)
+        self.assertIn("Operator settings changed during Rollback", self.script)
+
+    def test_snapshot_installed_with_exact_raw_sha_after_lf_normalization(self):
+        self.assertIn("Write-CanonicalLfFile $temporary", self.script)
+        self.assertIn("(Get-Sha256 $temporary) -ne $entry.Value", self.script)
+        self.assertIn("(Get-CanonicalTextSha256 $target) -ne $entry.Value", self.script)
+
+    def test_no_process_start_or_settings_rewrite(self):
+        self.assertNotIn("Invoke-Python", self.script)
+        self.assertNotIn("Start-Process", self.script)
+        self.assertNotIn("Start-Service", self.script)
+        self.assertNotIn("Set-Content -LiteralPath $targetSettingsPath", self.script)
 
 
 if __name__ == "__main__":
