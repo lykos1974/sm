@@ -4,19 +4,13 @@ strategy_validation.py
 PnF Strategy Validation Store
 =============================
 
-Optimized execution model
--------------------------
-- same schema
-- same activation / resolution logic
-- reduced DB overhead:
-  - in-memory cache for pending trades per symbol
-  - deferred / batched commits
-  - no full pending SELECT on every candle
-
-Behavioral intent
------------------
-This file preserves the original trade logic and DB layout while making
-historical backfill materially faster.
+Historical validation execution model
+-------------------------------------
+- one atomic transaction per candle across every eligible setup
+- replay-safe persisted candle watermarks
+- structured, registration-time-frozen tick provenance
+- explicit activation-candle branches for unresolved OHLC chronology
+- in-memory caching without intra-candle commits
 """
 
 from __future__ import annotations
@@ -52,6 +46,17 @@ BE_TRIGGER_R = 1.5
 DEFAULT_COMMIT_EVERY = 1000
 PENDING_EXPIRY_CANDLES = 3
 HISTORICAL_ACTIVATION_MODEL = "historical_ohlc_one_tick_trade_through_v1"
+VALIDATION_STATE_VERSION = 2
+TP1_PARTIAL_FRACTION = 0.5
+STRUCTURED_TICK_FIELDS = (
+    "provider",
+    "venue",
+    "instrument_type",
+    "native_symbol",
+    "source_symbol",
+    "provenance_timestamp",
+    "provenance_version",
+)
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -86,6 +91,34 @@ def _require_finite_positive_tick(value: Any, context: str) -> float:
     return tick_size
 
 
+def _normalize_tick_provenance(symbol: str, provenance: Any) -> dict[str, Any]:
+    if not isinstance(provenance, dict):
+        raise ValueError(f"tick provenance for {symbol} must be an object")
+    normalized: dict[str, Any] = {}
+    for field in STRUCTURED_TICK_FIELDS:
+        value = str(provenance.get(field) or "").strip()
+        if not value:
+            raise ValueError(
+                f"tick provenance for {symbol} requires structured field {field}"
+            )
+        normalized[field] = value
+    expected_native_symbol = str(symbol).split(":", 1)[-1]
+    if (
+        normalized["source_symbol"] != str(symbol)
+        or normalized["native_symbol"] != expected_native_symbol
+    ):
+        raise ValueError(
+            "tick provenance symbol identity mismatch: "
+            f"registered={symbol} source_symbol={normalized['source_symbol']} "
+            f"native_symbol={normalized['native_symbol']}"
+        )
+    normalized["tick_size"] = _require_finite_positive_tick(
+        provenance.get("tick_size"), f"tick provenance for {symbol}"
+    )
+    normalized["source"] = str(provenance.get("source") or "").strip()
+    return normalized
+
+
 class StrategyValidationStore:
     def __init__(
         self,
@@ -102,29 +135,14 @@ class StrategyValidationStore:
         )
         self._commit_every = max(1, int(commit_every))
         self._dirty_writes = 0
+        self._candle_transaction_active = False
         self._symbol_tick_provenance: dict[str, dict[str, Any]] = {}
         for symbol, provenance in dict(symbol_tick_provenance or {}).items():
-            if not isinstance(provenance, dict):
-                raise ValueError(f"tick provenance for {symbol} must be an object")
-            configured_symbol = provenance.get("symbol")
-            if configured_symbol is not None and str(configured_symbol) != str(symbol):
-                raise ValueError(
-                    f"tick provenance symbol mismatch: key={symbol} value={configured_symbol}"
-                )
-            configured_tick = _require_finite_positive_tick(
-                provenance.get("tick_size"), f"tick provenance for {symbol}"
+            self._symbol_tick_provenance[str(symbol)] = _normalize_tick_provenance(
+                str(symbol), provenance
             )
-            configured_source = str(provenance.get("source") or "").strip()
-            if not configured_source:
-                raise ValueError(
-                    f"tick provenance for {symbol} requires a non-empty source"
-                )
-            self._symbol_tick_provenance[str(symbol)] = {
-                "tick_size": configured_tick,
-                "source": configured_source,
-            }
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._conn:
@@ -312,7 +330,16 @@ class StrategyValidationStore:
                     activated_price REAL,
                     activation_tick_size REAL,
                     activation_tick_source TEXT,
+                    activation_tick_provider TEXT,
+                    activation_tick_venue TEXT,
+                    activation_tick_instrument_type TEXT,
+                    activation_tick_native_symbol TEXT,
+                    activation_tick_source_symbol TEXT,
+                    activation_tick_provenance_timestamp TEXT,
+                    activation_tick_provenance_version TEXT,
                     last_evaluated_candle_ts INTEGER,
+                    validation_state_version INTEGER,
+                    branch_active INTEGER NOT NULL DEFAULT 0,
 
                     tp1_hit INTEGER NOT NULL DEFAULT 0,
                     tp1_hit_ts INTEGER,
@@ -350,11 +377,38 @@ class StrategyValidationStore:
         self._ensure_column("strategy_setups", "snapshot_path", "TEXT")
         self._ensure_column("strategy_setups", "activation_tick_size", "REAL")
         self._ensure_column("strategy_setups", "activation_tick_source", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_provider", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_venue", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_instrument_type", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_native_symbol", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_source_symbol", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_provenance_timestamp", "TEXT")
+        self._ensure_column("strategy_setups", "activation_tick_provenance_version", "TEXT")
         self._ensure_column("strategy_setups", "last_evaluated_candle_ts", "INTEGER")
+        self._ensure_column("strategy_setups", "validation_state_version", "INTEGER")
+        self._ensure_column("strategy_setups", "branch_active", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("strategy_setups", "ambiguous_pessimistic_r", "REAL")
         self._ensure_column("strategy_setups", "ambiguous_optimistic_r", "REAL")
 
         with self._lock, self._conn:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_setup_branches (
+                    setup_id TEXT NOT NULL,
+                    branch_key TEXT NOT NULL,
+                    branch_status TEXT NOT NULL,
+                    resolution_status TEXT,
+                    created_ts INTEGER NOT NULL,
+                    resolved_ts INTEGER,
+                    resolved_price REAL,
+                    r_lower REAL,
+                    r_upper REAL,
+                    tp1_hit INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (setup_id, branch_key),
+                    FOREIGN KEY (setup_id) REFERENCES strategy_setups(setup_id)
+                )
+                """
+            )
             self._conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_strategy_setups_pending
@@ -407,7 +461,7 @@ class StrategyValidationStore:
         symbol: Optional[str] = None,
     ) -> None:
         self._dirty_writes += max(1, int(units))
-        if self._dirty_writes >= self._commit_every:
+        if self._dirty_writes >= self._commit_every and not self._candle_transaction_active:
             self._record_commit(category=category, symbol=symbol)
             self._dirty_writes = 0
 
@@ -434,10 +488,13 @@ class StrategyValidationStore:
             SELECT *
             FROM strategy_setups
             WHERE symbol = ?
-              AND resolution_status = ?
+              AND (
+                    resolution_status = ?
+                    OR (resolution_status = ? AND branch_active = 1)
+                  )
             ORDER BY reference_ts ASC
             """,
-            (symbol, RESOLUTION_PENDING),
+            (symbol, RESOLUTION_PENDING, RESOLUTION_AMBIGUOUS),
             symbol=symbol,
         ).fetchall()
         self._pending_by_symbol[symbol] = [self._row_to_pending_dict(r) for r in rows]
@@ -568,7 +625,16 @@ class StrategyValidationStore:
                 "activated_price": None,
                 "activation_tick_size": frozen_tick["tick_size"],
                 "activation_tick_source": frozen_tick["source"],
+                "activation_tick_provider": frozen_tick["provider"],
+                "activation_tick_venue": frozen_tick["venue"],
+                "activation_tick_instrument_type": frozen_tick["instrument_type"],
+                "activation_tick_native_symbol": frozen_tick["native_symbol"],
+                "activation_tick_source_symbol": frozen_tick["source_symbol"],
+                "activation_tick_provenance_timestamp": frozen_tick["provenance_timestamp"],
+                "activation_tick_provenance_version": frozen_tick["provenance_version"],
                 "last_evaluated_candle_ts": None,
+                "validation_state_version": VALIDATION_STATE_VERSION,
+                "branch_active": 0,
                 "tp1_hit": 0,
                 "tp1_hit_ts": None,
                 "tp1_price": None,
@@ -578,6 +644,8 @@ class StrategyValidationStore:
                 "resolved_ts": None,
                 "resolved_price": None,
                 "resolution_note": None,
+                "ambiguous_pessimistic_r": None,
+                "ambiguous_optimistic_r": None,
                 "first_outcome_ts": None,
                 "last_outcome_ts": None,
                 "snapshot_path": snapshot_path,
@@ -600,7 +668,12 @@ class StrategyValidationStore:
                     pullback_quality, risk_quality, reward_quality, quality_score, quality_grade,
                     reason, reject_reason,
                     activation_status, activated_ts, activated_price,
-                    activation_tick_size, activation_tick_source, last_evaluated_candle_ts,
+                    activation_tick_size, activation_tick_source,
+                    activation_tick_provider, activation_tick_venue,
+                    activation_tick_instrument_type, activation_tick_native_symbol,
+                    activation_tick_source_symbol, activation_tick_provenance_timestamp,
+                    activation_tick_provenance_version,
+                    last_evaluated_candle_ts, validation_state_version, branch_active,
                     tp1_hit, tp1_hit_ts, tp1_price,
                     max_favorable_excursion, max_adverse_excursion,
                     resolution_status, resolved_ts, resolved_price, resolution_note,
@@ -618,7 +691,12 @@ class StrategyValidationStore:
                     :pullback_quality, :risk_quality, :reward_quality, :quality_score, :quality_grade,
                     :reason, :reject_reason,
                     :activation_status, :activated_ts, :activated_price,
-                    :activation_tick_size, :activation_tick_source, :last_evaluated_candle_ts,
+                    :activation_tick_size, :activation_tick_source,
+                    :activation_tick_provider, :activation_tick_venue,
+                    :activation_tick_instrument_type, :activation_tick_native_symbol,
+                    :activation_tick_source_symbol, :activation_tick_provenance_timestamp,
+                    :activation_tick_provenance_version,
+                    :last_evaluated_candle_ts, :validation_state_version, :branch_active,
                     :tp1_hit, :tp1_hit_ts, :tp1_price,
                     :max_favorable_excursion, :max_adverse_excursion,
                     :resolution_status, :resolved_ts, :resolved_price, :resolution_note,
@@ -675,56 +753,6 @@ class StrategyValidationStore:
         if side == "SHORT":
             return high >= entry + tick
         return False
-
-    def _activation_candle_outcome(
-        self,
-        side: str,
-        low_price: float,
-        high_price: float,
-        entry_price: float,
-        invalidation: Optional[float],
-        tp1: Optional[float],
-        tp2: Optional[float],
-    ) -> tuple[Optional[str], Optional[float], Optional[str], Optional[float], Optional[float]]:
-        side = str(side or "").upper()
-        if side == "LONG":
-            hit_stop = invalidation is not None and low_price <= invalidation
-            hit_tp1 = tp1 is not None and high_price >= tp1
-            hit_tp2 = tp2 is not None and high_price >= tp2
-        elif side == "SHORT":
-            hit_stop = invalidation is not None and high_price >= invalidation
-            hit_tp1 = tp1 is not None and low_price <= tp1
-            hit_tp2 = tp2 is not None and low_price <= tp2
-        else:
-            return None, None, None, None, None
-
-        if hit_stop:
-            return (
-                RESOLUTION_STOPPED,
-                invalidation,
-                "activation_candle_stop_touch",
-                None,
-                None,
-            )
-        if hit_tp1 or hit_tp2:
-            optimistic_price = tp2 if hit_tp2 else tp1
-            optimistic_r = None
-            if optimistic_price is not None and invalidation is not None:
-                risk = abs(float(entry_price) - float(invalidation))
-                if risk > 0:
-                    if side == "LONG":
-                        optimistic_r = (float(optimistic_price) - float(entry_price)) / risk
-                    else:
-                        optimistic_r = (float(entry_price) - float(optimistic_price)) / risk
-            target_name = "tp2" if hit_tp2 else "tp1"
-            return (
-                RESOLUTION_AMBIGUOUS,
-                None,
-                f"activation_candle_target_touch_without_stop:{target_name}",
-                -1.0,
-                optimistic_r,
-            )
-        return None, None, None, None, None
 
     def _breakeven_price(self, side: str, entry_price: float) -> float:
         side = str(side or "").upper()
@@ -786,6 +814,285 @@ class StrategyValidationStore:
             return RESOLUTION_TP2, tp2, "tp2_hit_after_tp1"
         return None, None, None
 
+    def _frozen_provenance_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        setup_id = str(row.get("setup_id") or "")
+        symbol = str(row.get("symbol") or "")
+        if _safe_int(row.get("validation_state_version")) != VALIDATION_STATE_VERSION:
+            if row.get("last_evaluated_candle_ts") is None:
+                raise ValueError(
+                    f"legacy nonterminal setup {setup_id} has NULL watermark and must remain unchanged"
+                )
+            raise ValueError(f"legacy nonterminal setup {setup_id} has incomplete validation state")
+        values = {
+            "provider": row.get("activation_tick_provider"),
+            "venue": row.get("activation_tick_venue"),
+            "instrument_type": row.get("activation_tick_instrument_type"),
+            "native_symbol": row.get("activation_tick_native_symbol"),
+            "source_symbol": row.get("activation_tick_source_symbol"),
+            "provenance_timestamp": row.get("activation_tick_provenance_timestamp"),
+            "provenance_version": row.get("activation_tick_provenance_version"),
+            "tick_size": row.get("activation_tick_size"),
+            "source": row.get("activation_tick_source"),
+        }
+        try:
+            return _normalize_tick_provenance(symbol, values)
+        except ValueError as exc:
+            raise ValueError(f"legacy incomplete provenance for setup {setup_id}: {exc}") from exc
+
+    @staticmethod
+    def _r_for_price(
+        side: str,
+        entry_price: Optional[float],
+        invalidation: Optional[float],
+        price: Optional[float],
+    ) -> Optional[float]:
+        if entry_price is None or invalidation is None or price is None:
+            return None
+        risk = abs(float(entry_price) - float(invalidation))
+        if risk <= 0:
+            return None
+        if str(side or "").upper() == "LONG":
+            return (float(price) - float(entry_price)) / risk
+        if str(side or "").upper() == "SHORT":
+            return (float(entry_price) - float(price)) / risk
+        return None
+
+    def _completed_outcome_r(
+        self,
+        row: dict[str, Any],
+        resolution_status: str,
+        resolved_price: Optional[float],
+        tp1_hit: bool,
+        tp1_price: Optional[float],
+    ) -> Optional[float]:
+        side = str(row.get("side") or "").upper()
+        entry = _safe_float(row.get("activated_price")) or _safe_float(row.get("ideal_entry"))
+        invalidation = _safe_float(row.get("invalidation"))
+        status = str(resolution_status or "").upper()
+        exit_r = self._r_for_price(side, entry, invalidation, resolved_price)
+        if status == RESOLUTION_STOPPED:
+            return -1.0
+        if status == RESOLUTION_TP1_PARTIAL_THEN_BE:
+            first_r = self._r_for_price(side, entry, invalidation, tp1_price)
+            if first_r is None or exit_r is None:
+                return None
+            return TP1_PARTIAL_FRACTION * first_r + (1.0 - TP1_PARTIAL_FRACTION) * exit_r
+        if status == RESOLUTION_TP2 and tp1_hit:
+            first_r = self._r_for_price(side, entry, invalidation, tp1_price)
+            if first_r is None or exit_r is None:
+                return None
+            return TP1_PARTIAL_FRACTION * first_r + (1.0 - TP1_PARTIAL_FRACTION) * exit_r
+        return exit_r
+
+    def _persist_setup_state(self, symbol: str, row: dict[str, Any]) -> None:
+        self._execute_counted(
+            "update_pending",
+            """
+            UPDATE strategy_setups
+            SET updated_ts=:updated_ts,
+                bars_observed=:bars_observed,
+                activation_status=:activation_status,
+                activated_ts=:activated_ts,
+                activated_price=:activated_price,
+                tp1_hit=:tp1_hit,
+                tp1_hit_ts=:tp1_hit_ts,
+                tp1_price=:tp1_price,
+                max_favorable_excursion=:max_favorable_excursion,
+                max_adverse_excursion=:max_adverse_excursion,
+                resolution_status=:resolution_status,
+                resolved_ts=:resolved_ts,
+                resolved_price=:resolved_price,
+                resolution_note=:resolution_note,
+                ambiguous_pessimistic_r=:ambiguous_pessimistic_r,
+                ambiguous_optimistic_r=:ambiguous_optimistic_r,
+                last_evaluated_candle_ts=:last_evaluated_candle_ts,
+                first_outcome_ts=:first_outcome_ts,
+                last_outcome_ts=:last_outcome_ts,
+                branch_active=:branch_active
+            WHERE setup_id=:setup_id
+            """,
+            row,
+            symbol=symbol,
+        )
+
+    def _candle_transaction_boundary(self, name: str) -> None:
+        """Test seam for deterministic crash injection; production is a no-op."""
+        return None
+
+    def _persist_branch(
+        self,
+        symbol: str,
+        *,
+        setup_id: str,
+        branch_key: str,
+        branch_status: str,
+        resolution_status: Optional[str],
+        created_ts: int,
+        resolved_ts: Optional[int],
+        resolved_price: Optional[float],
+        r_lower: Optional[float],
+        r_upper: Optional[float],
+        tp1_hit: bool,
+    ) -> None:
+        self._execute_counted(
+            "update_pending",
+            """
+            INSERT INTO strategy_setup_branches (
+                setup_id, branch_key, branch_status, resolution_status,
+                created_ts, resolved_ts, resolved_price, r_lower, r_upper, tp1_hit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(setup_id, branch_key) DO UPDATE SET
+                branch_status=excluded.branch_status,
+                resolution_status=excluded.resolution_status,
+                resolved_ts=excluded.resolved_ts,
+                resolved_price=excluded.resolved_price,
+                r_lower=excluded.r_lower,
+                r_upper=excluded.r_upper,
+                tp1_hit=excluded.tp1_hit
+            """,
+            (
+                setup_id,
+                branch_key,
+                branch_status,
+                resolution_status,
+                created_ts,
+                resolved_ts,
+                resolved_price,
+                r_lower,
+                r_upper,
+                1 if tp1_hit else 0,
+            ),
+            symbol=symbol,
+        )
+
+    def _apply_later_candle(
+        self,
+        row: dict[str, Any],
+        close_ts: int,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+    ) -> tuple[dict[str, Any], Optional[tuple[Optional[float], Optional[float]]]]:
+        side = str(row.get("side") or "").upper()
+        entry = _safe_float(row.get("activated_price")) or _safe_float(row.get("ideal_entry"))
+        invalidation = _safe_float(row.get("invalidation"))
+        configured_tp1 = _safe_float(row.get("tp1"))
+        tp2 = _safe_float(row.get("tp2"))
+        tp1_hit = bool(int(row.get("tp1_hit") or 0))
+        effective_tp1 = _safe_float(row.get("tp1_price")) if tp1_hit else configured_tp1
+        resolution_status = None
+        resolved_price = None
+        resolution_note = None
+        mark_tp1_hit = False
+
+        if entry is not None:
+            if side == "LONG":
+                fav = max(0.0, high_price - entry)
+                adv = max(0.0, entry - low_price)
+            else:
+                fav = max(0.0, entry - low_price)
+                adv = max(0.0, high_price - entry)
+            prior_fav = _safe_float(row.get("max_favorable_excursion"))
+            prior_adv = _safe_float(row.get("max_adverse_excursion"))
+            row["max_favorable_excursion"] = fav if prior_fav is None else max(prior_fav, fav)
+            row["max_adverse_excursion"] = adv if prior_adv is None else max(prior_adv, adv)
+
+        if not tp1_hit:
+            if BE_MODE and entry is not None and invalidation is not None:
+                risk = abs(entry - invalidation)
+                if risk > 0:
+                    trigger = (
+                        entry + BE_TRIGGER_R * risk
+                        if side == "LONG"
+                        else entry - BE_TRIGGER_R * risk
+                    )
+                    trigger_hit = high_price >= trigger if side == "LONG" else low_price <= trigger
+                    if trigger_hit:
+                        effective_tp1 = trigger
+            if side == "LONG":
+                resolution_status, resolved_price, resolution_note, mark_tp1_hit, _ = (
+                    self._resolve_long_before_tp1(
+                        low_price, high_price, close_price, invalidation, effective_tp1, tp2
+                    )
+                )
+            elif side == "SHORT":
+                resolution_status, resolved_price, resolution_note, mark_tp1_hit, _ = (
+                    self._resolve_short_before_tp1(
+                        low_price, high_price, close_price, invalidation, effective_tp1, tp2
+                    )
+                )
+            if mark_tp1_hit:
+                row["tp1_hit"] = 1
+                row["tp1_hit_ts"] = close_ts
+                row["tp1_price"] = effective_tp1
+                tp1_hit = True
+        elif entry is not None:
+            be_price = self._breakeven_price(side, entry)
+            if side == "LONG":
+                resolution_status, resolved_price, resolution_note = self._resolve_long_after_tp1(
+                    low_price, high_price, close_price, be_price, tp2
+                )
+            elif side == "SHORT":
+                resolution_status, resolved_price, resolution_note = self._resolve_short_after_tp1(
+                    low_price, high_price, close_price, be_price, tp2
+                )
+
+        bounds = None
+        if resolution_status == RESOLUTION_AMBIGUOUS:
+            optimistic_status = None
+            optimistic_price = None
+            optimistic_tp1_hit = False
+            if side == "LONG":
+                if tp2 is not None and high_price >= tp2:
+                    optimistic_status = RESOLUTION_TP2
+                    optimistic_price = tp2
+                    optimistic_tp1_hit = True
+                elif effective_tp1 is not None and high_price >= effective_tp1:
+                    optimistic_status = RESOLUTION_TP1_PARTIAL_THEN_BE
+                    optimistic_price = self._breakeven_price(side, entry)
+                    optimistic_tp1_hit = True
+            else:
+                if tp2 is not None and low_price <= tp2:
+                    optimistic_status = RESOLUTION_TP2
+                    optimistic_price = tp2
+                    optimistic_tp1_hit = True
+                elif effective_tp1 is not None and low_price <= effective_tp1:
+                    optimistic_status = RESOLUTION_TP1_PARTIAL_THEN_BE
+                    optimistic_price = self._breakeven_price(side, entry)
+                    optimistic_tp1_hit = True
+            optimistic_r = self._completed_outcome_r(
+                row,
+                optimistic_status,
+                optimistic_price,
+                optimistic_tp1_hit,
+                effective_tp1,
+            )
+            bounds = (-1.0, optimistic_r)
+            row["ambiguous_pessimistic_r"] = bounds[0]
+            row["ambiguous_optimistic_r"] = bounds[1]
+            resolved_price = None
+        elif resolution_status is not None:
+            exact_r = self._completed_outcome_r(
+                row,
+                resolution_status,
+                resolved_price,
+                tp1_hit,
+                _safe_float(row.get("tp1_price")),
+            )
+            bounds = (exact_r, exact_r)
+
+        row["updated_ts"] = close_ts
+        row["bars_observed"] = int(row.get("bars_observed") or 0) + 1
+        row["last_evaluated_candle_ts"] = close_ts
+        row["first_outcome_ts"] = row.get("first_outcome_ts") or close_ts
+        row["last_outcome_ts"] = close_ts
+        if resolution_status is not None:
+            row["resolution_status"] = resolution_status
+            row["resolved_ts"] = close_ts
+            row["resolved_price"] = resolved_price
+            row["resolution_note"] = resolution_note
+        return row, bounds
+
     def update_pending_with_candle(
         self,
         symbol: str,
@@ -802,8 +1109,8 @@ class StrategyValidationStore:
         low_price = float(low_price)
         close_price = float(close_price)
         override_requested = tick_size is not None or tick_size_source is not None
-        normalized_override_tick: Optional[float] = None
-        normalized_override_source: Optional[str] = None
+        normalized_override_tick = None
+        normalized_override_source = None
         if override_requested:
             if symbol not in self._symbol_tick_provenance:
                 raise ValueError(f"unknown-symbol override rejected for {symbol}")
@@ -817,688 +1124,281 @@ class StrategyValidationStore:
                 )
 
         with self._lock:
-            print(
-                "VALIDATION_FUNCTION_BEGIN "
-                f"symbol={symbol} close_ts={close_ts} "
-                f"high_price={high_price} low_price={low_price} close_price={close_price}",
-                flush=True,
-            )
-            profile = {
-                "rows_scanned": 0,
-                "rows_updated": 0,
-                "rows_skipped": 0,
-                "rows_removed": 0,
-                "activation_checks": 0,
-                "activation_elapsed_ms": 0,
-                "mfe_mae_elapsed_ms": 0,
-                "resolver_before_tp1_elapsed_ms": 0,
-                "resolver_after_tp1_elapsed_ms": 0,
-                "sql_update_elapsed_ms": 0,
-                "commit_elapsed_ms": 0,
-            }
-
-            def _print_validation_summary() -> None:
-                print(
-                    "VALIDATION_FUNCTION_SUMMARY "
-                    f"symbol={symbol} "
-                    f"rows_scanned={profile['rows_scanned']} "
-                    f"rows_updated={profile['rows_updated']} "
-                    f"rows_skipped={profile['rows_skipped']} "
-                    f"rows_removed={profile['rows_removed']} "
-                    f"activation_checks={profile['activation_checks']} "
-                    f"activation_elapsed_ms={profile['activation_elapsed_ms']} "
-                    f"mfe_mae_elapsed_ms={profile['mfe_mae_elapsed_ms']} "
-                    f"resolver_before_tp1_elapsed_ms={profile['resolver_before_tp1_elapsed_ms']} "
-                    f"resolver_after_tp1_elapsed_ms={profile['resolver_after_tp1_elapsed_ms']} "
-                    f"sql_update_elapsed_ms={profile['sql_update_elapsed_ms']} "
-                    f"commit_elapsed_ms={profile['commit_elapsed_ms']} "
-                    f"total_elapsed_ms={_elapsed_ms(started)}",
-                    flush=True,
-                )
-
             self._perf_inc("update_pending", "call_count", 1, symbol=symbol)
             self._ensure_pending_loaded(symbol, perf_category="update_pending")
             pending = self._pending_by_symbol.get(symbol, [])
-            pending_count = len(pending)
-            self._perf_set("update_pending", "current_pending_count", pending_count, symbol=symbol)
-            self._perf_inc("update_pending", "pending_count_total", pending_count, symbol=symbol)
-            with self._perf_lock:
-                counter = self._perf_counter("update_pending", symbol=symbol)
-                counter["max_pending_count"] = max(counter.get("max_pending_count", 0), pending_count)
+            self._perf_set("update_pending", "current_pending_count", len(pending), symbol=symbol)
+            self._perf_inc("update_pending", "pending_count_total", len(pending), symbol=symbol)
             if not pending:
-                self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
-                _print_validation_summary()
                 return
 
-            frozen_ticks: dict[str, tuple[float, str]] = {}
-            for pending_row in pending:
-                setup_id = str(pending_row.get("setup_id") or "")
-                frozen_tick = _require_finite_positive_tick(
-                    pending_row.get("activation_tick_size"),
-                    f"setup {setup_id} frozen tick provenance",
-                )
-                frozen_source = str(
-                    pending_row.get("activation_tick_source") or ""
-                ).strip()
-                if not frozen_source:
-                    raise ValueError(
-                        f"setup {setup_id} requires frozen tick provenance source"
-                    )
+            provenance_by_setup: dict[str, dict[str, Any]] = {}
+            for row in pending:
+                frozen = self._frozen_provenance_from_row(row)
+                setup_id = str(row.get("setup_id") or "")
                 if override_requested and (
-                    normalized_override_tick != frozen_tick
-                    or normalized_override_source != frozen_source
+                    normalized_override_tick != frozen["tick_size"]
+                    or normalized_override_source != frozen["source"]
                 ):
                     raise ValueError(
                         f"historical activation override does not match frozen provenance for setup {setup_id}"
                     )
-                frozen_ticks[setup_id] = (frozen_tick, frozen_source)
+                provenance_by_setup[setup_id] = frozen
 
-            still_pending: list[dict[str, Any]] = []
-
-            def _execute_update_profiled(sql: str, params: Any) -> None:
-                sql_started = time.perf_counter()
-                self._execute_counted("update_pending", sql, params, symbol=symbol)
-                profile["sql_update_elapsed_ms"] += _elapsed_ms(sql_started)
-                profile["rows_updated"] += 1
-
-            def _mark_dirty_profiled() -> None:
-                commit_before = self._perf_counter("update_pending", symbol=symbol).get("commit_elapsed_s", 0.0)
-                self._mark_dirty(category="update_pending", symbol=symbol)
-                commit_after = self._perf_counter("update_pending", symbol=symbol).get("commit_elapsed_s", 0.0)
-                profile["commit_elapsed_ms"] += round(max(0.0, commit_after - commit_before) * 1000, 3)
-
-            def _print_slow_row(row: dict[str, Any], row_elapsed_ms: float) -> None:
-                if row_elapsed_ms <= 100:
-                    return
-                print(
-                    "VALIDATION_SLOW_ROW "
-                    f"setup_id={row.get('setup_id')} "
-                    f"symbol={symbol} "
-                    f"activation_status={row.get('activation_status')} "
-                    f"resolution_status={row.get('resolution_status')} "
-                    f"elapsed_ms={row_elapsed_ms}",
-                    flush=True,
-                )
-
-            def _print_progress() -> None:
-                if profile["rows_scanned"] % 100 != 0:
-                    return
-                print(
-                    "VALIDATION_PROGRESS "
-                    f"symbol={symbol} "
-                    f"processed_rows={profile['rows_scanned']} "
-                    f"elapsed_ms={_elapsed_ms(started)}",
-                    flush=True,
-                )
-
-            def _floats_meaningfully_different(left: Optional[float], right: Optional[float]) -> bool:
-                if left is None or right is None:
-                    return left is not right
-                return abs(float(left) - float(right)) > 1e-12
-
-            def _record_noop_skipped(*, progress_key: Optional[str] = None, noop_candidate: bool = True) -> None:
-                self._perf_inc("update_pending", "noop_skipped_count", 1, symbol=symbol)
-                if progress_key is not None:
-                    self._perf_inc("update_pending", progress_key, 1, symbol=symbol)
-                if noop_candidate:
-                    self._perf_inc("update_pending", "update_pending_noop_candidate_updates", 1, symbol=symbol)
-
-            def _record_update_diagnostic(
-                *,
-                event_key: Optional[str] = None,
-                progress_key: Optional[str] = None,
-                only_timestamp: bool = False,
-                excursion: bool = False,
-                noop_candidate: bool = False,
-            ) -> None:
-                self._perf_inc("update_pending", "update_pending_sql_updates_total", 1, symbol=symbol)
-                if event_key is not None:
-                    self._perf_inc("update_pending", "update_pending_event_updates", 1, symbol=symbol)
-                    self._perf_inc("update_pending", "lifecycle_update_count", 1, symbol=symbol)
-                    self._perf_inc("update_pending", event_key, 1, symbol=symbol)
-                if progress_key is not None:
-                    self._perf_inc("update_pending", "update_pending_progress_updates", 1, symbol=symbol)
-                    self._perf_inc("update_pending", progress_key, 1, symbol=symbol)
-                if only_timestamp:
-                    self._perf_inc("update_pending", "update_pending_only_timestamp_updates", 1, symbol=symbol)
-                if excursion:
-                    self._perf_inc("update_pending", "update_pending_excursion_updates", 1, symbol=symbol)
-                if noop_candidate:
-                    self._perf_inc("update_pending", "update_pending_noop_candidate_updates", 1, symbol=symbol)
-
-            for row in pending:
-                row_started = time.perf_counter()
-                self._perf_inc("update_pending", "trades_scanned", 1, symbol=symbol)
-                profile["rows_scanned"] += 1
-                last_evaluated_candle_ts = _safe_int(
-                    row.get("last_evaluated_candle_ts")
-                )
-                if (
-                    int(row.get("reference_ts") or 0) >= close_ts
-                    or (
-                        last_evaluated_candle_ts is not None
-                        and close_ts <= last_evaluated_candle_ts
-                    )
+            eligible = []
+            skipped = []
+            for original_row in pending:
+                watermark = _safe_int(original_row.get("last_evaluated_candle_ts"))
+                if int(original_row.get("reference_ts") or 0) >= close_ts or (
+                    watermark is not None and close_ts <= watermark
                 ):
-                    still_pending.append(row)
-                    profile["rows_skipped"] += 1
-                    _print_progress()
-                    _print_slow_row(row, _elapsed_ms(row_started))
-                    continue
+                    skipped.append(original_row)
+                else:
+                    eligible.append(original_row)
+            self._perf_inc("update_pending", "trades_scanned", len(pending), symbol=symbol)
+            if not eligible:
+                self._perf_inc("update_pending", "noop_skipped_count", len(skipped), symbol=symbol)
+                self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
+                return
 
-                bars_observed = int(row.get("bars_observed") or 0) + 1
-                side = str(row.get("side") or "").upper()
-                ideal_entry = _safe_float(row.get("ideal_entry"))
-                invalidation = _safe_float(row.get("invalidation"))
-                tp1 = _safe_float(row.get("tp1"))
-                tp2 = _safe_float(row.get("tp2"))
-                activation_status = str(row.get("activation_status") or ACTIVATION_PENDING).upper()
-                tp1_hit = bool(int(row.get("tp1_hit") or 0))
-                activated_this_candle = False
-                normalized_tick_size, normalized_tick_source = frozen_ticks[
-                    str(row.get("setup_id") or "")
-                ]
+            if self._conn.in_transaction:
+                self._record_commit(category="update_pending", symbol=symbol)
+                self._dirty_writes = 0
 
-                max_fav = _safe_float(row.get("max_favorable_excursion"))
-                max_adv = _safe_float(row.get("max_adverse_excursion"))
-                first_outcome_ts = row.get("first_outcome_ts") if row.get("first_outcome_ts") is not None else close_ts
-                last_outcome_ts = close_ts
+            next_pending = [dict(row) for row in skipped]
+            committed_events: list[str] = []
+            savepoint = "validation_candle"
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            self._candle_transaction_active = True
+            released = False
+            try:
+                self._candle_transaction_boundary("after_savepoint")
+                for original_row in eligible:
+                    row = dict(original_row)
+                    setup_id = str(row["setup_id"])
+                    side = str(row.get("side") or "").upper()
+                    ideal_entry = _safe_float(row.get("ideal_entry"))
+                    invalidation = _safe_float(row.get("invalidation"))
+                    tp1 = _safe_float(row.get("tp1"))
+                    tp2 = _safe_float(row.get("tp2"))
+                    activation_status = str(row.get("activation_status") or ACTIVATION_PENDING).upper()
+                    tick = provenance_by_setup[setup_id]["tick_size"]
 
-                if activation_status == ACTIVATION_PENDING:
-                    activation_started = time.perf_counter()
-                    should_activate = self._should_activate(
-                        side=side,
-                        high_price=high_price,
-                        low_price=low_price,
-                        ideal_entry=ideal_entry,
-                        tick_size=normalized_tick_size,
-                    )
-                    profile["activation_checks"] += 1
-                    profile["activation_elapsed_ms"] += _elapsed_ms(activation_started)
-                    if should_activate:
-                        activated_price = ideal_entry if ideal_entry is not None else close_price
-                        _execute_update_profiled(
-                            """
-                            UPDATE strategy_setups
-                            SET updated_ts = ?,
-                                bars_observed = ?,
-                                activation_status = ?,
-                                activated_ts = ?,
-                                activated_price = ?,
-                                last_evaluated_candle_ts = ?,
-                                first_outcome_ts = ?,
-                                last_outcome_ts = ?
-                            WHERE setup_id = ?
-                            """,
-                            (
-                                close_ts,
-                                bars_observed,
-                                ACTIVATION_ACTIVE,
-                                close_ts,
-                                activated_price,
-                                close_ts,
-                                first_outcome_ts,
-                                last_outcome_ts,
-                                row["setup_id"],
-                            ),
+                    if activation_status == ACTIVATION_PENDING:
+                        bars = int(row.get("bars_observed") or 0) + 1
+                        activated = self._should_activate(
+                            side, high_price, low_price, ideal_entry, tick
                         )
                         row["updated_ts"] = close_ts
-                        row["bars_observed"] = bars_observed
+                        row["bars_observed"] = bars
+                        row["last_evaluated_candle_ts"] = close_ts
+                        if not activated:
+                            if bars >= PENDING_EXPIRY_CANDLES:
+                                row["resolution_status"] = RESOLUTION_EXPIRED
+                                row["resolved_ts"] = close_ts
+                                row["resolution_note"] = "pending_not_activated_within_three_candles"
+                                committed_events.append("expired")
+                            else:
+                                next_pending.append(row)
+                                committed_events.append("pending")
+                            self._persist_setup_state(symbol, row)
+                            continue
+
                         row["activation_status"] = ACTIVATION_ACTIVE
                         row["activated_ts"] = close_ts
-                        row["activated_price"] = activated_price
-                        row["last_evaluated_candle_ts"] = close_ts
-                        row["first_outcome_ts"] = first_outcome_ts
-                        row["last_outcome_ts"] = last_outcome_ts
-                        activation_status = ACTIVATION_ACTIVE
-                        activated_this_candle = True
-                        _mark_dirty_profiled()
-                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                        self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
-                        _record_update_diagnostic(event_key="update_pending_event_activation")
-                    else:
-                        expired = bars_observed >= PENDING_EXPIRY_CANDLES
-                        _execute_update_profiled(
-                            """
-                            UPDATE strategy_setups
-                            SET updated_ts = ?,
-                                bars_observed = ?,
-                                resolution_status = ?,
-                                resolved_ts = ?,
-                                resolution_note = ?,
-                                last_evaluated_candle_ts = ?
-                            WHERE setup_id = ?
-                            """,
-                            (
-                                close_ts,
-                                bars_observed,
-                                RESOLUTION_EXPIRED if expired else RESOLUTION_PENDING,
-                                close_ts if expired else None,
-                                "pending_not_activated_within_three_candles" if expired else None,
-                                close_ts,
-                                row["setup_id"],
-                            ),
+                        row["activated_price"] = ideal_entry
+                        row["first_outcome_ts"] = row.get("first_outcome_ts") or close_ts
+                        row["last_outcome_ts"] = close_ts
+                        committed_events.append("activated")
+                        stop_hit = invalidation is not None and (
+                            (side == "LONG" and low_price <= invalidation)
+                            or (side == "SHORT" and high_price >= invalidation)
                         )
-                        row["updated_ts"] = close_ts
-                        row["bars_observed"] = bars_observed
-                        row["last_evaluated_candle_ts"] = close_ts
-                        if expired:
-                            row["resolution_status"] = RESOLUTION_EXPIRED
+                        tp1_hit_on_candle = tp1 is not None and (
+                            (side == "LONG" and high_price >= tp1)
+                            or (side == "SHORT" and low_price <= tp1)
+                        )
+                        tp2_hit_on_candle = tp2 is not None and (
+                            (side == "LONG" and high_price >= tp2)
+                            or (side == "SHORT" and low_price <= tp2)
+                        )
+                        if stop_hit:
+                            row["resolution_status"] = RESOLUTION_STOPPED
                             row["resolved_ts"] = close_ts
-                            row["resolution_note"] = "pending_not_activated_within_three_candles"
-                            profile["rows_removed"] += 1
-                            self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
-                            _record_update_diagnostic(event_key="update_pending_event_timeout_expiry")
-                        else:
-                            still_pending.append(row)
-                            _record_update_diagnostic(
-                                progress_key="update_pending_progress_pending_not_activated"
+                            row["resolved_price"] = invalidation
+                            row["resolution_note"] = "activation_candle_stop_touch"
+                            committed_events.append("resolved_stop")
+                        elif tp1_hit_on_candle or tp2_hit_on_candle:
+                            target_status = RESOLUTION_TP2 if tp2_hit_on_candle else "TP1"
+                            target_price = tp2 if tp2_hit_on_candle else tp1
+                            if tp2_hit_on_candle:
+                                target_r = self._completed_outcome_r(
+                                    row, RESOLUTION_TP2, target_price, True, tp1
+                                )
+                            else:
+                                target_r = self._r_for_price(
+                                    side, ideal_entry, invalidation, target_price
+                                )
+                            row["resolution_status"] = RESOLUTION_AMBIGUOUS
+                            row["resolved_ts"] = None
+                            row["resolved_price"] = None
+                            row["resolution_note"] = "activation_candle_target_order_unknown:branched"
+                            row["ambiguous_pessimistic_r"] = None
+                            row["ambiguous_optimistic_r"] = None
+                            row["branch_active"] = 1
+                            self._persist_branch(
+                                symbol,
+                                setup_id=setup_id,
+                                branch_key="TARGET_TERMINAL",
+                                branch_status="COMPLETED",
+                                resolution_status=target_status,
+                                created_ts=close_ts,
+                                resolved_ts=close_ts,
+                                resolved_price=target_price,
+                                r_lower=target_r,
+                                r_upper=target_r,
+                                tp1_hit=tp2_hit_on_candle,
                             )
-                        _mark_dirty_profiled()
-                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                        _print_progress()
-                        _print_slow_row(row, _elapsed_ms(row_started))
-                        continue
-
-                if activation_status != ACTIVATION_ACTIVE:
-                    still_pending.append(row)
-                    profile["rows_skipped"] += 1
-                    _print_progress()
-                    _print_slow_row(row, _elapsed_ms(row_started))
-                    continue
-
-                entry_price = _safe_float(row.get("activated_price"))
-                if entry_price is None:
-                    entry_price = ideal_entry
-
-                mfe_mae_started = time.perf_counter()
-                if entry_price is not None:
-                    if side == "LONG":
-                        favorable = high_price - entry_price
-                        adverse = entry_price - low_price
-                    else:
-                        favorable = entry_price - low_price
-                        adverse = high_price - entry_price
-                    favorable = max(0.0, favorable)
-                    adverse = max(0.0, adverse)
-                    max_fav = favorable if max_fav is None else max(max_fav, favorable)
-                    max_adv = adverse if max_adv is None else max(max_adv, adverse)
-                profile["mfe_mae_elapsed_ms"] += _elapsed_ms(mfe_mae_started)
-
-                resolution_status = None
-                resolved_price = None
-                resolution_note = None
-
-                if activated_this_candle and entry_price is not None:
-                    (
-                        resolution_status,
-                        resolved_price,
-                        resolution_note,
-                        ambiguous_pessimistic_r,
-                        ambiguous_optimistic_r,
-                    ) = self._activation_candle_outcome(
-                        side=side,
-                        low_price=low_price,
-                        high_price=high_price,
-                        entry_price=entry_price,
-                        invalidation=invalidation,
-                        tp1=tp1,
-                        tp2=tp2,
-                    )
-                    if resolution_status is not None:
-                        _execute_update_profiled(
-                            """
-                            UPDATE strategy_setups
-                            SET updated_ts = ?,
-                                bars_observed = ?,
-                                max_favorable_excursion = ?,
-                                max_adverse_excursion = ?,
-                                resolution_status = ?,
-                                resolved_ts = ?,
-                                resolved_price = ?,
-                                resolution_note = ?,
-                                ambiguous_pessimistic_r = ?,
-                                ambiguous_optimistic_r = ?,
-                                last_evaluated_candle_ts = ?,
-                                first_outcome_ts = ?,
-                                last_outcome_ts = ?
-                            WHERE setup_id = ?
-                            """,
-                            (
-                                close_ts,
-                                bars_observed,
-                                max_fav,
-                                max_adv,
-                                resolution_status,
-                                close_ts,
-                                resolved_price,
-                                resolution_note,
-                                ambiguous_pessimistic_r,
-                                ambiguous_optimistic_r,
-                                close_ts,
-                                first_outcome_ts,
-                                last_outcome_ts,
-                                row["setup_id"],
-                            ),
-                        )
-                        row["updated_ts"] = close_ts
-                        row["bars_observed"] = bars_observed
-                        row["max_favorable_excursion"] = max_fav
-                        row["max_adverse_excursion"] = max_adv
-                        row["resolution_status"] = resolution_status
-                        row["resolved_ts"] = close_ts
-                        row["resolved_price"] = resolved_price
-                        row["resolution_note"] = resolution_note
-                        row["ambiguous_pessimistic_r"] = ambiguous_pessimistic_r
-                        row["ambiguous_optimistic_r"] = ambiguous_optimistic_r
-                        row["last_evaluated_candle_ts"] = close_ts
-                        row["first_outcome_ts"] = first_outcome_ts
-                        row["last_outcome_ts"] = last_outcome_ts
-                        _mark_dirty_profiled()
-                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                        self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
-                        if resolution_status == RESOLUTION_STOPPED:
-                            self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
-                            self._perf_inc(
-                                "update_pending", "update_pending_event_stop_loss", 1, symbol=symbol
+                            self._persist_branch(
+                                symbol,
+                                setup_id=setup_id,
+                                branch_key="STILL_ACTIVE",
+                                branch_status="ACTIVE",
+                                resolution_status=None,
+                                created_ts=close_ts,
+                                resolved_ts=None,
+                                resolved_price=None,
+                                r_lower=None,
+                                r_upper=None,
+                                tp1_hit=False,
                             )
+                            next_pending.append(row)
+                            committed_events.append("branched")
                         else:
-                            self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
-                        _record_update_diagnostic(
-                            event_key="update_pending_event_final_resolution",
-                            excursion=True,
-                        )
-                        profile["rows_removed"] += 1
-                        _print_progress()
-                        _print_slow_row(row, _elapsed_ms(row_started))
+                            row["resolution_status"] = RESOLUTION_PENDING
+                            next_pending.append(row)
+                        self._persist_setup_state(symbol, row)
                         continue
 
-                if not tp1_hit:
-                    if BE_MODE and entry_price is not None:
-                        risk = abs(entry_price - invalidation) if invalidation is not None else None
-                        if risk and risk > 0:
-                            if side == "LONG":
-                                trigger = entry_price + BE_TRIGGER_R * risk
-                                if high_price >= trigger:
-                                    tp1_hit = True
-                                    tp1 = trigger
-                            elif side == "SHORT":
-                                trigger = entry_price - BE_TRIGGER_R * risk
-                                if low_price <= trigger:
-                                    tp1_hit = True
-                                    tp1 = trigger
-
-                    resolver_started = time.perf_counter()
-                    if side == "LONG":
-                        resolution_status, resolved_price, resolution_note, mark_tp1_hit, direct_tp2 = self._resolve_long_before_tp1(
-                            low_price, high_price, close_price, invalidation, tp1, tp2
-                        )
-                    elif side == "SHORT":
-                        resolution_status, resolved_price, resolution_note, mark_tp1_hit, direct_tp2 = self._resolve_short_before_tp1(
-                            low_price, high_price, close_price, invalidation, tp1, tp2
-                        )
+                    is_branched = bool(int(row.get("branch_active") or 0))
+                    working = dict(row)
+                    if is_branched:
+                        working["resolution_status"] = RESOLUTION_PENDING
+                        working["resolved_ts"] = None
+                        working["resolved_price"] = None
+                    working, outcome_bounds = self._apply_later_candle(
+                        working, close_ts, high_price, low_price, close_price
+                    )
+                    if is_branched:
+                        if outcome_bounds is None:
+                            working["resolution_status"] = RESOLUTION_AMBIGUOUS
+                            working["resolved_ts"] = None
+                            working["resolved_price"] = None
+                            working["resolution_note"] = "activation_candle_target_order_unknown:active_branch_open"
+                            working["branch_active"] = 1
+                            self._persist_branch(
+                                symbol,
+                                setup_id=setup_id,
+                                branch_key="STILL_ACTIVE",
+                                branch_status="ACTIVE",
+                                resolution_status=None,
+                                created_ts=int(row.get("activated_ts") or close_ts),
+                                resolved_ts=None,
+                                resolved_price=None,
+                                r_lower=None,
+                                r_upper=None,
+                                tp1_hit=bool(int(working.get("tp1_hit") or 0)),
+                            )
+                            next_pending.append(working)
+                        else:
+                            active_status = str(working.get("resolution_status") or "")
+                            self._persist_branch(
+                                symbol,
+                                setup_id=setup_id,
+                                branch_key="STILL_ACTIVE",
+                                branch_status="COMPLETED",
+                                resolution_status=active_status,
+                                created_ts=int(row.get("activated_ts") or close_ts),
+                                resolved_ts=close_ts,
+                                resolved_price=_safe_float(working.get("resolved_price")),
+                                r_lower=outcome_bounds[0],
+                                r_upper=outcome_bounds[1],
+                                tp1_hit=bool(int(working.get("tp1_hit") or 0)),
+                            )
+                            branch_bounds = self._execute_counted(
+                                "update_pending",
+                                """
+                                SELECT r_lower, r_upper
+                                FROM strategy_setup_branches
+                                WHERE setup_id = ? AND branch_status = 'COMPLETED'
+                                ORDER BY branch_key
+                                """,
+                                (setup_id,),
+                                symbol=symbol,
+                            ).fetchall()
+                            lowers = [_safe_float(item["r_lower"]) for item in branch_bounds]
+                            uppers = [_safe_float(item["r_upper"]) for item in branch_bounds]
+                            working["resolution_status"] = RESOLUTION_AMBIGUOUS
+                            working["resolved_ts"] = close_ts
+                            working["resolved_price"] = None
+                            working["resolution_note"] = "activation_candle_target_order_unknown:branches_completed"
+                            working["ambiguous_pessimistic_r"] = min(
+                                value for value in lowers if value is not None
+                            )
+                            working["ambiguous_optimistic_r"] = max(
+                                value for value in uppers if value is not None
+                            )
+                            working["branch_active"] = 0
+                            committed_events.append("branched_resolved")
+                    elif str(working.get("resolution_status") or "") == RESOLUTION_PENDING:
+                        next_pending.append(working)
                     else:
-                        mark_tp1_hit = False
-                    profile["resolver_before_tp1_elapsed_ms"] += _elapsed_ms(resolver_started)
+                        committed_events.append("resolved")
+                    self._persist_setup_state(symbol, working)
 
-                    if mark_tp1_hit and resolution_status is None:
-                        _execute_update_profiled(
-                            """
-                            UPDATE strategy_setups
-                            SET updated_ts = ?,
-                                bars_observed = ?,
-                                tp1_hit = 1,
-                                tp1_hit_ts = ?,
-                                tp1_price = ?,
-                                max_favorable_excursion = ?,
-                                max_adverse_excursion = ?,
-                                last_evaluated_candle_ts = ?,
-                                first_outcome_ts = ?,
-                                last_outcome_ts = ?
-                            WHERE setup_id = ?
-                            """,
-                            (close_ts, bars_observed, close_ts, tp1, max_fav, max_adv, close_ts, first_outcome_ts, last_outcome_ts, row["setup_id"]),
-                        )
-                        row["updated_ts"] = close_ts
-                        row["bars_observed"] = bars_observed
-                        row["tp1_hit"] = 1
-                        row["tp1_hit_ts"] = close_ts
-                        row["tp1_price"] = tp1
-                        row["max_favorable_excursion"] = max_fav
-                        row["max_adverse_excursion"] = max_adv
-                        row["last_evaluated_candle_ts"] = close_ts
-                        row["first_outcome_ts"] = first_outcome_ts
-                        row["last_outcome_ts"] = last_outcome_ts
-                        still_pending.append(row)
-                        _mark_dirty_profiled()
-                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                        self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
-                        _record_update_diagnostic(
-                            event_key="update_pending_event_tp1_hit",
-                            excursion=True,
-                        )
-                        _print_progress()
-                        _print_slow_row(row, _elapsed_ms(row_started))
-                        continue
+                self._candle_transaction_boundary("before_release")
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                released = True
+                self._candle_transaction_boundary("after_release")
+            except BaseException:
+                if not released:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self._pending_by_symbol.pop(symbol, None)
+                self._pending_loaded_symbols.discard(symbol)
+                raise
+            finally:
+                self._candle_transaction_active = False
 
-                    if mark_tp1_hit and resolution_status is not None:
-                        _execute_update_profiled(
-                            """
-                            UPDATE strategy_setups
-                            SET updated_ts = ?,
-                                bars_observed = ?,
-                                tp1_hit = 1,
-                                tp1_hit_ts = ?,
-                                tp1_price = ?,
-                                max_favorable_excursion = ?,
-                                max_adverse_excursion = ?,
-                                resolution_status = ?,
-                                resolved_ts = ?,
-                                resolved_price = ?,
-                                resolution_note = ?,
-                                last_evaluated_candle_ts = ?,
-                                first_outcome_ts = ?,
-                                last_outcome_ts = ?
-                            WHERE setup_id = ?
-                            """,
-                            (
-                                close_ts,
-                                bars_observed,
-                                close_ts,
-                                tp1,
-                                max_fav,
-                                max_adv,
-                                resolution_status,
-                                close_ts,
-                                resolved_price,
-                                resolution_note,
-                                close_ts,
-                                first_outcome_ts,
-                                last_outcome_ts,
-                                row["setup_id"],
-                            ),
-                        )
-                        row["updated_ts"] = close_ts
-                        row["bars_observed"] = bars_observed
-                        row["tp1_hit"] = 1
-                        row["tp1_hit_ts"] = close_ts
-                        row["tp1_price"] = tp1
-                        row["max_favorable_excursion"] = max_fav
-                        row["max_adverse_excursion"] = max_adv
-                        row["resolution_status"] = resolution_status
-                        row["resolved_ts"] = close_ts
-                        row["resolved_price"] = resolved_price
-                        row["resolution_note"] = resolution_note
-                        row["last_evaluated_candle_ts"] = close_ts
-                        row["first_outcome_ts"] = first_outcome_ts
-                        row["last_outcome_ts"] = last_outcome_ts
-                        _mark_dirty_profiled()
-                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                        self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
-                        self._perf_inc("update_pending", "tp1_hits", 1, symbol=symbol)
-                        if resolution_status == RESOLUTION_TP2:
-                            self._perf_inc("update_pending", "tp2_hits", 1, symbol=symbol)
-                        elif resolution_status == RESOLUTION_STOPPED:
-                            self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
-                        elif resolution_status == RESOLUTION_AMBIGUOUS:
-                            self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
-                        _record_update_diagnostic(
-                            event_key="update_pending_event_final_resolution",
-                            excursion=True,
-                        )
-                        if resolution_status == RESOLUTION_STOPPED:
-                            self._perf_inc("update_pending", "update_pending_event_stop_loss", 1, symbol=symbol)
-                        elif resolution_status == RESOLUTION_TP1_PARTIAL_THEN_BE:
-                            self._perf_inc("update_pending", "update_pending_event_break_even", 1, symbol=symbol)
-                        profile["rows_removed"] += 1
-                        _print_progress()
-                        _print_slow_row(row, _elapsed_ms(row_started))
-                        continue
-                else:
-                    if entry_price is None:
-                        still_pending.append(row)
-                        profile["rows_skipped"] += 1
-                        _print_progress()
-                        _print_slow_row(row, _elapsed_ms(row_started))
-                        continue
-                    be_price = self._breakeven_price(side, entry_price)
-
-                    resolver_started = time.perf_counter()
-                    if side == "LONG":
-                        resolution_status, resolved_price, resolution_note = self._resolve_long_after_tp1(
-                            low_price, high_price, close_price, be_price, tp2
-                        )
-                    elif side == "SHORT":
-                        resolution_status, resolved_price, resolution_note = self._resolve_short_after_tp1(
-                            low_price, high_price, close_price, be_price, tp2
-                        )
-                    profile["resolver_after_tp1_elapsed_ms"] += _elapsed_ms(resolver_started)
-
-                if resolution_status is None:
-                    excursion_changed = (
-                        _floats_meaningfully_different(_safe_float(row.get("max_favorable_excursion")), max_fav)
-                        or _floats_meaningfully_different(_safe_float(row.get("max_adverse_excursion")), max_adv)
-                    )
-                    if not excursion_changed:
-                        _execute_update_profiled(
-                            """
-                            UPDATE strategy_setups
-                            SET updated_ts = ?,
-                                bars_observed = ?,
-                                last_evaluated_candle_ts = ?
-                            WHERE setup_id = ?
-                            """,
-                            (close_ts, bars_observed, close_ts, row["setup_id"]),
-                        )
-                        row["updated_ts"] = close_ts
-                        row["bars_observed"] = bars_observed
-                        row["last_evaluated_candle_ts"] = close_ts
-                        still_pending.append(row)
-                        _mark_dirty_profiled()
-                        self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                        _record_update_diagnostic(
-                            progress_key="update_pending_progress_unresolved_active",
-                            only_timestamp=True,
-                        )
-                        _print_progress()
-                        _print_slow_row(row, _elapsed_ms(row_started))
-                        continue
-
-                    _execute_update_profiled(
-                        """
-                        UPDATE strategy_setups
-                        SET updated_ts = ?,
-                            bars_observed = ?,
-                            max_favorable_excursion = ?,
-                            max_adverse_excursion = ?,
-                            last_evaluated_candle_ts = ?,
-                            first_outcome_ts = ?,
-                            last_outcome_ts = ?
-                        WHERE setup_id = ?
-                        """,
-                        (close_ts, bars_observed, max_fav, max_adv, close_ts, first_outcome_ts, last_outcome_ts, row["setup_id"]),
-                    )
-                    row["updated_ts"] = close_ts
-                    row["bars_observed"] = bars_observed
-                    row["max_favorable_excursion"] = max_fav
-                    row["max_adverse_excursion"] = max_adv
-                    row["last_evaluated_candle_ts"] = close_ts
-                    row["first_outcome_ts"] = first_outcome_ts
-                    row["last_outcome_ts"] = last_outcome_ts
-                    still_pending.append(row)
-                    _mark_dirty_profiled()
-                    self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                    _record_update_diagnostic(
-                        progress_key="update_pending_progress_unresolved_active",
-                        excursion=True,
-                        noop_candidate=False,
-                    )
-                    _print_progress()
-                    _print_slow_row(row, _elapsed_ms(row_started))
-                else:
-                    _execute_update_profiled(
-                        """
-                        UPDATE strategy_setups
-                        SET updated_ts = ?,
-                            bars_observed = ?,
-                            max_favorable_excursion = ?,
-                            max_adverse_excursion = ?,
-                            resolution_status = ?,
-                            resolved_ts = ?,
-                            resolved_price = ?,
-                            resolution_note = ?,
-                            last_evaluated_candle_ts = ?,
-                            first_outcome_ts = ?,
-                            last_outcome_ts = ?
-                        WHERE setup_id = ?
-                        """,
-                        (
-                            close_ts,
-                            bars_observed,
-                            max_fav,
-                            max_adv,
-                            resolution_status,
-                            close_ts,
-                            resolved_price,
-                            resolution_note,
-                            close_ts,
-                            first_outcome_ts,
-                            last_outcome_ts,
-                            row["setup_id"],
-                        ),
-                    )
-                    row["updated_ts"] = close_ts
-                    row["bars_observed"] = bars_observed
-                    row["max_favorable_excursion"] = max_fav
-                    row["max_adverse_excursion"] = max_adv
-                    row["resolution_status"] = resolution_status
-                    row["resolved_ts"] = close_ts
-                    row["resolved_price"] = resolved_price
-                    row["resolution_note"] = resolution_note
-                    row["last_evaluated_candle_ts"] = close_ts
-                    row["first_outcome_ts"] = first_outcome_ts
-                    row["last_outcome_ts"] = last_outcome_ts
-                    _mark_dirty_profiled()
-                    self._perf_inc("update_pending", "trades_updated", 1, symbol=symbol)
-                    self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
-                    if resolution_status == RESOLUTION_TP2:
-                        self._perf_inc("update_pending", "tp2_hits", 1, symbol=symbol)
-                    elif resolution_status == RESOLUTION_STOPPED:
-                        self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
-                    elif resolution_status == RESOLUTION_AMBIGUOUS:
-                        self._perf_inc("update_pending", "ambiguous_hits", 1, symbol=symbol)
-                    _record_update_diagnostic(
-                        event_key="update_pending_event_final_resolution",
-                        excursion=True,
-                    )
-                    if resolution_status == RESOLUTION_STOPPED:
-                        self._perf_inc("update_pending", "update_pending_event_stop_loss", 1, symbol=symbol)
-                    elif resolution_status == RESOLUTION_TP1_PARTIAL_THEN_BE:
-                        self._perf_inc("update_pending", "update_pending_event_break_even", 1, symbol=symbol)
-                    profile["rows_removed"] += 1
-                    _print_progress()
-                    _print_slow_row(row, _elapsed_ms(row_started))
-
-            self._pending_by_symbol[symbol] = [r for r in still_pending if str(r.get("resolution_status") or "").upper() == RESOLUTION_PENDING]
+            self._record_commit(category="update_pending", symbol=symbol)
+            self._dirty_writes = 0
+            self._pending_by_symbol[symbol] = next_pending
+            self._pending_loaded_symbols.add(symbol)
+            self._perf_inc("update_pending", "trades_updated", len(eligible), symbol=symbol)
+            self._perf_inc("update_pending", "update_pending_sql_updates_total", len(eligible), symbol=symbol)
             self._perf_inc("update_pending", "elapsed_s", time.perf_counter() - started, symbol=symbol)
-            _print_validation_summary()
+            for event in committed_events:
+                if event == "pending":
+                    self._perf_inc(
+                        "update_pending",
+                        "update_pending_progress_pending_not_activated",
+                        1,
+                        symbol=symbol,
+                    )
+                elif event == "activated":
+                    self._perf_inc("update_pending", "trades_activated", 1, symbol=symbol)
+                    self._perf_inc("update_pending", "lifecycle_update_count", 1, symbol=symbol)
+                    self._perf_inc(
+                        "update_pending", "update_pending_event_activation", 1, symbol=symbol
+                    )
+                elif event in ("resolved", "resolved_stop", "branched_resolved", "expired"):
+                    self._perf_inc("update_pending", "trades_resolved", 1, symbol=symbol)
+                if event == "resolved_stop":
+                    self._perf_inc("update_pending", "stop_hits", 1, symbol=symbol)
+            print(
+                "VALIDATION_FUNCTION_SUMMARY "
+                f"symbol={symbol} rows_scanned={len(pending)} "
+                f"rows_updated={len(eligible)} rows_skipped={len(skipped)} "
+                f"total_elapsed_ms={_elapsed_ms(started)}",
+                flush=True,
+            )

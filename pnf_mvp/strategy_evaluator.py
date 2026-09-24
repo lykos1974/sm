@@ -13,6 +13,12 @@ from pathlib import Path
 
 import pandas as pd
 
+from strategy_trade_export import (
+    build_accounting_breakdown,
+    build_accounting_summary,
+    compute_trade_metrics,
+)
+
 
 DB_PATH = "strategy_validation.db"
 TABLE_NAME = "strategy_setups"
@@ -62,33 +68,8 @@ def load_data(db_path: str = DB_PATH) -> pd.DataFrame:
 
 
 def basic_stats(df: pd.DataFrame) -> dict:
-    total = len(df)
-    resolved = df[df["resolution_status"].notna() & (df["resolution_status"] != "PENDING")]
-
-    wins = resolved[resolved["resolution_status"].isin(["TP1", "TP2"])]
-    losses = resolved[resolved["resolution_status"] == "STOPPED"]
-    ambiguous = resolved[resolved["resolution_status"] == "AMBIGUOUS"]
-    expired = resolved[resolved["resolution_status"] == "EXPIRED"]
-    headline_outcomes = len(wins) + len(losses) + len(ambiguous)
-
-    return {
-        "total_setups": int(total),
-        "resolved_setups": int(len(resolved)),
-        "pending_setups": int((df["resolution_status"] == "PENDING").sum()) if "resolution_status" in df.columns else 0,
-        "win_rate_resolved": (len(wins) / len(resolved)) if len(resolved) else 0.0,
-        "loss_rate_resolved": (len(losses) / len(resolved)) if len(resolved) else 0.0,
-        "ambiguous_rate_resolved": (len(ambiguous) / len(resolved)) if len(resolved) else 0.0,
-        "expired_rate_resolved": (len(expired) / len(resolved)) if len(resolved) else 0.0,
-        "headline_outcome_rows": int(headline_outcomes),
-        "win_rate_pessimistic_bound": (
-            len(wins) / headline_outcomes if headline_outcomes else 0.0
-        ),
-        "win_rate_optimistic_bound": (
-            (len(wins) + len(ambiguous)) / headline_outcomes
-            if headline_outcomes
-            else 0.0
-        ),
-    }
+    metrics = df if "r_pessimistic_bound" in df.columns else compute_trade_metrics(df)
+    return build_accounting_summary(metrics)
 
 
 def count_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
@@ -108,69 +89,23 @@ def outcome_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
     if field not in df.columns or "resolution_status" not in df.columns:
         return pd.DataFrame()
 
-    resolved = df[df["resolution_status"].notna() & (df["resolution_status"] != "PENDING")].copy()
-    if resolved.empty:
-        return pd.DataFrame()
-
-    out = (
-        resolved.groupby([field, "resolution_status"], dropna=False)
-        .size()
-        .unstack(fill_value=0)
-    )
-
-    out["resolved_total"] = out.sum(axis=1)
-    for col in ["TP1", "TP2", "STOPPED", "AMBIGUOUS", "EXPIRED"]:
-        if col not in out.columns:
-            out[col] = 0
-
-    out["win_rate"] = (out["TP1"] + out["TP2"]) / out["resolved_total"]
-    out["loss_rate"] = out["STOPPED"] / out["resolved_total"]
-    out = out.sort_values(["win_rate", "resolved_total"], ascending=[False, False])
-    return out
+    metrics = df if "r_pessimistic_bound" in df.columns else compute_trade_metrics(df)
+    return build_accounting_breakdown(metrics, field).set_index(field)
 
 
 def expectancy_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
     if field not in df.columns or "resolution_status" not in df.columns:
         return pd.DataFrame()
 
-    resolved = df[df["resolution_status"].notna() & (df["resolution_status"] != "PENDING")].copy()
-    if resolved.empty:
+    if df.empty:
         return pd.DataFrame()
+    metrics = compute_trade_metrics(df)
+    return accounting_breakdown(metrics, field).set_index(field)
 
-    rr_map = {
-        "TP2": 3.0,
-        "TP1": 2.0,
-        "STOPPED": -1.0,
-        "EXPIRED": 0.0,
-    }
-    resolved["r_multiple_proxy"] = resolved["resolution_status"].map(rr_map)
-    if "ambiguous_pessimistic_r" not in resolved.columns:
-        resolved["ambiguous_pessimistic_r"] = None
-    if "ambiguous_optimistic_r" not in resolved.columns:
-        resolved["ambiguous_optimistic_r"] = None
-    resolved["r_pessimistic_bound"] = resolved["r_multiple_proxy"].where(
-        resolved["resolution_status"] != "AMBIGUOUS",
-        resolved["ambiguous_pessimistic_r"],
-    )
-    resolved["r_optimistic_bound"] = resolved["r_multiple_proxy"].where(
-        resolved["resolution_status"] != "AMBIGUOUS",
-        resolved["ambiguous_optimistic_r"],
-    )
 
-    out = (
-        resolved.groupby(field, dropna=False)
-        .agg(
-            resolved_total=("resolution_status", "size"),
-            avg_quality_score=("quality_score", "mean"),
-            avg_rr1=("rr1", "mean"),
-            avg_r_multiple_proxy=("r_multiple_proxy", "mean"),
-            avg_r_pessimistic_bound=("r_pessimistic_bound", "mean"),
-            avg_r_optimistic_bound=("r_optimistic_bound", "mean"),
-            ambiguous_rows=("resolution_status", lambda values: (values == "AMBIGUOUS").sum()),
-        )
-        .sort_values(["avg_r_multiple_proxy", "resolved_total"], ascending=[False, False])
-    )
-    return out
+def accounting_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
+    metrics = df if "r_pessimistic_bound" in df.columns else compute_trade_metrics(df)
+    return build_accounting_breakdown(metrics, field)
 
 
 def print_section(title: str, df: pd.DataFrame | None = None) -> None:
