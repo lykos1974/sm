@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-The committed 12-symbol tick-provenance snapshot now has a read-only, SHA-256-pinned preflight that requires exact configured storage-symbol, identity, and tick matches and fails closed without validation DB writes or strategy transitions. Targeted preflight tests pass; validation and alerts remain OFF. The next gate is an independent audit of this preflight only.
+Validation bootstrap now loads tick provenance only from the accepted snapshot after the shared read-only preflight passes; OFF startup does not read or require the snapshot, and ON failures occur before validation DB access. Targeted OFF/PASS/fail-closed tests pass; validation and alerts remain OFF. The next gate is an independent audit of this loading boundary only.

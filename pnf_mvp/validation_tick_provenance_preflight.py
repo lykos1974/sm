@@ -99,11 +99,16 @@ def load_validation_tick_provenance(
     *,
     settings_path: str | Path = DEFAULT_SETTINGS,
     snapshot_path: str | Path = DEFAULT_SNAPSHOT,
+    configured_symbols: list[str] | None = None,
 ) -> dict[str, Any]:
     """Validate and return provenance maps without opening or writing any database."""
     settings_path = Path(settings_path)
     snapshot_path = Path(snapshot_path)
-    _, settings = _read_json(settings_path)
+    if configured_symbols is None:
+        _, settings = _read_json(settings_path)
+        configured = settings.get("symbols") if isinstance(settings, dict) else None
+    else:
+        configured = configured_symbols
     raw, snapshot = _read_json(snapshot_path)
 
     digest = hashlib.sha256(raw).hexdigest()
@@ -117,7 +122,6 @@ def load_validation_tick_provenance(
     if not isinstance(rows, list) or len(rows) != 12:
         raise PreflightError("snapshot must contain exactly 12 identities")
 
-    configured = settings.get("symbols") if isinstance(settings, dict) else None
     if not isinstance(configured, list) or len(configured) != 12 or len(set(configured)) != 12:
         raise PreflightError("configured storage symbols must contain 12 unique identities")
     if set(configured) != set(ACCEPTED_IDENTITIES):
