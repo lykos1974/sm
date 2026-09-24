@@ -6,9 +6,6 @@ from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "WINDOWS_AUDIT_UPDATE.ps1"
-PACKAGE_SOURCE_COMMIT = "484c6da1f5e0e0fdfc91f44cf207287584062e10"
-
-
 def canonical_text_sha256(payload):
     text = payload.decode("utf-8", errors="strict")
     canonical = text.replace("\r\n", "\n")
@@ -21,6 +18,13 @@ def expected_files(script):
             r'^\s*"([^"]+\.py)"\s*=\s*"([0-9a-f]{64})"$', script, re.MULTILINE
         )
     )
+
+
+def package_source_commit(script):
+    match = re.search(r'^\$PackageSourceCommit = "([0-9a-f]{40})"$', script, re.MULTILINE)
+    if not match:
+        raise AssertionError("missing hash-pinned PackageSourceCommit")
+    return match.group(1)
 
 
 class WindowsAuditUpdatePortabilityTests(TestCase):
@@ -59,17 +63,40 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         import subprocess
 
         pinned = expected_files(self.script)
+        source_commit = package_source_commit(self.script)
         self.assertEqual(len(pinned), 8)
         for relative_path, expected in pinned.items():
             with self.subTest(relative_path=relative_path):
                 payload = subprocess.check_output(
-                    ["git", "show", f"{PACKAGE_SOURCE_COMMIT}:{relative_path}"],
+                    ["git", "show", f"{source_commit}:{relative_path}"],
                     cwd=ROOT,
                 )
                 lf_payload = payload.replace(b"\r\n", b"\n")
                 crlf_payload = lf_payload.replace(b"\n", b"\r\n")
                 self.assertEqual(canonical_text_sha256(lf_payload), expected)
                 self.assertEqual(canonical_text_sha256(crlf_payload), expected)
+
+    def test_final_runtime_hashes_pass_and_stale_runtime_hashes_fail(self):
+        import subprocess
+
+        pinned = expected_files(self.script)
+        source_commit = package_source_commit(self.script)
+        stale_commit = "484c6da1f5e0e0fdfc91f44cf207287584062e10"
+        changed_runtime = (
+            "pnf_mvp/strategy_validation.py",
+            "pnf_mvp/strategy_trade_export.py",
+            "pnf_mvp/strategy_evaluator.py",
+        )
+        for relative_path in changed_runtime:
+            with self.subTest(relative_path=relative_path):
+                final_payload = subprocess.check_output(
+                    ["git", "show", f"{source_commit}:{relative_path}"], cwd=ROOT
+                )
+                stale_payload = subprocess.check_output(
+                    ["git", "show", f"{stale_commit}:{relative_path}"], cwd=ROOT
+                )
+                self.assertEqual(canonical_text_sha256(final_payload), pinned[relative_path])
+                self.assertNotEqual(canonical_text_sha256(stale_payload), pinned[relative_path])
 
     def test_package_install_and_post_install_checks_use_canonical_hash(self):
         calls = re.findall(r"Get-CanonicalTextSha256 \$[A-Za-z]+", self.script)
@@ -96,6 +123,13 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         for fragment in required_fragments:
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, self.script)
+
+    def test_settings_are_preflight_only_and_never_packaged_or_overwritten(self):
+        pinned = expected_files(self.script)
+        self.assertNotIn("pnf_mvp/settings.json", pinned)
+        self.assertNotIn("settings_backup", self.script)
+        self.assertNotIn('Destination (Join-Path $Target "pnf_mvp\\settings.json")', self.script)
+        self.assertIn("$targetSettings = Assert-SettingsOff $targetSettingsPath", self.script)
 
 
 if __name__ == "__main__":

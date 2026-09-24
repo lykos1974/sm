@@ -68,6 +68,18 @@ def provenance(**overrides):
     return {"BTCUSDT": item}
 
 
+def identities(symbol="BTCUSDT", **overrides):
+    identity = {
+        "provider": "BINANCE",
+        "venue": "BINANCE_SPOT",
+        "instrument_type": "SPOT",
+        "native_symbol": "BTCUSDT",
+        "source_symbol": symbol,
+    }
+    identity.update(overrides)
+    return {symbol: identity}
+
+
 def fetch_one(db_path, query, params=()):
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -82,6 +94,102 @@ def fetch_all(db_path, query, params=()):
 
 
 class StructuredProvenanceTests(TestCase):
+    def test_explicit_allowlist_accepts_supported_test_identities(self):
+        cases = (
+            (
+                "BTCUSDT",
+                identities(),
+                provenance(),
+            ),
+            (
+                "BINANCE_FUT:BTCUSDT",
+                identities(
+                    "BINANCE_FUT:BTCUSDT",
+                    venue="BINANCE_FUTURES",
+                    instrument_type="PERPETUAL",
+                ),
+                {
+                    "BINANCE_FUT:BTCUSDT": provenance()["BTCUSDT"]
+                    | {
+                        "venue": "BINANCE_FUTURES",
+                        "instrument_type": "PERPETUAL",
+                        "source_symbol": "BINANCE_FUT:BTCUSDT",
+                    }
+                },
+            ),
+            (
+                "MEXC_FUT:BTCUSDT",
+                identities(
+                    "MEXC_FUT:BTCUSDT",
+                    provider="MEXC",
+                    venue="MEXC_FUTURES",
+                    instrument_type="PERPETUAL",
+                ),
+                {
+                    "MEXC_FUT:BTCUSDT": provenance()["BTCUSDT"]
+                    | {
+                        "provider": "MEXC",
+                        "venue": "MEXC_FUTURES",
+                        "instrument_type": "PERPETUAL",
+                        "source_symbol": "MEXC_FUT:BTCUSDT",
+                    }
+                },
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, (symbol, allowlist, ticks) in enumerate(cases):
+                with self.subTest(symbol=symbol):
+                    store = StrategyValidationStore(
+                        str(Path(temp_dir) / f"positive-{index}.db"),
+                        symbol_tick_provenance=ticks,
+                        symbol_identity_allowlist=allowlist,
+                    )
+                    store.close()
+
+    def test_unknown_and_incompatible_identities_fail_before_database_creation(self):
+        cases = (
+            (
+                "UNKNOWN:FAKE",
+                {},
+                {
+                    "UNKNOWN:FAKE": provenance()["BTCUSDT"]
+                    | {
+                        "provider": "UNKNOWN",
+                        "venue": "UNKNOWN",
+                        "instrument_type": "UNKNOWN",
+                        "native_symbol": "FAKE",
+                        "source_symbol": "UNKNOWN:FAKE",
+                    }
+                },
+            ),
+            (
+                "BINANCE_FUT:BTCUSDT",
+                identities(
+                    "BINANCE_FUT:BTCUSDT",
+                    venue="BINANCE_FUTURES",
+                    instrument_type="PERPETUAL",
+                ),
+                {
+                    "BINANCE_FUT:BTCUSDT": provenance()["BTCUSDT"]
+                    | {
+                        "provider": "MEXC",
+                        "venue": "MEXC_FUTURES",
+                        "instrument_type": "SPOT",
+                        "source_symbol": "BINANCE_FUT:BTCUSDT",
+                    }
+                },
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, (symbol, allowlist, ticks) in enumerate(cases):
+                db_path = Path(temp_dir) / f"rejected-{index}.db"
+                with self.subTest(symbol=symbol), self.assertRaises(ValueError):
+                    StrategyValidationStore(
+                        str(db_path),
+                        symbol_tick_provenance=ticks,
+                        symbol_identity_allowlist=allowlist,
+                    )
+                self.assertFalse(db_path.exists())
     def test_all_structured_fields_are_required_and_tick_must_be_finite_positive(self):
         required = (
             "provider",

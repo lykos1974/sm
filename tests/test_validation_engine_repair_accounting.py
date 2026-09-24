@@ -12,7 +12,7 @@ PNF_MVP_ROOT = REPO_ROOT / "pnf_mvp"
 if str(PNF_MVP_ROOT) not in sys.path:
     sys.path.insert(0, str(PNF_MVP_ROOT))
 
-from strategy_evaluator import accounting_breakdown, basic_stats, outcome_breakdown  # noqa: E402
+from strategy_evaluator import accounting_breakdown, basic_stats, load_data, outcome_breakdown  # noqa: E402
 from strategy_trade_export import (  # noqa: E402
     build_accounting_breakdown,
     build_accounting_summary,
@@ -25,7 +25,7 @@ from strategy_trade_export import (  # noqa: E402
 def row(setup_id, status, side="LONG", **overrides):
     base = {
         "setup_id": setup_id,
-        "created_ts": int(setup_id.strip("r") or 0),
+        "created_ts": int(setup_id[1:]) if setup_id.startswith("r") and setup_id[1:].isdigit() else 0,
         "updated_ts": 10,
         "reference_ts": 1,
         "resolved_ts": 10,
@@ -163,6 +163,53 @@ class AccountingInvariantTests(TestCase):
             loaded = load_validation_rows(str(db_path))
         self.assertEqual(set(loaded["resolution_status"]), {"TP2", "AMBIGUOUS", "PENDING", "EXPIRED"})
         self.assertEqual(len(loaded), 4)
+
+    def test_evaluator_and_exporter_share_economic_order_before_path_metrics(self):
+        source = pd.DataFrame(
+            [
+                row("loss-a", "STOPPED", created_ts=2, resolved_price=98.0),
+                row("win", "TP1", created_ts=1, resolved_price=104.0),
+                row("loss-b", "STOPPED", created_ts=3, resolved_price=98.0),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "validation.db"
+            with sqlite3.connect(db_path) as conn:
+                source.to_sql("strategy_setups", conn, index=False)
+            evaluator_metrics = compute_trade_metrics(load_data(str(db_path)))
+            exporter_metrics = compute_trade_metrics(load_validation_rows(str(db_path)))
+
+        self.assertEqual(evaluator_metrics["setup_id"].tolist(), ["win", "loss-a", "loss-b"])
+        self.assertEqual(exporter_metrics["setup_id"].tolist(), ["win", "loss-a", "loss-b"])
+        evaluator = build_accounting_summary(evaluator_metrics)
+        exporter = build_accounting_summary(exporter_metrics)
+        self.assertEqual(evaluator, exporter)
+        self.assertEqual(evaluator["headline_denominator_rows"], 3)
+        self.assertEqual(evaluator["total_r_pessimistic"], 0.0)
+        self.assertEqual(evaluator["expectancy_r_pessimistic"], 0.0)
+        self.assertAlmostEqual(evaluator["win_rate_pessimistic"], 1 / 3)
+        self.assertEqual(evaluator["max_drawdown_r_pessimistic"], 2.0)
+        self.assertEqual(evaluator["max_losing_streak_pessimistic"], 2)
+
+    def test_timestamp_ties_and_shuffled_frames_have_stable_metrics(self):
+        source = pd.DataFrame(
+            [
+                row("b", "STOPPED", created_ts=7, resolved_price=98.0),
+                row("c", "STOPPED", created_ts=8, resolved_price=98.0),
+                row("a", "TP1", created_ts=7, resolved_price=104.0),
+            ]
+        )
+        expected = None
+        for seed in range(5):
+            metrics = compute_trade_metrics(source.sample(frac=1, random_state=seed))
+            self.assertEqual(metrics["setup_id"].tolist(), ["a", "b", "c"])
+            summary = build_accounting_summary(metrics)
+            if expected is None:
+                expected = summary
+            else:
+                self.assertEqual(summary, expected)
+        self.assertEqual(expected["max_drawdown_r_optimistic"], 2.0)
+        self.assertEqual(expected["max_losing_streak_optimistic"], 2)
 
 
 if __name__ == "__main__":
