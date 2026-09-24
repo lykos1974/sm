@@ -66,7 +66,17 @@ class TradeThroughActivationTests(TestCase):
             allow_multiple_trades_per_symbol=True,
             commit_every=1,
             symbol_tick_provenance={
-                "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+                "BTCUSDT": {
+                    "provider": "TEST",
+                    "venue": "TEST_SPOT",
+                    "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT",
+                    "source_symbol": "BTCUSDT",
+                    "tick_size": 0.01,
+                    "provenance_timestamp": "2026-09-23T00:00:00Z",
+                    "provenance_version": "test-v1",
+                    "source": "test:BTCUSDT",
+                }
             },
         )
 
@@ -157,10 +167,11 @@ class TradeThroughActivationTests(TestCase):
                 self.assertIsNone(observed["resolved_price"])
                 self.assertEqual(
                     observed["resolution_note"],
-                    f"activation_candle_target_touch_without_stop:{target_name}",
+                    "activation_candle_target_order_unknown:branched",
                 )
-                self.assertEqual(observed["ambiguous_pessimistic_r"], -1.0)
-                self.assertEqual(observed["ambiguous_optimistic_r"], optimistic_r)
+                self.assertEqual(observed["branch_active"], 1)
+                self.assertIsNone(observed["ambiguous_pessimistic_r"])
+                self.assertIsNone(observed["ambiguous_optimistic_r"])
 
     def test_tick_and_source_are_persisted_as_activation_provenance(self):
         observed = self._run_one(

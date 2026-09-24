@@ -32,7 +32,13 @@ class FakeStorage:
 class FakeValidationStore:
     allow_multiple_trades_per_symbol = False
 
-    def __init__(self, db_path, *, allow_multiple_trades_per_symbol=False):
+    def __init__(
+        self,
+        db_path,
+        *,
+        allow_multiple_trades_per_symbol=False,
+        symbol_tick_provenance=None,
+    ):
         self.db_path = db_path
         self.allow_multiple_trades_per_symbol = allow_multiple_trades_per_symbol
 
@@ -58,6 +64,21 @@ def _run_backfill(tmp_path, extra_args):
                 "profiles": {"BTCUSDT": {"box_size": 100, "reversal_boxes": 3}},
                 "max_open_watch_per_symbol": 20,
                 "allow_multiple_trades_per_symbol": False,
+                "strategy_validation_execution": {
+                    "activation_model": "historical_ohlc_one_tick_trade_through_v1",
+                    "symbol_ticks": {
+                        "BTCUSDT": {
+                            "provider": "TEST",
+                            "venue": "TEST_SPOT",
+                            "instrument_type": "SPOT",
+                            "native_symbol": "BTCUSDT",
+                            "source_symbol": "BTCUSDT",
+                            "tick_size": 0.01,
+                            "provenance_timestamp": "2026-09-23T00:00:00Z",
+                            "provenance_version": "test-v1",
+                        }
+                    },
+                },
             }
         ),
         encoding="utf-8",

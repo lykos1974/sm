@@ -1,4 +1,6 @@
 import sys
+import sqlite3
+import tempfile
 from pathlib import Path
 from unittest import TestCase
 
@@ -10,11 +12,13 @@ PNF_MVP_ROOT = REPO_ROOT / "pnf_mvp"
 if str(PNF_MVP_ROOT) not in sys.path:
     sys.path.insert(0, str(PNF_MVP_ROOT))
 
-from strategy_evaluator import accounting_breakdown  # noqa: E402
+from strategy_evaluator import accounting_breakdown, basic_stats, outcome_breakdown  # noqa: E402
 from strategy_trade_export import (  # noqa: E402
     build_accounting_breakdown,
     build_accounting_summary,
+    build_diagnostics_export,
     compute_trade_metrics,
+    load_validation_rows,
 )
 
 
@@ -115,6 +119,50 @@ class AccountingInvariantTests(TestCase):
         self.assertEqual(exported["headline_denominator_rows"].sum(), 4)
         self.assertAlmostEqual(exported["total_r_pessimistic"].sum(), 1.255)
         self.assertAlmostEqual(exported["total_r_optimistic"].sum(), 3.755)
+
+    def test_every_diagnostic_section_reconciles_to_the_headline(self):
+        metrics = self._frame()
+        headline = build_accounting_summary(metrics)
+        diagnostics = build_diagnostics_export(metrics)
+        for section, grouped in diagnostics.groupby("section"):
+            with self.subTest(section=section):
+                self.assertEqual(grouped["registered_rows"].sum(), headline["registered_rows"])
+                self.assertEqual(
+                    grouped["headline_denominator_rows"].sum(),
+                    headline["headline_denominator_rows"],
+                )
+                self.assertAlmostEqual(
+                    grouped["total_r_pessimistic"].sum(),
+                    headline["total_r_pessimistic"],
+                )
+                self.assertAlmostEqual(
+                    grouped["total_r_optimistic"].sum(),
+                    headline["total_r_optimistic"],
+                )
+
+    def test_evaluator_headline_and_outcome_groups_use_same_accounting(self):
+        metrics = self._frame()
+        self.assertEqual(basic_stats(metrics), build_accounting_summary(metrics))
+        evaluated = outcome_breakdown(metrics, "side").reset_index()
+        exported = build_accounting_breakdown(metrics, "side")
+        pd.testing.assert_frame_equal(evaluated, exported, check_dtype=False)
+
+    def test_export_loader_keeps_pending_expired_missed_and_ambiguous_rows(self):
+        source = pd.DataFrame(
+            [
+                row("r1", "TP2", tp1_hit=1, tp1_price=103.0, resolved_price=105.0),
+                row("r2", "AMBIGUOUS", ambiguous_pessimistic_r=-1.0, ambiguous_optimistic_r=2.0),
+                row("r3", "PENDING", resolved_ts=None, activation_status="PENDING"),
+                row("r4", "EXPIRED", activation_status="PENDING"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "validation.db"
+            with sqlite3.connect(db_path) as conn:
+                source.to_sql("strategy_setups", conn, index=False)
+            loaded = load_validation_rows(str(db_path))
+        self.assertEqual(set(loaded["resolution_status"]), {"TP2", "AMBIGUOUS", "PENDING", "EXPIRED"})
+        self.assertEqual(len(loaded), 4)
 
 
 if __name__ == "__main__":

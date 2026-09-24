@@ -30,7 +30,7 @@ STRUCTURE = {
 }
 
 
-def setup(side="LONG", tp1_r=1.5, tp2_r=2.5):
+def setup(side="LONG", tp1_r=2.0, tp2_r=2.5):
     entry = 100.0
     stop = 98.0 if side == "LONG" else 102.0
     direction = 1 if side == "LONG" else -1
@@ -210,7 +210,7 @@ class ActivationBranchChronologyTests(TestCase):
                 self.assertEqual(completed["resolution_status"], "AMBIGUOUS")
                 self.assertEqual(completed["branch_active"], 0)
                 self.assertEqual(completed["ambiguous_pessimistic_r"], -1.0)
-                self.assertEqual(completed["ambiguous_optimistic_r"], 1.5)
+                self.assertEqual(completed["ambiguous_optimistic_r"], 2.0)
 
     def test_activation_stop_dominates_and_creates_no_branches(self):
         cases = (
@@ -228,6 +228,64 @@ class ActivationBranchChronologyTests(TestCase):
                     fetch_all(db_path, "SELECT * FROM strategy_setup_branches WHERE setup_id=?", (setup_id,)),
                     [],
                 )
+
+    def test_completed_bounds_use_actual_branch_rr_for_long_and_short(self):
+        cases = (
+            ("LONG", (104.0, 99.99, 103.0), (108.5, 100.0, 108.0)),
+            ("SHORT", (100.01, 96.0, 97.0), (100.0, 91.5, 92.0)),
+        )
+        for side, activation, later_tp2 in cases:
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "validation.db"
+                store = StrategyValidationStore(
+                    str(db_path),
+                    allow_multiple_trades_per_symbol=True,
+                    commit_every=1,
+                    symbol_tick_provenance=provenance(),
+                )
+                configured = setup(side, tp1_r=2.0, tp2_r=4.0)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    setup_id = store.register_setup("BTCUSDT", configured, STRUCTURE, 1)
+                self._update(store, 2, *activation)
+                self._update(store, 3, *later_tp2)
+                store._conn.close()
+
+                row = fetch_one(db_path, "SELECT * FROM strategy_setups WHERE setup_id=?", (setup_id,))
+                branches = fetch_all(
+                    db_path,
+                    "SELECT * FROM strategy_setup_branches WHERE setup_id=? ORDER BY branch_key",
+                    (setup_id,),
+                )
+                actual = sorted(branch["r_lower"] for branch in branches)
+                self.assertEqual(actual, [2.0, 2.75])
+                self.assertEqual(row["ambiguous_pessimistic_r"], 2.0)
+                self.assertEqual(row["ambiguous_optimistic_r"], 2.75)
+
+    def test_later_same_candle_bounds_use_partial_position_rr_once(self):
+        cases = (
+            ("LONG", (101.0, 99.99, 100.0), (108.5, 97.5, 101.0)),
+            ("SHORT", (100.01, 99.0, 100.0), (102.5, 91.5, 99.0)),
+        )
+        for side, activation, ambiguous in cases:
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "validation.db"
+                store = StrategyValidationStore(
+                    str(db_path),
+                    allow_multiple_trades_per_symbol=True,
+                    commit_every=1,
+                    symbol_tick_provenance=provenance(),
+                )
+                configured = setup(side, tp1_r=2.0, tp2_r=4.0)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    setup_id = store.register_setup("BTCUSDT", configured, STRUCTURE, 1)
+                self._update(store, 2, *activation)
+                self._update(store, 3, *ambiguous)
+                store._conn.close()
+
+                row = fetch_one(db_path, "SELECT * FROM strategy_setups WHERE setup_id=?", (setup_id,))
+                self.assertEqual(row["resolution_status"], "AMBIGUOUS")
+                self.assertEqual(row["ambiguous_pessimistic_r"], -1.0)
+                self.assertEqual(row["ambiguous_optimistic_r"], 2.75)
 
 
 if __name__ == "__main__":

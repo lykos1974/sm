@@ -6,6 +6,7 @@ from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "WINDOWS_AUDIT_UPDATE.ps1"
+PACKAGE_SOURCE_COMMIT = "484c6da1f5e0e0fdfc91f44cf207287584062e10"
 
 
 def canonical_text_sha256(payload):
@@ -55,11 +56,16 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         )
 
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
+        import subprocess
+
         pinned = expected_files(self.script)
         self.assertEqual(len(pinned), 8)
         for relative_path, expected in pinned.items():
             with self.subTest(relative_path=relative_path):
-                payload = (ROOT / relative_path).read_bytes()
+                payload = subprocess.check_output(
+                    ["git", "show", f"{PACKAGE_SOURCE_COMMIT}:{relative_path}"],
+                    cwd=ROOT,
+                )
                 lf_payload = payload.replace(b"\r\n", b"\n")
                 crlf_payload = lf_payload.replace(b"\n", b"\r\n")
                 self.assertEqual(canonical_text_sha256(lf_payload), expected)

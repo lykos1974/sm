@@ -49,9 +49,17 @@ def setup(side="LONG"):
 
 
 def provenance(size=0.01, source="exchange-info:BTCUSDT", symbol=None):
-    item = {"tick_size": size, "source": source}
-    if symbol is not None:
-        item["symbol"] = symbol
+    item = {
+        "provider": "TEST",
+        "venue": "TEST_SPOT",
+        "instrument_type": "SPOT",
+        "native_symbol": symbol or "BTCUSDT",
+        "source_symbol": "BTCUSDT",
+        "tick_size": size,
+        "provenance_timestamp": "2026-09-23T00:00:00Z",
+        "provenance_version": "test-v1",
+        "source": source,
+    }
     return {"BTCUSDT": item}
 
 
@@ -117,6 +125,16 @@ class TickFreezeTests(TestCase):
                 self.assertEqual(
                     observed["activation_tick_source"], "exchange-info:BTCUSDT"
                 )
+                self.assertEqual(observed["activation_tick_provider"], "TEST")
+                self.assertEqual(observed["activation_tick_venue"], "TEST_SPOT")
+                self.assertEqual(observed["activation_tick_instrument_type"], "SPOT")
+                self.assertEqual(observed["activation_tick_native_symbol"], "BTCUSDT")
+                self.assertEqual(observed["activation_tick_source_symbol"], "BTCUSDT")
+                self.assertEqual(
+                    observed["activation_tick_provenance_timestamp"],
+                    "2026-09-23T00:00:00Z",
+                )
+                self.assertEqual(observed["activation_tick_provenance_version"], "test-v1")
 
     def test_restart_and_settings_change_do_not_change_existing_setup_tick(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -166,7 +184,7 @@ class TickFreezeTests(TestCase):
 
     def test_source_symbol_mismatch_and_unknown_symbol_registration_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            with self.assertRaisesRegex(ValueError, "symbol mismatch"):
+            with self.assertRaisesRegex(ValueError, "symbol identity mismatch"):
                 StrategyValidationStore(
                     str(Path(temp_dir) / "mismatch.db"),
                     symbol_tick_provenance=provenance(symbol="ETHUSDT"),
@@ -283,7 +301,7 @@ class TickFreezeTests(TestCase):
                 before = fetch_row(db_path, setup_id)
                 changes_before = reopened._conn.total_changes
                 with self.assertRaisesRegex(
-                    ValueError, "frozen tick provenance requires a finite positive"
+                    ValueError, "legacy incomplete provenance"
                 ):
                     self._update(
                         reopened,

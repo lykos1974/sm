@@ -85,7 +85,27 @@ class SchemaMigrationOrderingTests(TestCase):
             db_path = Path(temp_dir) / "empty.db"
             self._open_and_close(db_path)
             self._open_and_close(db_path)
-            self.assertIn("last_evaluated_candle_ts", columns(db_path))
+            migrated = columns(db_path)
+            for required in (
+                "last_evaluated_candle_ts",
+                "validation_state_version",
+                "branch_active",
+                "activation_tick_provider",
+                "activation_tick_venue",
+                "activation_tick_instrument_type",
+                "activation_tick_native_symbol",
+                "activation_tick_source_symbol",
+                "activation_tick_provenance_timestamp",
+                "activation_tick_provenance_version",
+            ):
+                self.assertIn(required, migrated)
+            with sqlite3.connect(db_path) as conn:
+                tables = {
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+            self.assertIn("strategy_setup_branches", tables)
             self.assertEqual(integrity(db_path), "ok")
 
     def test_immediately_previous_schema_preserves_rows_and_adds_watermark(self):

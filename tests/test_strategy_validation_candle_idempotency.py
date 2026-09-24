@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import sqlite3
 import sys
 import tempfile
@@ -51,7 +52,19 @@ def setup(side):
 
 
 def ticks(size=0.01, source="test:BTCUSDT"):
-    return {"BTCUSDT": {"tick_size": size, "source": source}}
+    return {
+        "BTCUSDT": {
+            "provider": "TEST",
+            "venue": "TEST_SPOT",
+            "instrument_type": "SPOT",
+            "native_symbol": "BTCUSDT",
+            "source_symbol": "BTCUSDT",
+            "tick_size": size,
+            "provenance_timestamp": "2026-09-23T00:00:00Z",
+            "provenance_version": "test-v1",
+            "source": source,
+        }
+    }
 
 
 def fetch_row(db_path, setup_id):
@@ -67,6 +80,20 @@ def fetch_row(db_path, setup_id):
 def close_store(store):
     store.flush()
     store._conn.close()
+
+
+def canonical_result(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        payload = {
+            "setups": [dict(row) for row in conn.execute(
+                "SELECT * FROM strategy_setups ORDER BY setup_id"
+            )],
+            "branches": [dict(row) for row in conn.execute(
+                "SELECT * FROM strategy_setup_branches ORDER BY setup_id, branch_key"
+            )],
+        }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 class CandleIdempotencyTests(TestCase):
@@ -240,6 +267,8 @@ class CandleIdempotencyTests(TestCase):
                 self.assertEqual(
                     {field: retried[field] for field in fields}, expected
                 )
+                self.assertEqual(canonical_result(root / "per-candle.db"), canonical_result(root / "batch.db"))
+                self.assertEqual(canonical_result(root / "retried.db"), canonical_result(root / "batch.db"))
 
     def test_replay_after_validation_flush_and_checkpoint_failure_is_noop(self):
         class ReplayDummy:

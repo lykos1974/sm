@@ -165,6 +165,84 @@ class AtomicCandleProcessingTests(TestCase):
                     replay._conn.close()
                     self.assertEqual(canonical_state(db_path), uninterrupted)
 
+    def test_crash_at_every_transaction_boundary_recovers_by_exact_replay(self):
+        boundaries = ("after_savepoint", "before_release", "after_release")
+        with tempfile.TemporaryDirectory() as baseline_dir:
+            baseline_db = self._prepared_db(baseline_dir)
+            baseline = open_store(baseline_db)
+            update_activation_target(baseline)
+            uninterrupted = canonical_state(baseline_db)
+            baseline._conn.close()
+
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = self._prepared_db(temp_dir)
+                before = canonical_state(db_path)
+                store = open_store(db_path)
+
+                def crash(name):
+                    if name == boundary:
+                        raise RuntimeError(f"crash-at-{name}")
+
+                store._candle_transaction_boundary = crash
+                with self.assertRaisesRegex(RuntimeError, f"crash-at-{boundary}"):
+                    update_activation_target(store)
+                store._conn.close()
+                expected_after_crash = uninterrupted if boundary == "after_release" else before
+                self.assertEqual(canonical_state(db_path), expected_after_crash)
+
+                replay = open_store(db_path)
+                update_activation_target(replay)
+                replay._conn.close()
+                self.assertEqual(canonical_state(db_path), uninterrupted)
+
+    def test_fault_after_every_sql_inside_savepoint_recovers_exactly(self):
+        with tempfile.TemporaryDirectory() as baseline_dir:
+            baseline_db = self._prepared_db(baseline_dir)
+            baseline = open_store(baseline_db)
+            original = baseline._execute_counted
+            sql_points = 0
+
+            def count_sql(category, sql, params=None, symbol=None):
+                nonlocal sql_points
+                cursor = original(category, sql, params, symbol)
+                if baseline._candle_transaction_active:
+                    sql_points += 1
+                return cursor
+
+            baseline._execute_counted = count_sql
+            update_activation_target(baseline)
+            uninterrupted = canonical_state(baseline_db)
+            baseline._conn.close()
+
+            for fail_at in range(1, sql_points + 1):
+                with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as temp_dir:
+                    db_path = self._prepared_db(temp_dir)
+                    before = canonical_state(db_path)
+                    store = open_store(db_path)
+                    original = store._execute_counted
+                    seen = 0
+
+                    def fail_after_sql(category, sql, params=None, symbol=None):
+                        nonlocal seen
+                        cursor = original(category, sql, params, symbol)
+                        if store._candle_transaction_active:
+                            seen += 1
+                            if seen == fail_at:
+                                raise RuntimeError(f"injected-after-sql-{fail_at}")
+                        return cursor
+
+                    store._execute_counted = fail_after_sql
+                    with self.assertRaisesRegex(RuntimeError, "injected-after-sql"):
+                        update_activation_target(store)
+                    store._conn.close()
+                    self.assertEqual(canonical_state(db_path), before)
+
+                    replay = open_store(db_path)
+                    update_activation_target(replay)
+                    replay._conn.close()
+                    self.assertEqual(canonical_state(db_path), uninterrupted)
+
     def test_commit_every_never_commits_inside_candle_transaction(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = self._prepared_db(temp_dir)
@@ -183,22 +261,22 @@ class AtomicCandleProcessingTests(TestCase):
 
     def test_migrated_nonterminal_null_watermark_fails_closed(self):
         lifecycle_updates = (
-            ("PENDING", 0),
-            ("ACTIVE", 0),
-            ("ACTIVE", 1),
-            ("AMBIGUOUS", 0),
+            ("PENDING", "PENDING", 0, 0),
+            ("PENDING", "ACTIVE", 0, 0),
+            ("PENDING", "ACTIVE", 1, 0),
+            ("AMBIGUOUS", "ACTIVE", 0, 1),
         )
-        for resolution_status, tp1_hit in lifecycle_updates:
-            with self.subTest(status=resolution_status, tp1=tp1_hit), tempfile.TemporaryDirectory() as temp_dir:
+        for resolution_status, activation_status, tp1_hit, branch_active in lifecycle_updates:
+            with self.subTest(status=resolution_status, activation=activation_status, tp1=tp1_hit), tempfile.TemporaryDirectory() as temp_dir:
                 db_path = self._prepared_db(temp_dir)
                 with sqlite3.connect(db_path) as conn:
                     conn.execute(
                         """
                         UPDATE strategy_setups
-                        SET resolution_status=?, activation_status='ACTIVE', tp1_hit=?,
+                        SET resolution_status=?, activation_status=?, tp1_hit=?, branch_active=?,
                             last_evaluated_candle_ts=NULL, validation_state_version=NULL
                         """,
-                        (resolution_status, tp1_hit),
+                        (resolution_status, activation_status, tp1_hit, branch_active),
                     )
                 before = canonical_state(db_path)
                 store = open_store(db_path)

@@ -11,7 +11,7 @@ if str(PNF_MVP_ROOT) not in sys.path:
     sys.path.insert(0, str(PNF_MVP_ROOT))
 
 from strategy_trade_export import (  # noqa: E402
-    build_summary_activated_only,
+    build_accounting_summary,
     compute_trade_metrics,
 )
 
@@ -37,6 +37,7 @@ def resolved_row(setup_id, status, resolved_price, *, ambiguous_low=None, ambigu
         "tp2": 106.0,
         "resolved_price": resolved_price,
         "tp1_hit": int(status == "TP2"),
+        "tp1_price": 104.0 if status == "TP2" else None,
         "quality_score": 70.0,
         "active_leg_boxes": 2,
         "is_extended_move": 0,
@@ -55,7 +56,7 @@ class AmbiguousMetricBoundsTests(TestCase):
         )
         observed = metrics.iloc[0]
         self.assertTrue(pd.isna(observed["realized_r_multiple"]))
-        self.assertTrue(pd.isna(observed["outcome_r_multiple_proxy"]))
+        self.assertNotIn("outcome_r_multiple_proxy", metrics.columns)
         self.assertEqual(observed["ambiguous_pessimistic_r"], -1.0)
         self.assertEqual(observed["ambiguous_optimistic_r"], 2.0)
 
@@ -75,29 +76,28 @@ class AmbiguousMetricBoundsTests(TestCase):
                 ]
             )
         )
-        summary = build_summary_activated_only(metrics)
+        summary = build_accounting_summary(metrics)
 
-        self.assertEqual(summary["ambiguous"], 1)
-        self.assertEqual(summary["headline_outcome_rows"], 3)
-        self.assertEqual(summary["ambiguous_bound_rows"], 1)
-        self.assertAlmostEqual(summary["win_rate_pessimistic_bound"], 1 / 3)
-        self.assertAlmostEqual(summary["win_rate_optimistic_bound"], 2 / 3)
-        self.assertAlmostEqual(summary["total_realized_r_pessimistic_bound"], 1.0)
-        self.assertAlmostEqual(summary["total_realized_r_optimistic_bound"], 4.0)
-        self.assertAlmostEqual(summary["avg_realized_r_pessimistic_bound"], 1 / 3)
-        self.assertAlmostEqual(summary["avg_realized_r_optimistic_bound"], 4 / 3)
+        self.assertEqual(summary["ambiguous_branched_rows"], 1)
+        self.assertEqual(summary["headline_denominator_rows"], 3)
+        self.assertAlmostEqual(summary["win_rate_pessimistic"], 1 / 3)
+        self.assertAlmostEqual(summary["win_rate_optimistic"], 2 / 3)
+        self.assertAlmostEqual(summary["total_r_pessimistic"], 0.5)
+        self.assertAlmostEqual(summary["total_r_optimistic"], 3.5)
+        self.assertAlmostEqual(summary["expectancy_r_pessimistic"], 0.5 / 3)
+        self.assertAlmostEqual(summary["expectancy_r_optimistic"], 3.5 / 3)
 
     def test_empty_summary_exposes_bound_fields(self):
-        summary = build_summary_activated_only(pd.DataFrame())
+        summary = build_accounting_summary(pd.DataFrame())
         for field in (
-            "headline_outcome_rows",
-            "ambiguous_bound_rows",
-            "win_rate_pessimistic_bound",
-            "win_rate_optimistic_bound",
-            "avg_realized_r_pessimistic_bound",
-            "avg_realized_r_optimistic_bound",
-            "total_realized_r_pessimistic_bound",
-            "total_realized_r_optimistic_bound",
+            "headline_denominator_rows",
+            "ambiguous_branched_rows",
+            "win_rate_pessimistic",
+            "win_rate_optimistic",
+            "expectancy_r_pessimistic",
+            "expectancy_r_optimistic",
+            "total_r_pessimistic",
+            "total_r_optimistic",
         ):
             self.assertIn(field, summary)
 

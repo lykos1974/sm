@@ -82,7 +82,17 @@ class StrategyValidationActivationDiagnosticTests(TestCase):
             allow_multiple_trades_per_symbol=True,
             commit_every=1,
             symbol_tick_provenance={
-                "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+                "BTCUSDT": {
+                    "provider": "TEST",
+                    "venue": "TEST_SPOT",
+                    "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT",
+                    "source_symbol": "BTCUSDT",
+                    "tick_size": 0.01,
+                    "provenance_timestamp": "2026-09-23T00:00:00Z",
+                    "provenance_version": "test-v1",
+                    "source": "test:BTCUSDT",
+                }
             },
         )
 

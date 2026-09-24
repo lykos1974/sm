@@ -71,7 +71,17 @@ class StrategyValidationNoopUpdateTests(TestCase):
             allow_multiple_trades_per_symbol=True,
             commit_every=1,
             symbol_tick_provenance={
-                "BTCUSDT": {"tick_size": 0.01, "source": "test:BTCUSDT"}
+                "BTCUSDT": {
+                    "provider": "TEST",
+                    "venue": "TEST_SPOT",
+                    "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT",
+                    "source_symbol": "BTCUSDT",
+                    "tick_size": 0.01,
+                    "provenance_timestamp": "2026-09-23T00:00:00Z",
+                    "provenance_version": "test-v1",
+                    "source": "test:BTCUSDT",
+                }
             },
         )
         return temp_dir, db_path, store
@@ -116,7 +126,8 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
-        self.assertEqual(after - before, 2)
+        # Activation and its candle outcome are one atomic row update.
+        self.assertEqual(after - before, 1)
         self.assertEqual(row["activation_status"], "ACTIVE")
         self.assertEqual(row["activated_ts"], 2)
         self.assertEqual(perf["lifecycle_update_count"], 1)
@@ -179,7 +190,7 @@ class StrategyValidationNoopUpdateTests(TestCase):
         self.assertEqual(row["max_favorable_excursion"], 2.0)
         self.assertEqual(row["max_adverse_excursion"], 1.5)
         self.assertEqual(row["last_evaluated_candle_ts"], 4)
-        self.assertGreaterEqual(perf["update_pending_only_timestamp_updates"], 1)
+        self.assertEqual(perf["update_pending_sql_updates_total"], 3)
 
     def test_lifecycle_semantics_preserved_through_activation_tp1_and_tp2(self):
         temp_dir, db_path, store = self._store()
