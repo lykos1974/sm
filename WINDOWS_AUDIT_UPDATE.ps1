@@ -12,15 +12,17 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
+$PackageSourceCommit = "ea257e43ca168b5e7e70f900a896c4434fb3fbc9"
+
 $ExpectedFiles = [ordered]@{
-    "pnf_mvp/app.py" = "4a87189086d5af387cfa5bb194a7c801c93cb3da1c7a47ab7c3ad35f9ec2b453"
+    "pnf_mvp/app.py" = "58158acef33892de298c97560b6314dfd8d934682770cf70047c87fec3092eb7"
     "pnf_mvp/pnf_engine.py" = "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e"
     "pnf_mvp/storage.py" = "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e"
-    "pnf_mvp/strategy_historical_backfill.py" = "3c004707e211aed88e97f868b119a7a7cd73f4eb82a0b78f9208fa4039673caa"
+    "pnf_mvp/strategy_historical_backfill.py" = "14c58e6983b74c7c1fee9e7f6817438fb48a54964552f566b930ea70319963fd"
     "pnf_mvp/strategy_setup_observer.py" = "60ae21e82266b9c371261dbcb83634d301447224b8bf66ab82b6a04ccdab5289"
-    "pnf_mvp/strategy_validation.py" = "c3402295b2f9fd2ffdfa3117019c8f8385c2aa0efb45572cca5455f14486f2e7"
-    "pnf_mvp/strategy_trade_export.py" = "4dde92fb4e91075af3188bca2961f7daa65df11ec827a5cf475c0c34b495fbc1"
-    "pnf_mvp/strategy_evaluator.py" = "627a89183877135e1cb870e975fd9aa13b28677eda63ba29415ea5a183affb91"
+    "pnf_mvp/strategy_validation.py" = "089b847ac55feacb8537b48ab3df90d2eed7768ea51874ddf1d866c4c290f3d2"
+    "pnf_mvp/strategy_trade_export.py" = "6b039c473c31453d4afeb185d9e7c15050387f2a2eca5d61fd7d6a4501499383"
+    "pnf_mvp/strategy_evaluator.py" = "37bf22f9bf42fbd8546b8aaddfe1b91ae3780371550736d63c75d894b331c467"
 }
 
 function Resolve-FullPath([string]$PathValue) {
@@ -162,9 +164,6 @@ function Restore-Code([object]$Manifest, [string]$Target) {
             Remove-Item -LiteralPath $destination -Force
         }
     }
-    if ($Manifest.settings_backup -and (Test-Path -LiteralPath ([string]$Manifest.settings_backup))) {
-        Copy-Item -LiteralPath ([string]$Manifest.settings_backup) -Destination (Join-Path $Target "pnf_mvp\settings.json") -Force
-    }
 }
 
 function Restore-Databases([object]$Manifest) {
@@ -276,9 +275,6 @@ foreach ($entry in $ExpectedFiles.GetEnumerator()) {
     }
 }
 
-$settingsBackup = Join-Path $BackupPath "settings.json"
-Copy-Item -LiteralPath $targetSettingsPath -Destination $settingsBackup -Force
-
 $databaseManifest = @()
 $databaseIndex = 0
 foreach ($database in (Get-DatabasePaths $targetSettings (Join-Path $TargetRoot "pnf_mvp"))) {
@@ -300,11 +296,10 @@ foreach ($database in (Get-DatabasePaths $targetSettings (Join-Path $TargetRoot 
 }
 
 $manifest = [ordered]@{
-    package_base_commit = "2f5cc971c93028725d7624dcabc2a5cdd59cb363"
+    package_source_commit = $PackageSourceCommit
     created_utc = [DateTime]::UtcNow.ToString("o")
     source_root = $SourceRoot
     target_root = $TargetRoot
-    settings_backup = $settingsBackup
     files = $fileManifest
     databases = $databaseManifest
 }

@@ -10,8 +10,18 @@ Pull request: `#350`
 - Strategy validation remains **OFF**.
 - Operational alerts remain **OFF**.
 - Signal generation, strategy classification, entry/SL/TP/RR values, promotion rules, PnF, structure, live traders, and the protected long-only baseline were not changed.
-- No broad recomputation, database reset, Windows installation package, or service start was performed.
-- The previously installed Windows package remains the older `484c6da` package and must not be used to install this release.
+- No broad recomputation, database reset, installation, or service start was performed.
+- A new hash-pinned reversible Windows updater is prepared for this final repair, but it must not be executed until an independent audit returns the required PASS verdict.
+
+## Final release-gate blocker repair
+
+The three independently reproduced blockers after `9c4337c8` are repaired in one narrow release series:
+
+- `WINDOWS_AUDIT_UPDATE.ps1` pins the final runtime bytes, canonicalizes CRLF/LF safely, backs up every replaced file into a timestamped manifest, restores the exact prior files, and treats the user's `settings.json` as preflight-only state that is never packaged or overwritten.
+- Tick provenance now requires a separate explicit `symbol_identities` allow-list. Provider, venue, instrument type, native symbol, and source symbol must all exactly match it before the database is opened. Unknown symbols and incompatible identities fail closed.
+- Exporter and evaluator use the same economic chronology, `created_ts` then `setup_id`, before drawdown and losing-streak calculations. Totals, denominator, expectancy, win rate, drawdown, and losing streak reconcile under shuffled insertion and timestamp ties.
+
+Validation and alerts remain OFF. The production `symbol_identities` and `symbol_ticks` maps remain empty; no exchange tick size was invented.
 
 ## Consolidated VALIDATION ENGINE REPAIR release
 
@@ -93,9 +103,9 @@ Runtime files changed:
 
 ## Remaining blockers
 
-1. A clean independent re-audit of the final remote HEAD is mandatory before validation enablement, recomputation, or Windows installation.
+1. A clean independent re-audit of the final remote HEAD must return `PASS FOR REVERSIBLE WINDOWS INSTALLATION WITH VALIDATION/ALERTS OFF` before Windows installation.
 2. Existing legacy nonterminal rows without a safe watermark and complete structured tick provenance intentionally fail closed. Their disposition requires a separate reviewed migration decision; values must never be inferred.
-3. `pnf_mvp/settings.json` intentionally keeps the per-symbol validation tick map empty while validation is OFF. Authoritative structured provenance is required before any future enablement.
+3. `pnf_mvp/settings.json` intentionally keeps both validation identity and tick maps empty while validation is OFF. Authoritative per-symbol identities and structured tick provenance are required before any future enablement.
 4. The legacy `live_mexc_forward_trader.py` `ORDER_SENT`-without-proven-fill issue remains open and was not combined with this release.
 5. Full XAUUSD headline figures and missing historical generation modules remain unreproduced audit gaps; no claims were made from them here.
 
