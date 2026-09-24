@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation
@@ -156,3 +157,52 @@ def load_validation_tick_provenance(
         for symbol in configured
     }
     return {"sha256": digest, "symbol_identities": identities, "symbol_ticks": ticks}
+
+
+def _available_snapshot_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--settings",
+        type=Path,
+        default=DEFAULT_SETTINGS,
+        help="scanner settings JSON (default: repository pnf_mvp/settings.json)",
+    )
+    parser.add_argument(
+        "--snapshot",
+        type=Path,
+        default=DEFAULT_SNAPSHOT,
+        help="accepted provenance snapshot JSON (default: repository snapshot)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        result = load_validation_tick_provenance(
+            settings_path=args.settings,
+            snapshot_path=args.snapshot,
+        )
+        output = {
+            "status": "PASS",
+            "snapshot_sha256": result["sha256"],
+            "verified_symbol_count": len(result["symbol_identities"]),
+        }
+        exit_code = 0
+    except Exception as exc:
+        output = {
+            "status": "FAIL",
+            "snapshot_sha256": _available_snapshot_sha256(args.snapshot),
+            "verified_symbol_count": 0,
+            "error": str(exc),
+        }
+        exit_code = 1
+    print(json.dumps(output, sort_keys=True, separators=(",", ":")))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
