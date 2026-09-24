@@ -29,16 +29,21 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def _positive_decimal_text(value: Any, context: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise SnapshotError(f"{context} requires an exact string tick size")
-    text = value.strip()
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(value, (str, Decimal)):
+        raise SnapshotError(f"{context} requires an exact string or Decimal tick size")
+    text = value.strip() if isinstance(value, str) else str(value)
+    if not text:
+        raise SnapshotError(f"{context} requires an exact string or Decimal tick size")
     try:
         tick = Decimal(text)
     except InvalidOperation as exc:
         raise SnapshotError(f"{context} has invalid tick size {text!r}") from exc
     if not tick.is_finite() or tick <= 0:
         raise SnapshotError(f"{context} requires a finite positive tick size")
-    return text
+    canonical = format(tick, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    return canonical
 
 
 def _configured_identity(symbol: str) -> dict[str, str]:
@@ -139,7 +144,11 @@ def fetch_official_json(provider: str, native_symbols: list[str]) -> Any:
     request = urllib.request.Request(url, headers={"User-Agent": "pnf-tick-provenance-snapshot/1"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(
+                response.read().decode("utf-8"),
+                parse_float=Decimal,
+                parse_int=Decimal,
+            )
     except Exception as exc:
         raise SnapshotError(f"official metadata request failed: {url}: {exc}") from exc
     return payload
@@ -205,7 +214,11 @@ def write_snapshot(snapshot: dict[str, Any], output_path: str | Path) -> dict[st
     if accepted_payload == payload:
         return {"status": "UNCHANGED", "path": str(output), "sha256": digest}
     try:
-        accepted = json.loads(accepted_payload.decode("utf-8"))
+        accepted = json.loads(
+            accepted_payload.decode("utf-8"),
+            parse_float=Decimal,
+            parse_int=Decimal,
+        )
     except Exception as exc:
         raise SnapshotError(f"accepted snapshot is not valid JSON: {output}") from exc
     candidate_path = output.with_name(f"{output.stem}.candidate.{digest[:12]}{output.suffix}")
@@ -234,7 +247,8 @@ def main() -> int:
     parser.add_argument("--settings", default=str(DEFAULT_SETTINGS))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     args = parser.parse_args()
-    settings = json.loads(Path(args.settings).read_text(encoding="utf-8"))
+    with Path(args.settings).open("r", encoding="utf-8") as handle:
+        settings = json.load(handle, parse_float=Decimal, parse_int=Decimal)
     symbols = settings.get("symbols")
     if not isinstance(symbols, list) or not symbols:
         raise SnapshotError("settings symbols must be a non-empty array")

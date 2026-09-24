@@ -119,7 +119,7 @@ class TickProvenanceSnapshotTests(TestCase):
                 "instrument_type": "SPOT",
                 "native_symbol": "BTCUSDT",
                 "source_symbol": "BTCUSDT",
-                "tick_size": "0.01000000",
+                "tick_size": "0.01",
                 "metadata_source": "https://api.binance.com/api/v3/exchangeInfo",
                 "provenance_timestamp": timestamp,
                 "provenance_version": "binance-spot-exchange-info-v3",
