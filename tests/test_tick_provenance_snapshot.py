@@ -2,6 +2,7 @@ import hashlib
 import json
 import sys
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from unittest import TestCase
 
@@ -174,6 +175,45 @@ class TickProvenanceSnapshotTests(TestCase):
         for symbols in (("UNKNOWN:FAKE",), ("BTCUSDT", "BTCUSDT")):
             with self.subTest(symbols=symbols), self.assertRaises(SnapshotError):
                 build_snapshot(symbols, fetch_json=FixtureFetcher(), captured_at="2026-09-24T10:00:00Z")
+
+    def test_mexc_numeric_decimal_and_string_ticks_are_exact(self):
+        def fetcher(provider, native_symbols):
+            if provider == "BINANCE":
+                return binance_payload(native_symbols)
+            payload = mexc_payload(native_symbols[0])
+            if native_symbols[0] == "BTC_USDT":
+                payload["data"][0]["priceUnit"] = Decimal("0.1000")
+            return payload
+
+        snapshot = build_snapshot(
+            SYMBOLS, fetch_json=fetcher, captured_at="2026-09-24T10:00:00Z"
+        )
+        rows = {row["source_symbol"]: row for row in snapshot["symbols"]}
+        self.assertEqual(rows["MEXC_FUT:BTCUSDT"]["tick_size"], "0.1")
+        self.assertEqual(rows["MEXC_FUT:ETHUSDT"]["tick_size"], "0.01")
+
+    def test_float_bool_and_invalid_decimal_ticks_fail_closed_without_output(self):
+        invalid_values = (0.1, True, Decimal("NaN"), Decimal("Infinity"), Decimal("0"), Decimal("-0.1"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, value in enumerate(invalid_values):
+                output = Path(temp_dir) / f"invalid-{index}.json"
+
+                def fetcher(provider, native_symbols, invalid=value):
+                    if provider == "BINANCE":
+                        return binance_payload(native_symbols)
+                    payload = mexc_payload(native_symbols[0])
+                    payload["data"][0]["priceUnit"] = invalid
+                    return payload
+
+                with self.subTest(value=value), self.assertRaises(SnapshotError):
+                    snapshot = build_snapshot(
+                        SYMBOLS,
+                        fetch_json=fetcher,
+                        captured_at="2026-09-24T10:00:00Z",
+                    )
+                    write_snapshot(snapshot, output)
+                self.assertFalse(output.exists())
+                self.assertFalse(output.with_suffix(".json.sha256").exists())
 
     def test_never_overwrites_accepted_snapshot_and_writes_explicit_diff(self):
         timestamp = "2026-09-24T10:00:00Z"
