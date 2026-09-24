@@ -62,8 +62,9 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
         pinned = expected_files(self.script)
         source_commit = package_source_commit(self.script)
-        self.assertEqual(source_commit, "803cb4895e9ab62db3e12c0c1ed508e2257215de")
-        self.assertEqual(len(pinned), 10)
+        self.assertEqual(source_commit, "b656eb23454bdbe951cebddf6c90acc036b9ae27")
+        self.assertEqual(len(pinned), 11)
+        self.assertEqual(pinned["live_mexc_forward_trader.py"], "37282d982b49a576ac0a6d08c94d03edfb7253935135063c15146ea73bb654e2")
         self.assertIn("pnf_mvp/app.py", pinned)
         self.assertIn("pnf_mvp/validation_tick_provenance_preflight.py", pinned)
         snapshot = "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json"

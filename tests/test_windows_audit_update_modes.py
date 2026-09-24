@@ -65,6 +65,13 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b"# altered\n")
         self.run_mode("Validate", success=False)
 
+    def test_mexc_trader_pin_rejects_tampering(self):
+        path = self.source / "live_mexc_forward_trader.py"
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        self.run_mode("Validate")
+        path.write_bytes(path.read_bytes() + b"# altered\n")
+        self.run_mode("Validate", success=False)
+
     def test_apply_and_rollback_restore_exact_bytes_and_settings(self):
         snapshot = self.source / "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json"
         snapshot.write_bytes(snapshot.read_bytes().replace(b"\n", b"\r\n"))

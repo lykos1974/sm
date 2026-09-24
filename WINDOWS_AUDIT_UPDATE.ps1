@@ -12,9 +12,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$PackageSourceCommit = "803cb4895e9ab62db3e12c0c1ed508e2257215de"
+$PackageSourceCommit = "b656eb23454bdbe951cebddf6c90acc036b9ae27"
 
 $ExpectedFiles = [ordered]@{
+    "live_mexc_forward_trader.py" = "37282d982b49a576ac0a6d08c94d03edfb7253935135063c15146ea73bb654e2"
     "pnf_mvp/app.py" = "e6e4686922e38a0c5588c3b44a22be93e751384232740b9fb435cc7cd5b7a6c9"
     "pnf_mvp/pnf_engine.py" = "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e"
     "pnf_mvp/storage.py" = "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e"
