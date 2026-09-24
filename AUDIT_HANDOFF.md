@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Tick-provenance snapshot generator and isolated regressions are complete. The accepted output path is `pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json`; no snapshot was created because the official MEXC metadata endpoint returned `Site Unavailable` from the execution environment, and the generator failed closed. Retry only the read-only generator from an environment with official MEXC API access. Keep validation and alerts OFF.
+The committed 12-symbol tick-provenance snapshot now has a read-only, SHA-256-pinned preflight that requires exact configured storage-symbol, identity, and tick matches and fails closed without validation DB writes or strategy transitions. Targeted preflight tests pass; validation and alerts remain OFF. The next gate is an independent audit of this preflight only.
