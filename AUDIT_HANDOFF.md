@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Independently re-audit the MEXC read-only order-status adapter's exact endpoint allowlist, redirect rejection without credential forwarding, and duplicate-key rejection at every JSON depth. Verify offline that normalized full-fill evidence still satisfies the existing reconciliation gate and that disabled paths remain inert. Trader, validation, alerts, and fill reconciliation remain OFF; any runtime enablement requires a separate review.
+Independently audit the standalone MEXC Futures read-only shadow CLI using offline transport fixtures: exact two GET requests for an existing full fill, deterministic sanitized output, fail-closed input/response errors, credential redaction, zero database access, and atomic creation of an optional report. The CLI is operator-invoked only; adapter, fill reconciliation, trader, validation and alerts remain OFF. Any live credential use or runtime enablement requires a separate decision.
