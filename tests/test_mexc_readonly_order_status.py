@@ -4,10 +4,11 @@ import json
 import os
 import sqlite3
 import unittest
+import urllib.request
 from decimal import Decimal
 from unittest.mock import patch
 
-from mexc_readonly_order_status import ReadOnlyMexcOrderStatusAdapter
+from mexc_readonly_order_status import ReadOnlyMexcOrderStatusAdapter, _GetOnlyTransport, _NoRedirect
 import live_mexc_forward_trader as trader
 
 ORDER_ID = '739106551624717312'
@@ -122,6 +123,64 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(trader.reconcile_exchange_fills(conn, adapter, enabled=True), 0)
         self.assertEqual(conn.total_changes, before)
         conn.close()
+
+    def test_exact_endpoint_allowlist_rejects_all_other_paths_before_transport(self):
+        transport = Transport()
+        adapter = self.adapter(transport)
+        bad = (
+            '/api/v1/private/order/create', '/api/v1/private/order/modify',
+            '/api/v1/private/order/cancel', '/api/v1/private/order/cancel_all',
+            '/api/v1/private/order/get/OTHER', '/api/v1/private/order/get/' + ORDER_ID + '/..',
+            '/api/v1/private/order/get/%37' + ORDER_ID[1:],
+            '/api/v1/private/order/get/' + ORDER_ID + '?x=1',
+            '/API/v1/private/order/get/' + ORDER_ID,
+            '/api//v1/private/order/get/' + ORDER_ID,
+            'https://audit.invalid/collect', '//audit.invalid/collect',
+        )
+        for path in bad:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                adapter._get(path)
+        self.assertEqual(transport.calls, [])
+
+    def test_redirects_never_forward_sensitive_headers(self):
+        request = urllib.request.Request('https://api.mexc.com/api/v1/private/order/get/' + ORDER_ID,
+                                         headers={'ApiKey': 'synthetic-key', 'Signature': 'synthetic-signature',
+                                                  'Request-Time': '123'}, method='GET')
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                opened = []
+                class FakeOpener:
+                    def open(self, req, timeout):
+                        opened.append(req.full_url)
+                        handler = _NoRedirect()
+                        if handler.redirect_request(req, None, code, 'redirect', {},
+                                                    'https://audit.invalid/collect') is None:
+                            raise urllib.error.HTTPError(req.full_url, code, 'redirect', {}, None)
+                        raise AssertionError('redirect followed')
+                with patch('urllib.request.build_opener', return_value=FakeOpener()) as build:
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        _GetOnlyTransport().get(request.full_url, dict(request.header_items()), 15)
+                self.assertTrue(any(isinstance(arg, _NoRedirect) for arg in build.call_args.args))
+                self.assertEqual(opened, [request.full_url])
+                self.assertNotIn('synthetic-key', str(error.exception))
+                self.assertNotIn('synthetic-signature', str(error.exception))
+
+    def test_duplicate_json_keys_at_every_depth_fail_closed(self):
+        original = json.dumps(ORDER)
+        cases = [
+            original.replace('"success": true', '"success": false, "success": true', 1),
+            original.replace('"state": 3', '"state": 4, "state": 3', 1),
+            original.replace('"orderId":', '"orderId": "other", "orderId":', 1),
+            original.replace('"dealVol": "3"', '"dealVol": "3", "dealVol": "3"', 1),
+            original.replace('"dealAvgPriceStr":', '"dealAvgPriceStr": "1", "dealAvgPriceStr":', 1),
+            original.replace('"price": "99"', '"price": "99", "unknown": {"x": 1, "x": 1}', 1),
+        ]
+        trades = json.dumps(TRADES).replace('"timestamp": 150000',
+                                          '"timestamp": 1, "timestamp": 150000', 1)
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.adapter(Transport(raw.encode(), TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        self.assertIsNone(self.adapter(Transport(ORDER, trades.encode())).get_order_status(ORDER_ID, SYMBOL))
 
 
 if __name__ == '__main__': unittest.main()

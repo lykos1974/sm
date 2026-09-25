@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Independently audit the isolated MEXC Futures read-only adapter against the official order and trade-record response contracts, including the exact deal timestamps and weighted fill price, and test its integration with the existing disabled-by-default reconciliation. The adapter is not wired into the trader loop; validation, alerts, trader and fill reconciliation remain OFF. Decide on any future runtime enablement only after a separate review.
+Independently re-audit the MEXC read-only order-status adapter's exact endpoint allowlist, redirect rejection without credential forwarding, and duplicate-key rejection at every JSON depth. Verify offline that normalized full-fill evidence still satisfies the existing reconciliation gate and that disabled paths remain inert. Trader, validation, alerts, and fill reconciliation remain OFF; any runtime enablement requires a separate review.

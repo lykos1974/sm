@@ -18,13 +18,33 @@ from typing import Any
 BASE_URL = "https://api.mexc.com"
 ORDER_PATH = "/api/v1/private/order/get/"
 DEALS_PATH = "/api/v1/private/order/deal_details/"
+_ALLOWED_PATH = re.compile(r"/api/v1/private/order/(?:get|deal_details)/[0-9]{1,30}\Z")
+
+
+def _checked_path(path: str) -> str:
+    # Full ASCII match rejects traversal, escapes, queries, alternate case,
+    # duplicate slashes and absolute or scheme-relative URLs without decoding.
+    if not isinstance(path, str) or _ALLOWED_PATH.fullmatch(path) is None:
+        raise ValueError("order status endpoint not allowed")
+    return path
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> None:
+        return None
 
 
 class _GetOnlyTransport:
     def get(self, url: str, headers: dict[str, str], timeout: float) -> bytes:
-        # Defense in depth: injected transports cannot expand this object's verbs.
+        if not isinstance(url, str) or not url.startswith(BASE_URL + "/"):
+            raise ValueError("order status origin not allowed")
+        _checked_path(url[len(BASE_URL):])
         request = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # A 3xx is an HTTP error. Authentication headers never reach Location.
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+            if not 200 <= response.status < 300:
+                raise ValueError("order status HTTP failure")
             return response.read()
 
 
@@ -43,7 +63,15 @@ def _positive_decimal(value: Any) -> Decimal:
 def _json(raw: bytes) -> dict[str, Any]:
     if not isinstance(raw, bytes):
         raise ValueError("invalid response")
-    value = json.loads(raw.decode("utf-8"), parse_float=Decimal,
+    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs, parse_float=Decimal,
                        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite")))
     if not isinstance(value, dict) or value.get("success") is not True or type(value.get("code")) is not int or value["code"] != 0:
         raise ValueError("unsuccessful response")
@@ -61,6 +89,7 @@ class ReadOnlyMexcOrderStatusAdapter:
         self._secret = os.environ.get("MEXC_FUTURES_API_SECRET") if enabled else None
 
     def _get(self, path: str) -> dict[str, Any]:
+        _checked_path(path)
         timestamp = str(int(time.time() * 1000))  # Authentication time, never fill time.
         signature = hmac.new(self._secret.encode(),
                              f"{self._key}{timestamp}".encode(), hashlib.sha256).hexdigest()
