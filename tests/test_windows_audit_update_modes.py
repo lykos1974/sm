@@ -94,7 +94,7 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         original = path.read_bytes()
         path.write_bytes(original.replace(b"\n", b"\r\n"))
         self.run_mode("Validate")
-        path.write_bytes(original.replace(b"key + timestamp + parameters", b"key + timestamp"))
+        path.write_bytes(original.replace(b"_filled_state", b"_positive_integer"))
         self.run_mode("Validate", success=False)
         path.write_bytes(original + b"# altered\n")
         self.run_mode("Validate", success=False)
@@ -122,6 +122,28 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         self.assertFalse(installed.exists())
         self.assertEqual(operator.read_bytes(), b"operator bytes\r\n")
         self.assertEqual(database.read_bytes(), b"database bytes\x00")
+        self.assertEqual(hashlib.sha256((self.target / "pnf_mvp/settings.json").read_bytes()).hexdigest(), self.settings_hash)
+
+    def test_discovery_upgrade_restores_previous_bytes_and_preserves_operator_data(self):
+        previous = b"existing discovery bytes\r\n"
+        installed = self.target / "mexc_readonly_order_discovery.py"
+        installed.write_bytes(previous)
+        operator = self.target / "operator-created.txt"
+        operator.write_bytes(b"operator\x00contents")
+        credentials = self.target / "private.credentials"
+        credentials.write_bytes(b"opaque local data\r\n")
+        database = self.target / "pnf_mvp" / "operator.sqlite3"
+        database.write_bytes(b"database\x00contents")
+        self.run_mode("Validate")
+        self.run_mode("Apply", "-ConfirmServicesStopped")
+        self.assertEqual(installed.read_bytes(), (ROOT / "mexc_readonly_order_discovery.py").read_bytes())
+        backup = next((self.target / "_audit_update_backups").glob("*/manifest.json"))
+        self.assertEqual((backup.parent / "code/mexc_readonly_order_discovery.py").read_bytes(), previous)
+        self.run_mode("Rollback", "-BackupPath", str(backup.parent), "-ConfirmServicesStopped")
+        self.assertEqual(installed.read_bytes(), previous)
+        self.assertEqual(operator.read_bytes(), b"operator\x00contents")
+        self.assertEqual(credentials.read_bytes(), b"opaque local data\r\n")
+        self.assertEqual(database.read_bytes(), b"database\x00contents")
         self.assertEqual(hashlib.sha256((self.target / "pnf_mvp/settings.json").read_bytes()).hexdigest(), self.settings_hash)
 
     def test_apply_rejects_tampered_shadow_without_touching_operator_files(self):
