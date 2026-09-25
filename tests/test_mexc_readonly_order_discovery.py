@@ -1,5 +1,7 @@
 """Synthetic, offline tests of the standalone GET-only discovery tool."""
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -47,7 +49,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], discovery.BASE_URL + discovery.HISTORY_PATH +
-                         '?symbol=BTC_USDT&states=3&page_num=1&page_size=5')
+                         '?page_num=1&page_size=5&states=3&symbol=BTC_USDT')
         self.assertEqual(result, {'status': 'PASS', 'orders': [{
             'order_id': ORDER['orderId'], 'native_symbol': SYMBOL, 'side': 'LONG',
             'requested_quantity': ORDER['vol'], 'filled_quantity': ORDER['dealVol'],
@@ -55,6 +57,32 @@ class DiscoveryTests(unittest.TestCase):
             'status': 'FILLED'}]})
         self.assertNotIn('synthetic-key', str(result))
         self.assertNotIn('synthetic-secret', str(result))
+
+    def test_exact_signature_and_transmitted_query_match(self):
+        with patch.object(discovery.time, 'time', return_value=1761912240):
+            code, _, calls = self.run_cli({'success': True, 'code': 0, 'data': [ORDER]})
+        self.assertEqual(code, 0)
+        url, headers, _ = calls[0]
+        query = 'page_num=1&page_size=5&states=3&symbol=BTC_USDT'
+        self.assertEqual(url.split('?', 1)[1], query)
+        self.assertEqual(headers['Request-Time'], '1761912240000')
+        signed_payload = 'synthetic-key1761912240000' + query
+        expected = hmac.new(b'synthetic-secret', signed_payload.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(headers['Signature'], expected)
+
+    def test_canonical_parameters_are_order_independent_and_encoded(self):
+        first = [('symbol', 'BTC USDT/ü'), ('states', 3), ('page_size', 5), ('page_num', 1)]
+        second = list(reversed(first))
+        expected = 'page_num=1&page_size=5&states=3&symbol=BTC%20USDT%2F%C3%BC'
+        self.assertEqual(discovery._canonical_parameters(first), expected)
+        self.assertEqual(discovery._canonical_parameters(second), expected)
+        for pairs in ([('states', 3), ('states', 3)], [('', 'a')],
+                      [('symbol', None)], [('states', True)], [('states', 3.0)],
+                      [('states', ['3'])], [('symbol', '')],
+                      [('Signature', 'bad')], [('ApiKey', 'bad')],
+                      [('Request-Time', 'bad')], [('signature', 'bad')]):
+            with self.subTest(pairs=pairs), self.assertRaises(ValueError):
+                discovery._canonical_parameters(pairs)
 
     def test_invalid_inputs_and_missing_credentials_never_call_transport(self):
         for args, credentials in ((('--symbol', '../BTC_USDT'), True),
@@ -97,7 +125,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIsNone(discovery._NoRedirect().redirect_request(None, None, 302, '', {},
                                                                     'https://evil.example/'))
         url = (discovery.BASE_URL + discovery.HISTORY_PATH +
-               '?symbol=BTC_USDT&states=3&page_num=1&page_size=5')
+               '?page_num=1&page_size=5&states=3&symbol=BTC_USDT')
         for status in (301, 302, 303, 307, 308):
             class FakeOpener:
                 def open(self, request, timeout):

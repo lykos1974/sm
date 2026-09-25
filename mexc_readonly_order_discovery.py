@@ -14,6 +14,7 @@ import os
 import re
 import time
 import urllib.request
+from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -21,8 +22,23 @@ BASE_URL = 'https://api.mexc.com'
 HISTORY_PATH = '/api/v1/private/order/list/history_orders'
 _ALLOWED_URL = re.compile(
     r'https://api\.mexc\.com/api/v1/private/order/list/history_orders'
-    r'\?symbol=[A-Z0-9]+_[A-Z0-9]+&states=3&page_num=1&page_size=(?:[1-9]|1[0-9]|20)\Z'
+    r'\?page_num=1&page_size=(?:[1-9]|1[0-9]|20)&states=3&symbol=[A-Z0-9]+_[A-Z0-9]+\Z'
 )
+
+
+def _canonical_parameters(pairs: list[tuple[str, str | int]]) -> str:
+    """One sorted, URL-encoded representation for both signing and transport."""
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        if (not isinstance(key, str) or key not in ('page_num', 'page_size', 'states', 'symbol')
+                or key in values
+                or type(value) not in (str, int) or value == ''):
+            raise ValueError('invalid request parameters')
+        values[key] = str(value)
+    if not values:
+        raise ValueError('empty request parameters')
+    return '&'.join(f'{quote(key, safe="-._~")}={quote(values[key], safe="-._~")}'
+                    for key in sorted(values))
 
 
 def _checked_url(url: str) -> str:
@@ -141,11 +157,14 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
     if not key or not secret:
         _emit('FAIL', reason='MISSING_CREDENTIALS')
         return 1
-    url = _checked_url(BASE_URL + HISTORY_PATH +
-                       f'?symbol={args.symbol}&states=3&page_num=1&page_size={args.limit}')
     try:
+        parameters = _canonical_parameters([
+            ('symbol', args.symbol), ('states', 3), ('page_num', 1), ('page_size', args.limit),
+        ])
+        url = _checked_url(BASE_URL + HISTORY_PATH + '?' + parameters)
         timestamp = str(int(time.time() * 1000))
-        signature = hmac.new(secret.encode(), f'{key}{timestamp}'.encode(), hashlib.sha256).hexdigest()
+        signature = hmac.new(secret.encode(),
+                             (key + timestamp + parameters).encode(), hashlib.sha256).hexdigest()
         headers = {'ApiKey': key, 'Request-Time': timestamp, 'Signature': signature}
         raw = (transport if transport is not None else _GetOnlyTransport()).get(url, headers, 15)
         orders = _orders(raw, args.symbol, args.limit)
