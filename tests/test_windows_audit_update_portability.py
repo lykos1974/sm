@@ -62,9 +62,9 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
         pinned = expected_files(self.script)
         source_commit = package_source_commit(self.script)
-        self.assertEqual(source_commit, "b656eb23454bdbe951cebddf6c90acc036b9ae27")
+        self.assertEqual(source_commit, "42d4cf525d627a8e8e8bce24d68871e3b54a302a")
         self.assertEqual(len(pinned), 11)
-        self.assertEqual(pinned["live_mexc_forward_trader.py"], "37282d982b49a576ac0a6d08c94d03edfb7253935135063c15146ea73bb654e2")
+        self.assertEqual(pinned["live_mexc_forward_trader.py"], "844b60cfed374fc665fc91aad9524403536e13fc2229ba44e57a5391a3f71f48")
         self.assertIn("pnf_mvp/app.py", pinned)
         self.assertIn("pnf_mvp/validation_tick_provenance_preflight.py", pinned)
         snapshot = "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json"
@@ -76,6 +76,23 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
                 crlf_payload = lf_payload.replace(b"\n", b"\r\n")
                 self.assertEqual(canonical_text_sha256(lf_payload), expected)
                 self.assertEqual(canonical_text_sha256(crlf_payload), expected)
+
+    def test_previous_package_hashes_are_preserved(self):
+        previous = {
+            "pnf_mvp/app.py": "e6e4686922e38a0c5588c3b44a22be93e751384232740b9fb435cc7cd5b7a6c9",
+            "pnf_mvp/pnf_engine.py": "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e",
+            "pnf_mvp/storage.py": "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e",
+            "pnf_mvp/strategy_historical_backfill.py": "14c58e6983b74c7c1fee9e7f6817438fb48a54964552f566b930ea70319963fd",
+            "pnf_mvp/strategy_setup_observer.py": "60ae21e82266b9c371261dbcb83634d301447224b8bf66ab82b6a04ccdab5289",
+            "pnf_mvp/strategy_validation.py": "089b847ac55feacb8537b48ab3df90d2eed7768ea51874ddf1d866c4c290f3d2",
+            "pnf_mvp/strategy_trade_export.py": "6b039c473c31453d4afeb185d9e7c15050387f2a2eca5d61fd7d6a4501499383",
+            "pnf_mvp/strategy_evaluator.py": "37bf22f9bf42fbd8546b8aaddfe1b91ae3780371550736d63c75d894b331c467",
+            "pnf_mvp/validation_tick_provenance_preflight.py": "d16c7ab4a755dd60b1a8dac60d30510fb1ccc1d4d5ec62e1b93e37d1589b0e7c",
+            "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json": "8ad27ceb2d89d2e9ab57b954240189982fdbaa5ceb02f99d474f540ea2dfa562",
+        }
+        pinned = expected_files(self.script)
+        self.assertEqual({key: pinned[key] for key in previous}, previous)
+        self.assertEqual(set(pinned) - set(previous), {"live_mexc_forward_trader.py"})
 
     def test_final_runtime_hashes_pass_and_stale_runtime_hashes_fail(self):
         pinned = expected_files(self.script)
@@ -140,6 +157,7 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         self.assertNotIn("Start-Process", self.script)
         self.assertNotIn("Start-Service", self.script)
         self.assertNotIn("Set-Content -LiteralPath $targetSettingsPath", self.script)
+        self.assertIn('if ($RestoreDatabases) {\n        Restore-Databases $manifest', self.script)
 
 
 if __name__ == "__main__":
