@@ -102,6 +102,54 @@ class DiscoveryTests(unittest.TestCase):
                 code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [broken]})
                 self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
 
+    def test_conflicting_economic_aliases_fail_closed(self):
+        aliases = {'order_id': '2', 'native_symbol': 'ETH_USDT', 'order_side': 3,
+                   'requested_quantity': '2', 'filled_quantity': '2',
+                   'dealAvgPrice': '200', 'status': 4, 'update_time': 1761912240001}
+        for alias, value in aliases.items():
+            with self.subTest(alias=alias):
+                body = {'success': True, 'code': 0, 'data': [dict(ORDER, **{alias: value})]}
+                code, result, _ = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA',
+                                                       'diagnostic': {'endpoint': 'HISTORY_ORDERS',
+                                                                      'http_status': None, 'schema': 'RESPONSE'}}))
+
+    def test_equivalent_aliases_use_exact_decimal_and_reject_invalid(self):
+        with self.assertRaises(ValueError):
+            discovery._positive(100.0)
+        with self.assertRaises(ValueError):
+            discovery._positive(True)
+        row = dict(ORDER, order_id=ORDER['orderId'], native_symbol=SYMBOL, order_side=1,
+                   requested_quantity='3.000000000000000001', filled_quantity=ORDER['dealVol'],
+                   dealAvgPrice='100.5000000000000000010', status=3,
+                   update_time=ORDER['updateTime'])
+        code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+        self.assertEqual(code, 0)
+        self.assertEqual(result['orders'][0]['average_fill_price'], ORDER['dealAvgPriceStr'])
+        for value in (100.5, True, 'NaN', 'Infinity', 'bad'):
+            with self.subTest(value=value):
+                row['dealAvgPrice'] = value
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+                self.assertEqual((code, result['reason']), (1, 'RESPONSE_SCHEMA'))
+        for value in ('100', '100.0', 100):
+            with self.subTest(equivalent=value):
+                row = dict(ORDER, dealAvgPriceStr='100', dealAvgPrice=value)
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+                self.assertEqual(code, 0)
+                self.assertEqual(result['orders'][0]['average_fill_price'], '100')
+
+    def test_missing_required_evidence_and_conflicting_fill_time_aliases(self):
+        for field in ('orderId', 'symbol', 'side', 'state', 'vol', 'dealVol',
+                      'dealAvgPriceStr', 'updateTime'):
+            with self.subTest(field=field):
+                row = dict(ORDER)
+                del row[field]
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+                self.assertEqual((code, result['reason']), (1, 'RESPONSE_SCHEMA'))
+        row = dict(ORDER, fillTime=1761912240000, fill_time=1761912240001)
+        code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+        self.assertEqual((code, result['reason']), (1, 'RESPONSE_SCHEMA'))
+
     def test_duplicate_json_keys_and_transport_failure_fail_closed(self):
         for body in (b'{"success":true,"success":true,"code":0,"data":[]}',
                      b'{"success":true,"code":0,"data":[{"orderId":"1","orderId":"1"}]}',

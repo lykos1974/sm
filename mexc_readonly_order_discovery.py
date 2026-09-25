@@ -113,6 +113,44 @@ def _positive(value: Any) -> Decimal:
     return result
 
 
+def _aliases(row: dict[str, Any], names: tuple[str, ...], normalize: Any,
+             *, required: bool = True) -> Any:
+    present = [name for name in names if name in row]
+    if not present:
+        if required:
+            raise ValueError('missing evidence')
+        return None
+    values = [normalize(row[name]) for name in present]
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError('conflicting evidence aliases')
+    return values[0]
+
+
+def _positive_integer(value: Any) -> int:
+    if type(value) is int:
+        result = value
+    elif isinstance(value, str) and re.fullmatch(r'[0-9]+', value):
+        result = int(value)
+    else:
+        raise ValueError('invalid integer evidence')
+    if result <= 0:
+        raise ValueError('invalid integer evidence')
+    return result
+
+
+def _order_id(value: Any) -> str:
+    if (type(value) not in (str, int)
+            or re.fullmatch(r'[0-9]{1,30}', str(value)) is None):
+        raise ValueError('invalid order ID')
+    return str(value)
+
+
+def _symbol(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r'[A-Z0-9]+_[A-Z0-9]+', value) is None:
+        raise ValueError('invalid symbol')
+    return value
+
+
 def _orders(raw: bytes, symbol: str, limit: int) -> list[dict[str, Any]]:
     data = _json(raw)['data']
     if isinstance(data, dict):
@@ -125,26 +163,30 @@ def _orders(raw: bytes, symbol: str, limit: int) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in data:
-        if not isinstance(row, dict) or type(row.get('state')) is not int:
+        if not isinstance(row, dict):
             raise ValueError('ambiguous order')
-        if row['state'] in (1, 2, 4, 5):
+        state = _aliases(row, ('state', 'status'), _positive_integer)
+        if state in (1, 2, 4, 5):
             continue
-        if row['state'] != 3 or row.get('symbol') != symbol or type(row.get('side')) is not int:
+        native_symbol = _aliases(row, ('symbol', 'native_symbol'), _symbol)
+        side = _aliases(row, ('side', 'order_side'), _positive_integer)
+        if state != 3 or native_symbol != symbol:
             raise ValueError('ambiguous order')
-        if row['side'] not in (1, 3):
+        if side not in (1, 3):
             raise ValueError('ambiguous side')
-        order_id = str(row['orderId'])
-        if (re.fullmatch(r'[0-9]{1,30}', order_id) is None or order_id in seen
-                or type(row.get('updateTime')) is not int or row['updateTime'] <= 0):
+        order_id = _aliases(row, ('orderId', 'order_id'), _order_id)
+        _aliases(row, ('updateTime', 'update_time'), _positive_integer)
+        _aliases(row, ('fillTime', 'fill_time'), _positive_integer, required=False)
+        if order_id in seen:
             raise ValueError('ambiguous identity or time')
         seen.add(order_id)
-        requested = _positive(row['vol'])
-        filled = _positive(row['dealVol'])
-        average = _positive(row.get('dealAvgPriceStr', row.get('dealAvgPrice')))
+        requested = _aliases(row, ('vol', 'requested_quantity'), _positive)
+        filled = _aliases(row, ('dealVol', 'filled_quantity'), _positive)
+        average = _aliases(row, ('dealAvgPriceStr', 'dealAvgPrice'), _positive)
         if requested != filled:
             raise ValueError('not fully filled')
         result.append({'order_id': order_id, 'native_symbol': symbol,
-                       'side': 'LONG' if row['side'] == 1 else 'SHORT',
+                       'side': 'LONG' if side == 1 else 'SHORT',
                        'requested_quantity': str(requested), 'filled_quantity': str(filled),
                        'average_fill_price': str(average), 'fill_time': None,
                        'status': 'FILLED'})
