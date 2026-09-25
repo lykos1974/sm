@@ -41,6 +41,15 @@ def _emit(status: str, *, evidence: dict[str, Any] | None = None,
     return json.dumps(result, sort_keys=True, separators=(',', ':')) + '\n'
 
 
+def _emit_published_report_best_effort(payload: str) -> None:
+    """A committed report stays authoritative if the console is unavailable."""
+    try:
+        print(payload, end='')
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def _cleanup_temporary(temporary: str) -> bool:
     """Try both ordinary removal APIs after the file handle has closed."""
     for remove in (os.unlink, os.remove, os.unlink):
@@ -157,12 +166,13 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
         except OSError:
             print(_emit('FAIL', reason='REPORT_ERROR'), end='')
             return 1
+        _emit_published_report_best_effort(payload)
+        return 0
     try:
         print(payload, end='')
         sys.stdout.flush()
     except OSError:
-        # Once published, the report is the committed result even if stdout breaks.
-        return 0 if args.output_report else 1
+        return 1
     return 0
 
 

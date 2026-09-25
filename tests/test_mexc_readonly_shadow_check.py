@@ -97,6 +97,40 @@ class ShadowCheckTests(unittest.TestCase):
             self.assertEqual(json.loads(target.read_text())['status'], 'PASS')
             self.assertEqual(list(Path(folder).iterdir()), [target])
 
+    def test_closed_console_after_publication_keeps_committed_pass(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            closed_output = io.StringIO()
+            closed_output.close()
+            with patch.object(cli, 'print', side_effect=lambda *args, **kwargs: closed_output.write(args[0]), create=True):
+                code, output, calls = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual((code, output, len(calls)), (0, '', 2))
+            self.assertEqual(json.loads(target.read_text())['status'], 'PASS')
+            self.assertEqual(list(Path(folder).iterdir()), [target])
+
+    def test_other_console_errors_after_publication_keep_committed_pass(self):
+        for error in (OSError('closed stream'), UnicodeError('encoding failure')):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as folder:
+                target = Path(folder) / 'report.json'
+                with patch.object(cli, 'print', side_effect=error, create=True):
+                    code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+                self.assertEqual((code, output), (0, ''))
+                self.assertEqual(json.loads(target.read_text())['status'], 'PASS')
+
+    def test_no_report_does_not_mask_console_failure(self):
+        with patch.object(cli, 'print', side_effect=ValueError('closed stream'), create=True):
+            with self.assertRaises(ValueError):
+                self.run_cli()
+
+    def test_process_control_exceptions_are_not_suppressed(self):
+        for exception in (KeyboardInterrupt, SystemExit, GeneratorExit):
+            with self.subTest(exception=exception.__name__), tempfile.TemporaryDirectory() as folder:
+                target = Path(folder) / 'report.json'
+                with patch.object(cli, 'print', side_effect=exception(), create=True):
+                    with self.assertRaises(exception):
+                        self.run_cli(ARGS + ['--output-report', str(target)])
+                self.assertEqual(json.loads(target.read_text())['status'], 'PASS')
+
     def test_universal_deletion_denial_fails_closed_without_publication(self):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'report.json'
