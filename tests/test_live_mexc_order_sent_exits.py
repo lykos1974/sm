@@ -1,9 +1,11 @@
 import sqlite3
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import live_mexc_forward_trader as trader
+from tests.test_live_mexc_fill_reconciliation import Adapter, evidence
 
 
 class NoExchangeCalls:
@@ -34,12 +36,12 @@ class OrderSentExitTests(unittest.TestCase):
                 conn.executemany("INSERT INTO candles VALUES('MEXC_FUT:BTCUSDT','1m',?,?,?)", (
                     (120000, pre_high, pre_low), (180000, fill_high, fill_low),
                 ))
-                conn.execute("""INSERT INTO live_trades(created_at,symbol,pattern,side,entry_time,entry_price,stop_price,tp1_price,tp2_price,notional_usdt,status)
-                    VALUES('now','MEXC_FUT:BTCUSDT','triangle',?,60000,100,?,?,?,1,'ORDER_SENT')""",
-                    (side, 90 if side == 'LONG' else 110, 105 if side == 'LONG' else 95, 120 if side == 'LONG' else 80))
+                conn.execute("""INSERT INTO live_trades(created_at,symbol,pattern,side,entry_time,entry_price,stop_price,tp1_price,tp2_price,notional_usdt,exchange_order_id,status,raw_order_response)
+                    VALUES('now','MEXC_FUT:BTCUSDT','triangle',?,60000,100,?,?,?,1,'oid','ORDER_SENT',?)""",
+                    (side, 90 if side == 'LONG' else 110, 105 if side == 'LONG' else 95, 120 if side == 'LONG' else 80, json.dumps({'order_request': {'symbol': 'BTC_USDT', 'side': 1 if side == 'LONG' else 3, 'vol': '2'}})))
                 conn.commit()
-                self.assertTrue(trader.confirm_exchange_fill(conn, 1, 150000, status="FILLED"))
-                self.assertFalse(trader.confirm_exchange_fill(conn, 1, 150000, status="FILLED"))
+                self.assertEqual(trader.reconcile_exchange_fills(conn, Adapter(evidence(side)), enabled=True), 1)
+                self.assertEqual(trader.reconcile_exchange_fills(conn, Adapter(evidence(side)), enabled=True), 0)
                 conn.close()
                 conn = sqlite3.connect(path)
                 try:
@@ -70,19 +72,8 @@ class OrderSentExitTests(unittest.TestCase):
         self.assertEqual(self.conn.total_changes, before)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM live_trades WHERE realized_r IS NOT NULL").fetchone()[0], 0)
 
-    def test_fill_confirmation_requires_explicit_timestamp_and_is_single_transition(self):
-        self.conn.execute("""INSERT INTO live_trades(created_at,symbol,pattern,side,entry_time,entry_price,stop_price,tp1_price,tp2_price,notional_usdt,status)
-            VALUES('now','MEXC_FUT:BTCUSDT','triangle','LONG',60000,100,90,105,120,1,'ORDER_SENT')""")
-        self.conn.commit()
-        for invalid in (None, '150000', 0, -1, True, 1.5):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                trader.confirm_exchange_fill(self.conn, 1, invalid)
-        self.assertEqual(self.conn.execute("SELECT status,confirmed_fill_ts FROM live_trades").fetchone(), ('ORDER_SENT', None))
-        self.assertTrue(trader.confirm_exchange_fill(self.conn, 1, 150000, status='OPEN_POSITION'))
-        before = self.conn.total_changes
-        self.assertFalse(trader.confirm_exchange_fill(self.conn, 1, 160000))
-        self.assertEqual(self.conn.total_changes, before)
-        self.assertEqual(self.conn.execute("SELECT status,confirmed_fill_ts FROM live_trades").fetchone(), ('OPEN_POSITION', 150000))
+    def test_timestamp_only_confirmation_bypass_absent(self):
+        self.assertFalse(hasattr(trader, 'confirm_exchange_fill'))
 
     def test_legacy_schema_migration_preserves_unverified_fill(self):
         with tempfile.TemporaryDirectory() as directory:

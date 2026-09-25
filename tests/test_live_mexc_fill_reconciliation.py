@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -43,10 +44,10 @@ class FillReconciliationTests(unittest.TestCase):
                 self.assertEqual(trader.reconcile_exchange_fills(conn, adapter), 0)
                 self.assertEqual(adapter.calls, 0)
                 self.assertEqual(trader.reconcile_exchange_fills(conn, adapter, enabled=True), 1)
-                original = conn.execute('SELECT status,confirmed_fill_ts,raw_fill_evidence,entry_price FROM live_trades').fetchone()
+                original = conn.execute('SELECT status,confirmed_fill_ts,raw_fill_evidence,entry_price,signal_entry_price,execution_entry_price FROM live_trades').fetchone()
                 self.assertEqual(original[:2], ('FILLED', 150000))
                 self.assertEqual(json.loads(original[2]), evidence(side))
-                self.assertEqual(original[3], 100)
+                self.assertEqual(original[3:], (100.5, '100.0', '100.5'))
                 conn.close()
                 conn = sqlite3.connect(path)
                 adapter.response = evidence(side)
@@ -54,8 +55,40 @@ class FillReconciliationTests(unittest.TestCase):
                 before = conn.total_changes
                 self.assertEqual(trader.reconcile_exchange_fills(conn, adapter, enabled=True), 0)
                 self.assertEqual(conn.total_changes, before)
-                self.assertEqual(conn.execute('SELECT status,confirmed_fill_ts,raw_fill_evidence,entry_price FROM live_trades').fetchone(), original)
+                self.assertEqual(conn.execute('SELECT status,confirmed_fill_ts,raw_fill_evidence,entry_price,signal_entry_price,execution_entry_price FROM live_trades').fetchone(), original)
                 conn.close()
+
+    def test_exact_fill_price_drives_exits_and_r_both_sides(self):
+        for side, stop, target, high, low, expected in (
+            ('LONG', 90, 120, 121, 100, Decimal('19.5') / Decimal('10.5')),
+            ('SHORT', 110, 80, 109, 79, Decimal('20.5') / Decimal('9.5')),
+        ):
+            with self.subTest(side=side):
+                conn = sqlite3.connect(':memory:')
+                setup(conn, side)
+                conn.execute('UPDATE live_trades SET stop_price=?, tp2_price=?', (stop, target))
+                conn.execute('CREATE TABLE candles(symbol TEXT, interval TEXT, close_time INTEGER, high REAL, low REAL)')
+                conn.executemany("INSERT INTO candles VALUES('MEXC_FUT:BTCUSDT','1m',?,?,?)", (
+                    (120000, 130, 70), (180000, 130, 70), (240000, high, low),
+                ))
+                conn.commit()
+                self.assertEqual(trader.reconcile_exchange_fills(conn, Adapter(evidence(side)), enabled=True), 1)
+                trader.update_open_trade_exits(conn, object(), live_enabled=False)
+                status, ts, result = conn.execute('SELECT status,exit_time,realized_r FROM live_trades').fetchone()
+                self.assertEqual((status, ts), ('POSITION_CLOSED', 240000))
+                self.assertEqual(result, float(expected))
+                conn.close()
+
+    def test_update_failure_rolls_back_every_fill_field(self):
+        conn = sqlite3.connect(':memory:')
+        setup(conn)
+        conn.execute('CREATE TRIGGER fail_fill BEFORE UPDATE OF raw_fill_evidence ON live_trades BEGIN SELECT RAISE(ABORT, "injected"); END')
+        conn.commit()
+        before = conn.execute('SELECT * FROM live_trades').fetchone()
+        with self.assertRaises(sqlite3.DatabaseError):
+            trader.reconcile_exchange_fills(conn, Adapter(evidence()), enabled=True)
+        self.assertEqual(conn.execute('SELECT * FROM live_trades').fetchone(), before)
+        conn.close()
 
     def test_invalid_evidence_is_write_free(self):
         changes = [
