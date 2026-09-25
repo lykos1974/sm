@@ -45,7 +45,7 @@ class DiscoveryTests(unittest.TestCase):
         return code, json.loads(output.getvalue()), transport.calls
 
     def test_completed_order_one_allowlisted_get_and_exact_decimal(self):
-        body = {'success': True, 'code': 0, 'data': [ORDER, dict(ORDER, orderId='2', state=4)]}
+        body = {'success': True, 'code': 0, 'data': [ORDER]}
         code, result, calls = self.run_cli(body)
         self.assertEqual(code, 0)
         self.assertEqual(len(calls), 1)
@@ -114,31 +114,38 @@ class DiscoveryTests(unittest.TestCase):
                                                        'diagnostic': {'endpoint': 'HISTORY_ORDERS',
                                                                       'http_status': None, 'schema': 'RESPONSE'}}))
 
-    def test_nonfilled_rows_validate_all_supplied_aliases_before_skipping(self):
-        aliases = {'order_id': '2', 'native_symbol': 'ETH_USDT', 'order_side': 3,
-                   'requested_quantity': '2', 'filled_quantity': '2',
-                   'dealAvgPrice': '200', 'status': 3, 'update_time': 1761912240001,
-                   'fillTime': 100, 'fill_time': 101}
-        for state in (1, 2, 4, 5):
-            for alias, value in aliases.items():
-                with self.subTest(state=state, alias=alias):
-                    row = dict(ORDER, state=state)
-                    if alias == 'fillTime':
-                        row['fill_time'] = 101
-                    if alias == 'fill_time':
-                        row['fillTime'] = 100
-                    row[alias] = value
-                    code, result, _ = self.run_cli(
-                        {'success': True, 'code': 0, 'data': [row]},
-                        args=('--symbol', SYMBOL, '--diagnostic'))
-                    self.assertEqual((code, result['reason'], result['diagnostic']['schema']),
-                                     (1, 'RESPONSE_SCHEMA', 'RESPONSE'))
+    def test_only_integer_state_three_is_accepted_for_every_row(self):
+        for state in (None, 1, 2, 4, 5, 0, 6, True, 3.0, '3', 'bad', [], {}):
+            with self.subTest(state=state):
+                row = dict(ORDER, state=state)
+                code, result, _ = self.run_cli(
+                    {'success': True, 'code': 0, 'data': [row]},
+                    args=('--symbol', SYMBOL, '--diagnostic'))
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA',
+                                                       'diagnostic': {'endpoint': 'HISTORY_ORDERS',
+                                                                      'http_status': None, 'schema': 'RESPONSE'}}))
+        for rows in ([{'state': 4}], [dict(ORDER), {'state': 4}],
+                     [dict(ORDER), dict(ORDER, orderId='2', state=4)]):
+            with self.subTest(rows=rows):
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': rows})
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
 
-    def test_valid_cancelled_zero_fill_stays_skipped(self):
-        row = dict(ORDER, state=4, dealVol='0', dealAvgPriceStr='0',
-                   dealAvgPrice=0, filled_quantity='0')
-        code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
-        self.assertEqual((code, result), (0, {'status': 'PASS', 'orders': []}))
+    def test_state_three_requires_all_discovery_evidence_and_consistent_aliases(self):
+        for field in ('orderId', 'symbol', 'side', 'vol', 'dealVol',
+                      'dealAvgPriceStr', 'updateTime'):
+            with self.subTest(field=field):
+                row = dict(ORDER)
+                del row[field]
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
+        for alias, value in (('status', '3'), ('status', 4), ('dealAvgPrice', '200'),
+                             ('fillTime', 100), ('fill_time', 101)):
+            with self.subTest(alias=alias):
+                row = dict(ORDER, **{alias: value})
+                if alias in ('fillTime', 'fill_time'):
+                    row['fillTime'], row['fill_time'] = 100, 101
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
 
     def test_equivalent_aliases_use_exact_decimal_and_reject_invalid(self):
         with self.assertRaises(ValueError):
