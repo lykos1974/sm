@@ -59,13 +59,108 @@ class ShadowCheckTests(unittest.TestCase):
     def test_report_creation_error_leaves_no_file_or_temp(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'report.json'
-            with patch.object(cli.os, 'link', side_effect=OSError('synthetic-secret')):
+            with patch.object(cli, '_publish_new_report', side_effect=OSError('synthetic-secret')):
                 code, output, calls = self.run_cli(ARGS + ['--output-report', str(path)])
             self.assertEqual(code, 1)
             self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
             self.assertEqual(len(calls), 2)
             self.assertEqual(list(Path(folder).iterdir()), [])
             self.assertNotIn('synthetic-secret', output)
+
+    def test_cleanup_failure_cannot_turn_published_pass_into_fail(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            with patch.object(cli.os, 'unlink', side_effect=OSError('cleanup failed')):
+                code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)['status'], 'PASS')
+            self.assertEqual(list(Path(folder).iterdir()), [target])
+
+    def test_cleanup_failure_before_publication_fails_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            with patch.object(cli.os, 'fsync', side_effect=OSError('fsync failed')):
+                with patch.object(cli.os, 'unlink', side_effect=OSError('cleanup failed')):
+                    code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
+            self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_target_created_during_publication_is_not_replaced(self):
+        original_publish = cli._publish_new_report
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            def competing_publish(temporary, destination):
+                self.assertEqual(Path(temporary).parent, target.parent)
+                target.write_bytes(b'competing operator bytes')
+                original_publish(temporary, destination)
+            with patch.object(cli, '_publish_new_report', side_effect=competing_publish):
+                code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
+            self.assertEqual(target.read_bytes(), b'competing operator bytes')
+            self.assertEqual(list(Path(folder).iterdir()), [target])
+
+    def test_existing_report_and_symlink_remain_untouched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'report.json'
+            path.write_bytes(b'operator bytes')
+            code, output, _ = self.run_cli(ARGS + ['--output-report', str(path)])
+            self.assertEqual((code, json.loads(output)['reason']), (1, 'REPORT_ERROR'))
+            self.assertEqual(path.read_bytes(), b'operator bytes')
+            self.assertEqual(list(Path(folder).iterdir()), [path])
+            link = Path(folder) / 'alias.json'
+            link.symlink_to(path)
+            code, output, _ = self.run_cli(ARGS + ['--output-report', str(link)])
+            self.assertEqual((code, json.loads(output)['reason']), (1, 'REPORT_ERROR'))
+            self.assertEqual(path.read_bytes(), b'operator bytes')
+            self.assertTrue(link.is_symlink())
+
+    def test_create_write_flush_fsync_close_publish_failures_leave_no_artifacts(self):
+        real_mkstemp, real_fdopen = cli.tempfile.mkstemp, cli.os.fdopen
+
+        class BrokenStream:
+            def __init__(self, stream, broken):
+                self.stream, self.broken = stream, broken
+            def __enter__(self): return self
+            def __exit__(self, typ, value, trace):
+                if self.broken == 'close':
+                    self.stream.close()
+                    raise OSError('synthetic-secret')
+                return self.stream.__exit__(typ, value, trace)
+            def write(self, value):
+                if self.broken == 'write': raise OSError('synthetic-secret')
+                return self.stream.write(value)
+            def flush(self):
+                if self.broken == 'flush': raise OSError('synthetic-secret')
+                return self.stream.flush()
+            def fileno(self): return self.stream.fileno()
+
+        for boundary in ('create', 'write', 'flush', 'fsync', 'close', 'publication'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as folder:
+                target = Path(folder) / 'report.json'
+                def broken_create(*args, **kwargs):
+                    if boundary == 'create': raise OSError('synthetic-secret')
+                    return real_mkstemp(*args, **kwargs)
+                def broken_fdopen(fd, mode):
+                    return BrokenStream(real_fdopen(fd, mode), boundary)
+                with patch.object(cli.tempfile, 'mkstemp', side_effect=broken_create):
+                    with patch.object(cli.os, 'fdopen', side_effect=broken_fdopen):
+                        with patch.object(cli.os, 'fsync', side_effect=OSError('synthetic-secret') if boundary == 'fsync' else None):
+                            with patch.object(cli, '_publish_new_report', side_effect=OSError('synthetic-secret') if boundary == 'publication' else None):
+                                code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
+                self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_fdopen_failure_closes_descriptor_and_removes_temp(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            with patch.object(cli.os, 'fdopen', side_effect=OSError('synthetic-secret')):
+                code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
+            self.assertEqual(list(Path(folder).iterdir()), [])
 
     def test_fail_closed_without_report_or_secrets(self):
         for args, order, trades, credentials, expected in (

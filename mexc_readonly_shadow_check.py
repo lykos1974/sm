@@ -7,6 +7,7 @@ with runtime environment credentials can issue the adapter's two GET requests.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -40,17 +41,54 @@ def _emit(status: str, *, evidence: dict[str, Any] | None = None,
 
 
 def _write_new_report(path: str, payload: str) -> None:
-    """Write a complete report via same-directory temporary file and exclusive link."""
+    """Publish once via a no-replace rename, with no cleanup after publication."""
     destination = Path(path)
+    if os.path.lexists(destination) or _is_reparse_point(destination):
+        raise FileExistsError('report target exists')
     fd, temporary = tempfile.mkstemp(prefix='.mexc-shadow-', suffix='.tmp', dir=str(destination.parent))
     try:
-        with os.fdopen(fd, 'wb') as stream:
+        try:
+            stream_context = os.fdopen(fd, 'wb')
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream_context as stream:
             stream.write(payload.encode('utf-8'))
             stream.flush()
             os.fsync(stream.fileno())
-        os.link(temporary, destination)  # Atomic creation; existing operator files are never replaced.
-    finally:
-        os.unlink(temporary)
+        _publish_new_report(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            os.remove(temporary)
+        raise
+
+
+def _is_reparse_point(path: Path) -> bool:
+    if os.name != 'nt':
+        return path.is_symlink()
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+
+
+def _publish_new_report(temporary: str, destination: Path) -> None:
+    """Atomic same-directory move that refuses to replace an existing path."""
+    if os.name == 'nt':
+        # Windows rename fails if the destination exists, including symlinks.
+        os.rename(temporary, destination)
+        return
+    # Linux test/development path; plain os.rename would replace an existing file.
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as exc:
+        raise OSError('exclusive report publication unavailable') from exc
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    result = renameat2(-100, os.fsencode(temporary), -100, os.fsencode(destination), 1)
+    if result != 0:
+        raise OSError(ctypes.get_errno(), 'exclusive report publication failed')
 
 
 def main(argv: list[str] | None = None, *, transport: Any = None) -> int:

@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Independently audit the standalone MEXC Futures read-only shadow CLI using offline transport fixtures: exact two GET requests for an existing full fill, deterministic sanitized output, fail-closed input/response errors, credential redaction, zero database access, and atomic creation of an optional report. The CLI is operator-invoked only; adapter, fill reconciliation, trader, validation and alerts remain OFF. Any live credential use or runtime enablement requires a separate decision.
+Independently re-audit the standalone MEXC shadow CLI's report publication boundaries. Verify offline that same-directory writes flush and fsync before a no-replace atomic rename, failure before publication leaves no new report or temporary artifact, success requires no post-publication cleanup, and existing files or symlink/reparse-point targets are never replaced. Confirm sanitized output and inert runtime paths. Adapter, fill reconciliation, trader, validation and alerts remain OFF.
