@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Independently audit the MEXC exit gate: `ORDER_SENT` and all unverified order states must remain ineligible for exits until explicit exchange fill evidence is verified and a `FILLED`/`OPEN_POSITION` state is persisted. Fill reconciliation is a separate gate before live use. Validation and alerts remain OFF.
+Independently audit the opt-in MEXC exchange-fill reconciliation against the exact order-status adapter contract and authoritative exchange fields. It remains disabled by default and is not wired into the trader loop. Verify atomic evidence persistence, restart idempotency, failure handling, and the existing exit chronology before considering a separate enablement decision. Validation and alerts remain OFF.

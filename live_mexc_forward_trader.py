@@ -247,6 +247,7 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             exchange_order_id TEXT,
             status TEXT NOT NULL,
             confirmed_fill_ts INTEGER,
+            raw_fill_evidence TEXT,
             exit_time INTEGER,
             exit_price REAL,
             realized_r REAL,
@@ -267,6 +268,8 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
     )
     if "confirmed_fill_ts" not in {row[1] for row in conn.execute("PRAGMA table_info(live_trades)")}:
         conn.execute("ALTER TABLE live_trades ADD COLUMN confirmed_fill_ts INTEGER")
+    if "raw_fill_evidence" not in {row[1] for row in conn.execute("PRAGMA table_info(live_trades)")}:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN raw_fill_evidence TEXT")
     conn.commit()
 
 
@@ -580,6 +583,63 @@ def confirm_exchange_fill(
     )
     conn.commit()
     return cursor.rowcount == 1
+
+
+def reconcile_exchange_fills(conn: sqlite3.Connection, adapter: Any, *, enabled: bool = False) -> int:
+    """Opt-in, offline-capable reconciliation; adapter supplies authoritative order status.
+
+    No exchange client is constructed here. An adapter must expose
+    get_order_status(exchange_order_id, native_symbol). Invalid evidence leaves
+    the submitted order pending for operator investigation.
+    """
+    if not enabled:
+        return 0
+    rows = conn.execute(
+        """SELECT id, symbol, side, exchange_order_id, raw_order_response
+           FROM live_trades WHERE status = 'ORDER_SENT' AND confirmed_fill_ts IS NULL"""
+    ).fetchall()
+    updated = 0
+    for trade_id, symbol, side, order_id, raw_request in rows:
+        try:
+            if not isinstance(order_id, str) or not order_id or side not in {'LONG', 'SHORT'}:
+                continue
+            request = json.loads(raw_request)['order_request']
+            native_symbol = mexc_contract_symbol(symbol)
+            expected_side = 1 if side == 'LONG' else 3
+            requested = _dec(request['vol'])
+            if (request['symbol'] != native_symbol or type(request['side']) is not int
+                    or request['side'] != expected_side or not requested.is_finite() or requested <= 0):
+                continue
+            response = adapter.get_order_status(order_id, native_symbol)
+            if not isinstance(response, dict) or response.get('success') is not True:
+                continue
+            data = response['data']
+            if not isinstance(data, dict) or data['status'] != 'FILLED':
+                continue
+            fill_ts = data['exchange_fill_timestamp']
+            price = _dec(data['average_fill_price'])
+            exchange_requested = _dec(data['requested_quantity'])
+            filled = _dec(data['cumulative_filled_quantity'])
+            if (data['exchange_order_id'] != order_id or data['symbol'] != native_symbol
+                    or type(data['side']) is not int or data['side'] != expected_side
+                    or not exchange_requested.is_finite() or exchange_requested != requested
+                    or not filled.is_finite() or filled != requested
+                    or not price.is_finite() or price <= 0
+                    or type(fill_ts) is not int or fill_ts <= 0):
+                continue
+            evidence = json.dumps(response, sort_keys=True, allow_nan=False)
+        except (Exception):
+            # Includes adapter timeout/API errors and malformed/missing response fields.
+            continue
+        with conn:
+            cursor = conn.execute(
+                """UPDATE live_trades SET status = 'FILLED', confirmed_fill_ts = ?, raw_fill_evidence = ?
+                   WHERE id = ? AND status = 'ORDER_SENT' AND confirmed_fill_ts IS NULL
+                     AND raw_fill_evidence IS NULL""",
+                (fill_ts, evidence, trade_id),
+            )
+        updated += cursor.rowcount
+    return updated
 
 
 def update_open_trade_exits(conn: sqlite3.Connection, client: MexcFuturesClient, *, live_enabled: bool) -> None:
