@@ -62,8 +62,9 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
         pinned = expected_files(self.script)
         source_commit = package_source_commit(self.script)
-        self.assertEqual(source_commit, "42d4cf525d627a8e8e8bce24d68871e3b54a302a")
-        self.assertEqual(len(pinned), 11)
+        self.assertEqual(source_commit, "5c5899c94c08a28ebeb7161f9a4315554dd7a1d9")
+        self.assertEqual(len(pinned), 12)
+        self.assertEqual(pinned["mexc_readonly_order_status.py"], "29e86f65cf40c4047d680b5c8a06701f23663612a187f613b0dec75514c4a1e6")
         self.assertEqual(pinned["live_mexc_forward_trader.py"], "844b60cfed374fc665fc91aad9524403536e13fc2229ba44e57a5391a3f71f48")
         self.assertIn("pnf_mvp/app.py", pinned)
         self.assertIn("pnf_mvp/validation_tick_provenance_preflight.py", pinned)
@@ -79,6 +80,7 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
 
     def test_previous_package_hashes_are_preserved(self):
         previous = {
+            "live_mexc_forward_trader.py": "844b60cfed374fc665fc91aad9524403536e13fc2229ba44e57a5391a3f71f48",
             "pnf_mvp/app.py": "e6e4686922e38a0c5588c3b44a22be93e751384232740b9fb435cc7cd5b7a6c9",
             "pnf_mvp/pnf_engine.py": "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e",
             "pnf_mvp/storage.py": "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e",
@@ -92,7 +94,14 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         }
         pinned = expected_files(self.script)
         self.assertEqual({key: pinned[key] for key in previous}, previous)
-        self.assertEqual(set(pinned) - set(previous), {"live_mexc_forward_trader.py"})
+        self.assertEqual(set(pinned) - set(previous), {"mexc_readonly_order_status.py"})
+
+    def test_adapter_source_is_canonical_and_tampering_is_rejected(self):
+        expected = expected_files(self.script)["mexc_readonly_order_status.py"]
+        payload = (ROOT / "mexc_readonly_order_status.py").read_bytes()
+        self.assertEqual(canonical_text_sha256(payload), expected)
+        self.assertEqual(canonical_text_sha256(payload.replace(b"\n", b"\r\n")), expected)
+        self.assertNotEqual(canonical_text_sha256(payload + b"# altered\n"), expected)
 
     def test_final_runtime_hashes_pass_and_stale_runtime_hashes_fail(self):
         pinned = expected_files(self.script)
