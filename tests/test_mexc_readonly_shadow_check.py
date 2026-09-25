@@ -86,6 +86,35 @@ class ShadowCheckTests(unittest.TestCase):
             self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
             self.assertEqual(list(Path(folder).iterdir()), [])
 
+    def test_broken_pipe_after_publication_keeps_committed_pass(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            with patch.object(cli, 'print', side_effect=BrokenPipeError('synthetic-secret'), create=True):
+                code, output, calls = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual(code, 0)
+            self.assertEqual(output, '')
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(json.loads(target.read_text())['status'], 'PASS')
+            self.assertEqual(list(Path(folder).iterdir()), [target])
+
+    def test_universal_deletion_denial_fails_closed_without_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'report.json'
+            with patch.object(cli.os, 'fsync', side_effect=OSError('synthetic-secret')):
+                with patch.object(cli.os, 'unlink', side_effect=PermissionError('synthetic-secret')) as unlink:
+                    with patch.object(cli.os, 'remove', side_effect=PermissionError('synthetic-secret')) as remove:
+                        code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output), {'status': 'FAIL', 'reason': 'REPORT_ERROR'})
+            self.assertNotIn('synthetic-secret', output)
+            self.assertFalse(target.exists())
+            self.assertGreaterEqual(unlink.call_count, 1)
+            self.assertGreaterEqual(remove.call_count, 1)
+            # Universal OS deletion denial makes removal impossible; clear the fixture afterward.
+            for artifact in Path(folder).iterdir():
+                self.assertTrue(artifact.name.startswith('.mexc-shadow-'))
+                artifact.unlink()
+
     def test_target_created_during_publication_is_not_replaced(self):
         original_publish = cli._publish_new_report
         with tempfile.TemporaryDirectory() as folder:

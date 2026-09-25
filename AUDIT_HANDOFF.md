@@ -111,4 +111,4 @@ Runtime files changed:
 
 ## Next gate
 
-Independently re-audit the standalone MEXC shadow CLI's report publication boundaries. Verify offline that same-directory writes flush and fsync before a no-replace atomic rename, failure before publication leaves no new report or temporary artifact, success requires no post-publication cleanup, and existing files or symlink/reparse-point targets are never replaced. Confirm sanitized output and inert runtime paths. Adapter, fill reconciliation, trader, validation and alerts remain OFF.
+Independently re-audit the standalone MEXC shadow CLI's report publication boundaries. Verify offline that a failed console write after atomic publication preserves the committed PASS, while pre-publication failures return sanitized REPORT_ERROR without publishing a report. Confirm closed handles and best-effort cleanup through available deletion methods; universal OS deletion denial can leave a temporary artifact and must never be represented as successful removal. Existing reports remain untouched. Adapter, fill reconciliation, trader, validation and alerts remain OFF.

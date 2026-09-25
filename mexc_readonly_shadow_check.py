@@ -11,6 +11,7 @@ import ctypes
 import json
 import os
 import re
+import sys
 import tempfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -40,6 +41,19 @@ def _emit(status: str, *, evidence: dict[str, Any] | None = None,
     return json.dumps(result, sort_keys=True, separators=(',', ':')) + '\n'
 
 
+def _cleanup_temporary(temporary: str) -> bool:
+    """Try both ordinary removal APIs after the file handle has closed."""
+    for remove in (os.unlink, os.remove, os.unlink):
+        try:
+            remove(temporary)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass
+    return False  # Universal OS deletion denial cannot be repaired in process.
+
+
 def _write_new_report(path: str, payload: str) -> None:
     """Publish once via a no-replace rename, with no cleanup after publication."""
     destination = Path(path)
@@ -50,7 +64,10 @@ def _write_new_report(path: str, payload: str) -> None:
         try:
             stream_context = os.fdopen(fd, 'wb')
         except BaseException:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             raise
         with stream_context as stream:
             stream.write(payload.encode('utf-8'))
@@ -58,10 +75,7 @@ def _write_new_report(path: str, payload: str) -> None:
             os.fsync(stream.fileno())
         _publish_new_report(temporary, destination)
     except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            os.remove(temporary)
+        _cleanup_temporary(temporary)
         raise
 
 
@@ -143,7 +157,12 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
         except OSError:
             print(_emit('FAIL', reason='REPORT_ERROR'), end='')
             return 1
-    print(payload, end='')
+    try:
+        print(payload, end='')
+        sys.stdout.flush()
+    except OSError:
+        # Once published, the report is the committed result even if stdout breaks.
+        return 0 if args.output_report else 1
     return 0
 
 
