@@ -113,6 +113,18 @@ def _positive(value: Any) -> Decimal:
     return result
 
 
+def _nonnegative(value: Any) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise ValueError('invalid decimal evidence')
+    try:
+        result = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ValueError('invalid decimal evidence') from exc
+    if not result.is_finite() or result < 0:
+        raise ValueError('invalid decimal evidence')
+    return result
+
+
 def _aliases(row: dict[str, Any], names: tuple[str, ...], normalize: Any,
              *, required: bool = True) -> Any:
     present = [name for name in names if name in row]
@@ -167,6 +179,19 @@ def _orders(raw: bytes, symbol: str, limit: int) -> list[dict[str, Any]]:
             raise ValueError('ambiguous order')
         state = _aliases(row, ('state', 'status'), _positive_integer)
         if state in (1, 2, 4, 5):
+            # Non-filled orders can legitimately report zero fills/prices, but
+            # contradictory supplied fields must never validate as a page.
+            for names, normalize in (
+                (('symbol', 'native_symbol'), _symbol),
+                (('side', 'order_side'), _positive_integer),
+                (('orderId', 'order_id'), _order_id),
+                (('updateTime', 'update_time'), _positive_integer),
+                (('fillTime', 'fill_time'), _positive_integer),
+                (('vol', 'requested_quantity'), _nonnegative),
+                (('dealVol', 'filled_quantity'), _nonnegative),
+                (('dealAvgPriceStr', 'dealAvgPrice'), _nonnegative),
+            ):
+                _aliases(row, names, normalize, required=False)
             continue
         native_symbol = _aliases(row, ('symbol', 'native_symbol'), _symbol)
         side = _aliases(row, ('side', 'order_side'), _positive_integer)

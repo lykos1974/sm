@@ -114,6 +114,32 @@ class DiscoveryTests(unittest.TestCase):
                                                        'diagnostic': {'endpoint': 'HISTORY_ORDERS',
                                                                       'http_status': None, 'schema': 'RESPONSE'}}))
 
+    def test_nonfilled_rows_validate_all_supplied_aliases_before_skipping(self):
+        aliases = {'order_id': '2', 'native_symbol': 'ETH_USDT', 'order_side': 3,
+                   'requested_quantity': '2', 'filled_quantity': '2',
+                   'dealAvgPrice': '200', 'status': 3, 'update_time': 1761912240001,
+                   'fillTime': 100, 'fill_time': 101}
+        for state in (1, 2, 4, 5):
+            for alias, value in aliases.items():
+                with self.subTest(state=state, alias=alias):
+                    row = dict(ORDER, state=state)
+                    if alias == 'fillTime':
+                        row['fill_time'] = 101
+                    if alias == 'fill_time':
+                        row['fillTime'] = 100
+                    row[alias] = value
+                    code, result, _ = self.run_cli(
+                        {'success': True, 'code': 0, 'data': [row]},
+                        args=('--symbol', SYMBOL, '--diagnostic'))
+                    self.assertEqual((code, result['reason'], result['diagnostic']['schema']),
+                                     (1, 'RESPONSE_SCHEMA', 'RESPONSE'))
+
+    def test_valid_cancelled_zero_fill_stays_skipped(self):
+        row = dict(ORDER, state=4, dealVol='0', dealAvgPriceStr='0',
+                   dealAvgPrice=0, filled_quantity='0')
+        code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+        self.assertEqual((code, result), (0, {'status': 'PASS', 'orders': []}))
+
     def test_equivalent_aliases_use_exact_decimal_and_reject_invalid(self):
         with self.assertRaises(ValueError):
             discovery._positive(100.0)
