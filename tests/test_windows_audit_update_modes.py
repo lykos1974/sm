@@ -79,6 +79,41 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b"# altered\n")
         self.run_mode("Validate", success=False)
 
+    def test_shadow_check_pin_rejects_stale_and_altered_bytes(self):
+        path = self.source / "mexc_readonly_shadow_check.py"
+        original = path.read_bytes()
+        path.write_bytes(original.replace(b"\n", b"\r\n"))
+        self.run_mode("Validate")
+        path.write_bytes(original.replace(b"except Exception:", b"except OSError:"))
+        self.run_mode("Validate", success=False)
+        path.write_bytes(original + b"# altered\n")
+        self.run_mode("Validate", success=False)
+
+    def test_apply_rejects_tampered_shadow_without_touching_operator_files(self):
+        path = self.source / "mexc_readonly_shadow_check.py"
+        path.write_bytes(path.read_bytes() + b"# altered\n")
+        operator = self.target / "operator.log"
+        operator.write_bytes(b"operator bytes\r\n")
+        self.run_mode("Apply", "-ConfirmServicesStopped", success=False)
+        self.assertFalse((self.target / "_audit_update_backups").exists())
+        self.assertEqual(operator.read_bytes(), b"operator bytes\r\n")
+        self.assertFalse((self.target / "mexc_readonly_shadow_check.py").exists())
+
+    def test_shadow_apply_and_rollback_preserve_operator_files(self):
+        operator = self.target / "operator.log"
+        operator.write_bytes(b"operator bytes\r\n")
+        database = self.target / "pnf_mvp" / "operator.sqlite3"
+        database.write_bytes(b"database bytes\x00")
+        self.run_mode("Apply", "-ConfirmServicesStopped")
+        installed = self.target / "mexc_readonly_shadow_check.py"
+        self.assertEqual(installed.read_bytes(), (ROOT / "mexc_readonly_shadow_check.py").read_bytes())
+        backup = next((self.target / "_audit_update_backups").glob("*/manifest.json"))
+        self.run_mode("Rollback", "-BackupPath", str(backup.parent), "-ConfirmServicesStopped")
+        self.assertFalse(installed.exists())
+        self.assertEqual(operator.read_bytes(), b"operator bytes\r\n")
+        self.assertEqual(database.read_bytes(), b"database bytes\x00")
+        self.assertEqual(hashlib.sha256((self.target / "pnf_mvp/settings.json").read_bytes()).hexdigest(), self.settings_hash)
+
     def test_apply_and_rollback_restore_exact_bytes_and_settings(self):
         snapshot = self.source / "pnf_mvp/data/tick_provenance/strategy_validation_tick_provenance.json"
         snapshot.write_bytes(snapshot.read_bytes().replace(b"\n", b"\r\n"))
