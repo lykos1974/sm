@@ -14,6 +14,7 @@ import os
 import re
 import time
 import urllib.request
+import urllib.error
 from urllib.parse import quote
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -24,6 +25,17 @@ _ALLOWED_URL = re.compile(
     r'https://api\.mexc\.com/api/v1/private/order/list/history_orders'
     r'\?page_num=1&page_size=(?:[1-9]|1[0-9]|20)&states=3&symbol=[A-Z0-9]+_[A-Z0-9]+\Z'
 )
+_AUTH_API_CODES = frozenset((401, 402, 406, 511, 602, 701, 703))
+
+
+class _ApiRejected(Exception):
+    def __init__(self, *, authentication: bool):
+        self.authentication = authentication
+
+
+class _HttpStatus(Exception):
+    def __init__(self, status: int | None):
+        self.status = status
 
 
 def _canonical_parameters(pairs: list[tuple[str, str | int]]) -> str:
@@ -58,7 +70,7 @@ class _GetOnlyTransport:
         request = urllib.request.Request(_checked_url(url), headers=headers, method='GET')
         with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
-                raise ValueError('history HTTP failure')
+                raise _HttpStatus(response.status)
             return response.read()
 
 
@@ -81,9 +93,11 @@ def _json(raw: bytes) -> dict[str, Any]:
     parsed = json.loads(raw.decode('utf-8'), object_pairs_hook=unique,
                         parse_float=Decimal,
                         parse_constant=lambda _: (_ for _ in ()).throw(ValueError('non-finite')))
-    if (not isinstance(parsed, dict) or parsed.get('success') is not True
-            or type(parsed.get('code')) is not int or parsed['code'] != 0):
+    if (not isinstance(parsed, dict) or type(parsed.get('success')) is not bool
+            or type(parsed.get('code')) is not int):
         raise ValueError('invalid response')
+    if not parsed['success'] or parsed['code'] != 0:
+        raise _ApiRejected(authentication=parsed['code'] in _AUTH_API_CODES)
     return parsed
 
 
@@ -145,6 +159,8 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
     parser = _Parser(description='Find existing filled MEXC Futures order IDs (read only)')
     parser.add_argument('--symbol', required=True, help='Native symbol, e.g. BTC_USDT')
     parser.add_argument('--limit', type=int, default=5)
+    parser.add_argument('--diagnostic', action='store_true')
+    stage = 'INTERNAL'
     try:
         args = parser.parse_args(argv)
         if re.fullmatch(r'[A-Z0-9]+_[A-Z0-9]+', args.symbol) is None or not 1 <= args.limit <= 20:
@@ -166,12 +182,35 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
         signature = hmac.new(secret.encode(),
                              (key + timestamp + parameters).encode(), hashlib.sha256).hexdigest()
         headers = {'ApiKey': key, 'Request-Time': timestamp, 'Signature': signature}
+        stage = 'TRANSPORT'
         raw = (transport if transport is not None else _GetOnlyTransport()).get(url, headers, 15)
+        stage = 'RESPONSE'
         orders = _orders(raw, args.symbol, args.limit)
-    except Exception:
-        _emit('FAIL', reason='EVIDENCE_UNAVAILABLE')
+    except Exception as exc:
+        status = None
+        if isinstance(exc, urllib.error.HTTPError):
+            status = exc.code if type(exc.code) is int and 100 <= exc.code <= 599 else None
+            reason = 'AUTH_REJECTED' if status in (401, 403) else 'HTTP_STATUS'
+        elif isinstance(exc, _HttpStatus):
+            status = exc.status if type(exc.status) is int and 100 <= exc.status <= 599 else None
+            reason = 'AUTH_REJECTED' if status in (401, 403) else 'HTTP_STATUS'
+        elif isinstance(exc, _ApiRejected):
+            reason = 'AUTH_REJECTED' if exc.authentication else 'API_REJECTED'
+            stage = 'API'
+        elif stage == 'RESPONSE' and isinstance(exc, (ValueError, KeyError, TypeError, UnicodeError)):
+            reason = 'RESPONSE_SCHEMA'
+        elif stage == 'TRANSPORT' and isinstance(exc, (OSError, urllib.error.URLError)):
+            reason = 'NETWORK_ERROR'
+        else:
+            reason = 'INTERNAL_ERROR'
+            stage = 'INTERNAL'
+        metadata = {'diagnostic': {'endpoint': 'HISTORY_ORDERS', 'http_status': status,
+                                   'schema': stage}} if args.diagnostic else {}
+        _emit('FAIL', reason=reason, **metadata)
         return 1
-    _emit('PASS', orders=orders)
+    metadata = {'diagnostic': {'endpoint': 'HISTORY_ORDERS', 'http_status': None,
+                               'schema': 'VALID'}} if args.diagnostic else {}
+    _emit('PASS', orders=orders, **metadata)
     return 0
 
 

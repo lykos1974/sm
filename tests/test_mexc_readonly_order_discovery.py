@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import socket
 import unittest
 import urllib.request
 import urllib.error
@@ -99,14 +100,88 @@ class DiscoveryTests(unittest.TestCase):
                        dict(ORDER, updateTime=None), dict(ORDER, orderId='bad')):
             with self.subTest(broken=broken):
                 code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [broken]})
-                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'EVIDENCE_UNAVAILABLE'}))
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
 
     def test_duplicate_json_keys_and_transport_failure_fail_closed(self):
         for body in (b'{"success":true,"success":true,"code":0,"data":[]}',
                      b'{"success":true,"code":0,"data":[{"orderId":"1","orderId":"1"}]}',
-                     b'{broken', TimeoutError('synthetic-secret'), OSError('synthetic-secret')):
+                     b'{broken'):
             code, result, _ = self.run_cli(body)
-            self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'EVIDENCE_UNAVAILABLE'}))
+            self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
+
+    def test_deterministic_diagnostics_redact_exceptions_and_response(self):
+        cases = (
+            (urllib.error.HTTPError('https://secret.invalid/key', 302, 'synthetic-secret', {}, None), 'HTTP_STATUS', 302, 'TRANSPORT'),
+            (urllib.error.HTTPError('https://secret.invalid/key', 401, 'synthetic-secret', {}, None), 'AUTH_REJECTED', 401, 'TRANSPORT'),
+            (urllib.error.HTTPError('https://secret.invalid/key', 500, 'synthetic-secret', {}, None), 'HTTP_STATUS', 500, 'TRANSPORT'),
+            ({'success': False, 'code': 602, 'msg': 'synthetic-secret'}, 'AUTH_REJECTED', None, 'API'),
+            ({'success': False, 'code': 600, 'msg': 'synthetic-secret'}, 'API_REJECTED', None, 'API'),
+            (b'{"success":true,"code":0,"data":{"resultList":[]}}', 'RESPONSE_SCHEMA', None, 'RESPONSE'),
+            (socket.timeout('synthetic-secret'), 'NETWORK_ERROR', None, 'TRANSPORT'),
+            (urllib.error.URLError('synthetic-secret'), 'NETWORK_ERROR', None, 'TRANSPORT'),
+            (RuntimeError('synthetic-secret'), 'INTERNAL_ERROR', None, 'INTERNAL'),
+        )
+        for body, reason, http_status, schema in cases:
+            with self.subTest(reason=reason, body=type(body).__name__):
+                code, result, calls = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
+                self.assertEqual(code, 1)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(result, {'status': 'FAIL', 'reason': reason,
+                                          'diagnostic': {'endpoint': 'HISTORY_ORDERS',
+                                                         'http_status': http_status, 'schema': schema}})
+                rendered = json.dumps(result)
+                for forbidden in ('synthetic-secret', 'synthetic-key', 'Signature', 'Request-Time',
+                                  'https://', 'orderId', SYMBOL):
+                    self.assertNotIn(forbidden, rendered)
+
+    def test_diagnostic_is_opt_in_and_success_does_not_expose_headers(self):
+        body = {'success': True, 'code': 0, 'data': [ORDER]}
+        code, result, _ = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
+        self.assertEqual(code, 0)
+        self.assertEqual(result['diagnostic'], {'endpoint': 'HISTORY_ORDERS',
+                                                'http_status': None, 'schema': 'VALID'})
+        code, result, _ = self.run_cli(urllib.error.URLError('synthetic-secret'))
+        self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'NETWORK_ERROR'}))
+
+    def test_non_2xx_response_object_is_http_status_without_body(self):
+        class Response:
+            status = 429
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                raise AssertionError('must not read rejected response')
+
+        class Opener:
+            def open(self, request, timeout):
+                self.assert_get(request)
+                return Response()
+
+            def assert_get(self, request):
+                if request.get_method() != 'GET':
+                    raise AssertionError('unexpected method')
+
+        # Offline production transport: a synthetic non-2xx response never yields evidence.
+        with patch.object(discovery.urllib.request, 'build_opener', return_value=Opener()):
+            code, result, _ = self.run_cli_with_production_transport()
+        self.assertEqual(code, 1)
+        self.assertEqual(result, {'status': 'FAIL', 'reason': 'HTTP_STATUS',
+                                  'diagnostic': {'endpoint': 'HISTORY_ORDERS',
+                                                 'http_status': 429, 'schema': 'TRANSPORT'}})
+
+    def run_cli_with_production_transport(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {'MEXC_FUTURES_API_KEY': 'synthetic-key',
+                                     'MEXC_FUTURES_API_SECRET': 'synthetic-secret'}, clear=True):
+            with patch.object(sqlite3, 'connect', side_effect=AssertionError('DB')):
+                with patch.object(urllib.request, 'urlopen', side_effect=AssertionError('network')):
+                    with contextlib.redirect_stdout(output):
+                        code = discovery.main(['--symbol', SYMBOL, '--diagnostic'])
+        return code, json.loads(output.getvalue()), None
 
     def test_reject_every_other_path_before_transport(self):
         transport = Transport(b'{}')
