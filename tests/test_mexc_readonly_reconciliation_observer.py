@@ -51,12 +51,14 @@ class ObserverTests(unittest.TestCase):
             conn.execute(DB_SCHEMA)
             conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', BINDING)
 
-    def execute(self, adapter, *, report=None, max_records=5):
+    def execute(self, adapter, *, report=None, max_records=5, previous=None):
         out = io.StringIO()
         env = {'MEXC_FUTURES_API_KEY': 'synthetic-key',
                'MEXC_FUTURES_API_SECRET': 'synthetic-secret'}
         args = ['--database', str(self.db), '--output-report', str(report or self.report),
                 '--max-records', str(max_records)]
+        if previous is not None:
+            args.extend(('--previous-report', str(previous)))
         with patch.dict(os.environ, env, clear=True), \
                 patch.object(urllib.request, 'urlopen', side_effect=AssertionError('network')), \
                 patch.object(urllib.request, 'build_opener', side_effect=AssertionError('network')), \
@@ -105,7 +107,7 @@ class ObserverTests(unittest.TestCase):
     def test_classifications_and_strict_complete_binding(self):
         cases = (
             (dict(FILL, cumulative_filled_quantity='20', status='PARTIALLY_FILLED'), 'PARTIAL_FILL'),
-            (dict(FILL, cumulative_filled_quantity='0', status='NEW'), 'ZERO_FILL'),
+            (dict(FILL, cumulative_filled_quantity='0', average_fill_price='0', status='NEW'), 'ZERO_FILL'),
             (dict(FILL, status='CANCELLED'), 'CANCELLED_OR_REJECTED'),
             (dict(FILL, status='REJECTED'), 'CANCELLED_OR_REJECTED'),
             (dict(FILL, status='EXPIRED'), 'CANCELLED_OR_REJECTED'),
@@ -116,7 +118,7 @@ class ObserverTests(unittest.TestCase):
             (dict(FILL, requested_quantity='43'), 'QUANTITY_MISMATCH'),
             (dict(FILL, cumulative_filled_quantity='45'), 'QUANTITY_MISMATCH'),
             (dict(FILL, exchange_fill_timestamp=BINDING[7] - 1), 'STALE_OR_INVALID_TIMESTAMP'),
-            (dict(FILL, exchange_fill_timestamp=1790323253001), 'STALE_OR_INVALID_TIMESTAMP'),
+            (dict(FILL, exchange_fill_timestamp=1790323258001), 'STALE_OR_INVALID_TIMESTAMP'),
             (dict(FILL, status='UNKNOWN'), 'EVIDENCE_UNAVAILABLE'),
             (dict(FILL, average_fill_price='NaN'), 'CONFLICTING_EVIDENCE'),
             (None, 'EVIDENCE_UNAVAILABLE'),
@@ -191,7 +193,7 @@ class ObserverTests(unittest.TestCase):
             conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
                          (2, 'FILLED', '2', 'pnf-syn1-1790323251000-S', 'SUI_USDT', 'SHORT', '44', BINDING[7], 1))
             conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
-                         (3, 'ORDER_SENT', '3', 'pnf-syn1-1790323251000-S', 'SUI_USDT', 'SHORT', '44', BINDING[7], 1))
+                         (3, 'ORDER_SENT', '3', 'pnf-syn2-1790323251000-S', 'SUI_USDT', 'SHORT', '44', BINDING[7], 1))
         for maximum, responses, count in ((1, [None], 1),
                                           (2, [TimeoutError('rate limit'), dict(FILL)], 1)):
             with self.subTest(maximum=maximum):
@@ -218,7 +220,7 @@ class ObserverTests(unittest.TestCase):
                          ['CONFLICTING_EVIDENCE', 'CONFLICTING_EVIDENCE'])
         with sqlite3.connect(self.db) as conn:
             conn.execute('DELETE FROM live_trades WHERE id=2')
-            conn.execute('UPDATE live_trades SET submitted_at_ms=? WHERE id=1', (1790323253001,))
+            conn.execute('UPDATE live_trades SET submitted_at_ms=? WHERE id=1', (1790323258001,))
         report = Path(self.tmp.name) / 'future.json'
         self.assertEqual(self.execute(adapter, report=report)[0], 0)
         self.assertEqual(adapter.calls, [])
@@ -258,7 +260,7 @@ class ObserverTests(unittest.TestCase):
                     self.assert_closed_to_writes()
 
             def assert_closed_to_writes(self):
-                if '?mode=ro&immutable=1' not in self.uri or self.kwargs.get('uri') is not True:
+                if '?mode=ro' not in self.uri or 'immutable=' in self.uri or self.kwargs.get('uri') is not True:
                     raise AssertionError('database was not opened in URI mode=ro')
                 for sql in ('UPDATE live_trades SET status="FILLED"',
                             'DELETE FROM live_trades', 'CREATE TABLE observer_tmp(x)',
@@ -399,6 +401,127 @@ class ObserverTests(unittest.TestCase):
         for forbidden in (BINDING[2], BINDING[3], BINDING[4],
                           'synthetic-secret', 'synthetic-key', 'Signature', 'ApiKey', 'https://'):
             self.assertNotIn(forbidden, report + json.dumps(output))
+
+    def test_duplicate_beyond_observation_limit_is_ambiguous(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                         (2, 'ORDER_SENT', '999', 'pnf-syn2-1790323251000-S',
+                          'SUI_USDT', 'SHORT', '44', BINDING[7], 1))
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                         (3, 'ORDER_SENT', *BINDING[2:]))
+        adapter = Adapter([])
+        code, _ = self.execute(adapter, max_records=1)
+        self.assertEqual((code, adapter.calls), (0, []))
+        self.assertEqual(json.loads(self.report.read_text())['observations'][0]['classification'],
+                         'CONFLICTING_EVIDENCE')
+
+    def test_unknown_status_never_infers_quantity_state(self):
+        for index, quantity in enumerate(('0', '20', '44')):
+            for status in ('UNKNOWN', None):
+                evidence = dict(FILL, cumulative_filled_quantity=quantity)
+                if status is None:
+                    evidence.pop('status')
+                else:
+                    evidence['status'] = status
+                target = Path(self.tmp.name) / f'unknown-{index}-{status}.json'
+                code, _ = self.execute(Adapter([{'success': True, 'data': evidence}]), report=target)
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(target.read_text())['observations'][0]['classification'],
+                                 'EVIDENCE_UNAVAILABLE')
+
+    def test_previous_report_progression_regression_and_tampering(self):
+        first = dict(FILL, status='NEW', cumulative_filled_quantity='0', average_fill_price='0')
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': first}]))[0], 0)
+        partial = dict(FILL, status='PARTIALLY_FILLED', cumulative_filled_quantity='20')
+        second = Path(self.tmp.name) / 'partial.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': partial}]),
+                                      report=second, previous=self.report)[0], 0)
+        self.assertEqual(json.loads(second.read_text())['observations'][0]['classification'], 'PARTIAL_FILL')
+        final = Path(self.tmp.name) / 'final.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]),
+                                      report=final, previous=second)[0], 0)
+        self.assertEqual(json.loads(final.read_text())['observations'][0]['classification'], 'FULL_FILL_MATCH')
+        for name, payload, prior in (
+                ('regression', first, second),
+                ('frozen', dict(FILL, average_fill_price='2'), final),
+                ('timestamp', dict(FILL, exchange_fill_timestamp=BINDING[7]), final)):
+            target = Path(self.tmp.name) / (name + '.json')
+            self.assertEqual(self.execute(Adapter([{'success': True, 'data': payload}]),
+                                          report=target, previous=prior)[0], 0)
+            self.assertEqual(json.loads(target.read_text())['observations'][0]['classification'],
+                             'CONFLICTING_EVIDENCE')
+        self.assertEqual(self.report.read_text(), self.report.read_text())
+        tampered = Path(self.tmp.name) / 'tampered.json'
+        tampered.write_text(second.read_text().replace('PARTIAL_FILL', 'FULL_FILL_MATCH'))
+        adapter = Adapter([])
+        target = Path(self.tmp.name) / 'invalid.json'
+        self.assertEqual(self.execute(adapter, report=target, previous=tampered)[0], 1)
+        self.assertEqual(adapter.calls, [])
+        self.assertFalse(target.exists())
+
+    def test_multiple_duplicate_groups_outside_batch(self):
+        with sqlite3.connect(self.db) as conn:
+            for row in ((2, '900', 'pnf-syn2-1790323251000-S'),
+                        (3, BINDING[2], BINDING[3]),
+                        (4, '900', 'pnf-syn3-1790323251000-S')):
+                conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                             (row[0], 'ORDER_SENT', row[1], row[2], 'SUI_USDT',
+                              'SHORT', '44', BINDING[7], 1))
+        adapter = Adapter([])
+        self.assertEqual(self.execute(adapter, max_records=2)[0], 0)
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual([x['reason'] for x in json.loads(self.report.read_text())['observations']],
+                         ['AMBIGUOUS_OWNERSHIP', 'AMBIGUOUS_OWNERSHIP'])
+
+    def test_two_connections_keep_integrity_decision_in_read_snapshot(self):
+        original = sqlite3.connect
+        writer = original(self.db, timeout=0.01)
+        self.addCleanup(writer.close)
+        before = self.db.read_bytes()
+        class Reader:
+            def __init__(self, path_uri, **kwargs):
+                self.conn = original(path_uri, **kwargs)
+            def execute(self, sql, *args):
+                result = self.conn.execute(sql, *args)
+                if sql == 'PRAGMA data_version':
+                    writer.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                                   (2, 'ORDER_SENT', *BINDING[2:]))
+                    with self_test.assertRaises(sqlite3.OperationalError):
+                        writer.commit()
+                    writer.rollback()
+                return result
+            def set_authorizer(self, fn):
+                self.conn.set_authorizer(fn)
+            def close(self):
+                self.conn.close()
+        self_test = self
+        with patch.object(observer.sqlite3, 'connect', side_effect=Reader):
+            code, _ = self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.report.read_text())['observations'][0]['classification'],
+                         'FULL_FILL_MATCH')
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertFalse(self.db.with_name(self.db.name + '-journal').exists())
+
+    def test_begin_failure_is_snapshot_unavailable(self):
+        original = sqlite3.connect
+        class Reader:
+            def __init__(self, path_uri, **kwargs):
+                self.conn = original(path_uri, **kwargs)
+            def execute(self, sql, *args):
+                if sql == 'BEGIN':
+                    raise sqlite3.OperationalError('sensitive exception')
+                return self.conn.execute(sql, *args)
+            def set_authorizer(self, fn):
+                self.conn.set_authorizer(fn)
+            def close(self):
+                self.conn.close()
+        adapter = Adapter([])
+        with patch.object(observer.sqlite3, 'connect', side_effect=Reader):
+            code, output = self.execute(adapter)
+        self.assertEqual((code, output['reason'], adapter.calls),
+                         (1, 'SNAPSHOT_UNAVAILABLE', []))
+        self.assertFalse(self.report.exists())
 
 
 if __name__ == '__main__':
