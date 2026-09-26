@@ -12,11 +12,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
-$PackageSourceCommit = "68d963d4620fa4881e32877812f1daa10cdbd89e"
+$PackageSourceCommit = "f35da9ce2a222fdebdc4f14b14a1dc54e7bc08ef"
 
 $ExpectedFiles = [ordered]@{
     "live_mexc_forward_trader.py" = "844b60cfed374fc665fc91aad9524403536e13fc2229ba44e57a5391a3f71f48"
-    "mexc_readonly_order_discovery.py" = "6e92dbc101187d40b255d7c79a95fe03037fcc35e456502cbc318e5ccb8f021a"
+    "mexc_readonly_order_discovery.py" = "bbdd80f88f85ec3f395e4059c8f3e586cec1a57ae32037868b2ba79d2d85a084"
     "mexc_readonly_order_status.py" = "29e86f65cf40c4047d680b5c8a06701f23663612a187f613b0dec75514c4a1e6"
     "mexc_readonly_shadow_check.py" = "1de65e669d9fb1aa3ff99e23cd2cfef32363f708d26964bf86e431abaed99583"
     "pnf_mvp/app.py" = "e6e4686922e38a0c5588c3b44a22be93e751384232740b9fb435cc7cd5b7a6c9"
