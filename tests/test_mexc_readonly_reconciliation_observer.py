@@ -51,7 +51,7 @@ class ObserverTests(unittest.TestCase):
             conn.execute(DB_SCHEMA)
             conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', BINDING)
 
-    def execute(self, adapter, *, report=None, max_records=5, previous=None):
+    def execute(self, adapter, *, report=None, max_records=5, previous=None, genesis=True):
         out = io.StringIO()
         env = {'MEXC_FUTURES_API_KEY': 'synthetic-key',
                'MEXC_FUTURES_API_SECRET': 'synthetic-secret'}
@@ -59,6 +59,8 @@ class ObserverTests(unittest.TestCase):
                 '--max-records', str(max_records)]
         if previous is not None:
             args.extend(('--previous-report', str(previous)))
+        elif genesis:
+            args.append('--genesis')
         with patch.dict(os.environ, env, clear=True), \
                 patch.object(urllib.request, 'urlopen', side_effect=AssertionError('network')), \
                 patch.object(urllib.request, 'build_opener', side_effect=AssertionError('network')), \
@@ -412,7 +414,8 @@ class ObserverTests(unittest.TestCase):
                          (3, 'ORDER_SENT', *BINDING[2:]))
         adapter = Adapter([])
         code, _ = self.execute(adapter, max_records=1)
-        self.assertEqual((code, adapter.calls), (0, []))
+        self.assertEqual(code, 0)
+        self.assertNotIn((BINDING[2], BINDING[4]), adapter.calls)
         self.assertEqual(json.loads(self.report.read_text())['observations'][0]['classification'],
                          'CONFLICTING_EVIDENCE')
 
@@ -472,6 +475,7 @@ class ObserverTests(unittest.TestCase):
             self.assertEqual(row['classification'], 'EVIDENCE_UNAVAILABLE')
             self.assertEqual(row['confirmed_evidence_anchor'], first['confirmed_evidence_anchor'])
             self.assertEqual(row['confirmed_anchor_digest'], first['confirmed_anchor_digest'])
+            self.assertEqual(row['history_chain_digest'], first['history_chain_digest'])
             previous = target
         mutated = Path(self.tmp.name) / 'mutated.json'
         self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL, average_fill_price='2')}]),
@@ -479,6 +483,226 @@ class ObserverTests(unittest.TestCase):
         row = json.loads(mutated.read_text())['observations'][0]
         self.assertEqual(row['classification'], 'CONFLICTING_EVIDENCE')
         self.assertEqual(row['confirmed_evidence_anchor'], first['confirmed_evidence_anchor'])
+
+    def test_two_bindings_early_stop_keeps_unobserved_final_anchor(self):
+        second = (2, 'ORDER_SENT', '900', 'pnf-syn2-1790323251000-S',
+                  'SUI_USDT', 'SHORT', '44', BINDING[7], 1)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', second)
+        second_fill = dict(FILL, exchange_order_id='900', external_oid=second[3])
+        first_adapter = Adapter([{'success': True, 'data': dict(FILL)},
+                                 {'success': True, 'data': second_fill}])
+        self.assertEqual(self.execute(first_adapter)[0], 0)
+        first_report = json.loads(self.report.read_text())
+        self.assertEqual(first_report['registry_count'], 2)
+        middle = Path(self.tmp.name) / 'middle.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL, status='UNKNOWN')}]),
+                                      report=middle, previous=self.report)[0], 0)
+        middle_report = json.loads(middle.read_text())
+        self.assertEqual(middle_report['registry_count'], 2)
+        self.assertEqual(middle_report['binding_registry'][1]['confirmed_evidence_anchor'],
+                         first_report['binding_registry'][1]['confirmed_evidence_anchor'])
+        self.assertEqual(middle_report['binding_registry'][1]['history_chain_digest'],
+                         first_report['binding_registry'][1]['history_chain_digest'])
+        self.assertEqual(middle_report['binding_registry'][0]['history_chain_digest'],
+                         first_report['binding_registry'][0]['history_chain_digest'])
+        last = Path(self.tmp.name) / 'last.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': dict(second_fill, average_fill_price='2')}]),
+                                      report=last, previous=middle)[0], 0)
+        self.assertEqual(json.loads(last.read_text())['observations'][1]['classification'],
+                         'CONFLICTING_EVIDENCE')
+
+    def test_genesis_is_explicit(self):
+        adapter = Adapter([])
+        code, result = self.execute(adapter, genesis=False)
+        self.assertEqual((code, adapter.calls), (1, []))
+        self.assertEqual(result['reason'], 'INVALID_INPUT')
+        self.assertFalse(self.report.exists())
+
+    def test_registry_survives_shrinking_batch_disappearance_and_reappearance(self):
+        second = (2, 'ORDER_SENT', '900', 'pnf-syn2-1790323251000-S',
+                  'SUI_USDT', 'SHORT', '44', BINDING[7], 1)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', second)
+        fill2 = dict(FILL, exchange_order_id='900', external_oid=second[3])
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': fill2}]))[0], 0)
+        prior = self.report
+        initial = {row['binding_digest']: row for row in json.loads(prior.read_text())['binding_registry']}
+        for index, maximum in enumerate((1, 1)):
+            current = Path(self.tmp.name) / f'small-{index}.json'
+            adapter = Adapter([{'success': True, 'data': dict(FILL)}])
+            self.assertEqual(self.execute(adapter, report=current, previous=prior,
+                                          max_records=maximum)[0], 0)
+            self.assertEqual(len(adapter.calls), 1)
+            rows = json.loads(current.read_text())['binding_registry']
+            second_entry = next(x for x in rows if x['exchange_order_identity_digest'] ==
+                                observer._report_hash({'order_id': '900'}))
+            old = initial[second_entry['binding_digest']]
+            for field in ('confirmed_evidence_anchor', 'confirmed_anchor_digest',
+                          'history_chain_digest', 'last_successful_observation'):
+                self.assertEqual(second_entry[field], old[field])
+            self.assertEqual(second_entry['current_observation_state'], 'UNOBSERVED')
+            prior = current
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE live_trades SET status='FILLED' WHERE id=2")
+        missing = Path(self.tmp.name) / 'missing-row.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]),
+                                      report=missing, previous=prior)[0], 0)
+        absent = next(x for x in json.loads(missing.read_text())['binding_registry']
+                      if x['exchange_order_identity_digest'] == observer._report_hash({'order_id': '900'}))
+        self.assertEqual(absent['current_observation_state'], 'NOT_PRESENT_IN_CURRENT_SNAPSHOT')
+        self.assertEqual(absent['history_chain_digest'], old['history_chain_digest'])
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE live_trades SET status='ORDER_SENT' WHERE id=2")
+        later = Path(self.tmp.name) / 'reappeared.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': dict(fill2, average_fill_price='2')}]),
+                                      report=later, previous=missing, max_records=2)[0], 0)
+        self.assertEqual(json.loads(later.read_text())['observations'][1]['classification'],
+                         'CONFLICTING_EVIDENCE')
+
+    def test_local_identity_reuse_and_mutated_binding_never_genesis(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE live_trades SET exchange_order_id=? WHERE id=1', ('900',))
+        current = Path(self.tmp.name) / 'identity-reuse.json'
+        adapter = Adapter([])
+        self.assertEqual(self.execute(adapter, report=current, previous=self.report)[0], 0)
+        self.assertEqual(adapter.calls, [])
+        result = json.loads(current.read_text())
+        self.assertEqual(result['observations'][0]['classification'], 'CONFLICTING_EVIDENCE')
+        self.assertEqual(result['registry_count'], 2)
+        self.assertEqual({row['lineage_origin'] for row in result['binding_registry']},
+                         {'GENESIS', 'CONFLICT'})
+        old = next(row for row in result['binding_registry'] if row['lineage_origin'] == 'GENESIS')
+        self.assertEqual(old['confirmed_evidence_anchor']['status'], 'FILLED')
+
+    def test_tampered_registry_fails_before_adapter_and_report_publication(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        for index, mutation in enumerate(('missing', 'duplicate', 'cleared', 'root',
+                                          'chain', 'extra', 'old_schema')):
+            forged = json.loads(self.report.read_text())
+            entries = forged['binding_registry']
+            if mutation == 'missing':
+                entries.pop()
+            elif mutation == 'duplicate':
+                entries.append(dict(entries[0]))
+            elif mutation == 'cleared':
+                entries[0]['confirmed_evidence_anchor'] = None
+            elif mutation == 'root':
+                forged['registry_root_digest'] = '0' * 64
+            elif mutation == 'chain':
+                entries[0]['history_chain_digest'] = '0' * 64
+            elif mutation == 'extra':
+                entries[0]['unexpected'] = 'unsafe'
+            else:
+                forged['version'] -= 1
+            forged['report_sha256'] = observer._report_hash({k: v for k, v in forged.items()
+                                                             if k != 'report_sha256'})
+            previous = Path(self.tmp.name) / f'invalid-registry-{index}.json'
+            previous.write_text(json.dumps(forged))
+            destination = Path(self.tmp.name) / f'after-invalid-registry-{index}.json'
+            adapter = Adapter([])
+            code, output = self.execute(adapter, report=destination, previous=previous)
+            self.assertEqual((code, output['reason'], adapter.calls),
+                             (1, 'PREVIOUS_REPORT_INVALID', []))
+            self.assertFalse(destination.exists())
+
+    def test_three_bindings_stop_at_each_position_and_resume(self):
+        bindings = [BINDING]
+        with sqlite3.connect(self.db) as conn:
+            for trade_id in (2, 3):
+                row = (trade_id, 'ORDER_SENT', str(900 + trade_id),
+                       f'pnf-syn{trade_id}-1790323251000-S', 'SUI_USDT', 'SHORT',
+                       '44', BINDING[7], 1)
+                conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', row)
+                bindings.append(row)
+        fills = [dict(FILL, exchange_order_id=row[2], external_oid=row[3]) for row in bindings]
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': x} for x in fills]))[0], 0)
+        original = json.loads(self.report.read_text())
+        for stop_at, failure in ((0, None), (1, TimeoutError('secret')),
+                                 (2, RuntimeError('secret'))):
+            responses = ([{'success': True, 'data': fills[i]} for i in range(stop_at)] +
+                         [failure])
+            middle = Path(self.tmp.name) / f'early-stop-{stop_at}.json'
+            adapter = Adapter(responses)
+            self.assertEqual(self.execute(adapter, report=middle, previous=self.report)[0], 0)
+            middle_data = json.loads(middle.read_text())
+            self.assertEqual(len(adapter.calls), stop_at + 1)
+            self.assertEqual(middle_data['registry_count'], 3)
+            old = {r['binding_digest']: r for r in original['binding_registry']}
+            for entry in middle_data['binding_registry']:
+                if entry['exchange_order_identity_digest'] != observer._report_hash(
+                        {'order_id': bindings[stop_at][2]}) and entry['current_observation_state'] == 'UNOBSERVED':
+                    self.assertEqual(entry['history_chain_digest'], old[entry['binding_digest']]['history_chain_digest'])
+                    self.assertEqual(entry['confirmed_evidence_anchor'], old[entry['binding_digest']]['confirmed_evidence_anchor'])
+            final = Path(self.tmp.name) / f'early-stop-final-{stop_at}.json'
+            later = list(fills)
+            later[stop_at] = dict(later[stop_at], average_fill_price='2')
+            self.assertEqual(self.execute(Adapter([{'success': True, 'data': x} for x in later]),
+                                          report=final, previous=middle)[0], 0)
+            self.assertEqual(json.loads(final.read_text())['observations'][stop_at]['classification'],
+                             'CONFLICTING_EVIDENCE')
+
+    def test_reordered_registry_entries_rejected_before_exchange(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                         (2, 'ORDER_SENT', '900', 'pnf-syn2-1790323251000-S',
+                          'SUI_USDT', 'SHORT', '44', BINDING[7], 1))
+        second = dict(FILL, exchange_order_id='900', external_oid='pnf-syn2-1790323251000-S')
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': second}]))[0], 0)
+        data = json.loads(self.report.read_text())
+        data['binding_registry'].reverse()
+        data['registry_root_digest'] = observer._report_hash(data['binding_registry'])
+        data['report_chain_digest'] = observer._report_chain(data)
+        data['report_sha256'] = observer._report_hash({key: value for key, value in data.items()
+                                                      if key != 'report_sha256'})
+        tampered = Path(self.tmp.name) / 'reordered-registry.json'
+        tampered.write_text(json.dumps(data))
+        adapter = Adapter([])
+        destination = Path(self.tmp.name) / 'after-reorder.json'
+        code, result = self.execute(adapter, report=destination, previous=tampered)
+        self.assertEqual((code, result['reason'], adapter.calls),
+                         (1, 'PREVIOUS_REPORT_INVALID', []))
+        self.assertFalse(destination.exists())
+
+    def test_extra_or_missing_registry_binding_rejected_with_recomputed_hashes(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        for index, operation in enumerate(('extra', 'extra_absent', 'missing')):
+            data = json.loads(self.report.read_text())
+            if operation.startswith('extra'):
+                invented = dict(data['binding_registry'][0])
+                invented['binding_digest'] = 'f' * 64
+                invented['confirmed_evidence_anchor'] = None
+                invented['confirmed_anchor_digest'] = observer._EMPTY_ANCHOR_DIGEST
+                invented['history_chain_digest'] = observer._GENESIS_CHAIN_DIGEST
+                invented['last_successful_observation'] = None
+                invented['lineage_origin'] = 'GENESIS'
+                invented['conflicting_prior_binding_digest'] = None
+                invented['current_observation_state'] = 'GENESIS'
+                if operation == 'extra_absent':
+                    invented['present_in_snapshot'] = False
+                    invented['current_observation_state'] = 'NOT_PRESENT_IN_CURRENT_SNAPSHOT'
+                data['binding_registry'].append(invented)
+                data['binding_registry'].sort(key=lambda row: row['binding_digest'])
+            else:
+                data['binding_registry'].clear()
+            data['registry_count'] = len(data['binding_registry'])
+            data['registry_root_digest'] = observer._report_hash(data['binding_registry'])
+            data['report_chain_digest'] = observer._report_chain(data)
+            data['report_sha256'] = observer._report_hash({k: v for k, v in data.items()
+                                                           if k != 'report_sha256'})
+            prior = Path(self.tmp.name) / f'invented-registry-{index}.json'
+            prior.write_text(json.dumps(data))
+            destination = Path(self.tmp.name) / f'invented-out-{index}.json'
+            adapter = Adapter([])
+            code, output = self.execute(adapter, report=destination, previous=prior)
+            self.assertEqual((code, output['reason'], adapter.calls),
+                             (1, 'PREVIOUS_REPORT_INVALID', []))
+            self.assertFalse(destination.exists())
 
     def test_prior_anchor_cannot_be_cleared_even_with_recomputed_report_hash(self):
         self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
@@ -592,7 +816,7 @@ class ObserverTests(unittest.TestCase):
             elif mutation == 'previous_chain':
                 row['previous_history_chain_digest'] = '0' * 64
             elif mutation == 'skipped_chain':
-                row['history_chain_digest'] = json.loads(first.read_text())['observations'][0]['history_chain_digest']
+                row['history_chain_digest'] = observer._GENESIS_CHAIN_DIGEST
             elif mutation == 'reordered_chain':
                 row['previous_history_chain_digest'], row['previous_confirmed_anchor_digest'] = (
                     row['previous_confirmed_anchor_digest'], row['previous_history_chain_digest'])
@@ -624,7 +848,7 @@ class ObserverTests(unittest.TestCase):
         adapter = Adapter([])
         self.assertEqual(self.execute(adapter, max_records=2)[0], 0)
         self.assertEqual(adapter.calls, [])
-        self.assertEqual([x['reason'] for x in json.loads(self.report.read_text())['observations']],
+        self.assertEqual([x['reason'] for x in json.loads(self.report.read_text())['observations'][:2]],
                          ['AMBIGUOUS_OWNERSHIP', 'AMBIGUOUS_OWNERSHIP'])
 
     def test_two_connections_keep_integrity_decision_in_read_snapshot(self):

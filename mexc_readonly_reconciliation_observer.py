@@ -25,7 +25,8 @@ _OID = re.compile(r'pnf-[A-Za-z0-9_]{1,4}-[0-9]+-[LS]\Z')
 _ORDER_ID = re.compile(r'[0-9]{1,30}\Z')
 _SYMBOL = re.compile(r'[A-Z0-9]+_[A-Z0-9]+\Z')
 _SKEW_MS = 5000
-_REPORT_VERSION = 3
+_REPORT_VERSION = 4
+_REGISTRY_VERSION = 1
 _ANCHOR_VERSION = 1
 _EMPTY_ANCHOR_DIGEST = hashlib.sha256(b'null').hexdigest()
 _GENESIS_CHAIN_DIGEST = hashlib.sha256(b'mexc-observer-history-v1').hexdigest()
@@ -116,8 +117,7 @@ def _rows(path: Path, maximum: int, now: int) -> tuple[bool, list[dict[str, Any]
             ambiguous: set[int] = set()
             for raw in conn.execute(query, ('ORDER_SENT',)):
                 row = dict(zip(names, raw))
-                if len(records) < maximum:
-                    records.append(row)
+                records.append(row)
                 try:
                     binding = _binding(row, now)
                 except ValueError:
@@ -342,12 +342,171 @@ def _seal_observation(entry: dict[str, Any], previous: dict[str, Any] | None,
     entry['history_chain_digest'] = _chain_digest(entry)
 
 
-def _prior(path: str) -> dict[str, dict[str, Any]]:
+def _identity(binding: dict[str, Any]) -> dict[str, str]:
+    return {'binding_digest': _digest(binding, {}),
+            'local_identity_digest': _report_hash({'trade_id': binding['trade_id']}),
+            'exchange_order_identity_digest': _report_hash({'order_id': binding['exchange_order_id']}),
+            'external_oid_identity_digest': _report_hash({'external_oid': binding['external_oid']})}
+
+
+def _new_registry_entry(binding: dict[str, Any], conflict: str | None = None) -> dict[str, Any]:
+    entry = {'version': _REGISTRY_VERSION, **_identity(binding),
+             'lineage_origin': 'CONFLICT' if conflict else 'GENESIS',
+             'conflicting_prior_binding_digest': conflict,
+             'confirmed_evidence_anchor': None,
+             'confirmed_anchor_digest': _EMPTY_ANCHOR_DIGEST,
+             'history_chain_digest': _GENESIS_CHAIN_DIGEST,
+             'last_successful_observation': None,
+             'present_in_snapshot': True,
+             'current_observation_state': 'CONFLICTING_EVIDENCE' if conflict else 'GENESIS'}
+    return entry
+
+
+def _validate_registry(entries: Any, count: Any, root: Any) -> dict[str, dict[str, Any]]:
+    if type(entries) is not list or type(count) is not int or count != len(entries) or not _is_digest(root):
+        raise ValueError('invalid binding registry')
+    by_binding = {}
+    expected_keys = {'version', 'binding_digest', 'local_identity_digest',
+                     'exchange_order_identity_digest', 'external_oid_identity_digest',
+                     'lineage_origin', 'conflicting_prior_binding_digest',
+                     'confirmed_evidence_anchor', 'confirmed_anchor_digest',
+                     'history_chain_digest', 'last_successful_observation',
+                     'current_observation_state', 'present_in_snapshot'}
+    for entry in entries:
+        if (type(entry) is not dict or set(entry) != expected_keys or
+                type(entry['version']) is not int or entry['version'] != _REGISTRY_VERSION or
+                any(not _is_digest(entry[key]) for key in (
+                    'binding_digest', 'local_identity_digest', 'exchange_order_identity_digest',
+                    'external_oid_identity_digest', 'confirmed_anchor_digest',
+                    'history_chain_digest')) or
+                type(entry['present_in_snapshot']) is not bool or
+                entry['lineage_origin'] not in ('GENESIS', 'CONFLICT') or
+                entry['current_observation_state'] not in (
+                    'GENESIS', 'OBSERVED', 'UNOBSERVED', 'NOT_PRESENT_IN_CURRENT_SNAPSHOT',
+                    'CONFLICTING_EVIDENCE') or
+                (entry['conflicting_prior_binding_digest'] is not None and
+                 not _is_digest(entry['conflicting_prior_binding_digest'])) or
+                (entry['lineage_origin'] == 'CONFLICT') !=
+                (entry['conflicting_prior_binding_digest'] is not None) or
+                (entry['current_observation_state'] == 'NOT_PRESENT_IN_CURRENT_SNAPSHOT' and
+                 entry['present_in_snapshot'])):
+            raise ValueError('invalid binding registry')
+        key = entry['binding_digest']
+        if key in by_binding or (by_binding and key <= next(reversed(by_binding))):
+            raise ValueError('duplicate or unordered binding')
+        anchor = entry['confirmed_evidence_anchor']
+        if anchor is not None:
+            _validate_anchor(anchor, key)
+        if entry['confirmed_anchor_digest'] != _anchor_digest(anchor):
+            raise ValueError('invalid registry anchor digest')
+        last = entry['last_successful_observation']
+        if anchor is None:
+            if last is not None:
+                raise ValueError('invalid registry metadata')
+        elif (type(last) is not dict or set(last) != {'observed_at_ms', 'observation_digest',
+                                                      'classification', 'exchange_timestamp_ms'} or
+              type(last['observed_at_ms']) is not int or last['observed_at_ms'] <= 0 or
+              last['observation_digest'] != anchor['evidence_digest'] or
+              last['classification'] != _anchor_classification(anchor['status']) or
+              last['exchange_timestamp_ms'] != anchor['exchange_timestamp_ms']):
+            raise ValueError('invalid registry metadata')
+        if entry['history_chain_digest'] == _GENESIS_CHAIN_DIGEST and anchor is not None:
+            raise ValueError('invalid genesis anchor')
+        by_binding[key] = entry
+    if root != _report_hash(entries):
+        raise ValueError('invalid registry root')
+    for entry in entries:
+        conflict = entry['conflicting_prior_binding_digest']
+        if conflict is not None and (conflict not in by_binding or conflict == entry['binding_digest']):
+            raise ValueError('orphaned registry conflict')
+    return by_binding
+
+
+def _report_chain(report: dict[str, Any]) -> str:
+    return _report_hash({key: report[key] for key in (
+        'previous_report_digest', 'previous_registry_root_digest',
+        'database_binding_set_digest', 'registry_root_digest')} | {
+        'observations': [(item['binding_digest'], item['digest'], item['classification'])
+                         for item in report['observations']]})
+
+
+def _registry_for_snapshot(prior: dict[str, dict[str, Any]],
+                           records: list[dict[str, Any]], now: int) -> tuple[
+                               dict[str, dict[str, Any]], dict[int, dict[str, Any]],
+                               dict[int, str], str]:
+    registry = {key: {**value, 'present_in_snapshot': False,
+                      'current_observation_state': 'NOT_PRESENT_IN_CURRENT_SNAPSHOT'}
+                for key, value in prior.items()}
+    prior_identity: dict[tuple[str, str], str] = {}
+    for key, value in prior.items():
+        for name in ('local_identity_digest', 'exchange_order_identity_digest',
+                     'external_oid_identity_digest'):
+            prior_identity.setdefault((name, value[name]), key)
+    bindings: dict[int, dict[str, Any]] = {}
+    conflicts: dict[int, str] = {}
+    binding_set: list[str] = []
+    for row in records:
+        try:
+            binding = _binding(row, now)
+        except ValueError:
+            if type(row.get('id')) is int:
+                previous = prior_identity.get(('local_identity_digest',
+                                               _report_hash({'trade_id': row['id']})))
+                if previous:
+                    conflicts[row['id']] = previous
+                    registry[previous]['current_observation_state'] = 'CONFLICTING_EVIDENCE'
+            continue
+        key = _digest(binding, {})
+        binding_set.append(key)
+        bindings[binding['trade_id']] = binding
+        identity = _identity(binding)
+        if key in registry:
+            if any(registry[key][name] != identity[name] for name in identity):
+                raise ValueError('inconsistent binding identity')
+            registry[key]['current_observation_state'] = 'UNOBSERVED'
+            registry[key]['present_in_snapshot'] = True
+            continue
+        conflict = next((prior_identity[(name, identity[name])] for name in (
+            'local_identity_digest', 'exchange_order_identity_digest',
+            'external_oid_identity_digest') if (name, identity[name]) in prior_identity), None)
+        registry[key] = _new_registry_entry(binding, conflict)
+        if conflict:
+            conflicts[binding['trade_id']] = conflict
+            registry[conflict]['current_observation_state'] = 'CONFLICTING_EVIDENCE'
+    return registry, bindings, conflicts, _report_hash(sorted(binding_set))
+
+
+def _update_registry(registry: dict[str, dict[str, Any]], entry: dict[str, Any],
+                     *, attempted: bool) -> None:
+    key = entry['binding_digest']
+    if key is None or key not in registry:
+        return
+    item = registry[key]
+    if attempted:
+        item['confirmed_evidence_anchor'] = entry['confirmed_evidence_anchor']
+        item['confirmed_anchor_digest'] = entry['confirmed_anchor_digest']
+        item['history_chain_digest'] = entry['history_chain_digest']
+        if entry['classification'] in _DETERMINATE:
+            item['last_successful_observation'] = {
+                'observed_at_ms': entry['observed_at_ms'],
+                'observation_digest': entry['digest'],
+                'classification': entry['classification'],
+                'exchange_timestamp_ms': entry['exchange_timestamp_ms']}
+        item['current_observation_state'] = ('CONFLICTING_EVIDENCE' if
+            entry['classification'] == 'CONFLICTING_EVIDENCE' else 'OBSERVED')
+    elif entry['classification'] == 'CONFLICTING_EVIDENCE':
+        item['current_observation_state'] = 'CONFLICTING_EVIDENCE'
+
+
+def _prior(path: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     if Path(path).is_symlink() or Path(path).stat().st_size > 1024 * 1024:
         raise ValueError('invalid previous report')
     report = json.loads(Path(path).read_text(encoding='utf-8'), object_pairs_hook=_unique_pairs)
     if (type(report) is not dict or set(report) != {'version', 'confirmed_evidence_anchor_version',
-            'status', 'schema_supported', 'snapshot', 'observations', 'report_sha256'}
+            'status', 'schema_supported', 'snapshot', 'observations', 'report_sha256',
+            'binding_registry', 'registry_count', 'registry_root_digest',
+            'previous_report_digest', 'previous_registry_root_digest',
+            'database_binding_set_digest', 'report_chain_digest'}
             or type(report.get('confirmed_evidence_anchor_version')) is not int or
             report['confirmed_evidence_anchor_version'] != _ANCHOR_VERSION or
             report.get('version') != _REPORT_VERSION
@@ -364,13 +523,28 @@ def _prior(path: str) -> dict[str, dict[str, Any]]:
             or type(snapshot['database_identity_digest']) is not str
             or re.fullmatch(r'[0-9a-f]{64}', snapshot['database_identity_digest']) is None):
         raise ValueError('invalid previous report')
+    registry = _validate_registry(report['binding_registry'], report['registry_count'],
+                                  report['registry_root_digest'])
+    if (any(not _is_digest(report[key]) for key in (
+            'previous_report_digest', 'previous_registry_root_digest',
+            'database_binding_set_digest', 'report_chain_digest')) or
+            report['database_binding_set_digest'] != _report_hash(sorted(
+                key for key, item in registry.items() if item['present_in_snapshot'])) or
+            report['report_chain_digest'] != _report_chain(report)):
+        raise ValueError('invalid report chain')
+    if (report['previous_report_digest'] == _GENESIS_CHAIN_DIGEST and
+            (report['previous_registry_root_digest'] != _report_hash([]) or
+             any(not item['present_in_snapshot'] or item['lineage_origin'] != 'GENESIS'
+                 for item in registry.values()))):
+        raise ValueError('invalid genesis report chain')
     entries = {}
     for item in report['observations']:
         required = {'classification', 'digest', 'observed_at_ms', 'exchange_timestamp_ms',
                     'binding_digest', 'confirmed_evidence_anchor', 'confirmed_anchor_digest',
                     'history_chain_digest', 'previous_history_chain_digest',
                     'previous_confirmed_anchor_digest', 'previous_confirmed_evidence_anchor'}
-        optional = {'reason', 'evidence_status', 'cumulative_quantity', 'average_fill_price'}
+        optional = {'reason', 'evidence_status', 'cumulative_quantity', 'average_fill_price',
+                    'observation_performed', 'history_advanced'}
         if (type(item) is not dict or not required.issubset(item) or
                 set(item) - required - optional or
                 (item['binding_digest'] is not None and not _is_digest(item['binding_digest'])) or
@@ -392,9 +566,16 @@ def _prior(path: str) -> dict[str, dict[str, Any]]:
             _validate_anchor(old_anchor, key)
         if anchor is not None:
             _validate_anchor(anchor, key)
+        skipped = item.get('history_advanced') is False
+        if (('history_advanced' in item and not skipped) or
+                ('observation_performed' in item and type(item['observation_performed']) is not bool) or
+                (skipped and (item['classification'] != 'EVIDENCE_UNAVAILABLE' or
+                             item['digest'] is not None or
+                             item['history_chain_digest'] != item['previous_history_chain_digest']))):
+            raise ValueError('invalid skipped observation')
         if (item['previous_confirmed_anchor_digest'] != _anchor_digest(old_anchor)
                 or item['confirmed_anchor_digest'] != _anchor_digest(anchor)
-                or item['history_chain_digest'] != _chain_digest(item)
+                or (not skipped and item['history_chain_digest'] != _chain_digest(item))
                 or (old_anchor is None and item['previous_confirmed_anchor_digest'] !=
                     _EMPTY_ANCHOR_DIGEST)
                 or (anchor is None and item['confirmed_anchor_digest'] != _EMPTY_ANCHOR_DIGEST)):
@@ -414,7 +595,13 @@ def _prior(path: str) -> dict[str, dict[str, Any]]:
             raise ValueError('invalid previous report')
         if key is not None:
             entries[key] = item
-    return entries
+            if (key not in registry or
+                    registry[key]['history_chain_digest'] != item['history_chain_digest'] or
+                    registry[key]['confirmed_anchor_digest'] != item['confirmed_anchor_digest'] or
+                    registry[key]['confirmed_evidence_anchor'] != item['confirmed_evidence_anchor']):
+                raise ValueError('observation missing registry binding')
+    report['report_sha256'] = checksum
+    return report, registry
 
 
 def _anchor_classification(status: str) -> str:
@@ -430,9 +617,11 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
     parser.add_argument('--output-report', required=True)
     parser.add_argument('--max-records', type=int, default=5)
     parser.add_argument('--previous-report')
+    parser.add_argument('--genesis', action='store_true')
     try:
         args = parser.parse_args(argv)
-        if (not 1 <= args.max_records <= 20 or not args.database or not args.output_report):
+        if (not 1 <= args.max_records <= 20 or not args.database or not args.output_report
+                or args.genesis == bool(args.previous_report)):
             raise ValueError('invalid arguments')
         now = (clock_ms or (lambda: int(time.time() * 1000)))()
         if type(now) is not int or now <= 0:
@@ -441,61 +630,90 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
         print('{"reason":"INVALID_INPUT","status":"FAIL"}')
         return 1
     try:
-        previous = _prior(args.previous_report) if args.previous_report else {}
+        previous_report, previous_registry = (_prior(args.previous_report) if args.previous_report
+                                              else (None, {}))
     except (ValueError, OSError, UnicodeError, json.JSONDecodeError):
         print('{"reason":"PREVIOUS_REPORT_INVALID","status":"FAIL"}')
         return 1
     try:
         supported, records, ambiguous, snapshot = _rows(Path(args.database), args.max_records, now)
+        registry, bindings, conflicts, binding_set_digest = _registry_for_snapshot(
+            previous_registry, records if supported else [], now)
         observations = []
         active_adapter = adapter
+        request_count = 0
         for record in records:
             category, digest, details = 'INSUFFICIENT_BINDING', None, {}
             entry = {'classification': category, 'digest': digest, 'observed_at_ms': now,
                      'exchange_timestamp_ms': None, 'binding_digest': None}
-            binding = None
-            if supported:
-                try:
-                    binding = _binding(record, now)
-                except ValueError:
-                    pass
+            binding = bindings.get(record.get('id')) if supported else None
+            attempted = False
+            stop = False
+            if binding is not None:
+                entry['binding_digest'] = _digest(binding, {})
+            elif type(record.get('id')) is int and record['id'] in conflicts:
+                entry['binding_digest'] = conflicts[record['id']]
+            if type(record.get('id')) is int and record['id'] in conflicts:
+                category = 'CONFLICTING_EVIDENCE'
+                entry['reason'] = 'LOCAL_BINDING_MUTATION'
+            elif binding is not None:
+                if record['id'] in ambiguous:
+                    category = 'CONFLICTING_EVIDENCE'
+                    entry['reason'] = 'AMBIGUOUS_OWNERSHIP'
+                elif binding['submitted_at_ms'] > now + _SKEW_MS:
+                    category = 'STALE_OR_INVALID_TIMESTAMP'
+                elif request_count >= args.max_records:
+                    continue
+                elif active_adapter is None and (not os.environ.get('MEXC_FUTURES_API_KEY')
+                                                 or not os.environ.get('MEXC_FUTURES_API_SECRET')):
+                    category = 'EVIDENCE_UNAVAILABLE'
+                    stop = True
                 else:
-                    entry['binding_digest'] = _digest(binding, {})
-                    if record['id'] in ambiguous:
-                        category = 'CONFLICTING_EVIDENCE'
-                        entry['reason'] = 'AMBIGUOUS_OWNERSHIP'
-                    elif binding['submitted_at_ms'] > now + _SKEW_MS:
-                        category = 'STALE_OR_INVALID_TIMESTAMP'
-                    elif active_adapter is None and (not os.environ.get('MEXC_FUTURES_API_KEY')
-                                                     or not os.environ.get('MEXC_FUTURES_API_SECRET')):
-                        category = 'EVIDENCE_UNAVAILABLE'
-                        entry['classification'] = category
-                        _seal_observation(entry, previous.get(entry['binding_digest']), binding)
-                        observations.append(entry)
-                        break
-                    else:
-                        if active_adapter is None:
-                            active_adapter = ReadOnlyMexcOrderStatusAdapter(enabled=True)
-                        try:
-                            response = active_adapter.get_order_status(binding['exchange_order_id'],
-                                                                       binding['symbol'])
-                        except Exception:
-                            response = None
-                        category, digest, details = _observe(binding, response, now)
-                        entry.update(details)
-                        entry.update(classification=category, digest=digest)
-                        _seal_observation(entry, previous.get(entry['binding_digest']), binding)
-                        observations.append(entry)
-                        if category == 'EVIDENCE_UNAVAILABLE':
-                            break  # Includes rate limiting: never retry within one run.
-                        continue
+                    if active_adapter is None:
+                        active_adapter = ReadOnlyMexcOrderStatusAdapter(enabled=True)
+                    request_count += 1
+                    attempted = True
+                    try:
+                        response = active_adapter.get_order_status(binding['exchange_order_id'],
+                                                                   binding['symbol'])
+                    except Exception:
+                        response = None
+                    category, digest, details = _observe(binding, response, now)
+                    entry.update(details)
+                    stop = category == 'EVIDENCE_UNAVAILABLE'
             entry.update(classification=category, digest=digest)
-            _seal_observation(entry, previous.get(entry['binding_digest']), binding)
+            previous_entry = registry.get(entry['binding_digest'])
+            if category != 'EVIDENCE_UNAVAILABLE':
+                _seal_observation(entry, previous_entry, binding)
+            else:
+                # Indeterminate evidence is bound by the report chain; confirmed
+                # per-binding history stays frozen until determinate evidence.
+                entry['previous_confirmed_evidence_anchor'] = previous_entry['confirmed_evidence_anchor'] if previous_entry else None
+                entry['previous_confirmed_anchor_digest'] = previous_entry['confirmed_anchor_digest'] if previous_entry else _EMPTY_ANCHOR_DIGEST
+                entry['previous_history_chain_digest'] = previous_entry['history_chain_digest'] if previous_entry else _GENESIS_CHAIN_DIGEST
+                entry['confirmed_evidence_anchor'] = entry['previous_confirmed_evidence_anchor']
+                entry['confirmed_anchor_digest'] = entry['previous_confirmed_anchor_digest']
+                entry['history_chain_digest'] = entry['previous_history_chain_digest']
+                entry['observation_performed'] = attempted
+                entry['history_advanced'] = False
+            _update_registry(registry, entry, attempted=attempted or category != 'EVIDENCE_UNAVAILABLE')
             observations.append(entry)
+            if stop:
+                break
+        registry_entries = [registry[key] for key in sorted(registry)]
+        registry_root = _report_hash(registry_entries)
         report = {'version': _REPORT_VERSION,
                   'confirmed_evidence_anchor_version': _ANCHOR_VERSION,
                   'status': 'PASS', 'schema_supported': supported,
-                  'snapshot': snapshot, 'observations': observations}
+                  'snapshot': snapshot, 'observations': observations,
+                  'binding_registry': registry_entries, 'registry_count': len(registry_entries),
+                  'registry_root_digest': registry_root,
+                  'database_binding_set_digest': binding_set_digest,
+                  'previous_report_digest': (previous_report['report_sha256'] if previous_report
+                                             else _GENESIS_CHAIN_DIGEST),
+                  'previous_registry_root_digest': (previous_report['registry_root_digest']
+                                                    if previous_report else _report_hash([]))}
+        report['report_chain_digest'] = _report_chain(report)
         report['report_sha256'] = _report_hash(report)
         payload = json.dumps(report, sort_keys=True, separators=(',', ':')) + '\n'
         _write_new_report(args.output_report, payload)
