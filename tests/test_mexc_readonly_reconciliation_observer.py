@@ -108,9 +108,10 @@ class ObserverTests(unittest.TestCase):
         cases = (
             (dict(FILL, cumulative_filled_quantity='20', status='PARTIALLY_FILLED'), 'PARTIAL_FILL'),
             (dict(FILL, cumulative_filled_quantity='0', average_fill_price='0', status='NEW'), 'ZERO_FILL'),
-            (dict(FILL, status='CANCELLED'), 'CANCELLED_OR_REJECTED'),
-            (dict(FILL, status='REJECTED'), 'CANCELLED_OR_REJECTED'),
-            (dict(FILL, status='EXPIRED'), 'CANCELLED_OR_REJECTED'),
+            (dict(FILL, cumulative_filled_quantity='20', status='CANCELLED'), 'CANCELLED_OR_REJECTED'),
+            (dict(FILL, cumulative_filled_quantity='20', status='REJECTED'), 'CANCELLED_OR_REJECTED'),
+            (dict(FILL, cumulative_filled_quantity='20', status='EXPIRED'), 'CANCELLED_OR_REJECTED'),
+            (dict(FILL, status='CANCELLED'), 'CONFLICTING_EVIDENCE'),
             (dict(FILL, exchange_order_id='2'), 'IDENTITY_MISMATCH'),
             (dict(FILL, external_oid='pnf-syn2-1790323251000-S'), 'IDENTITY_MISMATCH'),
             (dict(FILL, symbol='BTC_USDT'), 'IDENTITY_MISMATCH'),
@@ -458,6 +459,159 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(self.execute(adapter, report=target, previous=tampered)[0], 1)
         self.assertEqual(adapter.calls, [])
         self.assertFalse(target.exists())
+
+    def test_final_anchor_survives_indeterminate_chain(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        first = json.loads(self.report.read_text())['observations'][0]
+        previous = self.report
+        for index, response in enumerate(({'success': True, 'data': dict(FILL, status='UNKNOWN')},
+                                          TimeoutError('secret'), None)):
+            target = Path(self.tmp.name) / f'unknown-chain-{index}.json'
+            self.assertEqual(self.execute(Adapter([response]), report=target, previous=previous)[0], 0)
+            row = json.loads(target.read_text())['observations'][0]
+            self.assertEqual(row['classification'], 'EVIDENCE_UNAVAILABLE')
+            self.assertEqual(row['confirmed_evidence_anchor'], first['confirmed_evidence_anchor'])
+            self.assertEqual(row['confirmed_anchor_digest'], first['confirmed_anchor_digest'])
+            previous = target
+        mutated = Path(self.tmp.name) / 'mutated.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL, average_fill_price='2')}]),
+                                      report=mutated, previous=previous)[0], 0)
+        row = json.loads(mutated.read_text())['observations'][0]
+        self.assertEqual(row['classification'], 'CONFLICTING_EVIDENCE')
+        self.assertEqual(row['confirmed_evidence_anchor'], first['confirmed_evidence_anchor'])
+
+    def test_prior_anchor_cannot_be_cleared_even_with_recomputed_report_hash(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        for index, alteration in enumerate(('missing', 'cleared', 'downgraded', 'chain')):
+            report = json.loads(self.report.read_text())
+            item = report['observations'][0]
+            if alteration == 'missing':
+                del item['confirmed_evidence_anchor']
+            elif alteration == 'cleared':
+                item['confirmed_evidence_anchor'] = None
+            elif alteration == 'downgraded':
+                item['confirmed_evidence_anchor']['status'] = 'NEW'
+            else:
+                item['history_chain_digest'] = '0' * 64
+            report['report_sha256'] = observer._report_hash({k: v for k, v in report.items()
+                                                             if k != 'report_sha256'})
+            prior = Path(self.tmp.name) / f'forged-{index}.json'
+            prior.write_text(json.dumps(report))
+            adapter = Adapter([])
+            target = Path(self.tmp.name) / f'after-forged-{index}.json'
+            code, output = self.execute(adapter, report=target, previous=prior)
+            self.assertEqual((code, output['reason'], adapter.calls),
+                             (1, 'PREVIOUS_REPORT_INVALID', []))
+            self.assertFalse(target.exists())
+
+    def test_partial_unknown_progression_and_terminal_cancellation(self):
+        partial = dict(FILL, status='PARTIALLY_FILLED', cumulative_filled_quantity='20')
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': partial}]))[0], 0)
+        unknown = Path(self.tmp.name) / 'partial-unknown.json'
+        self.assertEqual(self.execute(Adapter([None]), report=unknown, previous=self.report)[0], 0)
+        original_anchor = json.loads(self.report.read_text())['observations'][0]['confirmed_evidence_anchor']
+        self.assertEqual(json.loads(unknown.read_text())['observations'][0]['confirmed_evidence_anchor'],
+                         original_anchor)
+        for index, (response, expected) in enumerate((
+                (dict(FILL, status='PARTIALLY_FILLED', cumulative_filled_quantity='19'),
+                 'CONFLICTING_EVIDENCE'),
+                (dict(FILL, status='PARTIALLY_FILLED', cumulative_filled_quantity='21',
+                      exchange_fill_timestamp=BINDING[7]), 'CONFLICTING_EVIDENCE'),
+                (dict(FILL, status='PARTIALLY_FILLED', cumulative_filled_quantity='30'),
+                 'PARTIAL_FILL'),
+                (dict(FILL, cumulative_filled_quantity='20', status='CANCELLED'),
+                 'CANCELLED_OR_REJECTED'),
+                (dict(FILL, cumulative_filled_quantity='20', status='REJECTED'),
+                 'CANCELLED_OR_REJECTED'),
+                (dict(FILL), 'FULL_FILL_MATCH'))):
+            target = Path(self.tmp.name) / f'partial-next-{index}.json'
+            self.assertEqual(self.execute(Adapter([{'success': True, 'data': response}]),
+                                          report=target, previous=unknown)[0], 0)
+            self.assertEqual(json.loads(target.read_text())['observations'][0]['classification'],
+                             expected)
+            if expected == 'CANCELLED_OR_REJECTED':
+                terminal = json.loads(target.read_text())['observations'][0]
+                self.assertEqual(terminal['confirmed_evidence_anchor']['cumulative_quantity'], '20')
+                later = Path(self.tmp.name) / f'terminal-unknown-{index}.json'
+                self.assertEqual(self.execute(Adapter([None]), report=later, previous=target)[0], 0)
+                self.assertEqual(json.loads(later.read_text())['observations'][0]['confirmed_evidence_anchor'],
+                                 terminal['confirmed_evidence_anchor'])
+
+    def test_anchor_decimal_equivalence_long_short_and_repeatable_chain(self):
+        for side, native_side, suffix in (('LONG', 1, 'L'), ('SHORT', 3, 'S')):
+            oid = 'pnf-syn1-1790323251000-' + suffix
+            with sqlite3.connect(self.db) as conn:
+                conn.execute('UPDATE live_trades SET side=?,external_oid=?', (side, oid))
+            fill = dict(FILL, side=native_side, external_oid=oid)
+            original = Path(self.tmp.name) / f'original-{side}.json'
+            self.assertEqual(self.execute(Adapter([{'success': True, 'data': fill}]),
+                                          report=original)[0], 0)
+            equivalent = dict(fill, requested_quantity='44.000',
+                              cumulative_filled_quantity='44', average_fill_price='1.0150')
+            outcomes = []
+            for index in (1, 2):
+                target = Path(self.tmp.name) / f'equal-{side}-{index}.json'
+                self.assertEqual(self.execute(Adapter([{'success': True, 'data': equivalent}]),
+                                              report=target, previous=original)[0], 0)
+                outcomes.append(json.loads(target.read_text())['observations'][0])
+            self.assertEqual(outcomes[0]['classification'], 'FULL_FILL_MATCH')
+            self.assertEqual(outcomes[0]['confirmed_evidence_anchor'], outcomes[1]['confirmed_evidence_anchor'])
+            self.assertEqual(outcomes[0]['history_chain_digest'], outcomes[1]['history_chain_digest'])
+
+    def test_final_anchor_rejects_identity_quantity_and_time_mutations(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        frozen = json.loads(self.report.read_text())['observations'][0]['confirmed_evidence_anchor']
+        changes = ({'exchange_order_id': '9'},
+                   {'external_oid': 'pnf-syn2-1790323251000-S'},
+                   {'symbol': 'BTC_USDT'}, {'side': 1},
+                   {'requested_quantity': '43'},
+                   {'cumulative_filled_quantity': '43'},
+                   {'average_fill_price': '2'},
+                   {'exchange_fill_timestamp': FILL['exchange_fill_timestamp'] + 1})
+        for index, mutation in enumerate(changes):
+            target = Path(self.tmp.name) / f'final-mutation-{index}.json'
+            code, _ = self.execute(Adapter([{'success': True, 'data': dict(FILL, **mutation)}]),
+                                   report=target, previous=self.report)
+            self.assertEqual(code, 0)
+            row = json.loads(target.read_text())['observations'][0]
+            self.assertEqual(row['classification'], 'CONFLICTING_EVIDENCE')
+            self.assertEqual(row['confirmed_evidence_anchor'], frozen)
+
+    def test_downgraded_and_broken_chain_rejected_before_request(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        first = self.report
+        unknown = Path(self.tmp.name) / 'chain-second.json'
+        self.assertEqual(self.execute(Adapter([None]), report=unknown, previous=first)[0], 0)
+        for index, mutation in enumerate(('version', 'previous_chain', 'skipped_chain',
+                                          'reordered_chain', 'previous_anchor',
+                                          'observation', 'status')):
+            data = json.loads(unknown.read_text())
+            row = data['observations'][0]
+            if mutation == 'version':
+                data['version'] = 2
+            elif mutation == 'previous_chain':
+                row['previous_history_chain_digest'] = '0' * 64
+            elif mutation == 'skipped_chain':
+                row['history_chain_digest'] = json.loads(first.read_text())['observations'][0]['history_chain_digest']
+            elif mutation == 'reordered_chain':
+                row['previous_history_chain_digest'], row['previous_confirmed_anchor_digest'] = (
+                    row['previous_confirmed_anchor_digest'], row['previous_history_chain_digest'])
+            elif mutation == 'previous_anchor':
+                row['previous_confirmed_anchor_digest'] = '0' * 64
+            elif mutation == 'observation':
+                row['digest'] = '0' * 64
+            else:
+                row['classification'] = 'FULL_FILL_MATCH'
+            data['report_sha256'] = observer._report_hash({key: value for key, value in data.items()
+                                                           if key != 'report_sha256'})
+            prior = Path(self.tmp.name) / f'broken-chain-{index}.json'
+            prior.write_text(json.dumps(data))
+            target = Path(self.tmp.name) / f'broken-result-{index}.json'
+            adapter = Adapter([])
+            code, output = self.execute(adapter, report=target, previous=prior)
+            self.assertEqual((code, output['reason'], adapter.calls),
+                             (1, 'PREVIOUS_REPORT_INVALID', []))
+            self.assertFalse(target.exists())
 
     def test_multiple_duplicate_groups_outside_batch(self):
         with sqlite3.connect(self.db) as conn:

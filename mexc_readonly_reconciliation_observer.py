@@ -25,7 +25,13 @@ _OID = re.compile(r'pnf-[A-Za-z0-9_]{1,4}-[0-9]+-[LS]\Z')
 _ORDER_ID = re.compile(r'[0-9]{1,30}\Z')
 _SYMBOL = re.compile(r'[A-Z0-9]+_[A-Z0-9]+\Z')
 _SKEW_MS = 5000
-_REPORT_VERSION = 2
+_REPORT_VERSION = 3
+_ANCHOR_VERSION = 1
+_EMPTY_ANCHOR_DIGEST = hashlib.sha256(b'null').hexdigest()
+_GENESIS_CHAIN_DIGEST = hashlib.sha256(b'mexc-observer-history-v1').hexdigest()
+_DETERMINATE = frozenset(('FULL_FILL_MATCH', 'PARTIAL_FILL', 'ZERO_FILL',
+                          'CANCELLED_OR_REJECTED'))
+_HEX_DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise ValueError('invalid arguments')
@@ -208,7 +214,9 @@ def _observe(binding: dict[str, Any], response: Any, now: int) -> tuple[str, str
         if timestamp < binding['submitted_at_ms'] or timestamp > now + _SKEW_MS or timestamp <= 0:
             return 'STALE_OR_INVALID_TIMESTAMP', digest, details
         if state in ('CANCELLED', 'REJECTED', 'EXPIRED'):
-            return 'CANCELLED_OR_REJECTED', digest, details
+            return ('CANCELLED_OR_REJECTED' if cumulative < requested and
+                    (price > 0 if cumulative > 0 else price == 0) else
+                    'CONFLICTING_EVIDENCE'), digest, details
         if state == 'NEW':
             return ('ZERO_FILL' if cumulative == 0 and price == 0 else 'CONFLICTING_EVIDENCE'), digest, details
         if state == 'PARTIALLY_FILLED':
@@ -232,12 +240,117 @@ def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _is_digest(value: Any) -> bool:
+    return type(value) is str and _HEX_DIGEST.fullmatch(value) is not None
+
+
+def _anchor_digest(anchor: dict[str, Any] | None) -> str:
+    return _report_hash(anchor) if anchor is not None else _EMPTY_ANCHOR_DIGEST
+
+
+def _chain_digest(entry: dict[str, Any]) -> str:
+    return _report_hash({key: entry[key] for key in (
+        'previous_history_chain_digest', 'previous_confirmed_anchor_digest',
+        'digest', 'classification', 'confirmed_anchor_digest')})
+
+
+def _validate_anchor(anchor: Any, binding_digest: str | None) -> None:
+    if (type(anchor) is not dict or set(anchor) != {
+            'version', 'binding_digest', 'evidence_digest', 'status',
+            'requested_quantity', 'cumulative_quantity', 'average_fill_price',
+            'exchange_timestamp_ms'} or type(anchor['version']) is not int or
+            anchor['version'] != _ANCHOR_VERSION or not _is_digest(anchor['binding_digest']) or
+            anchor['binding_digest'] != binding_digest or not _is_digest(anchor['evidence_digest']) or
+            anchor['status'] not in ('NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED',
+                                     'REJECTED', 'EXPIRED') or type(anchor['status']) is not str or
+            type(anchor['exchange_timestamp_ms']) is not int or
+            anchor['exchange_timestamp_ms'] <= 0):
+        raise ValueError('invalid confirmed anchor')
+    requested = _positive(anchor['requested_quantity'])
+    cumulative = _positive(anchor['cumulative_quantity'], zero=True)
+    price = _positive(anchor['average_fill_price'], zero=True)
+    if (any(anchor[key] != _canonical(number) for key, number in (
+            ('requested_quantity', requested), ('cumulative_quantity', cumulative),
+            ('average_fill_price', price))) or cumulative > requested):
+        raise ValueError('invalid confirmed anchor')
+    status = anchor['status']
+    valid = ((status == 'NEW' and cumulative == 0 and price == 0) or
+             (status == 'PARTIALLY_FILLED' and 0 < cumulative < requested and price > 0) or
+             (status == 'FILLED' and cumulative == requested and price > 0) or
+             (status in ('CANCELLED', 'REJECTED', 'EXPIRED') and cumulative < requested and
+              (price > 0 if cumulative > 0 else price == 0)))
+    if not valid:
+        raise ValueError('invalid confirmed anchor')
+
+
+def _anchor_for(entry: dict[str, Any], binding: dict[str, Any]) -> dict[str, Any]:
+    anchor = {'version': _ANCHOR_VERSION, 'binding_digest': entry['binding_digest'],
+              'evidence_digest': entry['digest'], 'status': entry['evidence_status'],
+              'requested_quantity': binding['quantity'],
+              'cumulative_quantity': entry['cumulative_quantity'],
+              'average_fill_price': entry['average_fill_price'],
+              'exchange_timestamp_ms': entry['exchange_timestamp_ms']}
+    _validate_anchor(anchor, entry['binding_digest'])
+    return anchor
+
+
+def _contradicts(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    old_status, new_status = previous['status'], current['status']
+    if (previous['binding_digest'] != current['binding_digest'] or
+            previous['requested_quantity'] != current['requested_quantity']):
+        return True
+    if old_status == 'FILLED' or old_status in ('CANCELLED', 'REJECTED', 'EXPIRED'):
+        return previous != current
+    transitions = {'NEW': frozenset(('NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED',
+                                     'REJECTED', 'EXPIRED')),
+                   'PARTIALLY_FILLED': frozenset(('PARTIALLY_FILLED', 'FILLED',
+                                                'CANCELLED', 'REJECTED', 'EXPIRED'))}
+    if new_status not in transitions[old_status]:
+        return True
+    old_qty = _positive(previous['cumulative_quantity'], zero=True)
+    new_qty = _positive(current['cumulative_quantity'], zero=True)
+    if (new_qty < old_qty or current['exchange_timestamp_ms'] < previous['exchange_timestamp_ms']
+            or (new_qty == old_qty and current['average_fill_price'] != previous['average_fill_price'])):
+        return True
+    return False
+
+
+def _seal_observation(entry: dict[str, Any], previous: dict[str, Any] | None,
+                      binding: dict[str, Any] | None) -> None:
+    prior_anchor = previous['confirmed_evidence_anchor'] if previous else None
+    entry['previous_confirmed_evidence_anchor'] = prior_anchor
+    entry['previous_history_chain_digest'] = (previous['history_chain_digest'] if previous
+                                               else _GENESIS_CHAIN_DIGEST)
+    entry['previous_confirmed_anchor_digest'] = (previous['confirmed_anchor_digest'] if previous
+                                                  else _EMPTY_ANCHOR_DIGEST)
+    anchor = prior_anchor
+    if prior_anchor is not None and entry['classification'] in ('IDENTITY_MISMATCH',
+                                                                'QUANTITY_MISMATCH'):
+        entry['classification'] = 'CONFLICTING_EVIDENCE'
+        entry['reason'] = 'NON_MONOTONIC_EVIDENCE'
+    if entry['classification'] in _DETERMINATE:
+        if binding is None:
+            raise ValueError('determinate evidence requires complete binding')
+        candidate = _anchor_for(entry, binding)
+        if prior_anchor is not None and _contradicts(prior_anchor, candidate):
+            entry['classification'] = 'CONFLICTING_EVIDENCE'
+            entry['reason'] = 'NON_MONOTONIC_EVIDENCE'
+        else:
+            anchor = candidate
+    entry['confirmed_evidence_anchor'] = anchor
+    entry['confirmed_anchor_digest'] = _anchor_digest(anchor)
+    entry['history_chain_digest'] = _chain_digest(entry)
+
+
 def _prior(path: str) -> dict[str, dict[str, Any]]:
     if Path(path).is_symlink() or Path(path).stat().st_size > 1024 * 1024:
         raise ValueError('invalid previous report')
     report = json.loads(Path(path).read_text(encoding='utf-8'), object_pairs_hook=_unique_pairs)
-    if (type(report) is not dict or set(report) != {'version', 'status', 'schema_supported',
-            'snapshot', 'observations', 'report_sha256'} or report.get('version') != _REPORT_VERSION
+    if (type(report) is not dict or set(report) != {'version', 'confirmed_evidence_anchor_version',
+            'status', 'schema_supported', 'snapshot', 'observations', 'report_sha256'}
+            or type(report.get('confirmed_evidence_anchor_version')) is not int or
+            report['confirmed_evidence_anchor_version'] != _ANCHOR_VERSION or
+            report.get('version') != _REPORT_VERSION
             or report.get('status') != 'PASS' or type(report.get('report_sha256')) is not str):
         raise ValueError('invalid previous report')
     checksum = report.pop('report_sha256')
@@ -253,9 +366,18 @@ def _prior(path: str) -> dict[str, dict[str, Any]]:
         raise ValueError('invalid previous report')
     entries = {}
     for item in report['observations']:
-        if type(item) is not dict or (item.get('binding_digest') is not None and
-                (type(item['binding_digest']) is not str or
-                 re.fullmatch(r'[0-9a-f]{64}', item['binding_digest']) is None)):
+        required = {'classification', 'digest', 'observed_at_ms', 'exchange_timestamp_ms',
+                    'binding_digest', 'confirmed_evidence_anchor', 'confirmed_anchor_digest',
+                    'history_chain_digest', 'previous_history_chain_digest',
+                    'previous_confirmed_anchor_digest', 'previous_confirmed_evidence_anchor'}
+        optional = {'reason', 'evidence_status', 'cumulative_quantity', 'average_fill_price'}
+        if (type(item) is not dict or not required.issubset(item) or
+                set(item) - required - optional or
+                (item['binding_digest'] is not None and not _is_digest(item['binding_digest'])) or
+                (item['digest'] is not None and not _is_digest(item['digest'])) or
+                any(not _is_digest(item[key]) for key in (
+                    'confirmed_anchor_digest', 'history_chain_digest',
+                    'previous_history_chain_digest', 'previous_confirmed_anchor_digest'))):
             raise ValueError('invalid previous report')
         key = item['binding_digest']
         if (type(item.get('observed_at_ms')) is not int or item['observed_at_ms'] <= 0
@@ -264,30 +386,41 @@ def _prior(path: str) -> dict[str, dict[str, Any]]:
                 'IDENTITY_MISMATCH', 'QUANTITY_MISMATCH', 'CONFLICTING_EVIDENCE',
                 'INSUFFICIENT_BINDING', 'EVIDENCE_UNAVAILABLE', 'STALE_OR_INVALID_TIMESTAMP')):
             raise ValueError('invalid previous report')
-        if item.get('evidence_status') is not None:
-            _positive(item.get('cumulative_quantity'), zero=True)
-            _positive(item.get('average_fill_price'), zero=True)
-            if type(item.get('exchange_timestamp_ms')) is not int or item['exchange_timestamp_ms'] <= 0:
+        old_anchor, anchor = (item['previous_confirmed_evidence_anchor'],
+                              item['confirmed_evidence_anchor'])
+        if old_anchor is not None:
+            _validate_anchor(old_anchor, key)
+        if anchor is not None:
+            _validate_anchor(anchor, key)
+        if (item['previous_confirmed_anchor_digest'] != _anchor_digest(old_anchor)
+                or item['confirmed_anchor_digest'] != _anchor_digest(anchor)
+                or item['history_chain_digest'] != _chain_digest(item)
+                or (old_anchor is None and item['previous_confirmed_anchor_digest'] !=
+                    _EMPTY_ANCHOR_DIGEST)
+                or (anchor is None and item['confirmed_anchor_digest'] != _EMPTY_ANCHOR_DIGEST)):
+            raise ValueError('invalid previous report')
+        if item['classification'] in _DETERMINATE:
+            if (anchor is None or item['digest'] != anchor['evidence_digest'] or
+                    item.get('evidence_status') != anchor['status'] or
+                    item.get('cumulative_quantity') != anchor['cumulative_quantity'] or
+                    item.get('average_fill_price') != anchor['average_fill_price'] or
+                    item.get('exchange_timestamp_ms') != anchor['exchange_timestamp_ms'] or
+                    _anchor_classification(anchor['status']) != item['classification'] or
+                    (old_anchor is not None and _contradicts(old_anchor, anchor))):
                 raise ValueError('invalid previous report')
+        elif anchor != old_anchor:
+            raise ValueError('invalid previous report')
+        if item['previous_history_chain_digest'] == _GENESIS_CHAIN_DIGEST and old_anchor is not None:
+            raise ValueError('invalid previous report')
         if key is not None:
             entries[key] = item
     return entries
 
 
-def _contradicts(previous: dict[str, Any], current: dict[str, Any]) -> bool:
-    old_status, new_status = previous.get('evidence_status'), current.get('evidence_status')
-    old_time, new_time = previous.get('exchange_timestamp_ms'), current.get('exchange_timestamp_ms')
-    if type(old_time) is int and type(new_time) is int and new_time < old_time:
-        return True
-    if old_status is None or new_status is None:
-        return False
-    if (_positive(current['cumulative_quantity'], zero=True) <
-            _positive(previous['cumulative_quantity'], zero=True)):
-        return True
-    if old_status == 'FILLED':
-        return (new_status != 'FILLED' or any(previous.get(key) != current.get(key) for key in
-                ('cumulative_quantity', 'average_fill_price', 'exchange_timestamp_ms')))
-    return old_status in ('CANCELLED', 'REJECTED', 'EXPIRED') and old_status != new_status
+def _anchor_classification(status: str) -> str:
+    return {'NEW': 'ZERO_FILL', 'PARTIALLY_FILLED': 'PARTIAL_FILL',
+            'FILLED': 'FULL_FILL_MATCH', 'CANCELLED': 'CANCELLED_OR_REJECTED',
+            'REJECTED': 'CANCELLED_OR_REJECTED', 'EXPIRED': 'CANCELLED_OR_REJECTED'}[status]
 
 
 def main(argv: list[str] | None = None, *, adapter: Any = None,
@@ -320,6 +453,7 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
             category, digest, details = 'INSUFFICIENT_BINDING', None, {}
             entry = {'classification': category, 'digest': digest, 'observed_at_ms': now,
                      'exchange_timestamp_ms': None, 'binding_digest': None}
+            binding = None
             if supported:
                 try:
                     binding = _binding(record, now)
@@ -336,6 +470,7 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
                                                      or not os.environ.get('MEXC_FUTURES_API_SECRET')):
                         category = 'EVIDENCE_UNAVAILABLE'
                         entry['classification'] = category
+                        _seal_observation(entry, previous.get(entry['binding_digest']), binding)
                         observations.append(entry)
                         break
                     else:
@@ -349,16 +484,17 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
                         category, digest, details = _observe(binding, response, now)
                         entry.update(details)
                         entry.update(classification=category, digest=digest)
-                        if entry['binding_digest'] in previous and _contradicts(previous[entry['binding_digest']], entry):
-                            entry['classification'] = 'CONFLICTING_EVIDENCE'
-                            entry['reason'] = 'NON_MONOTONIC_EVIDENCE'
+                        _seal_observation(entry, previous.get(entry['binding_digest']), binding)
                         observations.append(entry)
                         if category == 'EVIDENCE_UNAVAILABLE':
                             break  # Includes rate limiting: never retry within one run.
                         continue
             entry.update(classification=category, digest=digest)
+            _seal_observation(entry, previous.get(entry['binding_digest']), binding)
             observations.append(entry)
-        report = {'version': _REPORT_VERSION, 'status': 'PASS', 'schema_supported': supported,
+        report = {'version': _REPORT_VERSION,
+                  'confirmed_evidence_anchor_version': _ANCHOR_VERSION,
+                  'status': 'PASS', 'schema_supported': supported,
                   'snapshot': snapshot, 'observations': observations}
         report['report_sha256'] = _report_hash(report)
         payload = json.dumps(report, sort_keys=True, separators=(',', ':')) + '\n'
