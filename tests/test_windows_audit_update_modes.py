@@ -84,7 +84,8 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         original = path.read_bytes()
         path.write_bytes(original.replace(b"\n", b"\r\n"))
         self.run_mode("Validate")
-        path.write_bytes(original.replace(b"except Exception:", b"except OSError:"))
+        path.write_bytes(original.replace(b"get_attributes.restype = ctypes.c_uint32",
+                                          b"get_attributes.restype = ctypes.c_int"))
         self.run_mode("Validate", success=False)
         path.write_bytes(original + b"# altered\n")
         self.run_mode("Validate", success=False)
@@ -164,9 +165,13 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b"# altered\n")
         operator = self.target / "operator.log"
         operator.write_bytes(b"operator bytes\r\n")
+        report = self.target / "mexc_shadow_reports" / "existing.json"
+        report.parent.mkdir()
+        report.write_bytes(b"operator report\r\n")
         self.run_mode("Apply", "-ConfirmServicesStopped", success=False)
         self.assertFalse((self.target / "_audit_update_backups").exists())
         self.assertEqual(operator.read_bytes(), b"operator bytes\r\n")
+        self.assertEqual(report.read_bytes(), b"operator report\r\n")
         self.assertFalse((self.target / "mexc_readonly_shadow_check.py").exists())
 
     def test_shadow_apply_and_rollback_preserve_operator_files(self):
@@ -182,6 +187,48 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         self.assertFalse(installed.exists())
         self.assertEqual(operator.read_bytes(), b"operator bytes\r\n")
         self.assertEqual(database.read_bytes(), b"database bytes\x00")
+        self.assertEqual(hashlib.sha256((self.target / "pnf_mvp/settings.json").read_bytes()).hexdigest(), self.settings_hash)
+
+    def test_shadow_upgrade_restores_exact_prior_bytes_and_preserves_reports(self):
+        installed = self.target / "mexc_readonly_shadow_check.py"
+        previous = b"original shadow check bytes\r\n"
+        installed.write_bytes(previous)
+        report = self.target / "mexc_shadow_reports" / "operator report.json"
+        report.parent.mkdir()
+        report.write_bytes(b'{"report":"operator"}\r\n')
+        operator = self.target / "operator-created.txt"
+        operator.write_bytes(b"operator\x00file")
+        credentials = self.target / "private.credentials"
+        credentials.write_bytes(b"local credential bytes\r\n")
+        database = self.target / "pnf_mvp" / "operator.sqlite3"
+        database.write_bytes(b"database\x00bytes")
+        log = self.target / "operator.log"
+        log.write_bytes(b"operator log\r\n")
+        self.run_mode("Validate")
+        self.run_mode("Apply", "-ConfirmServicesStopped")
+        self.assertEqual(installed.read_bytes(), (ROOT / "mexc_readonly_shadow_check.py").read_bytes())
+        backup = next((self.target / "_audit_update_backups").glob("*/manifest.json"))
+        self.assertEqual((backup.parent / "code/mexc_readonly_shadow_check.py").read_bytes(), previous)
+        manifest = json.loads(backup.read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["package_source_commit"], "7f598b670e09576b994dd8b601a79a24a38497f5")
+        entry = next(item for item in manifest["files"]
+                     if item["relative_path"] == "mexc_readonly_shadow_check.py")
+        self.assertEqual(entry["expected_sha256"], "baf6fbe468c0c56a80cc8f2b9a3a6b7b482e129c9b0903ae619ebb229834db54")
+        self.assertRegex(backup.parent.name, r"^\d{8}_\d{6}_\d{7}_[0-9a-f]{8}$")
+        for path, original in ((report, b'{"report":"operator"}\r\n'),
+                               (operator, b"operator\x00file"),
+                               (credentials, b"local credential bytes\r\n"),
+                               (database, b"database\x00bytes"),
+                               (log, b"operator log\r\n")):
+            self.assertEqual(path.read_bytes(), original)
+        self.run_mode("Rollback", "-BackupPath", str(backup.parent), "-ConfirmServicesStopped")
+        self.assertEqual(installed.read_bytes(), previous)
+        for path, original in ((report, b'{"report":"operator"}\r\n'),
+                               (operator, b"operator\x00file"),
+                               (credentials, b"local credential bytes\r\n"),
+                               (database, b"database\x00bytes"),
+                               (log, b"operator log\r\n")):
+            self.assertEqual(path.read_bytes(), original)
         self.assertEqual(hashlib.sha256((self.target / "pnf_mvp/settings.json").read_bytes()).hexdigest(), self.settings_hash)
 
     def test_apply_and_rollback_restore_exact_bytes_and_settings(self):
