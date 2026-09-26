@@ -32,6 +32,16 @@ class Transport:
 
 
 class DiscoveryTests(unittest.TestCase):
+    def assert_diagnostic(self, result, reason, stage, *, status=None, envelope='UNAVAILABLE',
+                          container='UNAVAILABLE', pagination='UNAVAILABLE', rows=None,
+                          index=None, field=None):
+        self.assertEqual(result, {'status': 'FAIL', 'reason': reason,
+                                  'diagnostic': {'endpoint': 'HISTORY_ORDERS',
+                                                 'http_status': status, 'stage': stage,
+                                                 'envelope': envelope, 'container': container,
+                                                 'pagination': pagination, 'row_count': rows,
+                                                 'row_index': index, 'field': field}})
+
     def run_cli(self, body, args=('--symbol', SYMBOL), credentials=True):
         transport = Transport(body)
         output = io.StringIO()
@@ -96,10 +106,47 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_ambiguous_records_fail_closed(self):
         for broken in (dict(ORDER, dealVol='2'), dict(ORDER, dealAvgPriceStr='NaN'),
-                       dict(ORDER, side=2), dict(ORDER, symbol='ETH_USDT'),
+                       dict(ORDER, side=5), dict(ORDER, symbol='ETH_USDT'),
                        dict(ORDER, updateTime=None), dict(ORDER, orderId='bad')):
             with self.subTest(broken=broken):
                 code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [broken]})
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
+
+    def test_all_four_exact_sides_and_closing_orders_are_validated_before_filtering(self):
+        rows = [dict(ORDER, side=side, orderId=str(side)) for side in (1, 2, 3, 4)]
+        for envelope in (rows, {'currentPage': 1, 'pageSize': 5, 'resultList': rows}):
+            with self.subTest(container=type(envelope).__name__):
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': envelope})
+                self.assertEqual(code, 0)
+                self.assertEqual([(order['order_id'], order['side']) for order in result['orders']],
+                                 [('1', 'LONG'), ('3', 'SHORT')])
+        for side in (2, 4):
+            code, result, _ = self.run_cli({'success': True, 'code': 0, 'data':
+                                            [dict(ORDER, side=side)]})
+            self.assertEqual((code, result), (0, {'status': 'PASS', 'orders': []}))
+            for field in ('orderId', 'symbol', 'vol', 'dealVol', 'dealAvgPriceStr', 'updateTime'):
+                with self.subTest(side=side, field=field):
+                    row = dict(ORDER, side=side)
+                    del row[field]
+                    code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': [row]})
+                    self.assertEqual((code, result),
+                                     (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
+        for side in (None, True, 2.0, '2', 0, 5, {}, []):
+            with self.subTest(side=side):
+                code, result, _ = self.run_cli({'success': True, 'code': 0,
+                                                'data': [dict(ORDER, side=side)]})
+                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
+        row = dict(ORDER, side=4, dealAvgPrice='200')
+        code, result, _ = self.run_cli({'success': True, 'code': 0,
+                                        'data': [dict(ORDER), row]})
+        self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
+        for broken in (dict(ORDER, side=4, order_side=3),
+                       dict(ORDER, side=2, dealVol='2'),
+                       dict(ORDER, side=4, symbol='ETH_USDT'),
+                       dict(ORDER, side=2, fillTime=1, fill_time=2)):
+            with self.subTest(broken=broken):
+                code, result, _ = self.run_cli({'success': True, 'code': 0,
+                                                'data': [dict(ORDER), broken]})
                 self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
 
     def test_conflicting_economic_aliases_fail_closed(self):
@@ -110,9 +157,13 @@ class DiscoveryTests(unittest.TestCase):
             with self.subTest(alias=alias):
                 body = {'success': True, 'code': 0, 'data': [dict(ORDER, **{alias: value})]}
                 code, result, _ = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
-                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA',
-                                                       'diagnostic': {'endpoint': 'HISTORY_ORDERS',
-                                                                      'http_status': None, 'schema': 'RESPONSE'}}))
+                self.assertEqual(code, 1)
+                self.assert_diagnostic(result, 'RESPONSE_SCHEMA', 'RESPONSE', envelope='OBJECT',
+                                       container='LIST', pagination='LIST', rows=1, index=0,
+                                       field={'order_id': 'ORDER_ID', 'native_symbol': 'SYMBOL',
+                                              'order_side': 'SIDE', 'requested_quantity': 'QUANTITY',
+                                              'filled_quantity': 'QUANTITY', 'dealAvgPrice': 'PRICE',
+                                              'status': 'STATE', 'update_time': 'TIMESTAMP'}[alias])
 
     def test_only_integer_state_three_is_accepted_for_every_row(self):
         for state in (None, 1, 2, 4, 5, 0, 6, True, 3.0, '3', 'bad', [], {}):
@@ -121,9 +172,9 @@ class DiscoveryTests(unittest.TestCase):
                 code, result, _ = self.run_cli(
                     {'success': True, 'code': 0, 'data': [row]},
                     args=('--symbol', SYMBOL, '--diagnostic'))
-                self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA',
-                                                       'diagnostic': {'endpoint': 'HISTORY_ORDERS',
-                                                                      'http_status': None, 'schema': 'RESPONSE'}}))
+                self.assertEqual(code, 1)
+                self.assert_diagnostic(result, 'RESPONSE_SCHEMA', 'RESPONSE', envelope='OBJECT',
+                                       container='LIST', pagination='LIST', rows=1, index=0, field='STATE')
         for rows in ([{'state': 4}], [dict(ORDER), {'state': 4}],
                      [dict(ORDER), dict(ORDER, orderId='2', state=4)]):
             with self.subTest(rows=rows):
@@ -190,26 +241,79 @@ class DiscoveryTests(unittest.TestCase):
             code, result, _ = self.run_cli(body)
             self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'RESPONSE_SCHEMA'}))
 
+    def test_bounded_diagnostic_classifies_envelope_container_and_late_row_without_values(self):
+        cases = (
+            (b'{"success":true,"success":true,"code":0,"data":[]}',
+             'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', None, None, 'JSON'),
+            (b'[]', 'OTHER', 'UNAVAILABLE', 'UNAVAILABLE', None, None, 'ENVELOPE'),
+            ({'success': True, 'code': 0},
+             'OBJECT', 'MISSING', 'INVALID', None, None, 'CONTAINER'),
+            (b'{"success":true,"code":0,"data":[],"secret":"synthetic-secret"}',
+             'OBJECT', 'LIST', 'LIST', 0, None, None),
+            ({'success': True, 'code': 0, 'data': 'synthetic-secret'},
+             'OBJECT', 'OTHER', 'INVALID', None, None, 'CONTAINER'),
+            ({'success': True, 'code': 0, 'data': {'currentPage': 2, 'pageSize': 5,
+                                                  'resultList': [ORDER]}},
+             'OBJECT', 'OBJECT', 'INVALID', None, None, 'PAGINATION'),
+            ({'success': True, 'code': 0, 'data': [ORDER, dict(ORDER, side=4, orderId='2',
+                                                               dealAvgPriceStr='NaN')]},
+             'OBJECT', 'LIST', 'LIST', 2, 1, 'PRICE'),
+            ({'success': True, 'code': 0, 'data': [dict(ORDER, side=4, orderId='2',
+                                                               dealAvgPriceStr='NaN')]},
+             'OBJECT', 'LIST', 'LIST', 1, 0, 'PRICE'),
+        )
+        for body, envelope, container, pagination, rows, index, field in cases:
+            with self.subTest(field=field, rows=rows):
+                code, result, _ = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
+                if field is None:
+                    self.assertEqual(result, {'status': 'PASS', 'diagnostic': {
+                        'endpoint': 'HISTORY_ORDERS', 'http_status': None, 'stage': 'VALID',
+                        'envelope': envelope, 'container': container, 'pagination': pagination,
+                        'row_count': rows, 'row_index': None, 'field': None}})
+                    continue
+                self.assertEqual(code, 1)
+                self.assert_diagnostic(result, 'RESPONSE_SCHEMA', 'RESPONSE',
+                                       envelope=envelope, container=container, pagination=pagination,
+                                       rows=rows, index=index, field=field)
+                rendered = json.dumps(result)
+                for sensitive in ('synthetic-secret', 'synthetic-key', SYMBOL, ORDER['orderId'],
+                                  'NaN', 'https://', 'ApiKey', 'Signature'):
+                    self.assertNotIn(sensitive, rendered)
+
+    def test_diagnostic_missing_credentials_and_invalid_input_have_no_evidence(self):
+        for args, credentials, reason, stage in (
+                (('--symbol', SYMBOL), False, 'MISSING_CREDENTIALS', 'CREDENTIALS'),
+                (('--symbol', '../SECRET', '--diagnostic'), True, 'INVALID_INPUT', 'INPUT')):
+            code, result, calls = self.run_cli({}, args=(*args, '--diagnostic') if credentials is False else args,
+                                               credentials=credentials)
+            self.assertEqual((code, calls), (1, []))
+            self.assert_diagnostic(result, reason, stage, field=stage)
+
+    def test_request_stage_failure_is_sanitized_and_does_not_call_transport(self):
+        with patch.object(discovery, '_canonical_parameters', side_effect=ValueError('synthetic-secret')):
+            code, result, calls = self.run_cli({}, args=('--symbol', SYMBOL, '--diagnostic'))
+        self.assertEqual((code, calls), (1, []))
+        self.assert_diagnostic(result, 'INTERNAL_ERROR', 'REQUEST', field='REQUEST')
+
     def test_deterministic_diagnostics_redact_exceptions_and_response(self):
         cases = (
-            (urllib.error.HTTPError('https://secret.invalid/key', 302, 'synthetic-secret', {}, None), 'HTTP_STATUS', 302, 'TRANSPORT'),
-            (urllib.error.HTTPError('https://secret.invalid/key', 401, 'synthetic-secret', {}, None), 'AUTH_REJECTED', 401, 'TRANSPORT'),
-            (urllib.error.HTTPError('https://secret.invalid/key', 500, 'synthetic-secret', {}, None), 'HTTP_STATUS', 500, 'TRANSPORT'),
-            ({'success': False, 'code': 602, 'msg': 'synthetic-secret'}, 'AUTH_REJECTED', None, 'API'),
-            ({'success': False, 'code': 600, 'msg': 'synthetic-secret'}, 'API_REJECTED', None, 'API'),
-            (b'{"success":true,"code":0,"data":{"resultList":[]}}', 'RESPONSE_SCHEMA', None, 'RESPONSE'),
-            (socket.timeout('synthetic-secret'), 'NETWORK_ERROR', None, 'TRANSPORT'),
-            (urllib.error.URLError('synthetic-secret'), 'NETWORK_ERROR', None, 'TRANSPORT'),
-            (RuntimeError('synthetic-secret'), 'INTERNAL_ERROR', None, 'INTERNAL'),
+            (urllib.error.HTTPError('https://secret.invalid/key', 302, 'synthetic-secret', {}, None), 'HTTP_STATUS', 302, 'TRANSPORT', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'TRANSPORT'),
+            (urllib.error.HTTPError('https://secret.invalid/key', 401, 'synthetic-secret', {}, None), 'AUTH_REJECTED', 401, 'TRANSPORT', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'TRANSPORT'),
+            (urllib.error.HTTPError('https://secret.invalid/key', 500, 'synthetic-secret', {}, None), 'HTTP_STATUS', 500, 'TRANSPORT', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'TRANSPORT'),
+            ({'success': False, 'code': 602, 'msg': 'synthetic-secret'}, 'AUTH_REJECTED', None, 'API', 'OBJECT', 'UNAVAILABLE', 'UNAVAILABLE', 'API'),
+            ({'success': False, 'code': 600, 'msg': 'synthetic-secret'}, 'API_REJECTED', None, 'API', 'OBJECT', 'UNAVAILABLE', 'UNAVAILABLE', 'API'),
+            (b'{"success":true,"code":0,"data":{"resultList":[]}}', 'RESPONSE_SCHEMA', None, 'RESPONSE', 'OBJECT', 'OBJECT', 'INVALID', 'PAGINATION'),
+            (socket.timeout('synthetic-secret'), 'NETWORK_ERROR', None, 'TRANSPORT', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'TRANSPORT'),
+            (urllib.error.URLError('synthetic-secret'), 'NETWORK_ERROR', None, 'TRANSPORT', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'TRANSPORT'),
+            (RuntimeError('synthetic-secret'), 'INTERNAL_ERROR', None, 'INTERNAL', 'UNAVAILABLE', 'UNAVAILABLE', 'UNAVAILABLE', 'INTERNAL'),
         )
-        for body, reason, http_status, schema in cases:
+        for body, reason, http_status, stage, envelope, container, pagination, field in cases:
             with self.subTest(reason=reason, body=type(body).__name__):
                 code, result, calls = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
                 self.assertEqual(code, 1)
                 self.assertEqual(len(calls), 1)
-                self.assertEqual(result, {'status': 'FAIL', 'reason': reason,
-                                          'diagnostic': {'endpoint': 'HISTORY_ORDERS',
-                                                         'http_status': http_status, 'schema': schema}})
+                self.assert_diagnostic(result, reason, stage, status=http_status, envelope=envelope,
+                                       container=container, pagination=pagination, field=field)
                 rendered = json.dumps(result)
                 for forbidden in ('synthetic-secret', 'synthetic-key', 'Signature', 'Request-Time',
                                   'https://', 'orderId', SYMBOL):
@@ -219,10 +323,24 @@ class DiscoveryTests(unittest.TestCase):
         body = {'success': True, 'code': 0, 'data': [ORDER]}
         code, result, _ = self.run_cli(body, args=('--symbol', SYMBOL, '--diagnostic'))
         self.assertEqual(code, 0)
-        self.assertEqual(result['diagnostic'], {'endpoint': 'HISTORY_ORDERS',
-                                                'http_status': None, 'schema': 'VALID'})
+        self.assertEqual(result, {'status': 'PASS', 'diagnostic': {
+            'endpoint': 'HISTORY_ORDERS', 'http_status': None, 'stage': 'VALID',
+            'envelope': 'OBJECT', 'container': 'LIST', 'pagination': 'LIST',
+            'row_count': 1, 'row_index': None, 'field': None}})
         code, result, _ = self.run_cli(urllib.error.URLError('synthetic-secret'))
         self.assertEqual((code, result), (1, {'status': 'FAIL', 'reason': 'NETWORK_ERROR'}))
+        for data, container, pagination in (
+                ([dict(ORDER, side=4)], 'LIST', 'LIST'),
+                ({'currentPage': 1, 'pageSize': 5,
+                  'resultList': [dict(ORDER, side=2)]}, 'OBJECT', 'VALID')):
+            with self.subTest(container=container):
+                code, result, _ = self.run_cli({'success': True, 'code': 0, 'data': data},
+                                                args=('--symbol', SYMBOL, '--diagnostic'))
+                self.assertEqual(code, 0)
+                self.assertEqual(result, {'status': 'PASS', 'diagnostic': {
+                    'endpoint': 'HISTORY_ORDERS', 'http_status': None, 'stage': 'VALID',
+                    'envelope': 'OBJECT', 'container': container, 'pagination': pagination,
+                    'row_count': 1, 'row_index': None, 'field': None}})
 
     def test_non_2xx_response_object_is_http_status_without_body(self):
         class Response:
@@ -250,9 +368,33 @@ class DiscoveryTests(unittest.TestCase):
         with patch.object(discovery.urllib.request, 'build_opener', return_value=Opener()):
             code, result, _ = self.run_cli_with_production_transport()
         self.assertEqual(code, 1)
-        self.assertEqual(result, {'status': 'FAIL', 'reason': 'HTTP_STATUS',
-                                  'diagnostic': {'endpoint': 'HISTORY_ORDERS',
-                                                 'http_status': 429, 'schema': 'TRANSPORT'}})
+        self.assert_diagnostic(result, 'HTTP_STATUS', 'TRANSPORT', status=429, field='TRANSPORT')
+
+    def test_actual_success_http_status_is_available_on_schema_failure(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return b'{"success":true,"code":0,"data":[{"state":4}]}'
+
+        class Opener:
+            def open(self, request, timeout):
+                if request.get_method() != 'GET':
+                    raise AssertionError('non-GET request')
+                return Response()
+
+        with patch.object(discovery.urllib.request, 'build_opener', return_value=Opener()):
+            code, result, _ = self.run_cli_with_production_transport()
+        self.assertEqual(code, 1)
+        self.assert_diagnostic(result, 'RESPONSE_SCHEMA', 'RESPONSE', status=200,
+                               envelope='OBJECT', container='LIST', pagination='LIST',
+                               rows=1, index=0, field='STATE')
 
     def run_cli_with_production_transport(self):
         output = io.StringIO()

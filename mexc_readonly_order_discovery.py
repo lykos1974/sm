@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -36,6 +37,11 @@ class _ApiRejected(Exception):
 class _HttpStatus(Exception):
     def __init__(self, status: int | None):
         self.status = status
+
+
+class _EvidenceError(ValueError):
+    def __init__(self, category: str):
+        self.category = category
 
 
 def _canonical_parameters(pairs: list[tuple[str, str | int]]) -> str:
@@ -66,11 +72,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class _GetOnlyTransport:
+    def __init__(self) -> None:
+        self.last_status: int | None = None
+
     def get(self, url: str, headers: dict[str, str], timeout: float) -> bytes:
         request = urllib.request.Request(_checked_url(url), headers=headers, method='GET')
         with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 raise _HttpStatus(response.status)
+            self.last_status = response.status
             return response.read()
 
 
@@ -79,7 +89,7 @@ class _Parser(argparse.ArgumentParser):
         raise ValueError('invalid arguments')
 
 
-def _json(raw: bytes) -> dict[str, Any]:
+def _json(raw: bytes, diagnostic: dict[str, Any]) -> dict[str, Any]:
     def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -88,14 +98,18 @@ def _json(raw: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
-    if not isinstance(raw, bytes):
-        raise ValueError('invalid response')
-    parsed = json.loads(raw.decode('utf-8'), object_pairs_hook=unique,
-                        parse_float=Decimal,
-                        parse_constant=lambda _: (_ for _ in ()).throw(ValueError('non-finite')))
+    try:
+        if not isinstance(raw, bytes):
+            raise ValueError('invalid response')
+        parsed = json.loads(raw.decode('utf-8'), object_pairs_hook=unique,
+                            parse_float=Decimal,
+                            parse_constant=lambda _: (_ for _ in ()).throw(ValueError('non-finite')))
+    except (ValueError, UnicodeError, TypeError) as exc:
+        raise _EvidenceError('JSON') from exc
+    diagnostic['envelope'] = 'OBJECT' if isinstance(parsed, dict) else 'OTHER'
     if (not isinstance(parsed, dict) or type(parsed.get('success')) is not bool
             or type(parsed.get('code')) is not int):
-        raise ValueError('invalid response')
+        raise _EvidenceError('ENVELOPE')
     if not parsed['success'] or parsed['code'] != 0:
         raise _ApiRejected(authentication=parsed['code'] in _AUTH_API_CODES)
     return parsed
@@ -126,6 +140,14 @@ def _aliases(row: dict[str, Any], names: tuple[str, ...], normalize: Any,
     return values[0]
 
 
+def _evidence(row: dict[str, Any], names: tuple[str, ...], normalize: Any,
+              category: str, *, required: bool = True) -> Any:
+    try:
+        return _aliases(row, names, normalize, required=required)
+    except (ValueError, TypeError) as exc:
+        raise _EvidenceError(category) from exc
+
+
 def _positive_integer(value: Any) -> int:
     if type(value) is int:
         result = value
@@ -144,6 +166,12 @@ def _filled_state(value: Any) -> int:
     return value
 
 
+def _order_side(value: Any) -> int:
+    if type(value) is not int or value not in (1, 2, 3, 4):
+        raise ValueError('invalid order side')
+    return value
+
+
 def _order_id(value: Any) -> str:
     if (type(value) not in (str, int)
             or re.fullmatch(r'[0-9]{1,30}', str(value)) is None):
@@ -157,44 +185,75 @@ def _symbol(value: Any) -> str:
     return value
 
 
-def _orders(raw: bytes, symbol: str, limit: int) -> list[dict[str, Any]]:
-    data = _json(raw)['data']
+def _orders(raw: bytes, symbol: str, limit: int,
+            diagnostic: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if diagnostic is None:
+        diagnostic = _diagnostic()
+    envelope = _json(raw, diagnostic)
+    if 'data' not in envelope:
+        diagnostic['container'] = 'MISSING'
+        diagnostic['pagination'] = 'INVALID'
+        raise _EvidenceError('CONTAINER')
+    data = envelope['data']
+    diagnostic['container'] = ('LIST' if isinstance(data, list) else
+                               'OBJECT' if isinstance(data, dict) else 'OTHER')
     if isinstance(data, dict):
         if (type(data.get('currentPage')) is not int or data['currentPage'] != 1
                 or type(data.get('pageSize')) is not int or data['pageSize'] != limit):
-            raise ValueError('invalid page')
+            diagnostic['pagination'] = 'INVALID'
+            raise _EvidenceError('PAGINATION')
+        diagnostic['pagination'] = 'VALID'
+        if 'resultList' not in data:
+            diagnostic['pagination'] = 'INVALID'
+            raise _EvidenceError('PAGINATION')
         data = data['resultList']
+    elif isinstance(data, list):
+        diagnostic['pagination'] = 'LIST'
+    else:
+        diagnostic['pagination'] = 'INVALID'
     if not isinstance(data, list) or len(data) > limit:
-        raise ValueError('invalid result set')
+        if isinstance(data, list):
+            diagnostic['row_count'] = min(len(data), limit + 1)
+        raise _EvidenceError('CONTAINER')
+    diagnostic['row_count'] = len(data)
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for row in data:
+    for index, row in enumerate(data):
+        diagnostic['row_index'] = index
         if not isinstance(row, dict):
-            raise ValueError('ambiguous order')
-        _aliases(row, ('state', 'status'), _filled_state)
-        native_symbol = _aliases(row, ('symbol', 'native_symbol'), _symbol)
-        side = _aliases(row, ('side', 'order_side'), _positive_integer)
+            raise _EvidenceError('ROW')
+        _evidence(row, ('state', 'status'), _filled_state, 'STATE')
+        native_symbol = _evidence(row, ('symbol', 'native_symbol'), _symbol, 'SYMBOL')
+        side = _evidence(row, ('side', 'order_side'), _order_side, 'SIDE')
         if native_symbol != symbol:
-            raise ValueError('ambiguous order')
-        if side not in (1, 3):
-            raise ValueError('ambiguous side')
-        order_id = _aliases(row, ('orderId', 'order_id'), _order_id)
-        _aliases(row, ('updateTime', 'update_time'), _positive_integer)
-        _aliases(row, ('fillTime', 'fill_time'), _positive_integer, required=False)
+            raise _EvidenceError('SYMBOL')
+        order_id = _evidence(row, ('orderId', 'order_id'), _order_id, 'ORDER_ID')
+        _evidence(row, ('updateTime', 'update_time'), _positive_integer, 'TIMESTAMP')
+        _evidence(row, ('fillTime', 'fill_time'), _positive_integer, 'TIMESTAMP', required=False)
         if order_id in seen:
-            raise ValueError('ambiguous identity or time')
+            raise _EvidenceError('ORDER_ID')
         seen.add(order_id)
-        requested = _aliases(row, ('vol', 'requested_quantity'), _positive)
-        filled = _aliases(row, ('dealVol', 'filled_quantity'), _positive)
-        average = _aliases(row, ('dealAvgPriceStr', 'dealAvgPrice'), _positive)
+        requested = _evidence(row, ('vol', 'requested_quantity'), _positive, 'QUANTITY')
+        filled = _evidence(row, ('dealVol', 'filled_quantity'), _positive, 'QUANTITY')
+        average = _evidence(row, ('dealAvgPriceStr', 'dealAvgPrice'), _positive, 'PRICE')
         if requested != filled:
-            raise ValueError('not fully filled')
+            raise _EvidenceError('QUANTITY')
+        if side in (2, 4):
+            continue
         result.append({'order_id': order_id, 'native_symbol': symbol,
                        'side': 'LONG' if side == 1 else 'SHORT',
                        'requested_quantity': str(requested), 'filled_quantity': str(filled),
                        'average_fill_price': str(average), 'fill_time': None,
                        'status': 'FILLED'})
+    diagnostic['row_index'] = None
     return result
+
+
+def _diagnostic() -> dict[str, Any]:
+    return {'endpoint': 'HISTORY_ORDERS', 'http_status': None, 'stage': 'INTERNAL',
+            'envelope': 'UNAVAILABLE', 'container': 'UNAVAILABLE',
+            'pagination': 'UNAVAILABLE', 'row_count': None,
+            'row_index': None, 'field': None}
 
 
 def _emit(status: str, **fields: Any) -> None:
@@ -206,19 +265,24 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
     parser.add_argument('--symbol', required=True, help='Native symbol, e.g. BTC_USDT')
     parser.add_argument('--limit', type=int, default=5)
     parser.add_argument('--diagnostic', action='store_true')
-    stage = 'INTERNAL'
+    diagnostic = _diagnostic()
+    diagnostic_requested = '--diagnostic' in (sys.argv[1:] if argv is None else argv)
+    stage = 'REQUEST'
     try:
         args = parser.parse_args(argv)
         if re.fullmatch(r'[A-Z0-9]+_[A-Z0-9]+', args.symbol) is None or not 1 <= args.limit <= 20:
             raise ValueError('invalid input')
     except (ValueError, TypeError):
-        _emit('FAIL', reason='INVALID_INPUT')
+        diagnostic.update(stage='INPUT', field='INPUT')
+        _emit('FAIL', reason='INVALID_INPUT', **({'diagnostic': diagnostic} if diagnostic_requested else {}))
         return 1
     key = os.environ.get('MEXC_FUTURES_API_KEY')
     secret = os.environ.get('MEXC_FUTURES_API_SECRET')
     if not key or not secret:
-        _emit('FAIL', reason='MISSING_CREDENTIALS')
+        diagnostic.update(stage='CREDENTIALS', field='CREDENTIALS')
+        _emit('FAIL', reason='MISSING_CREDENTIALS', **({'diagnostic': diagnostic} if args.diagnostic else {}))
         return 1
+    selected_transport = None
     try:
         parameters = _canonical_parameters([
             ('symbol', args.symbol), ('states', 3), ('page_num', 1), ('page_size', args.limit),
@@ -229,11 +293,19 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
                              (key + timestamp + parameters).encode(), hashlib.sha256).hexdigest()
         headers = {'ApiKey': key, 'Request-Time': timestamp, 'Signature': signature}
         stage = 'TRANSPORT'
-        raw = (transport if transport is not None else _GetOnlyTransport()).get(url, headers, 15)
+        selected_transport = transport if transport is not None else _GetOnlyTransport()
+        raw = selected_transport.get(url, headers, 15)
+        response_status = getattr(selected_transport, 'last_status', None)
+        if type(response_status) is int and 100 <= response_status <= 599:
+            diagnostic['http_status'] = response_status
         stage = 'RESPONSE'
-        orders = _orders(raw, args.symbol, args.limit)
+        orders = _orders(raw, args.symbol, args.limit, diagnostic)
     except Exception as exc:
-        status = None
+        status = diagnostic['http_status']
+        if isinstance(selected_transport, _GetOnlyTransport):
+            response_status = selected_transport.last_status
+            if type(response_status) is int and 100 <= response_status <= 599:
+                status = response_status
         if isinstance(exc, urllib.error.HTTPError):
             status = exc.code if type(exc.code) is int and 100 <= exc.code <= 599 else None
             reason = 'AUTH_REJECTED' if status in (401, 403) else 'HTTP_STATUS'
@@ -243,20 +315,29 @@ def main(argv: list[str] | None = None, *, transport: Any = None) -> int:
         elif isinstance(exc, _ApiRejected):
             reason = 'AUTH_REJECTED' if exc.authentication else 'API_REJECTED'
             stage = 'API'
+            diagnostic['field'] = 'API'
         elif stage == 'RESPONSE' and isinstance(exc, (ValueError, KeyError, TypeError, UnicodeError)):
             reason = 'RESPONSE_SCHEMA'
+            diagnostic['field'] = exc.category if isinstance(exc, _EvidenceError) else 'INTERNAL'
         elif stage == 'TRANSPORT' and isinstance(exc, (OSError, urllib.error.URLError)):
             reason = 'NETWORK_ERROR'
+        elif stage == 'REQUEST':
+            reason = 'INTERNAL_ERROR'
         else:
             reason = 'INTERNAL_ERROR'
             stage = 'INTERNAL'
-        metadata = {'diagnostic': {'endpoint': 'HISTORY_ORDERS', 'http_status': status,
-                                   'schema': stage}} if args.diagnostic else {}
+        diagnostic['http_status'] = status
+        diagnostic['stage'] = stage
+        if diagnostic['field'] is None:
+            diagnostic['field'] = stage
+        metadata = {'diagnostic': diagnostic} if args.diagnostic else {}
         _emit('FAIL', reason=reason, **metadata)
         return 1
-    metadata = {'diagnostic': {'endpoint': 'HISTORY_ORDERS', 'http_status': None,
-                               'schema': 'VALID'}} if args.diagnostic else {}
-    _emit('PASS', orders=orders, **metadata)
+    if args.diagnostic:
+        diagnostic['stage'] = 'VALID'
+        _emit('PASS', diagnostic=diagnostic)
+    else:
+        _emit('PASS', orders=orders)
     return 0
 
 
