@@ -1,5 +1,6 @@
 """Offline shadow CLI checks with synthetic exchange responses only."""
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 from tests.test_mexc_readonly_order_status import ORDER, ORDER_ID, SYMBOL, TRADES, Transport
@@ -17,6 +18,107 @@ ARGS = ['--order-id', ORDER_ID, '--symbol', SYMBOL, '--side', 'LONG', '--request
 
 
 class ShadowCheckTests(unittest.TestCase):
+    def test_windows_invalid_attributes_are_absent_only_for_missing_path_errors(self):
+        class Attributes:
+            argtypes = None
+            restype = None
+
+            def __init__(self, value):
+                self.value = value
+
+            def __call__(self, path):
+                self.path = path
+                return (ctypes.c_uint32(self.value).value if self.restype is ctypes.c_uint32
+                        else ctypes.c_int32(self.value).value)
+
+        for windows_path in (PureWindowsPath(r'.\mexc shadow\new.json'),
+                             PureWindowsPath(r'H:\pnf screener\mexc shadow\new.json')):
+            for attributes, error, absent in ((-1, 2, True), (-1, 3, True),
+                                              (-1, 5, False), (-1, 32, False),
+                                              (0x400, 0, False), (0, 0, False)):
+                with self.subTest(path=str(windows_path), error=error, attributes=attributes):
+                    function = Attributes(attributes)
+                    class Kernel:
+                        GetFileAttributesW = function
+                    with patch.object(cli.os, 'name', 'nt'), \
+                            patch.object(cli.ctypes, 'WinDLL', return_value=Kernel(), create=True) as dll, \
+                            patch.object(cli.ctypes, 'get_last_error', return_value=error, create=True):
+                        if attributes == -1 and not absent:
+                            with self.assertRaises(OSError) as caught:
+                                cli._is_reparse_point(windows_path)
+                            self.assertEqual(caught.exception.errno, error)
+                        else:
+                            self.assertEqual(cli._is_reparse_point(windows_path), attributes == 0x400)
+                    self.assertEqual(function.argtypes, (ctypes.c_wchar_p,))
+                    self.assertIs(function.restype, ctypes.c_uint32)
+                    self.assertEqual(function.path, str(windows_path))
+                    dll.assert_called_once_with('kernel32', use_last_error=True)
+
+    def test_missing_windows_target_reaches_exclusive_creation_and_publication(self):
+        class Attributes:
+            argtypes = None
+            restype = None
+
+            def __call__(self, path):
+                return -1 if self.restype is None else 0xFFFFFFFF
+
+        class Kernel:
+            GetFileAttributesW = Attributes()
+
+        original_check = cli._is_reparse_point
+        original_create = cli.tempfile.mkstemp
+        original_publish = cli._publish_new_report
+        with tempfile.TemporaryDirectory(prefix='mexc shadow ') as folder:
+            path = Path(folder) / 'new report.json'
+            def windows_check(target):
+                with patch.object(cli.os, 'name', 'nt'), \
+                        patch.object(cli.ctypes, 'WinDLL', return_value=Kernel(), create=True), \
+                        patch.object(cli.ctypes, 'get_last_error', return_value=2, create=True):
+                    return original_check(target)
+            with patch.object(cli, '_is_reparse_point', side_effect=windows_check), \
+                    patch.object(cli.tempfile, 'mkstemp', wraps=original_create) as create, \
+                    patch.object(cli, '_publish_new_report', wraps=original_publish) as publish:
+                code, output, _ = self.run_cli(ARGS + ['--output-report', str(path)])
+            self.assertEqual((code, json.loads(output)['status']), (0, 'PASS'))
+            self.assertEqual(create.call_count, 1)
+            self.assertEqual(create.call_args.kwargs['dir'], str(path.parent))
+            publish.assert_called_once()
+            self.assertEqual(path.read_text(encoding='utf-8'), output)
+
+    def test_windows_reparse_and_access_denial_block_creation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for result in (True, OSError(5, 'access denied')):
+                with self.subTest(result=str(result)):
+                    target = Path(folder) / 'new report.json'
+                    kwargs = {'side_effect': result} if isinstance(result, OSError) else {'return_value': result}
+                    with patch.object(cli, '_is_reparse_point', **kwargs), \
+                            patch.object(cli.tempfile, 'mkstemp', side_effect=AssertionError('created')) as create:
+                        code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+                    self.assertEqual((code, json.loads(output)),
+                                     (1, {'status': 'FAIL', 'reason': 'REPORT_ERROR'}))
+                    self.assertFalse(target.exists())
+                    create.assert_not_called()
+
+    def test_windows_publication_race_does_not_replace_existing_report(self):
+        original_publish = cli._publish_new_report
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'new report.json'
+
+            def windows_publish(temporary, destination):
+                def competing_rename(source, destination_path):
+                    target.write_bytes(b'existing operator bytes')
+                    raise FileExistsError(183, 'target already exists')
+
+                with patch.object(cli.os, 'name', 'nt'), patch.object(cli.os, 'rename', side_effect=competing_rename):
+                    original_publish(temporary, destination)
+
+            with patch.object(cli, '_publish_new_report', side_effect=windows_publish):
+                code, output, _ = self.run_cli(ARGS + ['--output-report', str(target)])
+            self.assertEqual((code, json.loads(output)),
+                             (1, {'status': 'FAIL', 'reason': 'REPORT_ERROR'}))
+            self.assertEqual(target.read_bytes(), b'existing operator bytes')
+            self.assertEqual(list(Path(folder).iterdir()), [target])
+
     def run_cli(self, args=ARGS, order=ORDER, trades=TRADES, credentials=True):
         output = io.StringIO()
         transport = Transport(order, trades)

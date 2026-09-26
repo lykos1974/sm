@@ -91,8 +91,17 @@ def _write_new_report(path: str, payload: str) -> None:
 def _is_reparse_point(path: Path) -> bool:
     if os.name != 'nt':
         return path.is_symlink()
-    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-    return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    get_attributes = kernel32.GetFileAttributesW
+    get_attributes.argtypes = (ctypes.c_wchar_p,)
+    get_attributes.restype = ctypes.c_uint32
+    attributes = get_attributes(str(path))
+    if attributes == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES (DWORD)
+        error = ctypes.get_last_error()
+        if error in (2, 3):  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+            return False
+        raise OSError(error, 'GetFileAttributesW failed')
+    return bool(attributes & 0x400)
 
 
 def _publish_new_report(temporary: str, destination: Path) -> None:
