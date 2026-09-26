@@ -134,12 +134,13 @@ class ValidationRefreshDummy:
     _refresh_validation_for_symbol = App._refresh_validation_for_symbol
 
     def __init__(self):
+        self.validation_store = object()
         self.run_calls = []
         self.snapshot_calls = []
         self.delta_calls = []
 
-    def _run_validation_for_symbol(self, symbol, engine, new_candles):
-        self.run_calls.append((symbol, engine, list(new_candles)))
+    def _run_validation_for_symbol(self, symbol, engine, new_candles, engine_steps=None):
+        self.run_calls.append((symbol, engine, list(new_candles), engine_steps))
         return {
             "update_pending_elapsed_ms": 1,
             "evaluate_strategy_setups_elapsed_ms": 2,
@@ -188,10 +189,12 @@ def test_new_candles_run_refresh_validation_metrics_path():
     candle = {"close_time": 123, "close": 10.0}
     engine = object()
 
-    metrics = dummy._refresh_validation_for_symbol("ETHUSDT", engine, [candle], logs.append)
+    metrics = dummy._refresh_validation_for_symbol(
+        "ETHUSDT", engine, [candle], logs.append, engine_steps=[engine]
+    )
 
     assert metrics["register_setup_elapsed_ms"] == 3
-    assert dummy.run_calls == [("ETHUSDT", engine, [candle])]
+    assert dummy.run_calls == [("ETHUSDT", engine, [candle], [engine])]
     assert dummy.snapshot_calls == ["ETHUSDT", "ETHUSDT"]
     assert len(dummy.delta_calls) == 1
     assert logs[0] == "REFRESH_VALIDATION_BEGIN symbol=ETHUSDT eligible_closed_count=1"
@@ -200,14 +203,144 @@ def test_new_candles_run_refresh_validation_metrics_path():
     assert logs[2] == "REFRESH_VALIDATION_END symbol=ETHUSDT"
 
 
-def test_refresh_persists_pnf_state_before_validation_skip():
+def test_refresh_checkpoint_follows_observer_and_validation():
     source = Path(ROOT / "pnf_mvp" / "app.py").read_text()
+    start = source.index("def _run_downstream_before_checkpoint")
+    end = source.index("def _observe_ideal_entry_setups", start)
+    downstream = source[start:end]
 
-    save_index = source.index("self._save_engine_snapshot(symbol, engine, last_processed, snapshot)")
-    persist_index = source.index("REFRESH_STATE_PERSIST")
-    validation_index = source.index("self._refresh_validation_for_symbol(symbol, engine, new_candles, stage_log)")
+    observer_index = downstream.index("self._observe_ideal_entry_setups(")
+    validation_index = downstream.index("self._refresh_validation_for_symbol(")
+    flush_index = downstream.index("self.validation_store.flush()")
+    save_index = downstream.index("self._save_engine_snapshot(symbol, engine, last_processed, snapshot)")
 
-    assert save_index < persist_index < validation_index
+    assert observer_index < validation_index < flush_index < save_index
+
+
+class CheckpointValidationStore:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def flush(self):
+        self.owner.events.append("validation_flush")
+        if self.owner.fail_at == "validation_flush":
+            raise RuntimeError("validation flush failed")
+
+
+class CheckpointOrderingDummy:
+    _run_downstream_before_checkpoint = App._run_downstream_before_checkpoint
+
+    def __init__(self, fail_at=None):
+        self.fail_at = fail_at
+        self.events = []
+        self.validation_store = CheckpointValidationStore(self)
+
+    def _observe_ideal_entry_setups(self, *_args):
+        self.events.append("observer")
+        if self.fail_at == "observer":
+            raise RuntimeError("observer failed")
+
+    def _refresh_validation_for_symbol(self, *_args, **_kwargs):
+        self.events.append("validation")
+        if self.fail_at == "validation":
+            raise RuntimeError("validation failed")
+
+    def _save_engine_snapshot(self, *_args):
+        self.events.append("checkpoint")
+
+
+def run_checkpoint_stages(dummy):
+    dummy._run_downstream_before_checkpoint(
+        symbol="BTCUSDT",
+        engine=object(),
+        new_candles=[{"close_time": 1}],
+        last_processed=1,
+        snapshot={},
+        validation_engine_steps=[object()],
+        stage_log=lambda _message: None,
+    )
+
+
+def test_observer_failure_does_not_advance_checkpoint():
+    dummy = CheckpointOrderingDummy(fail_at="observer")
+
+    try:
+        run_checkpoint_stages(dummy)
+    except RuntimeError as exc:
+        assert str(exc) == "observer failed"
+    else:
+        raise AssertionError("observer failure did not propagate")
+
+    assert dummy.events == ["observer"]
+
+
+def test_validation_failure_does_not_advance_checkpoint():
+    dummy = CheckpointOrderingDummy(fail_at="validation")
+
+    try:
+        run_checkpoint_stages(dummy)
+    except RuntimeError as exc:
+        assert str(exc) == "validation failed"
+    else:
+        raise AssertionError("validation failure did not propagate")
+
+    assert dummy.events == ["observer", "validation"]
+
+
+def test_validation_flush_failure_does_not_advance_checkpoint():
+    dummy = CheckpointOrderingDummy(fail_at="validation_flush")
+
+    try:
+        run_checkpoint_stages(dummy)
+    except RuntimeError as exc:
+        assert str(exc) == "validation flush failed"
+    else:
+        raise AssertionError("validation flush failure did not propagate")
+
+    assert dummy.events == ["observer", "validation", "validation_flush"]
+
+
+def test_checkpoint_advances_after_observer_and_validation_succeed():
+    dummy = CheckpointOrderingDummy()
+
+    run_checkpoint_stages(dummy)
+
+    assert dummy.events == ["observer", "validation", "validation_flush", "checkpoint"]
+
+
+class RaisingObserver:
+    symbols = {"BTCUSDT"}
+
+    def observe(self, **_kwargs):
+        raise RuntimeError("observer database failed")
+
+
+class ObserverFailureDummy:
+    _observe_ideal_entry_setups = App._observe_ideal_entry_setups
+
+    def __init__(self):
+        self.setup_observer = RaisingObserver()
+
+    def _evaluate_strategy_setups(self, _symbol, _engine):
+        return {}, []
+
+
+def test_observer_error_is_logged_and_propagated_before_checkpoint():
+    dummy = ObserverFailureDummy()
+    logs = []
+
+    try:
+        dummy._observe_ideal_entry_setups(
+            "BTCUSDT", object(), [{"close_time": 1}], 1, logs.append
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "observer database failed"
+    else:
+        raise AssertionError("observer error did not propagate")
+
+    assert logs == [
+        "IDEAL_ENTRY_OBSERVER_ERROR symbol=BTCUSDT error=observer database failed"
+    ]
 
 
 def test_refresh_validation_change_does_not_touch_strategy_logic():
@@ -217,3 +350,52 @@ def test_refresh_validation_change_does_not_touch_strategy_logic():
     assert "evaluate_pullback_retest_short" in source
     assert "def _run_validation_for_symbol" in source
     assert "REFRESH_VALIDATION_SKIPPED symbol={symbol} reason=no_new_closed_candles" in source
+
+
+class BatchChronologyStore:
+    def __init__(self):
+        self.events = []
+
+    def update_pending_with_candle(self, **kwargs):
+        self.events.append(("update", kwargs["close_ts"]))
+
+    def register_setup(self, *, reference_ts, **_kwargs):
+        self.events.append(("register", reference_ts))
+
+
+class BatchChronologyDummy:
+    _run_validation_for_symbol = App._run_validation_for_symbol
+
+    def __init__(self):
+        self.validation_store = BatchChronologyStore()
+
+    def _evaluate_strategy_setups(self, _symbol, engine):
+        return {"engine_step": engine}, [{"status": "CANDIDATE"}]
+
+
+class BatchEngine:
+    def __init__(self, name):
+        self.name = name
+        self.columns = [name]
+
+
+def test_batch_validation_matches_one_candle_chronology():
+    candles = [
+        {"close_time": 10, "close": 100.0, "high": 101.0, "low": 99.0},
+        {"close_time": 20, "close": 101.0, "high": 102.0, "low": 100.0},
+    ]
+    batch = BatchChronologyDummy()
+    single = BatchChronologyDummy()
+    first = BatchEngine("first")
+    second = BatchEngine("second")
+
+    batch._run_validation_for_symbol("BTCUSDT", second, candles, engine_steps=[first, second])
+    single._run_validation_for_symbol("BTCUSDT", first, [candles[0]], engine_steps=[first])
+    single._run_validation_for_symbol("BTCUSDT", second, [candles[1]], engine_steps=[second])
+
+    assert batch.validation_store.events == single.validation_store.events == [
+        ("update", 10),
+        ("register", 10),
+        ("update", 20),
+        ("register", 20),
+    ]

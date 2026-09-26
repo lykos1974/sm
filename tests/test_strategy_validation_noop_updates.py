@@ -66,13 +66,34 @@ class StrategyValidationNoopUpdateTests(TestCase):
     def _store(self):
         temp_dir = tempfile.TemporaryDirectory()
         db_path = Path(temp_dir.name) / "validation.db"
-        store = StrategyValidationStore(str(db_path), allow_multiple_trades_per_symbol=True, commit_every=1)
+        store = StrategyValidationStore(
+            str(db_path),
+            allow_multiple_trades_per_symbol=True,
+            commit_every=1,
+            symbol_tick_provenance={
+                "BTCUSDT": {
+                    "provider": "TEST",
+                    "venue": "TEST_SPOT",
+                    "instrument_type": "SPOT",
+                    "native_symbol": "BTCUSDT",
+                    "source_symbol": "BTCUSDT",
+                    "tick_size": 0.01,
+                    "provenance_timestamp": "2026-09-23T00:00:00Z",
+                    "provenance_version": "test-v1",
+                    "source": "test:BTCUSDT",
+                }
+            },
+            symbol_identity_allowlist={"BTCUSDT": {
+                "provider": "TEST", "venue": "TEST_SPOT", "instrument_type": "SPOT",
+                "native_symbol": "BTCUSDT", "source_symbol": "BTCUSDT",
+            }},
+        )
         return temp_dir, db_path, store
 
     def _sql_updates(self, store, symbol="BTCUSDT"):
         return store.get_perf_snapshot()["update_pending"].get(symbol, {}).get("sql_update_count", 0)
 
-    def test_pending_not_activated_receives_no_sql_update(self):
+    def test_pending_not_activated_persists_expiry_progress(self):
         temp_dir, db_path, store = self._store()
         try:
             setup_id = store.register_setup("BTCUSDT", make_setup(ideal_entry=100.0), BASE_STRUCTURE, 1)
@@ -87,14 +108,14 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
-        self.assertEqual(after - before, 0)
+        self.assertEqual(after - before, 1)
         self.assertEqual(row["activation_status"], "PENDING")
-        self.assertEqual(row["bars_observed"], 0)
+        self.assertEqual(row["bars_observed"], 1)
         self.assertIsNone(row["first_outcome_ts"])
-        self.assertEqual(perf["noop_skipped_count"], 1)
+        self.assertEqual(perf["update_pending_progress_pending_not_activated"], 1)
         self.assertEqual(perf["trades_scanned"], 1)
 
-    def test_activation_writes_exactly_one_meaningful_update(self):
+    def test_activation_and_same_candle_evaluation_are_both_persisted(self):
         temp_dir, db_path, store = self._store()
         try:
             setup_id = store.register_setup("BTCUSDT", make_setup(ideal_entry=100.0), BASE_STRUCTURE, 1)
@@ -109,6 +130,7 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
+        # Activation and its candle outcome are one atomic row update.
         self.assertEqual(after - before, 1)
         self.assertEqual(row["activation_status"], "ACTIVE")
         self.assertEqual(row["activated_ts"], 2)
@@ -151,7 +173,7 @@ class StrategyValidationNoopUpdateTests(TestCase):
         self.assertEqual(row["resolution_status"], "TP2")
         self.assertEqual(row["tp1_hit"], 1)
 
-    def test_active_row_with_unchanged_excursion_does_not_write(self):
+    def test_active_row_with_unchanged_excursion_persists_only_candle_watermark(self):
         temp_dir, db_path, store = self._store()
         try:
             setup_id = store.register_setup("BTCUSDT", make_setup(ideal_entry=100.0, tp1=110.0, tp2=120.0), BASE_STRUCTURE, 1)
@@ -167,11 +189,12 @@ class StrategyValidationNoopUpdateTests(TestCase):
             store.flush()
             store._conn.close()
             temp_dir.cleanup()
-        self.assertEqual(after - before, 0)
+        self.assertEqual(after - before, 1)
         self.assertEqual(row["resolution_status"], "PENDING")
         self.assertEqual(row["max_favorable_excursion"], 2.0)
         self.assertEqual(row["max_adverse_excursion"], 1.5)
-        self.assertGreaterEqual(perf["noop_skipped_count"], 1)
+        self.assertEqual(row["last_evaluated_candle_ts"], 4)
+        self.assertEqual(perf["update_pending_sql_updates_total"], 3)
 
     def test_lifecycle_semantics_preserved_through_activation_tp1_and_tp2(self):
         temp_dir, db_path, store = self._store()

@@ -329,6 +329,171 @@ class Storage:
         )
         return [dict(r) for r in cur.fetchall()]
 
+    def load_checkpoint(self, symbol, profile_name):
+        """Load state and columns from one consistent SQLite read snapshot."""
+        conn = sqlite3.connect(
+            Path(self.db_path).resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=10,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN")
+            state_row = conn.execute(
+                """
+                SELECT state_json
+                FROM pnf_state
+                WHERE symbol=? AND profile_name=?
+                """,
+                (symbol, profile_name),
+            ).fetchone()
+            column_rows = conn.execute(
+                """
+                SELECT idx, kind, top, bottom, start_ts, end_ts
+                FROM pnf_columns
+                WHERE symbol=? AND profile_name=?
+                ORDER BY idx
+                """,
+                (symbol, profile_name),
+            ).fetchall()
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        if state_row is None:
+            state = None
+        else:
+            try:
+                state = json.loads(state_row["state_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"Invalid checkpoint state JSON for {symbol}/{profile_name}"
+                ) from exc
+        return state, [dict(row) for row in column_rows]
+
+    def save_checkpoint(self, symbol, profile, state, columns, signals, snapshot):
+        """Persist a complete scanner checkpoint atomically and monotonically."""
+        state_json = json.dumps(state, allow_nan=False)
+        column_rows = [
+            (
+                symbol,
+                profile.name,
+                column.idx,
+                column.kind,
+                column.top,
+                column.bottom,
+                column.start_ts,
+                column.end_ts,
+            )
+            for column in columns
+        ]
+        signal_rows = [
+            (
+                symbol,
+                profile.name,
+                signal["type"],
+                signal["trigger"],
+                signal["column_idx"],
+                signal["note"],
+                signal["timestamp"],
+            )
+            for signal in signals
+        ]
+        if [column.idx for column in columns] != list(range(len(columns))):
+            raise ValueError("Non-contiguous PnF columns")
+
+        incoming_watermark = state.get("last_processed_close_ts")
+        conn = sqlite3.connect(
+            Path(self.db_path).resolve().as_uri() + "?mode=rw",
+            uri=True,
+            timeout=10,
+        )
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_row = conn.execute(
+                """
+                SELECT state_json
+                FROM pnf_state
+                WHERE symbol=? AND profile_name=?
+                """,
+                (symbol, profile.name),
+            ).fetchone()
+            if existing_row is not None:
+                existing_state = json.loads(existing_row[0])
+                existing_watermark = existing_state.get("last_processed_close_ts")
+                if (
+                    existing_watermark is not None
+                    and (
+                        incoming_watermark is None
+                        or int(incoming_watermark) < int(existing_watermark)
+                    )
+                ):
+                    raise ValueError(
+                        "Stale checkpoint refused for "
+                        f"{symbol}/{profile.name}: incoming={incoming_watermark}, "
+                        f"stored={existing_watermark}"
+                    )
+
+            conn.execute(
+                """
+                INSERT INTO pnf_state(symbol, profile_name, state_json)
+                VALUES(?,?,?)
+                ON CONFLICT(symbol, profile_name) DO UPDATE SET
+                  state_json=excluded.state_json,
+                  updated_at=CURRENT_TIMESTAMP
+                """,
+                (symbol, profile.name, state_json),
+            )
+            conn.execute(
+                "DELETE FROM pnf_columns WHERE symbol=? AND profile_name=?",
+                (symbol, profile.name),
+            )
+            conn.executemany(
+                """
+                INSERT INTO pnf_columns(symbol, profile_name, idx, kind, top, bottom, start_ts, end_ts)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                column_rows,
+            )
+            conn.executemany(
+                """
+                INSERT INTO signals(symbol, profile_name, signal_type, trigger, column_idx, note, ts)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(symbol, profile_name, signal_type, column_idx) DO NOTHING
+                """,
+                signal_rows,
+            )
+            conn.execute(
+                """
+                INSERT INTO scanner_snapshot(symbol, profile_name, market_state, signal, last_price, score, updated_at)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(symbol, profile_name) DO UPDATE SET
+                  market_state=excluded.market_state,
+                  signal=excluded.signal,
+                  last_price=excluded.last_price,
+                  score=excluded.score,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    symbol,
+                    profile.name,
+                    snapshot["state"],
+                    snapshot["signal"],
+                    float(state.get("last_price") or 0.0),
+                    int(snapshot["score"]),
+                    snapshot["updated"],
+                ),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def load_scanner_snapshot(self, symbol, profile_name):
         cur = self.conn.execute(
             """

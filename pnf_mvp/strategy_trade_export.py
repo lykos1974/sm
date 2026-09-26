@@ -27,16 +27,21 @@ CSV_PATH = "strategy_trades_export.csv"
 TP2_REVIEW_PATH = "strategy_tp2_review.csv"
 STOPPED_REVIEW_PATH = "strategy_stopped_review.csv"
 DIAG_BREAKDOWNS_PATH = "strategy_diagnostics_breakdowns.csv"
+ECONOMIC_CHRONOLOGY_COLUMNS = ("created_ts", "setup_id")
+ECONOMIC_CHRONOLOGY_SQL = "created_ts ASC, setup_id ASC"
 
-RESOLVED_STATUSES = (
-    "TP1",
-    "TP2",
-    "STOPPED",
-    "EXPIRED",
-    "AMBIGUOUS",
-    "TP1_PARTIAL_THEN_BE",
-)
 
+def order_economic_chronology(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    missing = [column for column in ECONOMIC_CHRONOLOGY_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "economic chronology requires columns: " + ", ".join(missing)
+        )
+    return df.sort_values(
+        list(ECONOMIC_CHRONOLOGY_COLUMNS), kind="mergesort", na_position="last"
+    ).reset_index(drop=True)
 
 def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
@@ -61,7 +66,7 @@ def get_table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
     return [str(r["name"]) for r in rows]
 
 
-def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
+def load_validation_rows(db_path: str = DB_PATH) -> pd.DataFrame:
     db_file = Path(db_path)
     if not db_file.exists():
         raise FileNotFoundError(f"Database file not found: {db_file.resolve()}")
@@ -120,6 +125,10 @@ def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
             "resolution_note",
             "max_favorable_excursion",
             "max_adverse_excursion",
+            "activation_tick_size",
+            "activation_tick_source",
+            "ambiguous_pessimistic_r",
+            "ambiguous_optimistic_r",
             "raw_setup_json",
         ]
 
@@ -130,17 +139,20 @@ def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
             else:
                 select_expr.append(f"NULL AS {col}")
 
-        placeholders = ",".join("?" for _ in RESOLVED_STATUSES)
         query = f"""
             SELECT
                 {", ".join(select_expr)}
             FROM {TABLE_NAME}
-            WHERE resolution_status IN ({placeholders})
-            ORDER BY resolved_ts ASC, created_ts ASC
+            ORDER BY {ECONOMIC_CHRONOLOGY_SQL}
         """
-        return pd.read_sql_query(query, conn, params=list(RESOLVED_STATUSES))
+        return pd.read_sql_query(query, conn)
     finally:
         conn.close()
+
+
+def load_resolved_trades(db_path: str = DB_PATH) -> pd.DataFrame:
+    """Compatibility alias; accounting now requires every registered setup."""
+    return load_validation_rows(db_path)
 
 
 def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -180,7 +192,12 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         "tp1_price",
         "realized_return_pct",
         "realized_r_multiple",
-        "outcome_r_multiple_proxy",
+        "r_pessimistic_bound",
+        "r_optimistic_bound",
+        "activation_tick_size",
+        "activation_tick_source",
+        "ambiguous_pessimistic_r",
+        "ambiguous_optimistic_r",
         "consistency_flag",
         "bars_observed",
         "trend_state",
@@ -196,13 +213,23 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=cols)
 
-    out = df.copy()
+    out = order_economic_chronology(df)
 
     out["activation_status"] = out["activation_status"].fillna("UNKNOWN")
     out["tp1_hit"] = pd.to_numeric(out["tp1_hit"], errors="coerce").fillna(0).astype(int)
     out["quality_score"] = pd.to_numeric(out["quality_score"], errors="coerce")
     out["active_leg_boxes"] = pd.to_numeric(out["active_leg_boxes"], errors="coerce")
     out["is_extended_move"] = out["is_extended_move"].fillna(0).astype(int)
+    for col in (
+        "activation_tick_size",
+        "ambiguous_pessimistic_r",
+        "ambiguous_optimistic_r",
+    ):
+        if col not in out.columns:
+            out[col] = None
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "activation_tick_source" not in out.columns:
+        out["activation_tick_source"] = None
 
     def lifecycle(row: pd.Series) -> str:
         if str(row["activation_status"]).upper() not in ("ACTIVE",):
@@ -233,33 +260,55 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
         stop = row["invalidation"]
         exit_price = row["exit_price"]
         side = str(row["side"]).upper()
+        status = str(row["resolution_status"]).upper()
+        if status == "AMBIGUOUS":
+            return None
         if pd.isna(entry) or pd.isna(stop) or pd.isna(exit_price):
             return None
         denom = abs(entry - stop)
         if denom <= 0:
             return None
-        if side == "LONG":
-            return (exit_price - entry) / denom
-        if side == "SHORT":
-            return (entry - exit_price) / denom
-        return None
-
-    rr_map = {
-        "TP1": 2.0,
-        "TP2": 3.0,
-        "STOPPED": -1.0,
-        "EXPIRED": 0.0,
-        "AMBIGUOUS": 0.0,
-        "TP1_PARTIAL_THEN_BE": 1.0,
-    }
+        exit_r = (
+            (exit_price - entry) / denom
+            if side == "LONG"
+            else (entry - exit_price) / denom
+            if side == "SHORT"
+            else None
+        )
+        if exit_r is None:
+            return None
+        if status == "STOPPED":
+            return -1.0
+        if status in ("TP2", "TP1_PARTIAL_THEN_BE") and int(row.get("tp1_hit") or 0):
+            first_price = row.get("tp1_price")
+            if pd.isna(first_price):
+                return None
+            first_r = (
+                (first_price - entry) / denom
+                if side == "LONG"
+                else (entry - first_price) / denom
+            )
+            return 0.5 * first_r + 0.5 * exit_r
+        return exit_r
 
     out["realized_return_pct"] = out.apply(calc_realized_return_pct, axis=1)
     out["realized_r_multiple"] = out.apply(calc_realized_r_multiple, axis=1)
-    out["outcome_r_multiple_proxy"] = out["resolution_status"].map(rr_map)
+    out["r_pessimistic_bound"] = out["realized_r_multiple"].where(
+        out["resolution_status"] != "AMBIGUOUS", out["ambiguous_pessimistic_r"]
+    )
+    out["r_optimistic_bound"] = out["realized_r_multiple"].where(
+        out["resolution_status"] != "AMBIGUOUS", out["ambiguous_optimistic_r"]
+    )
 
     def consistency_flag(row: pd.Series) -> str:
         status = str(row["resolution_status"]).upper()
         realized_r = row["realized_r_multiple"]
+        if status == "AMBIGUOUS":
+            if pd.notna(row["ambiguous_pessimistic_r"]) and pd.notna(
+                row["ambiguous_optimistic_r"]
+            ):
+                return "OK"
+            return "INCONSISTENT_AMBIGUOUS_MISSING_BOUNDS"
         if pd.isna(realized_r):
             return "NO_PRICE_METRIC"
         if status in ("TP1", "TP2", "TP1_PARTIAL_THEN_BE") and realized_r < 0:
@@ -349,107 +398,134 @@ def compute_trade_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return out[[c for c in cols if c in out.columns]]
 
 
-def build_summary_all_resolved(df: pd.DataFrame) -> dict:
+def _max_drawdown(values: list[float]) -> float:
+    cumulative = 0.0
+    peak = 0.0
+    maximum = 0.0
+    for value in values:
+        cumulative += float(value)
+        peak = max(peak, cumulative)
+        maximum = max(maximum, peak - cumulative)
+    return maximum
+
+
+def _max_losing_streak(values: list[float]) -> int:
+    current = 0
+    maximum = 0
+    for value in values:
+        if float(value) < 0:
+            current += 1
+            maximum = max(maximum, current)
+        else:
+            current = 0
+    return maximum
+
+
+def build_accounting_summary(df: pd.DataFrame) -> dict:
     if df.empty:
         return {
-            "total_resolved_rows": 0,
-            "wins": 0,
-            "partial_be": 0,
-            "losses": 0,
-            "expired": 0,
-            "ambiguous": 0,
-            "never_activated": 0,
-            "activated_rows": 0,
-            "inconsistent_rows": 0,
+            "registered_rows": 0,
+            "resolved_rows": 0,
+            "ambiguous_branched_rows": 0,
+            "pending_rows": 0,
+            "expired_rows": 0,
+            "missed_rows": 0,
+            "unclassified_rows": 0,
+            "headline_denominator_rows": 0,
+            "total_r_pessimistic": 0.0,
+            "total_r_optimistic": 0.0,
+            "expectancy_r_pessimistic": 0.0,
+            "expectancy_r_optimistic": 0.0,
+            "win_rate_pessimistic": 0.0,
+            "win_rate_optimistic": 0.0,
+            "max_drawdown_r_pessimistic": 0.0,
+            "max_drawdown_r_optimistic": 0.0,
+            "max_losing_streak_pessimistic": 0,
+            "max_losing_streak_optimistic": 0,
         }
 
-    never_activated = int((df["trade_lifecycle"] == "NEVER_ACTIVATED").sum())
-    activated_rows = int((df["trade_lifecycle"] != "NEVER_ACTIVATED").sum())
-    wins = int((df["resolution_status"] == "TP2").sum())
-    partial_be = int((df["resolution_status"] == "TP1_PARTIAL_THEN_BE").sum())
-    losses = int((df["resolution_status"] == "STOPPED").sum())
-    expired = int((df["resolution_status"] == "EXPIRED").sum())
-    ambiguous = int((df["resolution_status"] == "AMBIGUOUS").sum())
-    inconsistent = int((df["consistency_flag"] != "OK").sum())
+    work = order_economic_chronology(df)
+    statuses = work["resolution_status"].fillna("PENDING").astype(str).str.upper()
+    activation = work.get(
+        "activation_status", pd.Series("PENDING", index=work.index)
+    ).fillna("PENDING").astype(str).str.upper()
+    resolved_mask = statuses.isin({"TP1", "TP2", "STOPPED", "TP1_PARTIAL_THEN_BE"})
+    ambiguous_mask = statuses.eq("AMBIGUOUS")
+    pending_mask = statuses.eq("PENDING")
+    expired_mask = statuses.eq("EXPIRED") & activation.eq("ACTIVE")
+    missed_mask = statuses.eq("EXPIRED") & ~activation.eq("ACTIVE")
+    classified = resolved_mask | ambiguous_mask | pending_mask | expired_mask | missed_mask
+    headline_mask = resolved_mask | ambiguous_mask
+    headline = work.loc[headline_mask].copy()
+    denominator = int(len(headline))
+    lower = pd.to_numeric(headline.get("r_pessimistic_bound"), errors="coerce")
+    upper = pd.to_numeric(headline.get("r_optimistic_bound"), errors="coerce")
+    bounds_complete = bool(lower.notna().all() and upper.notna().all())
+
+    if denominator and bounds_complete:
+        total_lower = float(lower.sum())
+        total_upper = float(upper.sum())
+        expectancy_lower = total_lower / denominator
+        expectancy_upper = total_upper / denominator
+        win_lower = float((lower > 0).sum() / denominator)
+        win_upper = float((upper > 0).sum() / denominator)
+        drawdown_lower = _max_drawdown(lower.tolist())
+        drawdown_upper = _max_drawdown(upper.tolist())
+        losing_streak_lower = _max_losing_streak(lower.tolist())
+        losing_streak_upper = _max_losing_streak(upper.tolist())
+    elif denominator:
+        total_lower = total_upper = None
+        expectancy_lower = expectancy_upper = None
+        win_lower = win_upper = None
+        drawdown_lower = drawdown_upper = None
+        losing_streak_lower = losing_streak_upper = None
+    else:
+        total_lower = total_upper = 0.0
+        expectancy_lower = expectancy_upper = 0.0
+        win_lower = win_upper = 0.0
+        drawdown_lower = drawdown_upper = 0.0
+        losing_streak_lower = losing_streak_upper = 0
 
     return {
-        "total_resolved_rows": int(len(df)),
-        "wins": wins,
-        "partial_be": partial_be,
-        "losses": losses,
-        "expired": expired,
-        "ambiguous": ambiguous,
-        "never_activated": never_activated,
-        "activated_rows": activated_rows,
-        "inconsistent_rows": inconsistent,
+        "registered_rows": int(len(work)),
+        "resolved_rows": int(resolved_mask.sum()),
+        "ambiguous_branched_rows": int(ambiguous_mask.sum()),
+        "pending_rows": int(pending_mask.sum()),
+        "expired_rows": int(expired_mask.sum()),
+        "missed_rows": int(missed_mask.sum()),
+        "unclassified_rows": int((~classified).sum()),
+        "headline_denominator_rows": denominator,
+        "total_r_pessimistic": total_lower,
+        "total_r_optimistic": total_upper,
+        "expectancy_r_pessimistic": expectancy_lower,
+        "expectancy_r_optimistic": expectancy_upper,
+        "win_rate_pessimistic": win_lower,
+        "win_rate_optimistic": win_upper,
+        "max_drawdown_r_pessimistic": drawdown_lower,
+        "max_drawdown_r_optimistic": drawdown_upper,
+        "max_losing_streak_pessimistic": losing_streak_lower,
+        "max_losing_streak_optimistic": losing_streak_upper,
     }
 
 
-def build_summary_activated_only(df: pd.DataFrame) -> dict:
-    if df.empty or "trade_lifecycle" not in df.columns:
-        return {
-            "activated_rows": 0,
-            "wins": 0,
-            "partial_be": 0,
-            "losses": 0,
-            "expired_after_activation": 0,
-            "ambiguous": 0,
-            "win_rate_non_ambiguous": 0.0,
-            "avg_realized_return_pct": 0.0,
-            "median_realized_return_pct": 0.0,
-            "avg_realized_r_multiple": 0.0,
-            "median_realized_r_multiple": 0.0,
-            "total_realized_r_multiple": 0.0,
-            "avg_outcome_r_proxy": 0.0,
-            "total_outcome_r_proxy": 0.0,
-            "inconsistent_rows": 0,
-        }
+def build_accounting_breakdown(df: pd.DataFrame, field: str) -> pd.DataFrame:
+    columns = [field, *build_accounting_summary(pd.DataFrame()).keys()]
+    if df.empty or field not in df.columns:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for group, subset in df.groupby(field, dropna=False, sort=True):
+        rows.append({field: group, **build_accounting_summary(subset)})
+    return pd.DataFrame(rows, columns=columns)
 
-    active = df[df["trade_lifecycle"] != "NEVER_ACTIVATED"].copy()
-    if active.empty:
-        return {
-            "activated_rows": 0,
-            "wins": 0,
-            "partial_be": 0,
-            "losses": 0,
-            "expired_after_activation": 0,
-            "ambiguous": 0,
-            "win_rate_non_ambiguous": 0.0,
-            "avg_realized_return_pct": 0.0,
-            "median_realized_return_pct": 0.0,
-            "avg_realized_r_multiple": 0.0,
-            "median_realized_r_multiple": 0.0,
-            "total_realized_r_multiple": 0.0,
-            "avg_outcome_r_proxy": 0.0,
-            "total_outcome_r_proxy": 0.0,
-            "inconsistent_rows": 0,
-        }
 
-    wins = int((active["resolution_status"] == "TP2").sum())
-    partial_be = int((active["resolution_status"] == "TP1_PARTIAL_THEN_BE").sum())
-    losses = int((active["resolution_status"] == "STOPPED").sum())
-    ambiguous = int((active["resolution_status"] == "AMBIGUOUS").sum())
-    expired = int((active["resolution_status"] == "EXPIRED").sum())
-    wl_den = wins + partial_be + losses
-    inconsistent = int((active["consistency_flag"] != "OK").sum())
-
-    return {
-        "activated_rows": int(len(active)),
-        "wins": wins,
-        "partial_be": partial_be,
-        "losses": losses,
-        "expired_after_activation": expired,
-        "ambiguous": ambiguous,
-        "win_rate_non_ambiguous": float((wins + partial_be) / wl_den) if wl_den else 0.0,
-        "avg_realized_return_pct": float(active["realized_return_pct"].dropna().mean()) if active["realized_return_pct"].notna().any() else 0.0,
-        "median_realized_return_pct": float(active["realized_return_pct"].dropna().median()) if active["realized_return_pct"].notna().any() else 0.0,
-        "avg_realized_r_multiple": float(active["realized_r_multiple"].dropna().mean()) if active["realized_r_multiple"].notna().any() else 0.0,
-        "median_realized_r_multiple": float(active["realized_r_multiple"].dropna().median()) if active["realized_r_multiple"].notna().any() else 0.0,
-        "total_realized_r_multiple": float(active["realized_r_multiple"].dropna().sum()) if active["realized_r_multiple"].notna().any() else 0.0,
-        "avg_outcome_r_proxy": float(active["outcome_r_multiple_proxy"].dropna().mean()) if active["outcome_r_multiple_proxy"].notna().any() else 0.0,
-        "total_outcome_r_proxy": float(active["outcome_r_multiple_proxy"].dropna().sum()) if active["outcome_r_multiple_proxy"].notna().any() else 0.0,
-        "inconsistent_rows": inconsistent,
-    }
+def _bucketed_accounting(
+    df: pd.DataFrame, *, section: str, groups: pd.Series
+) -> pd.DataFrame:
+    work = df.copy()
+    work["group"] = groups.reindex(work.index).fillna("UNKNOWN").astype(str)
+    out = build_accounting_breakdown(work, "group")
+    out.insert(0, "section", section)
+    return out
 
 
 def print_summary(title: str, summary: dict) -> None:
@@ -467,297 +543,6 @@ def print_df(title: str, table: pd.DataFrame) -> None:
         print("(empty)")
     else:
         print(table.to_string(index=False))
-
-
-def build_score_bucket_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    if active.empty:
-        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
-
-    bucketed = active.copy()
-
-    def score_bucket(s: float) -> str:
-        if pd.isna(s):
-            return "UNKNOWN"
-        if s < 70:
-            return "0-69"
-        if s < 80:
-            return "70-79"
-        if s < 90:
-            return "80-89"
-        return "90-100"
-
-    bucketed["group"] = bucketed["quality_score"].apply(score_bucket)
-
-    out = (
-        bucketed.groupby("group")
-        .agg(
-            trades=("setup_id", "count"),
-            tp1_touched=("tp1_hit", "sum"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
-            avg_r=("realized_r_multiple", "mean"),
-        )
-        .reset_index()
-    )
-    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
-    out["tp2_rate"] = out["tp2"] / out["trades"]
-    out.insert(0, "section", "score_bucket")
-    return out.sort_values("group")
-
-
-def build_pullback_side_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    if active.empty:
-        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
-
-    bucketed = active.copy()
-    bucketed["group"] = (
-        bucketed["side"].fillna("UNKNOWN").astype(str)
-        + "_"
-        + bucketed["pullback_quality"].fillna("UNKNOWN").astype(str)
-    )
-
-    out = (
-        bucketed.groupby("group")
-        .agg(
-            trades=("setup_id", "count"),
-            tp1_touched=("tp1_hit", "sum"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
-            avg_r=("realized_r_multiple", "mean"),
-        )
-        .reset_index()
-    )
-    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
-    out["tp2_rate"] = out["tp2"] / out["trades"]
-    out.insert(0, "section", "pullback_side")
-    return out.sort_values("group")
-
-
-def build_active_leg_boxes_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    if active.empty:
-        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
-
-    bucketed = active.copy()
-
-    def leg_bucket(x: float) -> str:
-        if pd.isna(x):
-            return "UNKNOWN"
-        i = int(x)
-        if i == 1:
-            return "1"
-        if i == 2:
-            return "2"
-        if i == 3:
-            return "3"
-        return "4+"
-
-    bucketed["group"] = bucketed["active_leg_boxes"].apply(leg_bucket)
-
-    out = (
-        bucketed.groupby("group")
-        .agg(
-            trades=("setup_id", "count"),
-            tp1_touched=("tp1_hit", "sum"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
-            avg_r=("realized_r_multiple", "mean"),
-        )
-        .reset_index()
-    )
-    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
-    out["tp2_rate"] = out["tp2"] / out["trades"]
-    out.insert(0, "section", "active_leg_boxes")
-    order = {"1": 1, "2": 2, "3": 3, "4+": 4, "UNKNOWN": 99}
-    out["_ord"] = out["group"].map(order).fillna(999)
-    out = out.sort_values("_ord").drop(columns="_ord")
-    return out
-
-
-def build_continuation_strength_v1_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    if active.empty:
-        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
-
-    bucketed = active.copy()
-
-    def cs_bucket(x: float) -> str:
-        if pd.isna(x):
-            return "UNKNOWN"
-        v = float(x)
-        if v < 20:
-            return "00-19"
-        if v < 30:
-            return "20-29"
-        if v < 40:
-            return "30-39"
-        if v < 50:
-            return "40-49"
-        if v < 60:
-            return "50-59"
-        if v < 70:
-            return "60-69"
-        if v < 80:
-            return "70-79"
-        if v < 90:
-            return "80-89"
-        return "90-100"
-
-    bucketed["group"] = bucketed["continuation_strength_v1"].apply(cs_bucket)
-
-    out = (
-        bucketed.groupby("group")
-        .agg(
-            trades=("setup_id", "count"),
-            tp1_touched=("tp1_hit", "sum"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
-            avg_r=("realized_r_multiple", "mean"),
-        )
-        .reset_index()
-    )
-    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
-    out["tp2_rate"] = out["tp2"] / out["trades"]
-    out.insert(0, "section", "continuation_strength_v1")
-    order = {
-        "00-19": 1,
-        "20-29": 2,
-        "30-39": 3,
-        "40-49": 4,
-        "50-59": 5,
-        "60-69": 6,
-        "70-79": 7,
-        "80-89": 8,
-        "90-100": 9,
-        "UNKNOWN": 99,
-    }
-    out["_ord"] = out["group"].map(order).fillna(999)
-    out = out.sort_values("_ord").drop(columns="_ord")
-    return out
-
-
-def build_categorical_breakdown(active: pd.DataFrame, *, section: str, source_col: str, unknown_label: str) -> pd.DataFrame:
-    if active.empty:
-        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
-
-    bucketed = active.copy()
-    bucketed["group"] = bucketed[source_col].fillna(unknown_label).astype(str)
-    bucketed["group"] = bucketed["group"].replace("", unknown_label)
-
-    out = (
-        bucketed.groupby("group")
-        .agg(
-            trades=("setup_id", "count"),
-            tp1_touched=("tp1_hit", "sum"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
-            avg_r=("realized_r_multiple", "mean"),
-        )
-        .reset_index()
-    )
-    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
-    out["tp2_rate"] = out["tp2"] / out["trades"]
-    out.insert(0, "section", section)
-    return out.sort_values("group")
-
-
-def build_cs_geometry_component_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    return build_categorical_breakdown(
-        active,
-        section="cs_geometry_component",
-        source_col="cs_geometry_component",
-        unknown_label="UNKNOWN",
-    )
-
-
-def build_cs_profile_tag_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    return build_categorical_breakdown(
-        active,
-        section="cs_profile_tag",
-        source_col="cs_profile_tag",
-        unknown_label="UNKNOWN_CONTEXT",
-    )
-
-
-def build_pullback_quality_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    return build_categorical_breakdown(
-        active,
-        section="pullback_quality",
-        source_col="pullback_quality",
-        unknown_label="UNKNOWN",
-    )
-
-
-def build_structure_cluster_breakdown(active: pd.DataFrame) -> pd.DataFrame:
-    if active.empty:
-        return pd.DataFrame(columns=["section", "group", "trades", "tp1_touched", "tp2", "stopped", "avg_r", "tp1_rate", "tp2_rate"])
-
-    bucketed = active.copy()
-    bucketed["pullback_position_bucket"] = bucketed["pullback_position_bucket"].fillna("UNKNOWN").astype(str).str.upper()
-    bucketed["trend_regime"] = bucketed["trend_regime"].fillna("UNKNOWN").astype(str).str.upper()
-    bucketed["active_leg_boxes"] = pd.to_numeric(bucketed["active_leg_boxes"], errors="coerce").fillna(-1).astype(int)
-    bucketed["is_extended_move"] = pd.to_numeric(bucketed["is_extended_move"], errors="coerce").fillna(0).astype(int)
-
-    bucketed["group"] = bucketed.apply(
-        lambda r: (
-            f"pb={r['pullback_position_bucket']}"
-            f"|leg={r['active_leg_boxes']}"
-            f"|regime={r['trend_regime']}"
-            f"|extended={int(r['is_extended_move'])}"
-        ),
-        axis=1,
-    )
-
-    out = (
-        bucketed.groupby("group")
-        .agg(
-            trades=("setup_id", "count"),
-            tp1_touched=("tp1_hit", "sum"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-            stopped=("resolution_status", lambda x: (x == "STOPPED").sum()),
-            avg_r=("realized_r_multiple", "mean"),
-        )
-        .reset_index()
-        .sort_values("trades", ascending=False)
-    )
-    out["tp1_rate"] = out["tp1_touched"] / out["trades"]
-    out["tp2_rate"] = out["tp2"] / out["trades"]
-    out.insert(0, "section", "structure_cluster")
-    return out
-
-
-def filter_long_candidates(active: pd.DataFrame) -> pd.DataFrame:
-    if active.empty:
-        return active
-    return active[
-        (active["side"].fillna("").astype(str).str.upper() == "LONG")
-        & (active["status"].fillna("").astype(str).str.upper() == "CANDIDATE")
-    ].copy()
-
-
-def with_section_name(table: pd.DataFrame, section_name: str) -> pd.DataFrame:
-    if table.empty:
-        return table
-    out = table.copy()
-    out["section"] = section_name
-    return out
-
-
-def build_tp1_to_tp2_conversion(active: pd.DataFrame) -> pd.DataFrame:
-    tp1_df = active[active["tp1_hit"] == 1].copy()
-    if tp1_df.empty:
-        return pd.DataFrame(columns=["section", "group", "tp1_trades", "tp2", "tp2_after_tp1_rate"])
-
-    out = (
-        tp1_df.groupby("side")
-        .agg(
-            tp1_trades=("setup_id", "count"),
-            tp2=("resolution_status", lambda x: (x == "TP2").sum()),
-        )
-        .reset_index()
-        .rename(columns={"side": "group"})
-    )
-    out["tp2_after_tp1_rate"] = out["tp2"] / out["tp1_trades"]
-    out.insert(0, "section", "tp1_to_tp2_conversion")
-    return out.sort_values("group")
 
 
 def build_review_export(df: pd.DataFrame, resolution_status: str) -> pd.DataFrame:
@@ -805,96 +590,22 @@ def build_review_export(df: pd.DataFrame, resolution_status: str) -> pd.DataFram
 
 def print_breakdowns(df: pd.DataFrame) -> None:
     if df.empty:
-        print("\n(no resolved trades yet)")
+        print("\n(no validation setups yet)")
         return
-
-    print("\n=== CONSISTENCY BREAKDOWN ===")
-    consistency = (
-        df.groupby("consistency_flag")
-        .agg(
-            rows=("setup_id", "count"),
-            avg_realized_r_multiple=("realized_r_multiple", "mean"),
-            avg_outcome_r_proxy=("outcome_r_multiple_proxy", "mean"),
+    for field in (
+        "trade_lifecycle",
+        "side",
+        "status",
+        "breakout_context",
+        "pullback_quality",
+        "risk_quality",
+        "cs_geometry_component",
+        "cs_profile_tag",
+    ):
+        print_df(
+            f"ACCOUNTING BY {field.upper()}",
+            build_accounting_breakdown(df, field),
         )
-        .sort_values("rows", ascending=False)
-    )
-    print(consistency.to_string())
-
-    print("\n=== LIFECYCLE BREAKDOWN ===")
-    lifecycle = (
-        df.groupby("trade_lifecycle")
-        .agg(
-            rows=("setup_id", "count"),
-            avg_realized_return_pct=("realized_return_pct", "mean"),
-            avg_realized_r_multiple=("realized_r_multiple", "mean"),
-            total_realized_r_multiple=("realized_r_multiple", "sum"),
-            avg_outcome_r_proxy=("outcome_r_multiple_proxy", "mean"),
-            total_outcome_r_proxy=("outcome_r_multiple_proxy", "sum"),
-        )
-        .sort_values("rows", ascending=False)
-    )
-    print(lifecycle.to_string())
-
-    active = df[df["trade_lifecycle"] != "NEVER_ACTIVATED"].copy()
-    if active.empty:
-        return
-
-    print("\n=== ACTIVATED BY SIDE ===")
-    by_side = (
-        active.groupby("side")
-        .agg(
-            trades=("setup_id", "count"),
-            avg_realized_r_multiple=("realized_r_multiple", "mean"),
-            total_realized_r_multiple=("realized_r_multiple", "sum"),
-            avg_outcome_r_proxy=("outcome_r_multiple_proxy", "mean"),
-            total_outcome_r_proxy=("outcome_r_multiple_proxy", "sum"),
-        )
-        .sort_values("trades", ascending=False)
-    )
-    print(by_side.to_string())
-
-    print("\n=== ACTIVATED BY STATUS ===")
-    by_status = (
-        active.groupby("status")
-        .agg(
-            trades=("setup_id", "count"),
-            avg_realized_r_multiple=("realized_r_multiple", "mean"),
-            total_realized_r_multiple=("realized_r_multiple", "sum"),
-            avg_outcome_r_proxy=("outcome_r_multiple_proxy", "mean"),
-            total_outcome_r_proxy=("outcome_r_multiple_proxy", "sum"),
-        )
-        .sort_values("trades", ascending=False)
-    )
-    print(by_status.to_string())
-
-    print("\n=== ACTIVATED BY BREAKOUT CONTEXT ===")
-    by_context = (
-        active.groupby("breakout_context")
-        .agg(
-            trades=("setup_id", "count"),
-            avg_realized_r_multiple=("realized_r_multiple", "mean"),
-            total_realized_r_multiple=("realized_r_multiple", "sum"),
-            avg_outcome_r_proxy=("outcome_r_multiple_proxy", "mean"),
-            total_outcome_r_proxy=("outcome_r_multiple_proxy", "sum"),
-        )
-        .sort_values("trades", ascending=False)
-    )
-    print(by_context.to_string())
-
-    print_df("SCORE BUCKET BREAKDOWN", build_score_bucket_breakdown(active))
-    print_df("CONTINUATION STRENGTH V1 BREAKDOWN", build_continuation_strength_v1_breakdown(active))
-    print_df("CS GEOMETRY COMPONENT BREAKDOWN", build_cs_geometry_component_breakdown(active))
-    print_df("CS PROFILE TAG BREAKDOWN", build_cs_profile_tag_breakdown(active))
-    print_df("PULLBACK + SIDE BREAKDOWN", build_pullback_side_breakdown(active))
-    print_df("ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(active))
-    print_df("STRUCTURE CLUSTER BREAKDOWN", build_structure_cluster_breakdown(active))
-    print_df("TP1 -> TP2 CONVERSION", build_tp1_to_tp2_conversion(active))
-
-    long_candidate = filter_long_candidates(active)
-    print_df("LONG CANDIDATE – CS GEOMETRY COMPONENT BREAKDOWN", build_cs_geometry_component_breakdown(long_candidate))
-    print_df("LONG CANDIDATE – CONTINUATION STRENGTH V1 BREAKDOWN", build_continuation_strength_v1_breakdown(long_candidate))
-    print_df("LONG CANDIDATE – ACTIVE LEG BOXES BREAKDOWN", build_active_leg_boxes_breakdown(long_candidate))
-    print_df("LONG CANDIDATE – PULLBACK QUALITY BREAKDOWN", build_pullback_quality_breakdown(long_candidate))
 
 
 def export_csv(df: pd.DataFrame, csv_path: str) -> str:
@@ -903,51 +614,49 @@ def export_csv(df: pd.DataFrame, csv_path: str) -> str:
     return str(out_path)
 
 
-def build_diagnostics_export(active: pd.DataFrame) -> pd.DataFrame:
-    tables = [
-        build_score_bucket_breakdown(active),
-        build_continuation_strength_v1_breakdown(active),
-        build_cs_geometry_component_breakdown(active),
-        build_cs_profile_tag_breakdown(active),
-        build_pullback_quality_breakdown(active),
-        build_pullback_side_breakdown(active),
-        build_active_leg_boxes_breakdown(active),
-        build_structure_cluster_breakdown(active),
-    ]
-    long_candidate = filter_long_candidates(active)
-    tables.extend(
-        [
-            with_section_name(
-                build_cs_geometry_component_breakdown(long_candidate),
-                "long_candidate_cs_geometry_component",
-            ),
-            with_section_name(
-                build_continuation_strength_v1_breakdown(long_candidate),
-                "long_candidate_continuation_strength_v1",
-            ),
-            with_section_name(
-                build_active_leg_boxes_breakdown(long_candidate),
-                "long_candidate_active_leg_boxes",
-            ),
-            with_section_name(
-                build_pullback_quality_breakdown(long_candidate),
-                "long_candidate_pullback_quality",
-            ),
-        ]
+def build_diagnostics_export(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["section", "group", *build_accounting_summary(df).keys()])
+
+    tables = []
+    for field in (
+        "side",
+        "status",
+        "breakout_context",
+        "pullback_quality",
+        "risk_quality",
+        "cs_geometry_component",
+        "cs_profile_tag",
+        "trade_lifecycle",
+    ):
+        groups = df[field] if field in df.columns else pd.Series("UNKNOWN", index=df.index)
+        tables.append(_bucketed_accounting(df, section=field, groups=groups))
+
+    score = pd.to_numeric(df["quality_score"], errors="coerce")
+    score_groups = score.apply(
+        lambda value: "UNKNOWN" if pd.isna(value) else (
+            "0-69" if value < 70 else "70-79" if value < 80 else "80-89" if value < 90 else "90-100"
+        )
     )
-    merged = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+    tables.append(_bucketed_accounting(df, section="score_bucket", groups=score_groups))
 
-    conv = build_tp1_to_tp2_conversion(active)
-    if not conv.empty:
-        conv2 = conv.copy()
-        if "tp1_trades" in conv2.columns:
-            conv2 = conv2.rename(columns={"tp1_trades": "trades"})
-        if "tp2_after_tp1_rate" in conv2.columns:
-            conv2["tp1_rate"] = None
-            conv2["tp2_rate"] = conv2["tp2_after_tp1_rate"]
-        merged = pd.concat([merged, conv2], ignore_index=True, sort=False)
+    leg = pd.to_numeric(df["active_leg_boxes"], errors="coerce")
+    leg_groups = leg.apply(
+        lambda value: "UNKNOWN" if pd.isna(value) else str(int(value)) if int(value) <= 3 else "4+"
+    )
+    tables.append(_bucketed_accounting(df, section="active_leg_boxes", groups=leg_groups))
 
-    return merged
+    side_values = df.get("side", pd.Series("UNKNOWN", index=df.index))
+    pullback_values = df.get(
+        "pullback_quality", pd.Series("UNKNOWN", index=df.index)
+    )
+    pullback_side = (
+        side_values.fillna("UNKNOWN").astype(str)
+        + "_"
+        + pullback_values.fillna("UNKNOWN").astype(str)
+    )
+    tables.append(_bucketed_accounting(df, section="pullback_side", groups=pullback_side))
+    return pd.concat(tables, ignore_index=True)
 
 
 def main() -> None:
@@ -956,16 +665,15 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        raw = load_resolved_trades(args.db_path)
+        raw = load_validation_rows(args.db_path)
     except Exception as exc:
         print(f"ERROR: {exc}")
         return
 
     trades = compute_trade_metrics(raw)
-    print(f"Loaded {len(trades)} resolved rows from {args.db_path} / table={TABLE_NAME}")
+    print(f"Loaded {len(trades)} validation rows from {args.db_path} / table={TABLE_NAME}")
 
-    print_summary("ALL RESOLVED ROWS", build_summary_all_resolved(trades))
-    print_summary("ACTIVATED TRADES ONLY", build_summary_activated_only(trades))
+    print_summary("RECONCILED VALIDATION ACCOUNTING", build_accounting_summary(trades))
     print_breakdowns(trades)
 
     active = trades[trades["trade_lifecycle"] != "NEVER_ACTIVATED"].copy()
@@ -973,7 +681,7 @@ def main() -> None:
     csv_file = export_csv(trades, CSV_PATH)
     tp2_file = export_csv(build_review_export(active, "TP2"), TP2_REVIEW_PATH)
     stopped_file = export_csv(build_review_export(active, "STOPPED"), STOPPED_REVIEW_PATH)
-    diag_file = export_csv(build_diagnostics_export(active), DIAG_BREAKDOWNS_PATH)
+    diag_file = export_csv(build_diagnostics_export(trades), DIAG_BREAKDOWNS_PATH)
 
     print(f"\nCSV exported to: {csv_file}")
     print(f"TP2 review exported to: {tp2_file}")

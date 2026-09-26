@@ -1,0 +1,138 @@
+{
+  "captured_at": "2026-09-24T20:06:36Z",
+  "schema": "strategy-validation-tick-provenance-snapshot-v1",
+  "symbols": [
+    {
+      "instrument_type": "SPOT",
+      "metadata_source": "https://api.binance.com/api/v3/exchangeInfo",
+      "native_symbol": "BNBUSDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "binance-spot-exchange-info-v3",
+      "provider": "BINANCE",
+      "source_symbol": "BNBUSDT",
+      "tick_size": "0.01",
+      "venue": "BINANCE_SPOT"
+    },
+    {
+      "instrument_type": "SPOT",
+      "metadata_source": "https://api.binance.com/api/v3/exchangeInfo",
+      "native_symbol": "BTCUSDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "binance-spot-exchange-info-v3",
+      "provider": "BINANCE",
+      "source_symbol": "BTCUSDT",
+      "tick_size": "0.01",
+      "venue": "BINANCE_SPOT"
+    },
+    {
+      "instrument_type": "SPOT",
+      "metadata_source": "https://api.binance.com/api/v3/exchangeInfo",
+      "native_symbol": "ETHUSDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "binance-spot-exchange-info-v3",
+      "provider": "BINANCE",
+      "source_symbol": "ETHUSDT",
+      "tick_size": "0.01",
+      "venue": "BINANCE_SPOT"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "BTC_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:BTCUSDT",
+      "tick_size": "0.1",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "ENA_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:ENAUSDT",
+      "tick_size": "0.00001",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "ETH_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:ETHUSDT",
+      "tick_size": "0.01",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "HYPE_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:HYPEUSDT",
+      "tick_size": "0.001",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "SOL_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:SOLUSDT",
+      "tick_size": "0.01",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "SUI_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:SUIUSDT",
+      "tick_size": "0.0001",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "PERPETUAL",
+      "metadata_source": "https://contract.mexc.com/api/v1/contract/detail",
+      "native_symbol": "TAO_USDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "mexc-futures-contract-detail-v1",
+      "provider": "MEXC",
+      "source_symbol": "MEXC_FUT:TAOUSDT",
+      "tick_size": "0.01",
+      "venue": "MEXC_FUTURES"
+    },
+    {
+      "instrument_type": "SPOT",
+      "metadata_source": "https://api.binance.com/api/v3/exchangeInfo",
+      "native_symbol": "SOLUSDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "binance-spot-exchange-info-v3",
+      "provider": "BINANCE",
+      "source_symbol": "SOLUSDT",
+      "tick_size": "0.01",
+      "venue": "BINANCE_SPOT"
+    },
+    {
+      "instrument_type": "SPOT",
+      "metadata_source": "https://api.binance.com/api/v3/exchangeInfo",
+      "native_symbol": "XRPUSDT",
+      "provenance_timestamp": "2026-09-24T20:06:36Z",
+      "provenance_version": "binance-spot-exchange-info-v3",
+      "provider": "BINANCE",
+      "source_symbol": "XRPUSDT",
+      "tick_size": "0.0001",
+      "venue": "BINANCE_SPOT"
+    }
+  ]
+}
