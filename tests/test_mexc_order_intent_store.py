@@ -205,6 +205,106 @@ class IntentStoreTests(unittest.TestCase):
         with self.assertRaises(IntentError):
             IntentStore(legacy).initialize()
         self.assertEqual(legacy.read_bytes(), original)
+        self.prepare()
+        with sqlite3.connect(self.path) as db:
+            db.execute('DROP TRIGGER bot_intent_no_reinsert')
+        older_schema = self.path.read_bytes()
+        with self.assertRaises(IntentError):
+            IntentStore(self.path).initialize()
+        with self.assertRaises(IntentError):
+            IntentStore(self.path).claim('intent-1', expected_revision=0,
+                                         attempted_at_ms=1001)
+        self.assertEqual(self.path.read_bytes(), older_schema)
+
+    def test_raw_replace_cannot_restore_prepared_or_allow_second_claim(self):
+        self.prepare()
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            saved = dict(db.execute('SELECT * FROM bot_order_intents').fetchone())
+        self.store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+        before = self.path.read_bytes()
+        names = ','.join(saved)
+        slots = ','.join('?' for _ in saved)
+        with sqlite3.connect(self.path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(f'INSERT OR REPLACE INTO bot_order_intents ({names}) '
+                           f'VALUES ({slots})', tuple(saved.values()))
+            self.assertEqual(db.execute('SELECT state, revision FROM bot_order_intents').fetchone(),
+                             ('SUBMISSION_UNCERTAIN', 1))
+        self.assertEqual(self.path.read_bytes(), before)
+        with self.assertRaises(IntentError):
+            IntentStore(self.path).claim('intent-1', expected_revision=0,
+                                         attempted_at_ms=1002)
+
+    def test_raw_insert_guards_all_states_and_ownership_keys(self):
+        for state in ('PREPARED', 'SUBMISSION_UNCERTAIN', 'BOUND',
+                      'FILL_CONFIRMED', 'REJECTED', 'CONFLICT'):
+            with self.subTest(state=state):
+                path = Path(self.tmp.name) / f'{state}.sqlite'
+                store = IntentStore(path)
+                store.initialize()
+                store.prepare(**self.fields)
+                with sqlite3.connect(path) as db:
+                    db.row_factory = sqlite3.Row
+                    saved = dict(db.execute('SELECT * FROM bot_order_intents').fetchone())
+                if state != 'PREPARED':
+                    store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+                identity = dict(intent_id='intent-1', local_trade_id=17,
+                                account_id='account-a', venue='MEXC_FUTURES',
+                                external_oid='synthetic-oid-1', native_symbol='SUI_USDT',
+                                opening_side='LONG', requested_quantity='44',
+                                exchange_order_id='123456', exchange_timestamp_ms=1002,
+                                status='ACCEPTED')
+                if state in ('BOUND', 'FILL_CONFIRMED'):
+                    store.bind('intent-1', expected_revision=1, evidence=identity)
+                if state == 'FILL_CONFIRMED':
+                    store.confirm_fill('intent-1', expected_revision=2,
+                                       evidence=identity | dict(status='FILLED',
+                                           cumulative_filled_quantity='44',
+                                           average_fill_price='1.025',
+                                           exchange_fill_timestamp_ms=1003))
+                if state == 'REJECTED':
+                    store.reject('intent-1', expected_revision=1,
+                                 evidence=identity | {'status': 'REJECTED'})
+                if state == 'CONFLICT':
+                    store.mark_conflict('intent-1', expected_revision=1)
+                baseline = store.get('intent-1')
+                before = path.read_bytes()
+                with sqlite3.connect(path) as db:
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        db.execute('DELETE FROM bot_order_intents WHERE intent_id=?',
+                                   ('intent-1',))
+                self.assertEqual(path.read_bytes(), before)
+                names = ','.join(saved)
+                slots = ','.join('?' for _ in saved)
+                variants = [dict(saved),
+                            dict(saved, intent_id='another', local_trade_id=18,
+                                 strategy_decision_id='another'),
+                            dict(saved, intent_id='another', local_trade_id=18,
+                                 external_oid='another'),
+                            dict(saved, intent_id='another', local_trade_id=18,
+                                 external_oid='another', strategy_decision_id='another')]
+                if baseline['exchange_order_id'] is not None:
+                    variants[-1]['exchange_order_id'] = baseline['exchange_order_id']
+                else:
+                    variants.pop()
+                for verb in ('INSERT OR REPLACE', 'REPLACE', 'INSERT'):
+                    for values in variants:
+                        if verb == 'INSERT' and values is not variants[0]:
+                            continue
+                        sql = f'{verb} INTO bot_order_intents ({names}) VALUES ({slots})'
+                        if verb == 'INSERT':
+                            sql += (' ON CONFLICT(intent_id) DO UPDATE SET '
+                                    'state=excluded.state,revision=excluded.revision')
+                        with sqlite3.connect(path) as db:
+                            with self.assertRaises(sqlite3.IntegrityError):
+                                db.execute(sql, tuple(values.values()))
+                        self.assertEqual(store.get('intent-1'), baseline)
+                        self.assertEqual(path.read_bytes(), before)
+                if state != 'PREPARED':
+                    with self.assertRaises(IntentError):
+                        IntentStore(path).claim('intent-1', expected_revision=0,
+                                                attempted_at_ms=1004)
 
 
 if __name__ == '__main__':

@@ -75,6 +75,19 @@ CREATE TABLE bot_order_intents (
  UNIQUE(account_id, venue, strategy_decision_id),
  UNIQUE(account_id, venue, local_trade_id)
 );
+CREATE TRIGGER bot_intent_no_reinsert BEFORE INSERT ON bot_order_intents
+BEGIN
+ SELECT RAISE(ABORT, 'intent ownership already exists') WHERE EXISTS (
+  SELECT 1 FROM bot_order_intents AS prior WHERE
+   prior.intent_id = NEW.intent_id OR
+   (prior.account_id = NEW.account_id AND prior.venue = NEW.venue AND (
+    prior.external_oid = NEW.external_oid OR
+    prior.strategy_decision_id = NEW.strategy_decision_id OR
+    prior.local_trade_id = NEW.local_trade_id OR
+    (NEW.exchange_order_id IS NOT NULL AND
+     prior.exchange_order_id = NEW.exchange_order_id)))
+ );
+END;
 CREATE TRIGGER bot_intent_immutable BEFORE UPDATE ON bot_order_intents
 BEGIN
  SELECT RAISE(ABORT, 'immutable intent') WHERE
@@ -195,7 +208,9 @@ class IntentStore:
                 columns = {row[1] for row in db.execute('PRAGMA table_info(bot_order_intents)')}
                 triggers = {row[0] for row in db.execute(
                     "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='bot_order_intents'")}
-                if columns != set(_COLUMNS) or not {'bot_intent_immutable', 'bot_intent_no_delete'} <= triggers:
+                if columns != set(_COLUMNS) or not {
+                        'bot_intent_no_reinsert', 'bot_intent_immutable',
+                        'bot_intent_no_delete'} <= triggers:
                     raise IntentError('unsupported intent schema')
                 if write:
                     db.execute('BEGIN IMMEDIATE')
