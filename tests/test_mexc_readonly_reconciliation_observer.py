@@ -579,6 +579,176 @@ class ObserverTests(unittest.TestCase):
         old = next(row for row in result['binding_registry'] if row['lineage_origin'] == 'GENESIS')
         self.assertEqual(old['confirmed_evidence_anchor']['status'], 'FILLED')
 
+    def test_regression_a_final_fill_unknown_changed_price(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        original = json.loads(self.report.read_text())['binding_registry'][0]
+        unknown_report = Path(self.tmp.name) / 'regression-a-unknown.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL, status='UNKNOWN')}]),
+                                      report=unknown_report, previous=self.report)[0], 0)
+        unknown = json.loads(unknown_report.read_text())
+        self.assertEqual(unknown['observations'][0]['classification'], 'EVIDENCE_UNAVAILABLE')
+        self.assertEqual(unknown['binding_registry'][0]['confirmed_evidence_anchor'],
+                         original['confirmed_evidence_anchor'])
+        changed_report = Path(self.tmp.name) / 'regression-a-changed.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL, average_fill_price='2')}]),
+                                      report=changed_report, previous=unknown_report)[0], 0)
+        changed = json.loads(changed_report.read_text())
+        self.assertEqual(changed['observations'][0]['classification'], 'CONFLICTING_EVIDENCE')
+        self.assertEqual(changed['binding_registry'][0]['confirmed_evidence_anchor'],
+                         original['confirmed_evidence_anchor'])
+
+    def test_regression_b_two_fills_unknown_skip_second_changed_price(self):
+        second = (2, 'ORDER_SENT', '900', 'pnf-syn2-1790323251000-S',
+                  'SUI_USDT', 'SHORT', '44', BINDING[7], 1)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', second)
+        second_fill = dict(FILL, exchange_order_id=second[2], external_oid=second[3])
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': second_fill}]))[0], 0)
+        original = json.loads(self.report.read_text())
+        old_second = next(x for x in original['binding_registry'] if x['exchange_order_identity_digest'] ==
+                          observer._report_hash({'order_id': second[2]}))
+        unknown_report = Path(self.tmp.name) / 'regression-b-unknown.json'
+        adapter = Adapter([{'success': True, 'data': dict(FILL, status='UNKNOWN')}])
+        self.assertEqual(self.execute(adapter, report=unknown_report, previous=self.report,
+                                      max_records=2)[0], 0)
+        self.assertEqual(adapter.calls, [(BINDING[2], BINDING[4])])
+        interim = json.loads(unknown_report.read_text())
+        retained = next(x for x in interim['binding_registry'] if x['binding_digest'] ==
+                        old_second['binding_digest'])
+        self.assertEqual(retained['confirmed_evidence_anchor'], old_second['confirmed_evidence_anchor'])
+        self.assertEqual(retained['history_chain_digest'], old_second['history_chain_digest'])
+        changed_report = Path(self.tmp.name) / 'regression-b-changed.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': dict(second_fill,
+                                                                              average_fill_price='2')}]),
+                                      report=changed_report, previous=unknown_report,
+                                      max_records=2)[0], 0)
+        changed = json.loads(changed_report.read_text())
+        self.assertEqual(changed['observations'][1]['classification'], 'CONFLICTING_EVIDENCE')
+
+    def test_regression_c_mutated_local_quantity_conflict_persists_on_retry(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        original = json.loads(self.report.read_text())['binding_registry'][0]
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE live_trades SET requested_quantity=? WHERE id=?', ('45', BINDING[0]))
+        first_conflict = Path(self.tmp.name) / 'regression-c-conflict.json'
+        no_requests = Adapter([])
+        self.assertEqual(self.execute(no_requests, report=first_conflict,
+                                      previous=self.report)[0], 0)
+        self.assertEqual(no_requests.calls, [])
+        conflict = json.loads(first_conflict.read_text())
+        self.assertEqual(conflict['observations'][0]['classification'], 'CONFLICTING_EVIDENCE')
+        self.assertEqual(conflict['registry_count'], 2)
+        prior_frozen = next(x for x in conflict['binding_registry'] if x['binding_digest'] ==
+                            original['binding_digest'])
+        self.assertEqual(prior_frozen['confirmed_evidence_anchor'], original['confirmed_evidence_anchor'])
+        retry = Path(self.tmp.name) / 'regression-c-retry.json'
+        mutated_fill = dict(FILL, requested_quantity='45', cumulative_filled_quantity='45',
+                            average_fill_price='2')
+        adapter = Adapter([{'success': True, 'data': mutated_fill}])
+        self.assertEqual(self.execute(adapter, report=retry, previous=first_conflict)[0], 0)
+        result = json.loads(retry.read_text())
+        self.assertEqual((result['observations'][0]['classification'], adapter.calls),
+                         ('CONFLICTING_EVIDENCE', []),
+                         'persisted binding conflict must block all adapter calls')
+        frozen = next(x for x in result['binding_registry'] if x['binding_digest'] ==
+                      original['binding_digest'])
+        self.assertEqual(frozen['confirmed_evidence_anchor'], original['confirmed_evidence_anchor'])
+
+    def test_conflict_survives_retries_disappearance_restoration_and_limits(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        original = json.loads(self.report.read_text())['binding_registry'][0]
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE live_trades SET requested_quantity=? WHERE id=1', ('45',))
+        first = Path(self.tmp.name) / 'permanent-conflict-0.json'
+        self.assertEqual(self.execute(Adapter([]), report=first, previous=self.report)[0], 0)
+        conflict_key = next(x['binding_digest'] for x in json.loads(first.read_text())['binding_registry']
+                            if x['lineage_origin'] == 'CONFLICT')
+        previous = first
+        fill45 = dict(FILL, requested_quantity='45', cumulative_filled_quantity='45',
+                      average_fill_price='2')
+        for index, (quantity, present, maximum) in enumerate((
+                ('45', True, 1), ('45', True, 2), ('45', False, 1),
+                ('45', True, 2), ('44', True, 1), ('45', True, 2))):
+            with sqlite3.connect(self.db) as conn:
+                conn.execute('UPDATE live_trades SET requested_quantity=?,status=? WHERE id=1',
+                             (quantity, 'ORDER_SENT' if present else 'FILLED'))
+            current = Path(self.tmp.name) / f'permanent-conflict-{index + 1}.json'
+            adapter = Adapter([{'success': True, 'data': fill45}])
+            self.assertEqual(self.execute(adapter, report=current, previous=previous,
+                                          max_records=maximum)[0], 0)
+            self.assertEqual(adapter.calls, [], 'conflicted binding must never call adapter')
+            report = json.loads(current.read_text())
+            entries = {row['binding_digest']: row for row in report['binding_registry']}
+            self.assertEqual(entries[conflict_key]['lineage_origin'], 'CONFLICT')
+            self.assertEqual(entries[conflict_key]['current_observation_state'],
+                             'CONFLICTING_EVIDENCE')
+            self.assertEqual(entries[original['binding_digest']]['confirmed_evidence_anchor'],
+                             original['confirmed_evidence_anchor'])
+            if present:
+                self.assertEqual(report['observations'][0]['classification'], 'CONFLICTING_EVIDENCE')
+            previous = current
+
+    def test_conflicted_binding_never_blocks_unrelated_valid_observation(self):
+        second = (2, 'ORDER_SENT', '900', 'pnf-syn2-1790323251000-S',
+                  'SUI_USDT', 'SHORT', '44', BINDING[7], 1)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)', second)
+        fill2 = dict(FILL, exchange_order_id=second[2], external_oid=second[3])
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)},
+                                               {'success': True, 'data': fill2}]))[0], 0)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE live_trades SET requested_quantity=? WHERE id=1', ('45',))
+        first = Path(self.tmp.name) / 'unrelated-conflict.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': fill2}]),
+                                      report=first, previous=self.report, max_records=1)[0], 0)
+        previous = first
+        for index, (response, maximum) in enumerate((
+                (dict(fill2), 2), (dict(fill2, status='UNKNOWN'), 1),
+                (TimeoutError('secret'), 2), (dict(fill2), 1))):
+            current = Path(self.tmp.name) / f'unrelated-retry-{index}.json'
+            adapter = Adapter([{'success': True, 'data': response}
+                               if not isinstance(response, Exception) else response])
+            self.assertEqual(self.execute(adapter, report=current, previous=previous,
+                                          max_records=maximum)[0], 0)
+            self.assertEqual(adapter.calls, [(second[2], second[4])])
+            report = json.loads(current.read_text())
+            self.assertEqual(report['observations'][0]['classification'], 'CONFLICTING_EVIDENCE')
+            self.assertEqual(report['registry_count'], 3)
+            previous = current
+
+    def test_persisted_fill_evidence_conflict_blocks_matching_retry(self):
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
+        conflict = Path(self.tmp.name) / 'frozen-fill-conflict.json'
+        self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL,
+                                            average_fill_price='2')}]),
+                                      report=conflict, previous=self.report)[0], 0)
+        self.assertEqual(json.loads(conflict.read_text())['observations'][0]['classification'],
+                         'CONFLICTING_EVIDENCE')
+        retry = Path(self.tmp.name) / 'frozen-fill-retry.json'
+        adapter = Adapter([{'success': True, 'data': dict(FILL)}])
+        self.assertEqual(self.execute(adapter, report=retry, previous=conflict)[0], 0)
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(json.loads(retry.read_text())['observations'][0]['classification'],
+                         'CONFLICTING_EVIDENCE')
+
+    def test_persisted_ambiguous_ownership_blocks_after_duplicate_disappears(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                         (2, 'ORDER_SENT', *BINDING[2:]))
+        initial_adapter = Adapter([])
+        self.assertEqual(self.execute(initial_adapter)[0], 0)
+        self.assertEqual(initial_adapter.calls, [])
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE live_trades SET status='FILLED' WHERE id=2")
+        retry = Path(self.tmp.name) / 'ambiguous-retry.json'
+        adapter = Adapter([{'success': True, 'data': dict(FILL)}])
+        self.assertEqual(self.execute(adapter, report=retry, previous=self.report)[0], 0)
+        self.assertEqual(adapter.calls, [])
+        self.assertEqual(json.loads(retry.read_text())['observations'][0]['classification'],
+                         'CONFLICTING_EVIDENCE')
+
     def test_tampered_registry_fails_before_adapter_and_report_publication(self):
         self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
         for index, mutation in enumerate(('missing', 'duplicate', 'cleared', 'root',

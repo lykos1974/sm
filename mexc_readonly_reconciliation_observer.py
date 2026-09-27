@@ -362,6 +362,11 @@ def _new_registry_entry(binding: dict[str, Any], conflict: str | None = None) ->
     return entry
 
 
+def _persisted_conflict(entry: dict[str, Any]) -> bool:
+    return (entry['lineage_origin'] == 'CONFLICT' or
+            entry['current_observation_state'] == 'CONFLICTING_EVIDENCE')
+
+
 def _validate_registry(entries: Any, count: Any, root: Any) -> dict[str, dict[str, Any]]:
     if type(entries) is not list or type(count) is not int or count != len(entries) or not _is_digest(root):
         raise ValueError('invalid binding registry')
@@ -435,7 +440,9 @@ def _registry_for_snapshot(prior: dict[str, dict[str, Any]],
                                dict[str, dict[str, Any]], dict[int, dict[str, Any]],
                                dict[int, str], str]:
     registry = {key: {**value, 'present_in_snapshot': False,
-                      'current_observation_state': 'NOT_PRESENT_IN_CURRENT_SNAPSHOT'}
+                      'current_observation_state': ('CONFLICTING_EVIDENCE'
+                                                    if _persisted_conflict(value)
+                                                    else 'NOT_PRESENT_IN_CURRENT_SNAPSHOT')}
                 for key, value in prior.items()}
     prior_identity: dict[tuple[str, str], str] = {}
     for key, value in prior.items():
@@ -463,7 +470,11 @@ def _registry_for_snapshot(prior: dict[str, dict[str, Any]],
         if key in registry:
             if any(registry[key][name] != identity[name] for name in identity):
                 raise ValueError('inconsistent binding identity')
-            registry[key]['current_observation_state'] = 'UNOBSERVED'
+            if _persisted_conflict(registry[key]):
+                conflicts[binding['trade_id']] = key
+                registry[key]['current_observation_state'] = 'CONFLICTING_EVIDENCE'
+            else:
+                registry[key]['current_observation_state'] = 'UNOBSERVED'
             registry[key]['present_in_snapshot'] = True
             continue
         conflict = next((prior_identity[(name, identity[name])] for name in (
@@ -474,6 +485,27 @@ def _registry_for_snapshot(prior: dict[str, dict[str, Any]],
             conflicts[binding['trade_id']] = conflict
             registry[conflict]['current_observation_state'] = 'CONFLICTING_EVIDENCE'
     return registry, bindings, conflicts, _report_hash(sorted(binding_set))
+
+
+def _adapter_ineligibility(record: dict[str, Any], binding: dict[str, Any] | None,
+                           registry: dict[str, dict[str, Any]], conflicts: dict[int, str],
+                           ambiguous: set[int], now: int, request_count: int,
+                           maximum: int) -> tuple[str, str | None] | None:
+    trade_id = record.get('id')
+    if type(trade_id) is int and trade_id in conflicts:
+        return 'CONFLICTING_EVIDENCE', 'LOCAL_BINDING_MUTATION'
+    if binding is None:
+        return 'INSUFFICIENT_BINDING', None
+    state = registry.get(_digest(binding, {}))
+    if state is None or _persisted_conflict(state):
+        return 'CONFLICTING_EVIDENCE', 'PERSISTED_BINDING_CONFLICT'
+    if trade_id in ambiguous:
+        return 'CONFLICTING_EVIDENCE', 'AMBIGUOUS_OWNERSHIP'
+    if binding['submitted_at_ms'] > now + _SKEW_MS:
+        return 'STALE_OR_INVALID_TIMESTAMP', None
+    if request_count >= maximum:
+        return 'OBSERVATION_LIMIT', None
+    return None
 
 
 def _update_registry(registry: dict[str, dict[str, Any]], entry: dict[str, Any],
@@ -653,34 +685,37 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
                 entry['binding_digest'] = _digest(binding, {})
             elif type(record.get('id')) is int and record['id'] in conflicts:
                 entry['binding_digest'] = conflicts[record['id']]
-            if type(record.get('id')) is int and record['id'] in conflicts:
-                category = 'CONFLICTING_EVIDENCE'
-                entry['reason'] = 'LOCAL_BINDING_MUTATION'
-            elif binding is not None:
-                if record['id'] in ambiguous:
-                    category = 'CONFLICTING_EVIDENCE'
-                    entry['reason'] = 'AMBIGUOUS_OWNERSHIP'
-                elif binding['submitted_at_ms'] > now + _SKEW_MS:
-                    category = 'STALE_OR_INVALID_TIMESTAMP'
-                elif request_count >= args.max_records:
+            ineligible = _adapter_ineligibility(record, binding, registry, conflicts,
+                                                 ambiguous, now, request_count,
+                                                 args.max_records)
+            if ineligible is not None:
+                category, reason = ineligible
+                if category == 'OBSERVATION_LIMIT':
                     continue
-                elif active_adapter is None and (not os.environ.get('MEXC_FUTURES_API_KEY')
-                                                 or not os.environ.get('MEXC_FUTURES_API_SECRET')):
-                    category = 'EVIDENCE_UNAVAILABLE'
-                    stop = True
-                else:
-                    if active_adapter is None:
-                        active_adapter = ReadOnlyMexcOrderStatusAdapter(enabled=True)
-                    request_count += 1
-                    attempted = True
-                    try:
-                        response = active_adapter.get_order_status(binding['exchange_order_id'],
-                                                                   binding['symbol'])
-                    except Exception:
-                        response = None
-                    category, digest, details = _observe(binding, response, now)
-                    entry.update(details)
-                    stop = category == 'EVIDENCE_UNAVAILABLE'
+                if reason is not None:
+                    entry['reason'] = reason
+            elif active_adapter is None and (not os.environ.get('MEXC_FUTURES_API_KEY')
+                                             or not os.environ.get('MEXC_FUTURES_API_SECRET')):
+                category = 'EVIDENCE_UNAVAILABLE'
+                stop = True
+            else:
+                if active_adapter is None:
+                    active_adapter = ReadOnlyMexcOrderStatusAdapter(enabled=True)
+                # The same gate guards every adapter call, including injected adapters.
+                if _adapter_ineligibility(record, binding, registry, conflicts,
+                                          ambiguous, now, request_count,
+                                          args.max_records) is not None:
+                    raise ValueError('adapter eligibility changed')
+                request_count += 1
+                attempted = True
+                try:
+                    response = active_adapter.get_order_status(binding['exchange_order_id'],
+                                                               binding['symbol'])
+                except Exception:
+                    response = None
+                category, digest, details = _observe(binding, response, now)
+                entry.update(details)
+                stop = category == 'EVIDENCE_UNAVAILABLE'
             entry.update(classification=category, digest=digest)
             previous_entry = registry.get(entry['binding_digest'])
             if category != 'EVIDENCE_UNAVAILABLE':
