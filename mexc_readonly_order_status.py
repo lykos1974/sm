@@ -87,16 +87,115 @@ def _consistent_alias(row: dict[str, Any], names: tuple[str, ...], normalize: An
     return values[0]
 
 
-def _positive_decimal(value: Any) -> Decimal:
-    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
-        raise ValueError("invalid decimal")
+def _decimal(value: Any, *, zero: bool = False) -> Decimal:
+    if (type(value) not in (str, int, Decimal) or
+            isinstance(value, str) and (len(value) > 128 or '\x00' in value)):
+        raise ValueError('invalid decimal')
     try:
-        decimal = Decimal(str(value))
+        number = Decimal(str(value))
     except InvalidOperation as exc:
-        raise ValueError("invalid decimal") from exc
-    if not decimal.is_finite() or decimal <= 0:
-        raise ValueError("invalid decimal")
-    return decimal
+        raise ValueError('invalid decimal') from exc
+    if (not number.is_finite() or number < 0 or (not zero and number == 0) or
+            len(number.as_tuple().digits) > 100 or abs(number.as_tuple().exponent) > 100):
+        raise ValueError('invalid decimal')
+    return number
+
+
+def _canonical(value: Decimal) -> str:
+    rendered = format(value, 'f')
+    return rendered.rstrip('0').rstrip('.') if '.' in rendered else rendered
+
+
+def _order_id(value: Any) -> str:
+    if type(value) not in (str, int) or re.fullmatch(r'[0-9]{1,30}', str(value)) is None:
+        raise ValueError('invalid order ID')
+    return str(value)
+
+
+def _external_oid(value: Any) -> str:
+    if type(value) is not str or re.fullmatch(r'[A-Za-z0-9_-]{1,32}', value) is None:
+        raise ValueError('invalid external OID')
+    return value
+
+
+def _symbol(value: Any) -> str:
+    if (type(value) is not str or len(value) > 50 or
+            re.fullmatch(r'[A-Z0-9]+_[A-Z0-9]+', value) is None):
+        raise ValueError('invalid symbol')
+    return value
+
+
+def _side(value: Any) -> int:
+    if type(value) is not int or value not in (1, 3):
+        raise ValueError('invalid opening side')
+    return value
+
+
+def _state(value: Any) -> int:
+    if type(value) is not int:
+        raise ValueError('invalid state')
+    return value
+
+
+def _timestamp(value: Any) -> int:
+    if type(value) is not int or not 0 < value <= 9_000_000_000_000_000:
+        raise ValueError('invalid timestamp')
+    return value
+
+
+# Every supported spelling of each economic field is enumerated here. An
+# unknown key is never promoted to evidence, and any supplied alias is checked.
+_ORDER_ALIASES = {
+    'order_id': ('orderId', 'order_id', 'exchange_order_id'),
+    'external_oid': ('externalOid', 'external_oid'),
+    'symbol': ('symbol', 'native_symbol'),
+    'side': ('side', 'order_side'),
+    'requested': ('vol', 'requested_quantity'),
+    'filled': ('dealVol', 'filled_quantity', 'cumulative_filled_quantity'),
+    'average': ('dealAvgPriceStr', 'dealAvgPrice', 'average_fill_price'),
+    'state': ('state', 'status'),
+    'update_time': ('updateTime', 'update_time', 'exchange_update_timestamp_ms'),
+}
+_DEAL_ALIASES = {
+    'deal_id': ('id', 'deal_id'),
+    'order_id': _ORDER_ALIASES['order_id'],
+    'external_oid': _ORDER_ALIASES['external_oid'],
+    'symbol': _ORDER_ALIASES['symbol'],
+    'side': _ORDER_ALIASES['side'],
+    'requested': ('requested_quantity',),
+    'filled': ('vol', 'filled_quantity', 'trade_volume'),
+    'cumulative': ('dealVol', 'cumulative_filled_quantity'),
+    'price': ('price', 'trade_price', 'tradePrice'),
+    'average': _ORDER_ALIASES['average'],
+    'state': _ORDER_ALIASES['state'],
+    'update_time': _ORDER_ALIASES['update_time'],
+    'fill_time': ('timestamp', 'tradeTime', 'trade_time', 'exchange_fill_timestamp'),
+}
+
+
+def _normalize_evidence(row: Any, *, deal: bool = False,
+                        require_external: bool = False) -> dict[str, Any]:
+    if type(row) is not dict:
+        raise ValueError('invalid evidence row')
+    aliases = _DEAL_ALIASES if deal else _ORDER_ALIASES
+    normalizers = {
+        'deal_id': _order_id, 'order_id': _order_id, 'external_oid': _external_oid,
+        'symbol': _symbol, 'side': _side, 'requested': _decimal,
+        'filled': lambda value: _decimal(value, zero=not deal),
+        'cumulative': lambda value: _decimal(value, zero=True),
+        'price': _decimal, 'average': lambda value: _decimal(value, zero=True),
+        'state': _state, 'update_time': _timestamp, 'fill_time': _timestamp,
+    }
+    required = ({'deal_id', 'order_id', 'symbol', 'side', 'filled', 'price', 'fill_time'}
+                if deal else {'order_id', 'symbol', 'side', 'requested', 'filled',
+                              'average', 'state', 'update_time'})
+    if require_external:
+        required.add('external_oid')
+    result: dict[str, Any] = {}
+    for field, names in aliases.items():
+        if field in required or any(name in row for name in names):
+            result[field] = _consistent_alias(row, names, normalizers[field])
+    return result
 
 
 def _parse_json(raw: bytes) -> dict[str, Any]:
@@ -110,7 +209,8 @@ def _parse_json(raw: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
-    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs, parse_float=Decimal,
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs,
+                       parse_float=lambda _: (_ for _ in ()).throw(ValueError('float evidence')),
                        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite")))
     if not isinstance(value, dict) or type(value.get('success')) is not bool or type(value.get('code')) is not int:
         raise ValueError('invalid envelope')
@@ -148,20 +248,13 @@ class ReadOnlyMexcOrderStatusAdapter:
                     or re.fullmatch(r"[0-9]{1,30}", order_id) is None
                     or not isinstance(symbol, str) or re.fullmatch(r"[A-Z0-9]+_[A-Z0-9]+", symbol) is None):
                 return None
-            order = self._get(ORDER_PATH + order_id)["data"]
-            if (not isinstance(order, dict) or str(order["orderId"]) != order_id
-                    or order["symbol"] != symbol or type(order["side"]) is not int
-                    or order["side"] not in (1, 3) or type(order["state"]) is not int
-                    or order["state"] != 3):
+            order = _normalize_evidence(self._get(ORDER_PATH + order_id)['data'])
+            if (order['order_id'] != order_id or order['symbol'] != symbol or
+                    order['state'] != 3):
                 return None
-            requested = _positive_decimal(order["vol"])
-            filled = _positive_decimal(order["dealVol"])
-            price = _consistent_alias(order, ('dealAvgPriceStr', 'dealAvgPrice'),
-                                      _positive_decimal)
-            update_time = order["updateTime"]
-            if type(update_time) is not int or update_time <= 0:
-                return None
-            if requested != filled:
+            requested, filled, price, update_time = (order[key] for key in
+                ('requested', 'filled', 'average', 'update_time'))
+            if requested != filled or price <= 0:
                 return None
             deals = self._get(DEALS_PATH + order_id)["data"]
             if not isinstance(deals, list) or not deals:
@@ -175,25 +268,29 @@ class ReadOnlyMexcOrderStatusAdapter:
                 context.traps[Inexact] = True
                 context.traps[Rounded] = True
                 for deal in deals:
-                    if (not isinstance(deal, dict) or str(deal["orderId"]) != order_id
-                            or deal["symbol"] != symbol or type(deal["side"]) is not int
-                            or deal["side"] != order["side"]):
+                    item = _normalize_evidence(deal, deal=True)
+                    if (item['order_id'] != order_id or item['symbol'] != symbol or
+                            item['side'] != order['side'] or
+                            ('external_oid' in item and item['external_oid'] !=
+                             order.get('external_oid')) or
+                            ('requested' in item and item['requested'] != requested) or
+                            ('cumulative' in item and item['cumulative'] != filled) or
+                            ('average' in item and item['average'] != price) or
+                            ('state' in item and item['state'] != order['state']) or
+                            ('update_time' in item and item['update_time'] != update_time)):
                         return None
-                    deal_id = str(deal["id"])
-                    timestamp = deal["timestamp"]
-                    if (not deal_id or deal_id in seen or type(timestamp) is not int
-                            or timestamp <= 0 or timestamp > update_time):
+                    deal_id, timestamp = item['deal_id'], item['fill_time']
+                    if deal_id in seen or timestamp > update_time:
                         return None
                     seen.add(deal_id)
-                    volume = _positive_decimal(deal["vol"])
-                    trade_price = _positive_decimal(deal["price"])
+                    volume, trade_price = item['filled'], item['price']
                     quantity += volume
                     notional += volume * trade_price
                     latest = max(latest, timestamp)
                 if quantity != filled or notional != price * quantity:
                     return None
             return {"success": True, "data": {
-                "exchange_order_id": order_id, "symbol": symbol, "side": order["side"],
+                "exchange_order_id": order_id, "symbol": symbol, "side": order['side'],
                 "requested_quantity": str(requested), "cumulative_filled_quantity": str(filled),
                 "average_fill_price": str(price), "exchange_fill_timestamp": latest,
                 "status": "FILLED",
@@ -217,70 +314,14 @@ class ReadOnlyMexcExternalOidRecovery:
         self._key = os.environ.get('MEXC_FUTURES_API_KEY') if enabled else None
         self._secret = os.environ.get('MEXC_FUTURES_API_SECRET') if enabled else None
 
-    @staticmethod
-    def _field(row: dict[str, Any], names: tuple[str, ...], normalize: Any) -> Any:
-        return _consistent_alias(row, names, normalize)
-
-    @staticmethod
-    def _decimal(value: Any, *, zero: bool = False) -> Decimal:
-        if (isinstance(value, bool) or not isinstance(value, (str, int, Decimal)) or
-                isinstance(value, str) and (len(value) > 128 or '\x00' in value)):
-            raise ValueError('invalid decimal')
-        number = Decimal(str(value))
-        if (not number.is_finite() or number < 0 or (not zero and number == 0) or
-                len(number.as_tuple().digits) > 100 or abs(number.as_tuple().exponent) > 100):
-            raise ValueError('invalid decimal')
-        return number
-
-    @staticmethod
-    def _canonical(value: Decimal) -> str:
-        rendered = format(value, 'f')
-        return rendered.rstrip('0').rstrip('.') if '.' in rendered else rendered
-
-    @staticmethod
-    def _oid(value: Any) -> str:
-        if type(value) is not str or re.fullmatch(r'[A-Za-z0-9_-]{1,32}', value) is None:
-            raise ValueError('invalid OID')
-        return value
-
-    @staticmethod
-    def _symbol(value: Any) -> str:
-        if type(value) is not str or len(value) > 50 or re.fullmatch(r'[A-Z0-9]+_[A-Z0-9]+', value) is None:
-            raise ValueError('invalid symbol')
-        return value
-
-    @staticmethod
-    def _side(value: Any) -> int:
-        if type(value) is not int or value not in (1, 3):
-            raise ValueError('invalid opening side')
-        return value
-
-    @staticmethod
-    def _state(value: Any) -> int:
-        if type(value) is not int:
-            raise ValueError('invalid state')
-        return value
-
-    @staticmethod
-    def _timestamp(value: Any) -> int:
-        if type(value) is not int or not 0 < value <= 9_000_000_000_000_000:
-            raise ValueError('invalid timestamp')
-        return value
-
-    @staticmethod
-    def _id(value: Any) -> str:
-        if type(value) not in (str, int) or re.fullmatch(r'[0-9]{1,30}', str(value)) is None:
-            raise ValueError('invalid order ID')
-        return str(value)
-
     def recover(self, symbol: str, external_oid: str) -> dict[str, Any]:
         unavailable = {'outcome': 'TRANSPORT_FAILURE', 'evidence': None}
         unknown = {'outcome': 'UNKNOWN', 'evidence': None}
         if (not self._enabled or not self._key or not self._secret):
             return unavailable
         try:
-            self._symbol(symbol)
-            self._oid(external_oid)
+            _symbol(symbol)
+            _external_oid(external_oid)
         except ValueError:
             return unknown
         path = ('/api/v1/private/order/external/' + quote(symbol, safe='') + '/' +
@@ -296,20 +337,11 @@ class ReadOnlyMexcExternalOidRecovery:
                 if envelope['success'] is False and envelope['code'] == 2040:
                     return {'outcome': 'NOT_FOUND', 'evidence': None}
                 return unknown
-            row = envelope['data']
-            if type(row) is not dict:
-                return unknown
-            oid = self._field(row, ('externalOid', 'external_oid'), self._oid)
-            order_id = self._field(row, ('orderId', 'order_id'), self._id)
-            native = self._field(row, ('symbol', 'native_symbol'), self._symbol)
-            side = self._field(row, ('side',), self._side)
-            requested = self._field(row, ('vol', 'requested_quantity'), self._decimal)
-            filled = self._field(row, ('dealVol', 'cumulative_filled_quantity'),
-                                 lambda value: self._decimal(value, zero=True))
-            price = self._field(row, ('dealAvgPriceStr', 'dealAvgPrice', 'average_fill_price'),
-                                lambda value: self._decimal(value, zero=True))
-            state = self._field(row, ('state', 'status'), self._state)
-            timestamp = self._field(row, ('updateTime', 'update_time'), self._timestamp)
+            item = _normalize_evidence(envelope['data'], require_external=True)
+            oid, order_id, native, side = (item[key] for key in
+                ('external_oid', 'order_id', 'symbol', 'side'))
+            requested, filled, price, state, timestamp = (item[key] for key in
+                ('requested', 'filled', 'average', 'state', 'update_time'))
             if (oid != external_oid or native != symbol or filled > requested or
                     (filled > 0) != (price > 0)):
                 return unknown
@@ -324,10 +356,10 @@ class ReadOnlyMexcExternalOidRecovery:
             return {'outcome': outcome, 'evidence': {
                 'external_oid': oid, 'exchange_order_id': order_id, 'symbol': native,
                 'side': 'LONG' if side == 1 else 'SHORT',
-                'requested_quantity': self._canonical(requested),
-                'cumulative_filled_quantity': self._canonical(filled),
+                'requested_quantity': _canonical(requested),
+                'cumulative_filled_quantity': _canonical(filled),
                 'status': status,
-                'average_fill_price': self._canonical(price),
+                'average_fill_price': _canonical(price),
                 'exchange_update_timestamp_ms': timestamp,
             }}
         except Exception:

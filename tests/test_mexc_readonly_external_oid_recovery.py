@@ -148,6 +148,48 @@ class RecoveryTests(unittest.TestCase):
         adapter, _ = self.adapter(envelope(equivalent))
         self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
 
+    def test_recovery_bounded_complete_alias_matrix(self):
+        aliases = {'order_id': ('order_id', 999), 'external_oid': ('external_oid', 'other'),
+                   'symbol': ('native_symbol', 'ETH_USDT'), 'side': ('order_side', 3),
+                   'requested': ('requested_quantity', '45'),
+                   'filled': ('cumulative_filled_quantity', '43'),
+                   'price': ('average_fill_price', '2'), 'status': ('status', 4),
+                   'time': ('update_time', 1)}
+        for name, (alias, value) in aliases.items():
+            with self.subTest(field=name):
+                adapter, _ = self.adapter(envelope(ROW | {alias: value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        adapter, _ = self.adapter(envelope(ROW | dict(aliases.values())))
+        self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        equivalent = ROW | dict(order_id=123456, external_oid=OID, native_symbol=SYMBOL,
+                                order_side=1, requested_quantity='44.000',
+                                cumulative_filled_quantity=44, average_fill_price='1.01500',
+                                status=3, update_time=1761912240000)
+        adapter, _ = self.adapter(envelope(equivalent))
+        self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
+        domains = ((('order_id', True), ('order_id', 1.5), ('order_id', 'x'),
+                    ('external_oid', None), ('external_oid', 'x/y'),
+                    ('native_symbol', None), ('native_symbol', 'sui_usdt'),
+                    ('order_side', True), ('order_side', 1.0), ('order_side', '1'),
+                    ('requested_quantity', True), ('requested_quantity', 1.5),
+                    ('requested_quantity', '-1'), ('requested_quantity', '1e101'),
+                    ('cumulative_filled_quantity', True), ('cumulative_filled_quantity', 1.5),
+                    ('cumulative_filled_quantity', '-1'), ('average_fill_price', True),
+                    ('average_fill_price', 1.5), ('average_fill_price', 'NaN'),
+                    ('status', True), ('status', 3.0), ('status', '3'),
+                    ('update_time', True), ('update_time', '1761912240000'),
+                    ('update_time', 9_000_000_000_000_001)))
+        for alias, value in domains:
+            with self.subTest(alias=alias, value=value):
+                adapter, _ = self.adapter(envelope(ROW | {alias: value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        for alias, value in (('requested_quantity', 44.0), ('cumulative_filled_quantity', 44.0),
+                             ('average_fill_price', 1.015), ('status', 3.0),
+                             ('update_time', 1761912240000.0)):
+            with self.subTest(equivalent_float=alias):
+                adapter, _ = self.adapter(envelope(ROW | {alias: value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+
     def test_invalid_inputs_missing_credentials_and_transport_errors(self):
         for symbol, oid in (('SUI/USDT', OID), (SYMBOL, '../cancel'),
                             (SYMBOL, 'a%2Fb'), (SYMBOL, 'x?y=1'),

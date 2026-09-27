@@ -34,7 +34,7 @@ class Transport:
         response = self.trades if '/deal_details/' in url else self.order
         if isinstance(response, Exception):
             raise response
-        return json.dumps(response).encode() if not isinstance(response, bytes) else response
+        return json.dumps(response, default=str).encode() if not isinstance(response, bytes) else response
 
 
 class AdapterTests(unittest.TestCase):
@@ -116,6 +116,115 @@ class AdapterTests(unittest.TestCase):
             self.assertIsNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
         order['data']['dealAvgPrice'] = '100.5000000000000000010'
         self.assertIsNotNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+
+    def test_all_order_aliases_fail_closed_individually_and_together(self):
+        fields = {'order_id': ('order_id', '999'),
+                  'external_oid': ('external_oid', 'bad'),
+                  'symbol': ('native_symbol', 'ETH_USDT'),
+                  'side': ('order_side', 3),
+                  'requested_quantity': ('requested_quantity', '4'),
+                  'filled_quantity': ('cumulative_filled_quantity', '2'),
+                  'average_fill_price': ('average_fill_price', '2'),
+                  'status': ('status', 4),
+                  'update_time': ('update_time', 1)}
+        baseline = copy.deepcopy(ORDER)
+        baseline['data']['externalOid'] = 'oid-1'
+        for name, (alias, value) in fields.items():
+            with self.subTest(name=name):
+                order = copy.deepcopy(baseline)
+                order['data'][alias] = value
+                transport = Transport(order, TRADES)
+                self.assertIsNone(self.adapter(transport).get_order_status(ORDER_ID, SYMBOL))
+                self.assertEqual(len(transport.calls), 1)
+        order = copy.deepcopy(baseline)
+        order['data'].update(dict(fields.values()))
+        self.assertIsNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        order = copy.deepcopy(baseline)
+        order['data'].update(order_id=int(ORDER_ID), external_oid='oid-1',
+                             native_symbol=SYMBOL, order_side=1, requested_quantity='3.00',
+                             cumulative_filled_quantity=Decimal('3.000'),
+                             average_fill_price='100.5000000000000000010', status=3,
+                             update_time=190000)
+        self.assertIsNotNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+
+    def test_deal_aliases_and_order_trade_contradictions_fail_closed(self):
+        aliases = (('order_id', '999'), ('external_oid', 'bad'),
+                   ('native_symbol', 'ETH_USDT'), ('order_side', 3),
+                   ('requested_quantity', '4'), ('filled_quantity', '0.5'),
+                   ('trade_price', '2'), ('status', 4), ('trade_time', 1),
+                   ('cumulative_filled_quantity', '4'), ('dealAvgPrice', '2'),
+                   ('deal_id', '999'))
+        order = copy.deepcopy(ORDER)
+        order['data']['externalOid'] = 'oid-1'
+        for alias, value in aliases:
+            with self.subTest(alias=alias):
+                trades = copy.deepcopy(TRADES)
+                trades['data'][0][alias] = value
+                self.assertIsNone(self.adapter(Transport(order, trades)).get_order_status(ORDER_ID, SYMBOL))
+        trades = copy.deepcopy(TRADES)
+        trades['data'][0].update(dict(aliases))
+        self.assertIsNone(self.adapter(Transport(order, trades)).get_order_status(ORDER_ID, SYMBOL))
+        trades = copy.deepcopy(TRADES)
+        trades['data'][0].update(order_id=int(ORDER_ID), external_oid='oid-1',
+            native_symbol=SYMBOL, order_side=1, requested_quantity='3.0',
+            filled_quantity=Decimal('1.00'), trade_price=Decimal('100.500000000000000000'),
+            status=3, trade_time=150000, cumulative_filled_quantity=3,
+            dealAvgPrice='100.500000000000000001', deal_id=1)
+        self.assertIsNotNone(self.adapter(Transport(order, trades)).get_order_status(ORDER_ID, SYMBOL))
+        for field, value in (('externalOid', 'other'), ('vol', '4'), ('updateTime', 140000)):
+            with self.subTest(cross=field):
+                changed = copy.deepcopy(order)
+                changed['data'][field] = value
+                self.assertIsNone(self.adapter(Transport(changed, trades)).get_order_status(ORDER_ID, SYMBOL))
+
+    def test_alias_type_domain_matrix(self):
+        samples = {'order_id': ('order_id', ('', True, 1.5, '-1', '9'*31)),
+                   'external_oid': ('external_oid', (None, True, 1.5, 'bad/x', 'x'*33)),
+                   'symbol': ('native_symbol', (None, True, 1.5, 'eth_usdt', 'X'*200)),
+                   'side': ('order_side', (None, True, 1.0, '1', 2)),
+                   'requested': ('requested_quantity', (None, True, 1.5, 'NaN', '0', '-1', '1e101')),
+                   'filled': ('cumulative_filled_quantity', (None, True, 1.5, 'Infinity', '-1')),
+                   'price': ('average_fill_price', (None, True, 1.5, 'NaN', '0', '-1')),
+                   'status': ('status', (None, True, 3.0, '3', -1)),
+                   'time': ('update_time', (None, True, 1.5, '190000', 0, 9_000_000_000_000_001))}
+        for field, (alias, values) in samples.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    order = copy.deepcopy(ORDER)
+                    order['data'][alias] = value
+                    self.assertIsNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+
+    def test_required_fields_and_deal_alias_domains(self):
+        for field in ('orderId', 'symbol', 'side', 'vol', 'dealVol',
+                      'dealAvgPriceStr', 'state', 'updateTime'):
+            with self.subTest(order_missing=field):
+                order = copy.deepcopy(ORDER)
+                del order['data'][field]
+                self.assertIsNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        for field in ('id', 'orderId', 'symbol', 'side', 'vol', 'price', 'timestamp'):
+            with self.subTest(deal_missing=field):
+                trades = copy.deepcopy(TRADES)
+                del trades['data'][0][field]
+                self.assertIsNone(self.adapter(Transport(ORDER, trades)).get_order_status(ORDER_ID, SYMBOL))
+        samples = {'deal_id': ('deal_id', (None, True, 1.5, '-1')),
+                   'order_id': ('order_id', (None, True, 1.5, '-1')),
+                   'external_oid': ('external_oid', (None, True, 'bad/x')),
+                   'symbol': ('native_symbol', (None, True, 'eth_usdt')),
+                   'side': ('order_side', (None, True, 1.0, '1', 2)),
+                   'requested': ('requested_quantity', (None, True, 1.5, '-1', '0')),
+                   'filled': ('filled_quantity', (None, True, 1.5, '-1', '0', 'NaN')),
+                   'cumulative': ('cumulative_filled_quantity', (None, True, 1.5, '-1')),
+                   'price': ('trade_price', (None, True, 1.5, '-1', '0', 'Infinity')),
+                   'average': ('dealAvgPrice', (None, True, 1.5, '-1', 'NaN')),
+                   'state': ('status', (None, True, 3.0, '3')),
+                   'update': ('update_time', (None, True, 1.5, '190000', 0)),
+                   'fill_time': ('trade_time', (None, True, 1.5, '150000', 0))}
+        for field, (alias, values) in samples.items():
+            for value in values:
+                with self.subTest(deal_field=field, value=value):
+                    trades = copy.deepcopy(TRADES)
+                    trades['data'][0][alias] = value
+                    self.assertIsNone(self.adapter(Transport(ORDER, trades)).get_order_status(ORDER_ID, SYMBOL))
 
     def test_normalized_evidence_integrates_only_through_explicit_gate(self):
         conn = sqlite3.connect(':memory:')
