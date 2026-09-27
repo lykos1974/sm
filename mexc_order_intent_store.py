@@ -17,7 +17,7 @@ class IntentError(ValueError):
     """An intent cannot safely be created, claimed, or advanced."""
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _IDENTITY = ('intent_id', 'local_trade_id', 'account_id', 'venue', 'external_oid',
              'native_symbol', 'opening_side', 'requested_quantity')
 _IMMUTABLE = _IDENTITY + ('order_type', 'order_price', 'strategy_decision_id',
@@ -113,60 +113,18 @@ CREATE TABLE bot_order_intents (
  UNIQUE(account_id, venue, exchange_order_id),
  UNIQUE(account_id, venue, strategy_decision_id),
  UNIQUE(account_id, venue, local_trade_id)
-);
+ ) WITHOUT ROWID;
 CREATE TRIGGER bot_intent_no_reinsert BEFORE INSERT ON bot_order_intents
 BEGIN
- SELECT RAISE(ABORT, 'new intent must be prepared') WHERE
-   NEW.state IS NOT 'PREPARED' OR NEW.revision IS NOT 0 OR
-   NEW.attempted_at_ms IS NOT NULL OR NEW.exchange_order_id IS NOT NULL OR
-   NEW.bound_at_ms IS NOT NULL OR NEW.binding_digest IS NOT NULL OR
-   NEW.filled_quantity IS NOT NULL OR NEW.average_fill_price IS NOT NULL OR
-   NEW.fill_timestamp_ms IS NOT NULL OR NEW.fill_digest IS NOT NULL;
- SELECT RAISE(ABORT, 'intent ownership already exists') WHERE EXISTS (
-  SELECT 1 FROM bot_order_intents AS prior WHERE
-   prior.intent_id = NEW.intent_id OR
-   (NEW.rowid > 0 AND prior.rowid = NEW.rowid) OR
-   (prior.account_id = NEW.account_id AND prior.venue = NEW.venue AND (
-    prior.external_oid = NEW.external_oid OR
-    prior.strategy_decision_id = NEW.strategy_decision_id OR
-    prior.local_trade_id = NEW.local_trade_id OR
-    (NEW.exchange_order_id IS NOT NULL AND
-     prior.exchange_order_id = NEW.exchange_order_id)))
- );
+ SELECT RAISE(ABORT, 'invalid intent insert') WHERE
+   bot_intent_validate('INSERT',
+''' + ','.join('NULL' for _ in _COLUMNS) + ',\n' + ','.join('NEW.' + key for key in _COLUMNS) + ''') != 1;
 END;
 CREATE TRIGGER bot_intent_immutable BEFORE UPDATE ON bot_order_intents
 BEGIN
- SELECT RAISE(ABORT, 'intent row location changed') WHERE NEW.rowid IS NOT OLD.rowid;
- SELECT RAISE(ABORT, 'intent ownership already exists') WHERE EXISTS (
-  SELECT 1 FROM bot_order_intents AS prior WHERE prior.intent_id != OLD.intent_id AND
-   (prior.intent_id = NEW.intent_id OR
-    (prior.account_id = NEW.account_id AND prior.venue = NEW.venue AND (
-     prior.external_oid = NEW.external_oid OR
-     prior.strategy_decision_id = NEW.strategy_decision_id OR
-     prior.local_trade_id = NEW.local_trade_id OR
-     (NEW.exchange_order_id IS NOT NULL AND
-      prior.exchange_order_id = NEW.exchange_order_id))))
- );
- SELECT RAISE(ABORT, 'immutable intent') WHERE
-''' + ' OR\n'.join(' NEW.' + key + ' IS NOT OLD.' + key for key in _IMMUTABLE) + ''';
- SELECT RAISE(ABORT, 'invalid intent transition') WHERE
- NEW.revision != OLD.revision + 1 OR NOT (
-  (OLD.state = 'PREPARED' AND NEW.state IN ('SUBMISSION_UNCERTAIN','CONFLICT')) OR
-  (OLD.state = 'SUBMISSION_UNCERTAIN' AND NEW.state IN ('BOUND','REJECTED','CONFLICT')) OR
-  (OLD.state = 'BOUND' AND NEW.state IN ('FILL_CONFIRMED','CONFLICT')));
- SELECT RAISE(ABORT, 'invalid attempt chronology') WHERE
-  OLD.state='PREPARED' AND NEW.state='CONFLICT' AND NEW.attempted_at_ms IS NOT NULL;
- SELECT RAISE(ABORT, 'attempt timestamp changed') WHERE
-  OLD.attempted_at_ms IS NOT NULL AND NEW.attempted_at_ms IS NOT OLD.attempted_at_ms;
- SELECT RAISE(ABORT, 'binding evidence changed') WHERE
-  (OLD.exchange_order_id IS NOT NULL AND NEW.exchange_order_id IS NOT OLD.exchange_order_id)
-  OR (OLD.bound_at_ms IS NOT NULL AND NEW.bound_at_ms IS NOT OLD.bound_at_ms)
-  OR (OLD.binding_digest IS NOT NULL AND NEW.binding_digest IS NOT OLD.binding_digest);
- SELECT RAISE(ABORT, 'fill evidence changed') WHERE
-  (OLD.fill_digest IS NOT NULL AND NEW.fill_digest IS NOT OLD.fill_digest)
-  OR (OLD.fill_timestamp_ms IS NOT NULL AND NEW.fill_timestamp_ms IS NOT OLD.fill_timestamp_ms)
-  OR (OLD.average_fill_price IS NOT NULL AND NEW.average_fill_price IS NOT OLD.average_fill_price)
-  OR (OLD.filled_quantity IS NOT NULL AND NEW.filled_quantity IS NOT OLD.filled_quantity);
+ SELECT RAISE(ABORT, 'invalid intent update') WHERE
+   bot_intent_validate('UPDATE',
+''' + ','.join('OLD.' + key for key in _COLUMNS) + ',\n' + ','.join('NEW.' + key for key in _COLUMNS) + ''') != 1;
 END;
 CREATE TRIGGER bot_intent_no_delete BEFORE DELETE ON bot_order_intents
 BEGIN SELECT RAISE(ABORT, 'intent deletion forbidden'); END;
@@ -174,7 +132,8 @@ BEGIN SELECT RAISE(ABORT, 'intent deletion forbidden'); END;
 
 
 def _text(value: Any, pattern: str, name: str) -> str:
-    if type(value) is not str or re.fullmatch(pattern, value, flags=re.ASCII) is None:
+    if (type(value) is not str or len(value) > 128 or '\x00' in value or
+            re.fullmatch(pattern, value, flags=re.ASCII) is None):
         raise IntentError('invalid ' + name)
     return value
 
@@ -187,6 +146,8 @@ def _integer(value: Any, name: str) -> int:
 
 def _decimal(value: Any, name: str) -> str:
     if type(value) not in (str, int, Decimal):
+        raise IntentError('invalid ' + name)
+    if type(value) is str and (len(value) > 128 or '\x00' in value):
         raise IntentError('invalid ' + name)
     try:
         number = Decimal(value)
@@ -219,6 +180,7 @@ def _schema_contract(db: sqlite3.Connection) -> tuple[Any, ...]:
 @lru_cache(maxsize=1)
 def _expected_schema() -> tuple[Any, ...]:
     with closing(sqlite3.connect(':memory:')) as reference:
+        IntentStore._register_validator(reference)
         reference.executescript(_SQL)
         return _schema_contract(reference)
 
@@ -226,12 +188,82 @@ def _expected_schema() -> tuple[Any, ...]:
 def _identity(values: dict[str, Any]) -> dict[str, Any]:
     return {key: (_decimal(values[key], key) if key == 'requested_quantity' else
                   _integer(values[key], key) if key == 'local_trade_id' else
-                  _text(values[key], r'[A-Z0-9]+_[A-Z0-9]+', key) if key == 'native_symbol' else
+                  _text(values[key], r'[A-Z0-9]{1,49}_[A-Z0-9]{1,49}', key) if key == 'native_symbol' else
                   _text(values[key], r'LONG|SHORT', key) if key == 'opening_side' else
                   _text(values[key], r'MEXC_FUTURES', key) if key == 'venue' else
                   _text(values[key], r'[A-Za-z0-9_-]{1,128}', key) if key != 'external_oid' else
                   _text(values[key], r'[A-Za-z0-9_-]{1,32}', key))
             for key in _IDENTITY}
+
+
+def _validate_row(result: dict[str, Any]) -> dict[str, Any]:
+    if set(result) != set(_COLUMNS):
+        raise IntentError('incomplete intent row')
+    if type(result['native_symbol']) is not str or len(result['native_symbol']) > 50:
+        raise IntentError('invalid native symbol')
+    immutable = {key: result[key] for key in _IMMUTABLE if key != 'intent_digest'}
+    if (_digest(immutable) != result['intent_digest'] or
+            _identity(result) != {key: result[key] for key in _IDENTITY} or
+            _text(result['order_type'], r'MARKET|LIMIT', 'order type') != result['order_type'] or
+            _text(result['strategy_decision_id'], r'[A-Za-z0-9_-]{1,128}',
+                  'decision ID') != result['strategy_decision_id'] or
+            _integer(result['created_at_ms'], 'created timestamp') != result['created_at_ms'] or
+            (result['order_price'] is None) != (result['order_type'] == 'MARKET') or
+            (result['order_price'] is not None and
+             _decimal(result['order_price'], 'order price') != result['order_price'])):
+        raise IntentError('corrupt intent')
+    state, revision, attempted = (result[key] for key in ('state', 'revision', 'attempted_at_ms'))
+    if (type(revision) is not int or state not in (
+            'PREPARED', 'SUBMISSION_UNCERTAIN', 'BOUND', 'FILL_CONFIRMED',
+            'REJECTED', 'CONFLICT') or
+            (state == 'PREPARED' and (revision != 0 or attempted is not None)) or
+            (state == 'SUBMISSION_UNCERTAIN' and revision != 1) or
+            (state in ('BOUND', 'REJECTED') and revision != 2) or
+            (state == 'FILL_CONFIRMED' and revision != 3) or
+            (state == 'CONFLICT' and revision not in (1, 2, 3)) or
+            (attempted is not None and (_integer(attempted, 'attempt timestamp') <
+                                         result['created_at_ms'])) or
+            (state == 'CONFLICT' and revision == 1 and attempted is not None) or
+            (attempted is None and not (state == 'PREPARED' or
+                                        (state == 'CONFLICT' and revision == 1)))):
+        raise IntentError('corrupt intent state')
+    has_binding = state in ('BOUND', 'FILL_CONFIRMED', 'REJECTED') or (
+        state == 'CONFLICT' and revision == 3)
+    bound_fields = ('exchange_order_id', 'bound_at_ms', 'binding_digest')
+    if has_binding:
+        if (any(result[key] is None for key in bound_fields) or
+                _integer(result['bound_at_ms'], 'bound timestamp') < attempted or
+                _text(result['exchange_order_id'], r'[0-9]{1,30}', 'exchange order ID') !=
+                result['exchange_order_id']):
+            raise IntentError('corrupt binding')
+        expected = _identity(result) | dict(exchange_order_id=result['exchange_order_id'],
+            exchange_timestamp_ms=result['bound_at_ms'],
+            status='REJECTED' if state == 'REJECTED' else 'ACCEPTED')
+        if _digest(expected) != result['binding_digest']:
+            raise IntentError('corrupt binding evidence')
+    elif any(result[key] is not None for key in bound_fields):
+        raise IntentError('unexpected binding')
+    fill_fields = ('filled_quantity', 'average_fill_price', 'fill_timestamp_ms', 'fill_digest')
+    if state == 'FILL_CONFIRMED':
+        if (any(result[key] is None for key in fill_fields) or
+                _decimal(result['filled_quantity'], 'filled quantity') !=
+                result['requested_quantity'] or
+                result['filled_quantity'] != result['requested_quantity'] or
+                _decimal(result['average_fill_price'], 'fill price') !=
+                result['average_fill_price'] or
+                _integer(result['fill_timestamp_ms'], 'fill timestamp') <
+                result['bound_at_ms'] or
+                _digest(_identity(result) | dict(
+                    exchange_order_id=result['exchange_order_id'],
+                    exchange_timestamp_ms=result['bound_at_ms'], status='FILLED',
+                    cumulative_filled_quantity=result['filled_quantity'],
+                    average_fill_price=result['average_fill_price'],
+                    exchange_fill_timestamp_ms=result['fill_timestamp_ms'])) !=
+                result['fill_digest']):
+            raise IntentError('corrupt fill evidence')
+    elif any(result[key] is not None for key in fill_fields):
+        raise IntentError('unexpected fill')
+    return result
 
 
 def _binding_evidence(values: Any, intent: dict[str, Any], status: str) -> dict[str, Any]:
@@ -269,6 +301,55 @@ class IntentStore:
     def __init__(self, database: str | Path):
         self.database = Path(database)
 
+    @staticmethod
+    def _register_validator(db: sqlite3.Connection) -> None:
+        def validate(operation: Any, *fields: Any) -> int:
+            try:
+                width = len(_COLUMNS)
+                if len(fields) != 2 * width:
+                    return 0
+                old = dict(zip(_COLUMNS, fields[:width]))
+                new = dict(zip(_COLUMNS, fields[width:]))
+                if operation == 'INSERT':
+                    if any(value is not None for value in old.values()):
+                        return 0
+                    if new['state'] != 'PREPARED':
+                        return 0
+                elif operation == 'UPDATE':
+                    _validate_row(old)
+                    if any(old[key] != new[key] for key in _IMMUTABLE):
+                        return 0
+                    if (type(old['revision']) is not int or
+                            type(new['revision']) is not int or
+                            new['revision'] != old['revision'] + 1 or
+                            new['state'] not in {
+                                'PREPARED': ('SUBMISSION_UNCERTAIN', 'CONFLICT'),
+                                'SUBMISSION_UNCERTAIN': ('BOUND', 'REJECTED', 'CONFLICT'),
+                                'BOUND': ('FILL_CONFIRMED', 'CONFLICT'),
+                            }.get(old['state'], ())):
+                        return 0
+                    for key in ('attempted_at_ms', 'exchange_order_id', 'bound_at_ms',
+                                'binding_digest', 'filled_quantity', 'average_fill_price',
+                                'fill_timestamp_ms', 'fill_digest'):
+                        if old[key] is not None and old[key] != new[key]:
+                            return 0
+                else:
+                    return 0
+                _validate_row(new)
+                owner = db.execute('''SELECT intent_id FROM bot_order_intents WHERE
+                    intent_id=? OR (account_id=? AND venue=? AND (
+                    external_oid=? OR strategy_decision_id=? OR local_trade_id=? OR
+                    (? IS NOT NULL AND exchange_order_id=?))) LIMIT 2''',
+                    (new['intent_id'], new['account_id'], new['venue'],
+                     new['external_oid'], new['strategy_decision_id'], new['local_trade_id'],
+                     new['exchange_order_id'], new['exchange_order_id'])).fetchall()
+                if any(operation == 'INSERT' or row[0] != old['intent_id'] for row in owner):
+                    return 0
+                return 1
+            except (IntentError, sqlite3.Error, ValueError, TypeError, OverflowError):
+                return 0
+        db.create_function('bot_intent_validate', 1 + 2 * len(_COLUMNS), validate)
+
     @contextmanager
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
         if self.database.is_symlink() or not self.database.is_file():
@@ -276,6 +357,7 @@ class IntentStore:
         uri = self.database.resolve().as_uri() + '?mode=' + ('rw' if write else 'ro')
         try:
             with closing(sqlite3.connect(uri, uri=True, timeout=2, isolation_level=None)) as db:
+                self._register_validator(db)
                 db.row_factory = sqlite3.Row
                 db.execute('PRAGMA foreign_keys=ON')
                 if not write:
@@ -299,6 +381,7 @@ class IntentStore:
                 return
         try:
             with sqlite3.connect(self.database, timeout=2) as db:
+                self._register_validator(db)
                 db.executescript(_SQL)
                 db.execute(f'PRAGMA user_version={_SCHEMA_VERSION}')
         except sqlite3.Error as exc:
@@ -310,69 +393,7 @@ class IntentStore:
         if row is None:
             raise IntentError('unknown intent')
         result = dict(row)
-        immutable = {key: result[key] for key in _IMMUTABLE if key != 'intent_digest'}
-        if (_digest(immutable) != result['intent_digest'] or
-                _identity(result) != {key: result[key] for key in _IDENTITY} or
-                _text(result['order_type'], r'MARKET|LIMIT', 'order type') != result['order_type'] or
-                _text(result['strategy_decision_id'], r'[A-Za-z0-9_-]{1,128}',
-                      'decision ID') != result['strategy_decision_id'] or
-                _integer(result['created_at_ms'], 'created timestamp') != result['created_at_ms'] or
-                (result['order_price'] is None) != (result['order_type'] == 'MARKET') or
-                (result['order_price'] is not None and
-                 _decimal(result['order_price'], 'order price') != result['order_price'])):
-            raise IntentError('corrupt intent')
-        state, revision, attempted = (result[key] for key in ('state','revision','attempted_at_ms'))
-        if (type(revision) is not int or state not in (
-                'PREPARED', 'SUBMISSION_UNCERTAIN', 'BOUND', 'FILL_CONFIRMED',
-                'REJECTED', 'CONFLICT') or
-                (state == 'PREPARED' and (revision != 0 or attempted is not None)) or
-                (state == 'SUBMISSION_UNCERTAIN' and revision != 1) or
-                (state in ('BOUND','REJECTED') and revision != 2) or
-                (state == 'FILL_CONFIRMED' and revision != 3) or
-                (state == 'CONFLICT' and revision not in (1,2,3)) or
-                (attempted is not None and (_integer(attempted, 'attempt timestamp') <
-                                             result['created_at_ms'])) or
-                (state == 'CONFLICT' and revision == 1 and attempted is not None) or
-                (attempted is None and not (state == 'PREPARED' or
-                                            (state == 'CONFLICT' and revision == 1)))):
-            raise IntentError('corrupt intent state')
-        has_binding = state in ('BOUND', 'FILL_CONFIRMED', 'REJECTED') or (
-            state == 'CONFLICT' and revision == 3)
-        bound_fields = ('exchange_order_id', 'bound_at_ms', 'binding_digest')
-        if has_binding:
-            if (any(result[key] is None for key in bound_fields) or
-                    _integer(result['bound_at_ms'], 'bound timestamp') < attempted or
-                    _text(result['exchange_order_id'], r'[0-9]{1,30}', 'exchange order ID') !=
-                    result['exchange_order_id']):
-                raise IntentError('corrupt binding')
-            expected = _identity(result) | dict(exchange_order_id=result['exchange_order_id'],
-                exchange_timestamp_ms=result['bound_at_ms'],
-                status='REJECTED' if state == 'REJECTED' else 'ACCEPTED')
-            if _digest(expected) != result['binding_digest']:
-                raise IntentError('corrupt binding evidence')
-        elif any(result[key] is not None for key in bound_fields):
-            raise IntentError('unexpected binding')
-        fill_fields = ('filled_quantity', 'average_fill_price', 'fill_timestamp_ms', 'fill_digest')
-        if state == 'FILL_CONFIRMED':
-            if (any(result[key] is None for key in fill_fields) or
-                    _decimal(result['filled_quantity'], 'filled quantity') !=
-                    result['requested_quantity'] or
-                    result['filled_quantity'] != result['requested_quantity'] or
-                    _decimal(result['average_fill_price'], 'fill price') !=
-                    result['average_fill_price'] or
-                    _integer(result['fill_timestamp_ms'], 'fill timestamp') <
-                    result['bound_at_ms'] or
-                    _digest(_identity(result) | dict(
-                        exchange_order_id=result['exchange_order_id'],
-                        exchange_timestamp_ms=result['bound_at_ms'], status='FILLED',
-                        cumulative_filled_quantity=result['filled_quantity'],
-                        average_fill_price=result['average_fill_price'],
-                        exchange_fill_timestamp_ms=result['fill_timestamp_ms'])) !=
-                    result['fill_digest']):
-                raise IntentError('corrupt fill evidence')
-        elif any(result[key] is not None for key in fill_fields):
-            raise IntentError('unexpected fill')
-        return result
+        return _validate_row(result)
 
     def get(self, intent_id: str) -> dict[str, Any]:
         with self._connection() as db:
