@@ -5,7 +5,9 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
+import mexc_order_intent_store as intent_module
 from mexc_order_intent_store import IntentStore, IntentError
 
 
@@ -75,14 +77,19 @@ class IntentStoreTests(unittest.TestCase):
         claimed = self.store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
         self.assertEqual((claimed['state'], claimed['revision'], claimed['attempted_at_ms']),
                          ('SUBMISSION_UNCERTAIN', 1, 1001))
-        self.assertEqual(second.get('intent-1'), claimed)
-        self.assertEqual(second.claim('intent-1', expected_revision=1,
-                                      attempted_at_ms=1001), claimed)
-        for revision, timestamp in ((0, 1001), (1, 1002)):
+        self.assertEqual(claimed['claim_outcome'], 'CLAIM_ACQUIRED')
+        self.assertEqual(second.get('intent-1'),
+                         {k: v for k, v in claimed.items() if k != 'claim_outcome'})
+        for revision in (0, 1):
+            self.assertEqual(second.claim('intent-1', expected_revision=revision,
+                                          attempted_at_ms=1001)['claim_outcome'],
+                             'ALREADY_CLAIMED')
+        for revision, timestamp in ((0, 1002), (1, 1002)):
             with self.assertRaises(IntentError):
                 second.claim('intent-1', expected_revision=revision,
                              attempted_at_ms=timestamp)
-        self.assertEqual(IntentStore(self.path).get('intent-1'), claimed)
+        self.assertEqual(IntentStore(self.path).get('intent-1'),
+                         {k: v for k, v in claimed.items() if k != 'claim_outcome'})
 
     def test_bind_and_separate_confirm_frozen_after_restart(self):
         evidence = self.bound()
@@ -164,12 +171,12 @@ class IntentStoreTests(unittest.TestCase):
         def claim(_):
             try:
                 return IntentStore(self.path).claim('intent-1', expected_revision=0,
-                                                    attempted_at_ms=1001)['state']
+                                                    attempted_at_ms=1001)['claim_outcome']
             except IntentError:
                 return 'BLOCKED'
         with ThreadPoolExecutor(max_workers=2) as pool:
             outcomes = list(pool.map(claim, (0, 1)))
-        self.assertEqual(sorted(outcomes), ['BLOCKED', 'SUBMISSION_UNCERTAIN'])
+        self.assertEqual(sorted(outcomes), ['ALREADY_CLAIMED', 'CLAIM_ACQUIRED'])
         claimed = IntentStore(self.path).get('intent-1')
         self.assertEqual((claimed['revision'], claimed['attempted_at_ms']), (1, 1001))
         evidence = dict(intent_id='intent-1', local_trade_id=17, account_id='account-a',
@@ -289,12 +296,13 @@ class IntentStoreTests(unittest.TestCase):
                 else:
                     variants.pop()
                 for verb in ('INSERT OR REPLACE', 'REPLACE', 'INSERT'):
-                    for values in variants:
-                        if verb == 'INSERT' and values is not variants[0]:
-                            continue
+                    for index, values in enumerate(variants):
                         sql = f'{verb} INTO bot_order_intents ({names}) VALUES ({slots})'
                         if verb == 'INSERT':
-                            sql += (' ON CONFLICT(intent_id) DO UPDATE SET '
+                            key = ('intent_id', 'account_id,venue,external_oid',
+                                   'account_id,venue,strategy_decision_id',
+                                   'account_id,venue,exchange_order_id')[index]
+                            sql += (f' ON CONFLICT({key}) DO UPDATE SET '
                                     'state=excluded.state,revision=excluded.revision')
                         with sqlite3.connect(path) as db:
                             with self.assertRaises(sqlite3.IntegrityError):
@@ -305,6 +313,347 @@ class IntentStoreTests(unittest.TestCase):
                     with self.assertRaises(IntentError):
                         IntentStore(path).claim('intent-1', expected_revision=0,
                                                 attempted_at_ms=1004)
+
+    def test_update_or_replace_cannot_delete_bound_owner(self):
+        binding = self.bound()
+        self.store.bind('intent-1', expected_revision=1, evidence=binding)
+        self.prepare(intent_id='intent-2', local_trade_id=18,
+                     strategy_decision_id='decision-2', external_oid='synthetic-oid-2')
+        self.store.claim('intent-2', expected_revision=0, attempted_at_ms=1001)
+        before = self.path.read_bytes()
+        with sqlite3.connect(self.path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute('''UPDATE OR REPLACE bot_order_intents SET state='BOUND',
+                    revision=2, exchange_order_id='123456', bound_at_ms=1002,
+                    binding_digest=? WHERE intent_id='intent-2' ''', ('a' * 64,))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.store.get('intent-1')['state'], 'BOUND')
+        self.assertEqual(self.store.get('intent-2')['state'], 'SUBMISSION_UNCERTAIN')
+
+    def test_rowid_replace_cannot_delete_existing_owner(self):
+        self.prepare()
+        self.prepare(intent_id='intent-2', local_trade_id=18,
+                     external_oid='synthetic-oid-2', strategy_decision_id='decision-2')
+        with sqlite3.connect(self.path) as db:
+            owner_rowid = db.execute("SELECT rowid FROM bot_order_intents WHERE intent_id='intent-1'").fetchone()[0]
+            competitor_rowid = db.execute("SELECT rowid FROM bot_order_intents WHERE intent_id='intent-2'").fetchone()[0]
+            columns = [row[1] for row in db.execute('PRAGMA table_info(bot_order_intents)')]
+            competitor = dict(zip(columns, db.execute('SELECT ' + ','.join(columns) +
+                                    ' FROM bot_order_intents WHERE intent_id=?', ('intent-2',)).fetchone()))
+            third = competitor | dict(intent_id='intent-3', local_trade_id=19,
+                                      external_oid='synthetic-oid-3',
+                                      strategy_decision_id='decision-3')
+        before = self.path.read_bytes()
+        with sqlite3.connect(self.path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE OR REPLACE bot_order_intents SET rowid=? WHERE intent_id='intent-2'",
+                           (owner_rowid,))
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute('INSERT OR REPLACE INTO bot_order_intents (rowid,' +
+                           ','.join(columns) + ') VALUES (' +
+                           ','.join('?' for _ in range(len(columns)+1)) + ')',
+                           (owner_rowid, *third.values()))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.store.get('intent-1')['state'], 'PREPARED')
+        self.assertEqual(self.store.get('intent-2')['state'], 'PREPARED')
+        self.assertNotEqual(owner_rowid, competitor_rowid)
+
+    def test_update_ownership_attack_matrix_all_states_and_keys(self):
+        states = ('PREPARED', 'SUBMISSION_UNCERTAIN', 'BOUND',
+                  'FILL_CONFIRMED', 'REJECTED', 'CONFLICT')
+        for state in states:
+            with self.subTest(state=state):
+                path = Path(self.tmp.name) / ('update-' + state + '.sqlite')
+                store = IntentStore(path)
+                store.initialize()
+                store.prepare(**self.fields)
+                store.prepare(**(self.fields | dict(intent_id='intent-2', local_trade_id=18,
+                                                    external_oid='synthetic-oid-2',
+                                                    strategy_decision_id='decision-2')))
+                identity = dict(intent_id='intent-1', local_trade_id=17,
+                                account_id='account-a', venue='MEXC_FUTURES',
+                                external_oid='synthetic-oid-1', native_symbol='SUI_USDT',
+                                opening_side='LONG', requested_quantity='44',
+                                exchange_order_id='123456', exchange_timestamp_ms=1002,
+                                status='ACCEPTED')
+                if state != 'PREPARED':
+                    store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+                if state in ('BOUND', 'FILL_CONFIRMED'):
+                    store.bind('intent-1', expected_revision=1, evidence=identity)
+                if state == 'FILL_CONFIRMED':
+                    store.confirm_fill('intent-1', expected_revision=2,
+                                       evidence=identity | dict(status='FILLED',
+                                         cumulative_filled_quantity='44',
+                                         average_fill_price='1.025',
+                                         exchange_fill_timestamp_ms=1003))
+                if state == 'REJECTED':
+                    store.reject('intent-1', expected_revision=1,
+                                 evidence=identity | {'status': 'REJECTED'})
+                if state == 'CONFLICT':
+                    store.mark_conflict('intent-1', expected_revision=1)
+                for target in ('intent_id', 'external_oid', 'strategy_decision_id',
+                               'local_trade_id', 'exchange_order_id'):
+                    if target == 'exchange_order_id' and state not in (
+                            'BOUND', 'FILL_CONFIRMED', 'REJECTED'):
+                        continue
+                    for verb in ('UPDATE', 'UPDATE OR REPLACE'):
+                        with self.subTest(target=target, verb=verb):
+                            before = path.read_bytes()
+                            with sqlite3.connect(path) as db:
+                                rows_before = db.execute(
+                                    'SELECT rowid,* FROM bot_order_intents ORDER BY intent_id').fetchall()
+                            values = tuple(dict(intent_id='intent-1',
+                                external_oid='synthetic-oid-1',
+                                strategy_decision_id='decision-1', local_trade_id=17,
+                                exchange_order_id='123456')[target] for _ in (0,))
+                            assignment = f'{target}=?'
+                            if target == 'exchange_order_id':
+                                assignment += ",state='BOUND',revision=2,bound_at_ms=1002,binding_digest='" + 'a'*64 + "',attempted_at_ms=1001"
+                            with sqlite3.connect(path) as db:
+                                with self.assertRaises(sqlite3.IntegrityError):
+                                    db.execute(f'{verb} bot_order_intents SET {assignment} '
+                                               "WHERE intent_id='intent-2'", values)
+                            self.assertEqual(path.read_bytes(), before)
+                            with sqlite3.connect(path) as db:
+                                self.assertEqual(db.execute(
+                                    'SELECT rowid,* FROM bot_order_intents ORDER BY intent_id').fetchall(),
+                                    rows_before)
+                            self.assertEqual(store.get('intent-1')['state'], state)
+                            self.assertEqual(store.get('intent-2')['state'], 'PREPARED')
+                if state != 'PREPARED':
+                    with self.assertRaises(IntentError):
+                        store.claim('intent-1', expected_revision=0, attempted_at_ms=1004)
+
+    def test_invalid_raw_insert_and_direct_state_jump(self):
+        self.prepare()
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            saved = dict(db.execute('SELECT * FROM bot_order_intents').fetchone())
+        before = self.path.read_bytes()
+        for changes in (dict(state='BOUND', revision=2, attempted_at_ms=1001,
+                             exchange_order_id='123456', bound_at_ms=1002,
+                             binding_digest='a'*64),
+                        dict(requested_quantity='44.0'),
+                        dict(order_price='NaN'),
+                        dict(state='FILL_CONFIRMED', revision=3, attempted_at_ms=1001,
+                             exchange_order_id='123456', bound_at_ms=1002,
+                             binding_digest='a'*64, filled_quantity='43',
+                             average_fill_price='1.025', fill_timestamp_ms=1003,
+                             fill_digest='a'*64)):
+            values = saved | {'intent_id': 'new-' + str(len(changes)),
+                              'external_oid': 'new-' + str(len(changes)),
+                              'strategy_decision_id': 'new-' + str(len(changes)),
+                              'local_trade_id': 99} | changes
+            with self.subTest(changes=changes), sqlite3.connect(self.path) as db:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute('INSERT INTO bot_order_intents (' + ','.join(values) +
+                               ') VALUES (' + ','.join('?' for _ in values) + ')',
+                               tuple(values.values()))
+            self.assertEqual(self.path.read_bytes(), before)
+        with sqlite3.connect(self.path) as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE bot_order_intents SET state='BOUND',revision=2,"
+                           "attempted_at_ms=1001,exchange_order_id='123456',"
+                           "bound_at_ms=1002,binding_digest=? WHERE intent_id='intent-1'",
+                           ('a'*64,))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_invalid_full_fill_evidence_fails_without_sql_mutation(self):
+        evidence = self.bound()
+        self.store.bind('intent-1', expected_revision=1, evidence=evidence)
+        fill = evidence | dict(status='FILLED', cumulative_filled_quantity='44',
+                               average_fill_price='1.025', exchange_fill_timestamp_ms=1003)
+        before = self.path.read_bytes()
+        for change in (dict(cumulative_filled_quantity='43'),
+                       dict(cumulative_filled_quantity='0'),
+                       dict(cumulative_filled_quantity='-1'),
+                       dict(cumulative_filled_quantity='NaN'),
+                       dict(average_fill_price='0'),
+                       dict(average_fill_price='Infinity'),
+                       dict(average_fill_price=1.025),
+                       dict(exchange_fill_timestamp_ms=1001),
+                       dict(exchange_order_id='999999'),
+                       dict(status='UNKNOWN')):
+            with self.subTest(change=change), self.assertRaises(IntentError):
+                self.store.confirm_fill('intent-1', expected_revision=2,
+                                        evidence=fill | change)
+            self.assertEqual(self.path.read_bytes(), before)
+        for quantity, price in (('43', '1.025'), ('0', '1.025'),
+                                ('-1', '1.025'), ('44', 'NaN'),
+                                ('44', '0'), ('44', '1.0')):
+            with self.subTest(quantity=quantity, price=price), sqlite3.connect(self.path) as db:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.execute("UPDATE bot_order_intents SET state='FILL_CONFIRMED',"
+                               "revision=3,filled_quantity=?,average_fill_price=?,"
+                               "fill_timestamp_ms=1003,fill_digest=? WHERE intent_id='intent-1'",
+                               (quantity, price, 'a'*64))
+            self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.store.get('intent-1')['state'], 'BOUND')
+
+    def test_generated_oid_exact_retry_and_changed_input(self):
+        values = {k: v for k, v in self.fields.items() if k != 'external_oid'}
+        with patch.object(intent_module.secrets, 'token_hex', return_value='a'*32) as generate:
+            first = self.store.prepare(**values)
+            self.assertEqual(first['external_oid'], 'a'*32)
+            retry = IntentStore(self.path).prepare(**values | dict(requested_quantity='44.00'))
+            self.assertEqual(retry, first)
+            generate.assert_called_once()
+        with self.assertRaises(IntentError):
+            IntentStore(self.path).prepare(**values | dict(order_price='2'))
+
+    def test_read_time_rejects_corrupt_identity_binding_and_fill(self):
+        for phase, field, value in (('PREPARED', 'intent_digest', '0'*64),
+                                    ('BOUND', 'binding_digest', '0'*64),
+                                    ('FILL_CONFIRMED', 'average_fill_price', '2')):
+            with self.subTest(phase=phase):
+                path = Path(self.tmp.name) / ('corrupt-' + phase + '.sqlite')
+                store = IntentStore(path)
+                store.initialize()
+                store.prepare(**self.fields)
+                evidence = dict(intent_id='intent-1', local_trade_id=17,
+                                account_id='account-a', venue='MEXC_FUTURES',
+                                external_oid='synthetic-oid-1', native_symbol='SUI_USDT',
+                                opening_side='LONG', requested_quantity='44',
+                                exchange_order_id='123456', exchange_timestamp_ms=1002,
+                                status='ACCEPTED')
+                if phase != 'PREPARED':
+                    store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+                    store.bind('intent-1', expected_revision=1, evidence=evidence)
+                if phase == 'FILL_CONFIRMED':
+                    store.confirm_fill('intent-1', expected_revision=2,
+                        evidence=evidence | dict(status='FILLED',
+                            cumulative_filled_quantity='44', average_fill_price='1.025',
+                            exchange_fill_timestamp_ms=1003))
+                # Simulate preexisting on-disk corruption, then restore the exact
+                # schema to isolate read-time validation from schema validation.
+                with sqlite3.connect(path) as db:
+                    trigger = db.execute("SELECT sql FROM sqlite_master WHERE name='bot_intent_immutable'").fetchone()[0]
+                    db.execute('DROP TRIGGER bot_intent_immutable')
+                    db.execute(f'UPDATE bot_order_intents SET {field}=?', (value,))
+                    db.execute(trigger)
+                frozen = path.read_bytes()
+                with self.assertRaises(IntentError):
+                    IntentStore(path).get('intent-1')
+                with self.assertRaises(IntentError):
+                    IntentStore(path).claim('intent-1', expected_revision=0,
+                                             attempted_at_ms=1001)
+                self.assertEqual(path.read_bytes(), frozen)
+
+    def test_schema_contract_rejects_same_name_changed_trigger(self):
+        self.prepare()
+        with sqlite3.connect(self.path) as db:
+            db.execute('DROP TRIGGER bot_intent_immutable')
+            db.execute('CREATE TRIGGER bot_intent_immutable BEFORE UPDATE ON '
+                       'bot_order_intents BEGIN SELECT 1; END')
+        before = self.path.read_bytes()
+        with self.assertRaises(IntentError):
+            IntentStore(self.path).get('intent-1')
+        with self.assertRaises(IntentError):
+            IntentStore(self.path).claim('intent-1', expected_revision=0,
+                                         attempted_at_ms=1001)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_claim_failure_before_or_during_commit_rolls_back(self):
+        self.prepare()
+        before = self.path.read_bytes()
+        original_get = IntentStore._get
+        calls = 0
+        def fail_after_update(db, intent_id):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise IntentError('injected before commit')
+            return original_get(db, intent_id)
+        with patch.object(IntentStore, '_get', staticmethod(fail_after_update)):
+            with self.assertRaises(IntentError):
+                self.store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(IntentStore(self.path).get('intent-1')['state'], 'PREPARED')
+        original_connect = sqlite3.connect
+        class FailCommit(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == 'COMMIT':
+                    raise sqlite3.OperationalError('synthetic commit failure')
+                return super().execute(sql, *args)
+        def connect(*args, **kwargs):
+            return original_connect(*args, **(kwargs | {'factory': FailCommit}))
+        with patch.object(intent_module.sqlite3, 'connect', side_effect=connect):
+            with self.assertRaises(IntentError):
+                self.store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+        self.assertEqual(self.path.read_bytes(), before)
+        acquired = IntentStore(self.path).claim('intent-1', expected_revision=0,
+                                                attempted_at_ms=1001)
+        self.assertEqual(acquired['claim_outcome'], 'CLAIM_ACQUIRED')
+        self.assertEqual(IntentStore(self.path).claim('intent-1', expected_revision=0,
+            attempted_at_ms=1001)['claim_outcome'], 'ALREADY_CLAIMED')
+
+    def test_every_commit_boundary_rolls_back_and_retries_after_restart(self):
+        original_connect = sqlite3.connect
+        original_get = IntentStore._get
+        class FailCommit(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == 'COMMIT':
+                    raise sqlite3.OperationalError('synthetic commit failure')
+                return super().execute(sql, *args)
+        def connect(*args, **kwargs):
+            return original_connect(*args, **(kwargs | {'factory': FailCommit}))
+        for stage in ('PREPARE', 'CLAIM', 'BIND', 'FILL', 'REJECT', 'CONFLICT'):
+            with self.subTest(stage=stage):
+                path = Path(self.tmp.name) / ('failure-' + stage + '.sqlite')
+                store = IntentStore(path)
+                store.initialize()
+                identity = dict(intent_id='intent-1', local_trade_id=17,
+                                account_id='account-a', venue='MEXC_FUTURES',
+                                external_oid='synthetic-oid-1', native_symbol='SUI_USDT',
+                                opening_side='LONG', requested_quantity='44',
+                                exchange_order_id='123456', exchange_timestamp_ms=1002,
+                                status='ACCEPTED')
+                if stage != 'PREPARE':
+                    store.prepare(**self.fields)
+                if stage in ('BIND', 'FILL', 'REJECT'):
+                    store.claim('intent-1', expected_revision=0, attempted_at_ms=1001)
+                if stage == 'FILL':
+                    store.bind('intent-1', expected_revision=1, evidence=identity)
+                def operation():
+                    if stage == 'PREPARE':
+                        return store.prepare(**self.fields)
+                    if stage == 'CLAIM':
+                        return store.claim('intent-1', expected_revision=0,
+                                           attempted_at_ms=1001)
+                    if stage == 'BIND':
+                        return store.bind('intent-1', expected_revision=1,
+                                          evidence=identity)
+                    if stage == 'FILL':
+                        return store.confirm_fill('intent-1', expected_revision=2,
+                            evidence=identity | dict(status='FILLED',
+                                cumulative_filled_quantity='44', average_fill_price='1.025',
+                                exchange_fill_timestamp_ms=1003))
+                    if stage == 'REJECT':
+                        return store.reject('intent-1', expected_revision=1,
+                            evidence=identity | {'status': 'REJECTED'})
+                    return store.mark_conflict('intent-1', expected_revision=0)
+                before = path.read_bytes()
+                calls = 0
+                def fail_before_commit(db, intent_id):
+                    nonlocal calls
+                    calls += 1
+                    if calls == (1 if stage == 'PREPARE' else 2):
+                        raise IntentError('synthetic precommit failure')
+                    return original_get(db, intent_id)
+                with patch.object(IntentStore, '_get', staticmethod(fail_before_commit)):
+                    with self.assertRaises(IntentError):
+                        operation()
+                self.assertEqual(path.read_bytes(), before)
+                with patch.object(intent_module.sqlite3, 'connect', side_effect=connect):
+                    with self.assertRaises(IntentError):
+                        operation()
+                self.assertEqual(path.read_bytes(), before)
+                result = operation()
+                self.assertEqual(result['state'], {'PREPARE':'PREPARED',
+                    'CLAIM':'SUBMISSION_UNCERTAIN', 'BIND':'BOUND',
+                    'FILL':'FILL_CONFIRMED', 'REJECT':'REJECTED',
+                    'CONFLICT':'CONFLICT'}[stage])
+                self.assertEqual(IntentStore(path).get('intent-1')['state'], result['state'])
 
 
 if __name__ == '__main__':
