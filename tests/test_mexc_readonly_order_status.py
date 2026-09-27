@@ -8,7 +8,7 @@ import urllib.request
 from decimal import Decimal
 from unittest.mock import patch
 
-from mexc_readonly_order_status import ReadOnlyMexcOrderStatusAdapter, _GetOnlyTransport, _NoRedirect
+from mexc_readonly_order_status import ReadOnlyMexcOrderStatusAdapter, _GetOnlyTransport, _NoRedirect, _parse_json
 import live_mexc_forward_trader as trader
 
 ORDER_ID = '739106551624717312'
@@ -225,6 +225,48 @@ class AdapterTests(unittest.TestCase):
                     trades = copy.deepcopy(TRADES)
                     trades['data'][0][alias] = value
                     self.assertIsNone(self.adapter(Transport(ORDER, trades)).get_order_status(ORDER_ID, SYMBOL))
+
+    def test_numeric_json_price_quantity_aliases_and_unrelated_fees(self):
+        self.assertIs(type(_parse_json(b'{"success":true,"code":0,"data":{"state":3}}')['data']['state']), int)
+        self.assertIs(type(_parse_json(b'{"success":true,"code":0,"data":{"price":1.0150}}')['data']['price']), Decimal)
+        for token in (b'100.5000000000000000010', b'100500000000000000001e-18'):
+            with self.subTest(order_average=token):
+                raw_order = json.dumps(ORDER).encode().replace(b'"100.500000000000000001"', token)
+                self.assertIsNotNone(self.adapter(Transport(raw_order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        order = copy.deepcopy(ORDER)
+        order['data']['dealAvgPrice'] = '100.500000000000000001'
+        for token in (b'3.0', b'3e0'):
+            with self.subTest(order_quantity=token):
+                raw = json.dumps(order).encode().replace(b'"dealVol": "3"', b'"dealVol": ' + token)
+                self.assertIsNotNone(self.adapter(Transport(raw, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        for token in (b'1.0', b'1e0'):
+            with self.subTest(deal_quantity=token):
+                raw = json.dumps(TRADES).encode().replace(b'"vol": "1"', b'"vol": ' + token)
+                self.assertIsNotNone(self.adapter(Transport(ORDER, raw)).get_order_status(ORDER_ID, SYMBOL))
+        trades = copy.deepcopy(TRADES)
+        trades['data'][0]['trade_price'] = '100.500000000000000000'
+        for token in (b'100.5000000000000000000', b'100500000000000000000e-18'):
+            with self.subTest(deal_price=token):
+                raw = json.dumps(trades).encode().replace(b'"price": "100.500000000000000000"', b'"price": ' + token)
+                self.assertIsNotNone(self.adapter(Transport(ORDER, raw)).get_order_status(ORDER_ID, SYMBOL))
+        raw_order = json.dumps(ORDER).encode().replace(b'"orderId"', b'"takerFee":0.0001,"orderId"')
+        raw_deals = json.dumps(TRADES).encode().replace(b'"id"', b'"makerFee":0.0002,"id"')
+        self.assertIsNotNone(self.adapter(Transport(raw_order, raw_deals)).get_order_status(ORDER_ID, SYMBOL))
+        conflicting_deal = json.dumps(trades).encode().replace(
+            b'"price": "100.500000000000000000"', b'"price": 100.500000000000000001')
+        self.assertIsNone(self.adapter(Transport(ORDER, conflicting_deal)).get_order_status(ORDER_ID, SYMBOL))
+        for token in (b'100.500000000000000002', b'1e101', b'1e999999',
+                      b'1.' + b'0' * 130, b'NaN', b'Infinity', b'-Infinity'):
+            with self.subTest(invalid_price=token):
+                raw = json.dumps(order).encode().replace(b'"dealAvgPriceStr": "100.500000000000000001"',
+                                                        b'"dealAvgPriceStr": ' + token)
+                self.assertIsNone(self.adapter(Transport(raw, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        for token in (b'1e101', b'1e999999', b'1.' + b'0' * 130,
+                      b'9' * 130, b'NaN', b'Infinity', b'-Infinity'):
+            with self.subTest(invalid_unrelated_fee=token):
+                raw = json.dumps(ORDER).encode().replace(b'"orderId"',
+                    b'"takerFee":' + token + b',"orderId"')
+                self.assertIsNone(self.adapter(Transport(raw, TRADES)).get_order_status(ORDER_ID, SYMBOL))
 
     def test_normalized_evidence_integrates_only_through_explicit_gate(self):
         conn = sqlite3.connect(':memory:')

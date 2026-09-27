@@ -201,6 +201,22 @@ def _normalize_evidence(row: Any, *, deal: bool = False,
 def _parse_json(raw: bytes) -> dict[str, Any]:
     if not isinstance(raw, bytes):
         raise ValueError("invalid response")
+    def bounded_decimal(token: str) -> Decimal:
+        # json.loads has already checked JSON number syntax. Bound every
+        # numeric token, including otherwise unused fee and metadata fields.
+        if len(token) > 128:
+            raise ValueError('oversized decimal token')
+        number = Decimal(token)
+        if (not number.is_finite() or len(number.as_tuple().digits) > 100 or
+                abs(number.as_tuple().exponent) > 100):
+            raise ValueError('invalid decimal token')
+        return number
+
+    def bounded_integer(token: str) -> int:
+        if len(token) > 101:
+            raise ValueError('oversized integer token')
+        return int(token)
+
     def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -210,7 +226,7 @@ def _parse_json(raw: bytes) -> dict[str, Any]:
         return result
 
     value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_pairs,
-                       parse_float=lambda _: (_ for _ in ()).throw(ValueError('float evidence')),
+                       parse_float=bounded_decimal, parse_int=bounded_integer,
                        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite")))
     if not isinstance(value, dict) or type(value.get('success')) is not bool or type(value.get('code')) is not int:
         raise ValueError('invalid envelope')

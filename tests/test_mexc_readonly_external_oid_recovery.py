@@ -183,11 +183,41 @@ class RecoveryTests(unittest.TestCase):
             with self.subTest(alias=alias, value=value):
                 adapter, _ = self.adapter(envelope(ROW | {alias: value}))
                 self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
-        for alias, value in (('requested_quantity', 44.0), ('cumulative_filled_quantity', 44.0),
-                             ('average_fill_price', 1.015), ('status', 3.0),
-                             ('update_time', 1761912240000.0)):
+        for alias, value in (('status', 3.0), ('update_time', 1761912240000.0)):
             with self.subTest(equivalent_float=alias):
                 adapter, _ = self.adapter(envelope(ROW | {alias: value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+
+    def test_numeric_tokens_and_unrelated_fee_are_exact_and_bounded(self):
+        for token in (b'1.0150', b'1.01500', b'1015e-3'):
+            with self.subTest(price_token=token):
+                raw = envelope().replace(b'"1.0150"', token)
+                adapter, _ = self.adapter(raw)
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
+        for field, value in (('requested_quantity', 44.0),
+                             ('cumulative_filled_quantity', 44.0),
+                             ('average_fill_price', 1.015)):
+            with self.subTest(numeric_alias=field):
+                adapter, _ = self.adapter(envelope(ROW | {field: value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
+        raw = envelope().replace(b'"orderId"', b'"takerFee":0.0001,"orderId"')
+        adapter, _ = self.adapter(raw)
+        self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
+        for token in (b'44.0', b'44e0'):
+            with self.subTest(requested_token=token):
+                raw = envelope().replace(b'"vol": "44"', b'"vol": ' + token)
+                adapter, _ = self.adapter(raw)
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
+        for token in (b'1.0160', b'1016e-3', b'1e101', b'1e999999',
+                      b'1.' + b'0' * 130, b'NaN', b'Infinity', b'-Infinity'):
+            with self.subTest(invalid_token=token):
+                adapter, _ = self.adapter(envelope().replace(b'"1.0150"', token))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        for token in (b'1e101', b'1e999999', b'1.' + b'0' * 130,
+                      b'9' * 130, b'NaN', b'Infinity', b'-Infinity'):
+            with self.subTest(invalid_unrelated_fee=token):
+                raw = envelope().replace(b'"orderId"', b'"takerFee":' + token + b',"orderId"')
+                adapter, _ = self.adapter(raw)
                 self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
 
     def test_invalid_inputs_missing_credentials_and_transport_errors(self):
