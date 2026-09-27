@@ -8,7 +8,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from mexc_readonly_order_status import (
-    BASE_URL, ReadOnlyMexcExternalOidRecovery, _checked_path, _GetOnlyTransport,
+    BASE_URL, ReadOnlyMexcExternalOidRecovery, _checked_external_path, _ExternalGetOnlyTransport,
 )
 
 
@@ -121,6 +121,33 @@ class RecoveryTests(unittest.TestCase):
             adapter, _ = self.adapter(raw)
             self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
 
+    def test_price_alias_matrix_and_all_economic_alias_conflicts(self):
+        for value in ('2', None, False, 1.5, 'NaN', 'Infinity', '-1', '0', '', 'x'):
+            with self.subTest(value=value):
+                adapter, _ = self.adapter(envelope(ROW | {'dealAvgPrice': value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        for name in ('dealAvgPriceStr', 'dealAvgPrice'):
+            for value in (None, True, 1.5, 'NaN', '-1', '0'):
+                with self.subTest(name=name, value=value):
+                    adapter, _ = self.adapter(envelope(ROW | {name: value}))
+                    self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        adapter, _ = self.adapter(envelope({k: v for k, v in ROW.items()
+                                            if k not in ('dealAvgPriceStr', 'dealAvgPrice')}))
+        self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        for alias, value in (('external_oid', 'other'), ('order_id', '2'),
+                             ('native_symbol', 'ETH_USDT'), ('requested_quantity', '45'),
+                             ('cumulative_filled_quantity', '43'), ('status', 4),
+                             ('update_time', 1761912240001), ('average_fill_price', '2')):
+            with self.subTest(alias=alias):
+                adapter, _ = self.adapter(envelope(ROW | {alias: value}))
+                self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'UNKNOWN')
+        equivalent = ROW | {'external_oid': OID, 'order_id': 123456,
+                            'native_symbol': SYMBOL, 'requested_quantity': '44.000',
+                            'cumulative_filled_quantity': 44, 'status': 3,
+                            'update_time': 1761912240000, 'average_fill_price': '1.01500'}
+        adapter, _ = self.adapter(envelope(equivalent))
+        self.assertEqual(adapter.recover(SYMBOL, OID)['outcome'], 'FULL_FILL')
+
     def test_invalid_inputs_missing_credentials_and_transport_errors(self):
         for symbol, oid in (('SUI/USDT', OID), (SYMBOL, '../cancel'),
                             (SYMBOL, 'a%2Fb'), (SYMBOL, 'x?y=1'),
@@ -145,15 +172,26 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(transport.calls)
 
     def test_only_allowlisted_get_no_redirect_or_order_action(self):
-        self.assertEqual(_checked_path(PATH), PATH)
+        self.assertEqual(_checked_external_path(PATH), PATH)
+        adapter, injected = self.adapter()
+        self.assertFalse(hasattr(adapter, 'get_order_status'))
+        self.assertFalse(hasattr(adapter, '_get'))
+        self.assertFalse(hasattr(adapter, '_raw_get'))
+        for forbidden in ('/api/v1/private/order/get/123456',
+                          '/api/v1/private/order/deal_details/123456'):
+            with self.assertRaises(ValueError):
+                _checked_external_path(forbidden)
+            with self.assertRaises(ValueError):
+                _ExternalGetOnlyTransport().get(BASE_URL + forbidden, {}, 1)
+        self.assertEqual(injected.calls, [])
         for path in (PATH + '/', PATH + '?x=1', PATH.replace('external', 'cancel'),
                      '/api/v1/private/order/submit', '//api/v1/private/order/external/' +
                      SYMBOL + '/' + OID, PATH.replace('SUI_USDT', 'SUI%5FUSDT'),
                      PATH.replace('external', 'EXTERNAL'), 'https://evil.example' + PATH):
             with self.subTest(path=path), self.assertRaises(ValueError):
-                _checked_path(path)
+                _checked_external_path(path)
             with self.assertRaises(ValueError):
-                _GetOnlyTransport().get(BASE_URL + path, {}, 1)
+                _ExternalGetOnlyTransport().get(BASE_URL + path, {}, 1)
         class FakeOpener:
             def open(self, request, timeout):
                 self.request = request
@@ -168,7 +206,7 @@ class RecoveryTests(unittest.TestCase):
             with patch('mexc_readonly_order_status.urllib.request.build_opener',
                        return_value=opener) as build:
                 with self.assertRaises(HTTPError):
-                    _GetOnlyTransport().get(BASE_URL + PATH, {'ApiKey': 'synthetic-key'}, 1)
+                    _ExternalGetOnlyTransport().get(BASE_URL + PATH, {'ApiKey': 'synthetic-key'}, 1)
                 self.assertEqual(opener.request.get_method(), 'GET')
                 self.assertEqual(build.call_count, 1)
                 self.assertEqual(type(build.call_args.args[0]).__name__, '_NoRedirect')

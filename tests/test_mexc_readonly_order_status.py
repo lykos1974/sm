@@ -105,6 +105,18 @@ class AdapterTests(unittest.TestCase):
                 if mutate == 'future': trades['data'][0]['timestamp'] = 200000
                 self.assertIsNone(self.adapter(Transport(ORDER, trades)).get_order_status(ORDER_ID, SYMBOL))
 
+    def test_conflicting_average_price_alias_never_confirms_fill(self):
+        order = copy.deepcopy(ORDER)
+        order['data']['dealAvgPrice'] = '2'
+        transport = Transport(order, TRADES)
+        self.assertIsNone(self.adapter(transport).get_order_status(ORDER_ID, SYMBOL))
+        self.assertEqual(len(transport.calls), 1)
+        for value in (None, False, 1.5, 'NaN', '-1', '0'):
+            order['data']['dealAvgPrice'] = value
+            self.assertIsNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+        order['data']['dealAvgPrice'] = '100.5000000000000000010'
+        self.assertIsNotNone(self.adapter(Transport(order, TRADES)).get_order_status(ORDER_ID, SYMBOL))
+
     def test_normalized_evidence_integrates_only_through_explicit_gate(self):
         conn = sqlite3.connect(':memory:')
         trader.init_live_tables(conn)
@@ -130,6 +142,7 @@ class AdapterTests(unittest.TestCase):
         bad = (
             '/api/v1/private/order/create', '/api/v1/private/order/modify',
             '/api/v1/private/order/cancel', '/api/v1/private/order/cancel_all',
+            '/api/v1/private/order/external/BTC_USDT/synthetic-oid',
             '/api/v1/private/order/get/OTHER', '/api/v1/private/order/get/' + ORDER_ID + '/..',
             '/api/v1/private/order/get/%37' + ORDER_ID[1:],
             '/api/v1/private/order/get/' + ORDER_ID + '?x=1',

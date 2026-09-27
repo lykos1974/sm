@@ -1,7 +1,7 @@
 """Opt-in, read-only MEXC Futures order and deal evidence adapter.
 
-Only three fixed GET endpoint families are reachable. Construction is inert
-unless enabled; no runtime caller enables or instantiates these adapters.
+The legacy order-status adapter and isolated externalOid recovery have separate
+GET path allowlists. Both are inert unless explicitly enabled.
 """
 from __future__ import annotations
 
@@ -28,9 +28,14 @@ _EXTERNAL_PATH = re.compile(
 def _checked_path(path: str) -> str:
     # Full ASCII match rejects traversal, escapes, queries, alternate case,
     # duplicate slashes and absolute or scheme-relative URLs without decoding.
-    if (not isinstance(path, str) or
-            not (_ALLOWED_PATH.fullmatch(path) or _EXTERNAL_PATH.fullmatch(path))):
+    if not isinstance(path, str) or _ALLOWED_PATH.fullmatch(path) is None:
         raise ValueError("order status endpoint not allowed")
+    return path
+
+
+def _checked_external_path(path: str) -> str:
+    if not isinstance(path, str) or _EXTERNAL_PATH.fullmatch(path) is None:
+        raise ValueError('external order endpoint not allowed')
     return path
 
 
@@ -40,17 +45,46 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _read_get(url: str, headers: dict[str, str], timeout: float,
+              check_path: Any) -> bytes:
+    if not isinstance(url, str) or not url.startswith(BASE_URL + '/'):
+        raise ValueError('order status origin not allowed')
+    check_path(url[len(BASE_URL):])
+    request = urllib.request.Request(url, headers=headers, method='GET')
+    # A 3xx is an HTTP error. Authentication headers never reach Location.
+    with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+        if not 200 <= response.status < 300:
+            raise ValueError('order status HTTP failure')
+        return response.read()
+
+
 class _GetOnlyTransport:
     def get(self, url: str, headers: dict[str, str], timeout: float) -> bytes:
-        if not isinstance(url, str) or not url.startswith(BASE_URL + "/"):
-            raise ValueError("order status origin not allowed")
-        _checked_path(url[len(BASE_URL):])
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        # A 3xx is an HTTP error. Authentication headers never reach Location.
-        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
-            if not 200 <= response.status < 300:
-                raise ValueError("order status HTTP failure")
-            return response.read()
+        return _read_get(url, headers, timeout, _checked_path)
+
+
+class _ExternalGetOnlyTransport:
+    def get(self, url: str, headers: dict[str, str], timeout: float) -> bytes:
+        return _read_get(url, headers, timeout, _checked_external_path)
+
+
+def _signed_get(transport: Any, path: str, check_path: Any,
+                key: str, secret: str) -> bytes:
+    check_path(path)  # Refuse unsafe paths before signing or calling transport.
+    timestamp = str(int(time.time() * 1000))  # Authentication, never execution time.
+    signature = hmac.new(secret.encode(), f'{key}{timestamp}'.encode(), hashlib.sha256).hexdigest()
+    headers = {'ApiKey': key, 'Request-Time': timestamp, 'Signature': signature}
+    return transport.get(BASE_URL + path, headers, 15)
+
+
+def _consistent_alias(row: dict[str, Any], names: tuple[str, ...], normalize: Any) -> Any:
+    present = [name for name in names if name in row]
+    if not present:
+        raise ValueError('missing evidence')
+    values = [normalize(row[name]) for name in present]
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError('conflicting evidence aliases')
+    return values[0]
 
 
 def _positive_decimal(value: Any) -> Decimal:
@@ -101,12 +135,7 @@ class ReadOnlyMexcOrderStatusAdapter:
         self._secret = os.environ.get("MEXC_FUTURES_API_SECRET") if enabled else None
 
     def _raw_get(self, path: str) -> bytes:
-        _checked_path(path)
-        timestamp = str(int(time.time() * 1000))  # Authentication time, never fill time.
-        signature = hmac.new(self._secret.encode(),
-                             f"{self._key}{timestamp}".encode(), hashlib.sha256).hexdigest()
-        headers = {"ApiKey": self._key, "Request-Time": timestamp, "Signature": signature}
-        return self._transport.get(BASE_URL + path, headers, 15)
+        return _signed_get(self._transport, path, _checked_path, self._key, self._secret)
 
     def _get(self, path: str) -> dict[str, Any]:
         return _json(self._raw_get(path))
@@ -127,7 +156,8 @@ class ReadOnlyMexcOrderStatusAdapter:
                 return None
             requested = _positive_decimal(order["vol"])
             filled = _positive_decimal(order["dealVol"])
-            price = _positive_decimal(order.get("dealAvgPriceStr", order.get("dealAvgPrice")))
+            price = _consistent_alias(order, ('dealAvgPriceStr', 'dealAvgPrice'),
+                                      _positive_decimal)
             update_time = order["updateTime"]
             if type(update_time) is not int or update_time <= 0:
                 return None
@@ -174,22 +204,22 @@ class ReadOnlyMexcOrderStatusAdapter:
             return None
 
 
-class ReadOnlyMexcExternalOidRecovery(ReadOnlyMexcOrderStatusAdapter):
+class ReadOnlyMexcExternalOidRecovery:
     """Opt-in, single GET lookup. Outcomes never authorize another submission.
 
     updateTime is an exchange order-update timestamp, not a proven fill time.
     The separate deal-details adapter remains necessary to prove execution time.
     """
 
+    def __init__(self, *, enabled: bool = False, transport: Any = None) -> None:
+        self._enabled = enabled
+        self._transport = transport if transport is not None else _ExternalGetOnlyTransport()
+        self._key = os.environ.get('MEXC_FUTURES_API_KEY') if enabled else None
+        self._secret = os.environ.get('MEXC_FUTURES_API_SECRET') if enabled else None
+
     @staticmethod
     def _field(row: dict[str, Any], names: tuple[str, ...], normalize: Any) -> Any:
-        present = [name for name in names if name in row]
-        if not present:
-            raise ValueError('missing evidence')
-        values = [normalize(row[name]) for name in present]
-        if any(value != values[0] for value in values[1:]):
-            raise ValueError('conflicting evidence')
-        return values[0]
+        return _consistent_alias(row, names, normalize)
 
     @staticmethod
     def _decimal(value: Any, *, zero: bool = False) -> Decimal:
@@ -256,7 +286,8 @@ class ReadOnlyMexcExternalOidRecovery(ReadOnlyMexcOrderStatusAdapter):
         path = ('/api/v1/private/order/external/' + quote(symbol, safe='') + '/' +
                 quote(external_oid, safe=''))
         try:
-            raw = self._raw_get(path)
+            raw = _signed_get(self._transport, path, _checked_external_path,
+                              self._key, self._secret)
         except Exception:
             return unavailable
         try:
