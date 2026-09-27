@@ -436,7 +436,7 @@ def _report_chain(report: dict[str, Any]) -> str:
 
 
 def _registry_for_snapshot(prior: dict[str, dict[str, Any]],
-                           records: list[dict[str, Any]], now: int) -> tuple[
+                           records: list[dict[str, Any]], ambiguous: set[int], now: int) -> tuple[
                                dict[str, dict[str, Any]], dict[int, dict[str, Any]],
                                dict[int, str], str]:
     registry = {key: {**value, 'present_in_snapshot': False,
@@ -484,6 +484,12 @@ def _registry_for_snapshot(prior: dict[str, dict[str, Any]],
         if conflict:
             conflicts[binding['trade_id']] = conflict
             registry[conflict]['current_observation_state'] = 'CONFLICTING_EVIDENCE'
+    # Ownership is global to the snapshot. Persist every ambiguous binding
+    # before observation, including rows skipped by a limit or early stop.
+    for trade_id in ambiguous:
+        binding = bindings.get(trade_id)
+        if binding is not None:
+            registry[_digest(binding, {})]['current_observation_state'] = 'CONFLICTING_EVIDENCE'
     return registry, bindings, conflicts, _report_hash(sorted(binding_set))
 
 
@@ -496,11 +502,11 @@ def _adapter_ineligibility(record: dict[str, Any], binding: dict[str, Any] | Non
         return 'CONFLICTING_EVIDENCE', 'LOCAL_BINDING_MUTATION'
     if binding is None:
         return 'INSUFFICIENT_BINDING', None
+    if trade_id in ambiguous:
+        return 'CONFLICTING_EVIDENCE', 'AMBIGUOUS_OWNERSHIP'
     state = registry.get(_digest(binding, {}))
     if state is None or _persisted_conflict(state):
         return 'CONFLICTING_EVIDENCE', 'PERSISTED_BINDING_CONFLICT'
-    if trade_id in ambiguous:
-        return 'CONFLICTING_EVIDENCE', 'AMBIGUOUS_OWNERSHIP'
     if binding['submitted_at_ms'] > now + _SKEW_MS:
         return 'STALE_OR_INVALID_TIMESTAMP', None
     if request_count >= maximum:
@@ -670,7 +676,7 @@ def main(argv: list[str] | None = None, *, adapter: Any = None,
     try:
         supported, records, ambiguous, snapshot = _rows(Path(args.database), args.max_records, now)
         registry, bindings, conflicts, binding_set_digest = _registry_for_snapshot(
-            previous_registry, records if supported else [], now)
+            previous_registry, records if supported else [], ambiguous, now)
         observations = []
         active_adapter = adapter
         request_count = 0

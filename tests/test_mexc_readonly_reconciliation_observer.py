@@ -749,6 +749,76 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(json.loads(retry.read_text())['observations'][0]['classification'],
                          'CONFLICTING_EVIDENCE')
 
+    def test_unobserved_duplicate_ownership_survives_unknown_and_restart(self):
+        for stop_at_middle in (False, True):
+            with self.subTest(stop_at_middle=stop_at_middle):
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute('DELETE FROM live_trades WHERE id > 1')
+                    if stop_at_middle:
+                        conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                                     (2, 'ORDER_SENT', '9002', 'pnf-syn2-1790323251000-S',
+                                      'SUI_USDT', 'SHORT', '44', BINDING[7], 1))
+                        duplicate_ids = (3, 4)
+                    else:
+                        duplicate_ids = (2, 3)
+                    for trade_id in duplicate_ids:
+                        conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                                     (trade_id, 'ORDER_SENT', '9003',
+                                      'pnf-syn9-1790323251000-S', 'SUI_USDT', 'SHORT',
+                                      '44', BINDING[7], 1))
+                unknown = dict(FILL, status='UNKNOWN')
+                first = Path(self.tmp.name) / f'duplicates-first-{stop_at_middle}.json'
+                initial = Adapter([{'success': True, 'data': dict(FILL)}] if stop_at_middle else
+                                  [{'success': True, 'data': unknown}])
+                if stop_at_middle:
+                    initial.responses.append({'success': True, 'data': unknown})
+                self.assertEqual(self.execute(initial, report=first,
+                                              max_records=1 if not stop_at_middle else 2)[0], 0)
+                data = json.loads(first.read_text())
+                self.assertEqual(data['observations'][-1]['classification'],
+                                 'EVIDENCE_UNAVAILABLE')
+                implicated = [entry for entry in data['binding_registry']
+                              if entry['present_in_snapshot'] and entry['binding_digest']
+                              not in {item['binding_digest'] for item in data['observations']}]
+                self.assertEqual(len(implicated), 2)
+                self.assertTrue(all(entry['current_observation_state'] == 'CONFLICTING_EVIDENCE'
+                                    for entry in implicated))
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute('DELETE FROM live_trades WHERE id=?', (duplicate_ids[1],))
+                retry = Path(self.tmp.name) / f'duplicates-retry-{stop_at_middle}.json'
+                valid = Adapter([{'success': True, 'data': dict(FILL)},
+                                 {'success': True, 'data': dict(FILL)}])
+                self.assertEqual(self.execute(valid, report=retry, previous=first,
+                                              max_records=2)[0], 0)
+                retried = json.loads(retry.read_text())
+                self.assertEqual(retried['observations'][-1]['classification'],
+                                 'CONFLICTING_EVIDENCE')
+                self.assertNotIn(('9003', 'SUI_USDT'), valid.calls)
+                self.assertEqual(len(valid.calls), 1 if not stop_at_middle else 2)
+                self.assertTrue(all(entry['current_observation_state'] == 'CONFLICTING_EVIDENCE'
+                                    for entry in retried['binding_registry']
+                                    if entry['binding_digest'] in
+                                    {item['binding_digest'] for item in implicated}))
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute('INSERT INTO live_trades VALUES(?,?,?,?,?,?,?,?,?)',
+                                 (duplicate_ids[1], 'ORDER_SENT', '9003',
+                                  'pnf-syn9-1790323251000-S', 'SUI_USDT', 'SHORT',
+                                  '44', BINDING[7], 1))
+                previous = retry
+                for maximum in (1, 2):
+                    restarted = Path(self.tmp.name) / (f'duplicates-restarted-'
+                                 f'{stop_at_middle}-{maximum}.json')
+                    adapter = Adapter([{'success': True, 'data': dict(FILL)}] * maximum)
+                    self.assertEqual(self.execute(adapter, report=restarted,
+                                                  previous=previous, max_records=maximum)[0], 0)
+                    current = json.loads(restarted.read_text())
+                    self.assertNotIn(('9003', 'SUI_USDT'), adapter.calls)
+                    self.assertTrue(all(entry['current_observation_state'] == 'CONFLICTING_EVIDENCE'
+                                        for entry in current['binding_registry']
+                                        if entry['binding_digest'] in
+                                        {item['binding_digest'] for item in implicated}))
+                    previous = restarted
+
     def test_tampered_registry_fails_before_adapter_and_report_publication(self):
         self.assertEqual(self.execute(Adapter([{'success': True, 'data': dict(FILL)}]))[0], 0)
         for index, mutation in enumerate(('missing', 'duplicate', 'cleared', 'root',
