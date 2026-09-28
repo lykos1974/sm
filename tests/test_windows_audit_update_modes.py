@@ -74,10 +74,61 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
 
     def test_mexc_readonly_adapter_pin_rejects_tampering(self):
         path = self.source / "mexc_readonly_order_status.py"
-        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        original = path.read_bytes()
+        path.write_bytes(original.replace(b"\n", b"\r\n"))
         self.run_mode("Validate")
-        path.write_bytes(path.read_bytes() + b"# altered\n")
+        stale = original.replace(b"parse_float=bounded_decimal, parse_int=bounded_integer",
+                                 b"parse_float=lambda _: None")
+        self.assertNotEqual(stale, original)
+        path.write_bytes(stale)
         self.run_mode("Validate", success=False)
+        path.write_bytes(original + b"# altered\n")
+        self.run_mode("Validate", success=False)
+
+    def test_apply_rejects_stale_adapter_before_backup_or_operator_changes(self):
+        path = self.source / "mexc_readonly_order_status.py"
+        original = path.read_bytes()
+        stale = original.replace(b"parse_float=bounded_decimal, parse_int=bounded_integer",
+                                 b"parse_float=lambda _: None")
+        self.assertNotEqual(stale, original)
+        path.write_bytes(stale)
+        operator = self.target / "operator-created.txt"
+        operator.write_bytes(b"operator bytes\r\n")
+        self.run_mode("Apply", "-ConfirmServicesStopped", success=False)
+        self.assertFalse((self.target / "_audit_update_backups").exists())
+        self.assertFalse((self.target / "mexc_readonly_order_status.py").exists())
+        self.assertEqual(operator.read_bytes(), b"operator bytes\r\n")
+
+    def test_adapter_upgrade_validates_and_restores_exact_bytes_without_operator_changes(self):
+        installed = self.target / "mexc_readonly_order_status.py"
+        previous = b"original adapter bytes\r\n"
+        installed.write_bytes(previous)
+        operator = self.target / "operator-created.txt"
+        operator.write_bytes(b"operator\x00bytes")
+        credentials = self.target / "private.credentials"
+        credentials.write_bytes(b"opaque credentials\r\n")
+        database = self.target / "pnf_mvp/operator.sqlite3"
+        database.write_bytes(b"database\x00bytes")
+        self.run_mode("Validate")
+        self.run_mode("Apply", "-ConfirmServicesStopped")
+        self.assertEqual(installed.read_bytes(), (ROOT / "mexc_readonly_order_status.py").read_bytes())
+        backup = next((self.target / "_audit_update_backups").glob("*/manifest.json"))
+        manifest = json.loads(backup.read_text(encoding="utf-8-sig"))
+        entry = next(item for item in manifest["files"]
+                     if item["relative_path"] == "mexc_readonly_order_status.py")
+        self.assertEqual(manifest["package_source_commit"], "334367cae34f6d5a3febfa53d4de4c7ac777438e")
+        self.assertEqual(entry["expected_sha256"],
+                         "892c5d738d656f7ad7b1738cfbd0c01bcfb1eed2668313651deaabe0272b672f")
+        self.assertEqual((backup.parent / "code/mexc_readonly_order_status.py").read_bytes(), previous)
+        self.assertRegex(backup.parent.name, r"^\d{8}_\d{6}_\d{7}_[0-9a-f]{8}$")
+        self.run_mode("Rollback", "-BackupPath", str(backup.parent), "-ConfirmServicesStopped")
+        self.assertEqual(installed.read_bytes(), previous)
+        for path, expected in ((operator, b"operator\x00bytes"),
+                               (credentials, b"opaque credentials\r\n"),
+                               (database, b"database\x00bytes")):
+            self.assertEqual(path.read_bytes(), expected)
+        self.assertEqual(hashlib.sha256((self.target / "pnf_mvp/settings.json").read_bytes()).hexdigest(),
+                         self.settings_hash)
 
     def test_shadow_check_pin_rejects_stale_and_altered_bytes(self):
         path = self.source / "mexc_readonly_shadow_check.py"
@@ -143,7 +194,7 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         backup = next((self.target / "_audit_update_backups").glob("*/manifest.json"))
         self.assertEqual((backup.parent / "code/mexc_readonly_order_discovery.py").read_bytes(), previous)
         manifest = json.loads(backup.read_text(encoding="utf-8-sig"))
-        self.assertEqual(manifest["package_source_commit"], "f35da9ce2a222fdebdc4f14b14a1dc54e7bc08ef")
+        self.assertEqual(manifest["package_source_commit"], "334367cae34f6d5a3febfa53d4de4c7ac777438e")
         entry = next(item for item in manifest["files"]
                      if item["relative_path"] == "mexc_readonly_order_discovery.py")
         self.assertEqual(entry["expected_sha256"], "bbdd80f88f85ec3f395e4059c8f3e586cec1a57ae32037868b2ba79d2d85a084")
@@ -210,7 +261,7 @@ class WindowsAuditUpdateModeTests(unittest.TestCase):
         backup = next((self.target / "_audit_update_backups").glob("*/manifest.json"))
         self.assertEqual((backup.parent / "code/mexc_readonly_shadow_check.py").read_bytes(), previous)
         manifest = json.loads(backup.read_text(encoding="utf-8-sig"))
-        self.assertEqual(manifest["package_source_commit"], "7f598b670e09576b994dd8b601a79a24a38497f5")
+        self.assertEqual(manifest["package_source_commit"], "334367cae34f6d5a3febfa53d4de4c7ac777438e")
         entry = next(item for item in manifest["files"]
                      if item["relative_path"] == "mexc_readonly_shadow_check.py")
         self.assertEqual(entry["expected_sha256"], "baf6fbe468c0c56a80cc8f2b9a3a6b7b482e129c9b0903ae619ebb229834db54")

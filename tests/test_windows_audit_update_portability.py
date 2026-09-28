@@ -62,11 +62,11 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_all_pinned_files_match_in_lf_and_crlf_forms(self):
         pinned = expected_files(self.script)
         source_commit = package_source_commit(self.script)
-        self.assertEqual(source_commit, "7f598b670e09576b994dd8b601a79a24a38497f5")
+        self.assertEqual(source_commit, "334367cae34f6d5a3febfa53d4de4c7ac777438e")
         self.assertEqual(len(pinned), 14)
         self.assertEqual(pinned["mexc_readonly_order_discovery.py"], "bbdd80f88f85ec3f395e4059c8f3e586cec1a57ae32037868b2ba79d2d85a084")
         self.assertEqual(pinned["mexc_readonly_shadow_check.py"], "baf6fbe468c0c56a80cc8f2b9a3a6b7b482e129c9b0903ae619ebb229834db54")
-        self.assertEqual(pinned["mexc_readonly_order_status.py"], "29e86f65cf40c4047d680b5c8a06701f23663612a187f613b0dec75514c4a1e6")
+        self.assertEqual(pinned["mexc_readonly_order_status.py"], "892c5d738d656f7ad7b1738cfbd0c01bcfb1eed2668313651deaabe0272b672f")
         self.assertEqual(pinned["live_mexc_forward_trader.py"], "844b60cfed374fc665fc91aad9524403536e13fc2229ba44e57a5391a3f71f48")
         self.assertIn("pnf_mvp/app.py", pinned)
         self.assertIn("pnf_mvp/validation_tick_provenance_preflight.py", pinned)
@@ -83,7 +83,6 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_previous_package_hashes_are_preserved(self):
         previous = {
             "live_mexc_forward_trader.py": "844b60cfed374fc665fc91aad9524403536e13fc2229ba44e57a5391a3f71f48",
-            "mexc_readonly_order_status.py": "29e86f65cf40c4047d680b5c8a06701f23663612a187f613b0dec75514c4a1e6",
             "pnf_mvp/app.py": "e6e4686922e38a0c5588c3b44a22be93e751384232740b9fb435cc7cd5b7a6c9",
             "pnf_mvp/pnf_engine.py": "b561484175655da7b2327f5fea24f930ff5eeced7fb0d2344dc5e258894d4e9e",
             "pnf_mvp/storage.py": "7456e19757c557607f5985461f5b34baa628a2069560ded3ac72f276553d7f6e",
@@ -97,7 +96,7 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
         }
         pinned = expected_files(self.script)
         self.assertEqual({key: pinned[key] for key in previous}, previous)
-        self.assertEqual(set(pinned) - set(previous), {"mexc_readonly_order_discovery.py", "mexc_readonly_shadow_check.py"})
+        self.assertEqual(set(pinned) - set(previous), {"mexc_readonly_order_discovery.py", "mexc_readonly_shadow_check.py", "mexc_readonly_order_status.py"})
 
     def test_discovery_source_is_canonical_and_stale_or_modified_bytes_are_rejected(self):
         expected = expected_files(self.script)["mexc_readonly_order_discovery.py"]
@@ -125,9 +124,15 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_adapter_source_is_canonical_and_tampering_is_rejected(self):
         expected = expected_files(self.script)["mexc_readonly_order_status.py"]
         payload = (ROOT / "mexc_readonly_order_status.py").read_bytes()
+        self.assertEqual(expected, "892c5d738d656f7ad7b1738cfbd0c01bcfb1eed2668313651deaabe0272b672f")
         self.assertEqual(canonical_text_sha256(payload), expected)
         self.assertEqual(canonical_text_sha256(payload.replace(b"\n", b"\r\n")), expected)
         self.assertNotEqual(canonical_text_sha256(payload + b"# altered\n"), expected)
+        stale = payload.replace(b"parse_float=bounded_decimal, parse_int=bounded_integer",
+                                b"parse_float=lambda _: None")
+        self.assertNotEqual(stale, payload)
+        self.assertNotEqual(canonical_text_sha256(stale), expected)
+        self.assertNotEqual(expected, "29e86f65cf40c4047d680b5c8a06701f23663612a187f613b0dec75514c4a1e6")
 
     def test_final_runtime_hashes_pass_and_stale_runtime_hashes_fail(self):
         pinned = expected_files(self.script)
@@ -175,6 +180,10 @@ class WindowsAuditUpdatePortabilityTests(TestCase):
     def test_settings_are_preflight_only_and_never_packaged_or_overwritten(self):
         pinned = expected_files(self.script)
         self.assertNotIn("pnf_mvp/settings.json", pinned)
+        self.assertTrue(all(path.endswith((".py", ".json")) for path in pinned))
+        self.assertTrue(all(not any(word in path.lower() for word in
+            ("credential", "secret", "database", "sqlite", "report", "operator", "log"))
+            for path in pinned))
         self.assertNotIn("settings_backup", self.script)
         self.assertNotIn('Destination (Join-Path $Target "pnf_mvp\\settings.json")', self.script)
         self.assertIn("$targetSettings = Assert-SettingsOff $targetSettingsPath", self.script)
