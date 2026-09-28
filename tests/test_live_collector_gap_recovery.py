@@ -128,6 +128,19 @@ class GapRecoveryTests(unittest.TestCase):
                             'missing_local=3' in line and 'recovered=3' in line and
                             'not_returned=0 still_missing=0' in line for line in self.logs))
 
+    def test_competing_writer_is_not_reported_as_remaining_gap(self):
+        self.c.fetch_klines = lambda *a, **kw: [bar(self.end)]
+        insert = self.store.insert_missing_candles
+        def concurrent_insert(rows):
+            self.store.upsert_candle('MEXC_FUT:BTCUSDT', '1m', self.end,
+                                     self.end+59999, 100, 101, 100, 101, 2)
+            return insert(rows)
+        with patch.object(self.store, 'insert_missing_candles', side_effect=concurrent_insert), \
+             patch.object(collector.time, 'time', return_value=self.now):
+            self.c.recover_recent_symbol('BTCUSDT')
+        self.assertEqual(len(self.rows()), 1)
+        self.assertTrue(any('still_missing=0' in line for line in self.logs))
+
     def test_duplicate_keys_and_invalid_numbers_rejected_before_storage(self):
         class Response:
             def __init__(self, body): self.body = body

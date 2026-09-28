@@ -335,11 +335,12 @@ class MexcFuturesCollector(BaseCollector):
             for open_ms in sorted(returned) if open_ms not in present
         ]
         inserted = self.storage.insert_missing_candles(missing)
+        present_after = self.storage.get_candle_open_times(storage_symbol, "1m", first_open, last_open)
         complete = len(returned) == self.recovery_window_minutes and set(returned) == set(
-            range(first_open, last_open + minute_ms, minute_ms))
+            range(first_open, last_open + minute_ms, minute_ms)) and set(returned) <= present_after
         state = "COMPLETE" if complete else "PARTIAL_API_COVERAGE"
         not_returned = self.recovery_window_minutes - len(returned)
-        still_missing = max(0, len(missing) - inserted)
+        still_missing = len(set(returned) - present_after)
         self.logger(f"MEXC_FUT:{raw_symbol} recovery {state} returned={len(returned)} "
                     f"stored_before={len(present)} missing_local={len(missing)} "
                     f"recovered={inserted} not_returned={not_returned} still_missing={still_missing}")
