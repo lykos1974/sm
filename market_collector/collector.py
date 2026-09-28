@@ -1,4 +1,5 @@
 import json
+import math
 import ssl
 import time
 from threading import Event
@@ -213,6 +214,12 @@ class MexcFuturesCollector(BaseCollector):
     exchange_name = "MEXC_FUT"
     default_base_url = "https://api.mexc.com"
     max_kline_limit = 2000
+    recovery_window_minutes = 1440
+    recovery_interval_seconds = 300
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._next_recovery_at: Dict[str, float] = {}
 
     def api_symbol(self, raw_symbol: str) -> str:
         if "_" in raw_symbol:
@@ -242,11 +249,22 @@ class MexcFuturesCollector(BaseCollector):
         url = f"{self.base_url}/api/v1/contract/kline/{api_symbol}?{urlencode(params)}"
         with urlopen(url, context=self.ssl_context, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
-        payload = json.loads(raw)
-        if not isinstance(payload, dict) or not payload.get("success", False):
-            raise RuntimeError(f"{self.exchange_name}: unexpected response for {symbol}: {payload}")
+        def no_duplicate_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate MEXC response key")
+                result[key] = value
+            return result
 
-        data = payload.get("data", {})
+        payload = json.loads(raw, object_pairs_hook=no_duplicate_keys,
+                             parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite MEXC number")))
+        if not isinstance(payload, dict) or payload.get("success") is not True or payload.get("code") != 0:
+            raise ValueError("MEXC candle response rejected")
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("MEXC candle data missing")
         times = data.get("time", [])
         opens = data.get("open", [])
         highs = data.get("high", [])
@@ -254,13 +272,78 @@ class MexcFuturesCollector(BaseCollector):
         closes = data.get("close", [])
         vols = data.get("vol", [])
 
+        arrays = (times, opens, highs, lows, closes, vols)
+        if any(not isinstance(values, list) for values in arrays) or len({len(values) for values in arrays}) != 1:
+            raise ValueError("MEXC candle arrays incomplete")
         result = []
-        for t, o, h, l, c, v in zip(times, opens, highs, lows, closes, vols):
-            open_ms = int(t) * 1000
+        seen = set()
+        for t, o, h, l, c, v in zip(*arrays):
+            if type(t) is not int or t <= 0 or t % 60 or t in seen:
+                raise ValueError("MEXC candle timestamp invalid")
+            seen.add(t)
+            if any(type(x) not in (int, float, str) for x in (o, h, l, c, v)):
+                raise ValueError("MEXC candle number type invalid")
+            try:
+                prices = tuple(float(x) for x in (o, h, l, c, v))
+            except (ValueError, OverflowError) as exc:
+                raise ValueError("MEXC candle number invalid") from exc
+            op, hi, lo, cl, vol = prices
+            if (not all(math.isfinite(x) for x in prices) or min(op, hi, lo, cl) <= 0
+                    or vol < 0 or lo > min(op, cl) or hi < max(op, cl)):
+                raise ValueError("MEXC candle OHLCV invalid")
+            open_ms = t * 1000
             close_ms = open_ms + interval_to_ms("1m") - 1
-            result.append([open_ms, o, h, l, c, v, close_ms])
+            result.append([open_ms, op, hi, lo, cl, vol, close_ms])
 
+        result.sort(key=lambda row: row[0])
         return result[-min(limit, self.max_kline_limit):]
+
+    def recover_recent_symbol(self, raw_symbol: str) -> None:
+        """Reconcile returned closed MEXC candles against the last 24 hours."""
+        now = time.time()
+        if now < self._next_recovery_at.get(raw_symbol, 0):
+            return
+        cutoff_ms = int(now * 1000) - self.closed_candle_grace_ms
+        minute_ms = interval_to_ms("1m")
+        last_open = ((cutoff_ms + 1) // minute_ms) * minute_ms - minute_ms
+        if last_open < (self.recovery_window_minutes - 1) * minute_ms:
+            return
+        first_open = last_open - (self.recovery_window_minutes - 1) * minute_ms
+        candles = self.fetch_klines(raw_symbol, limit=self.recovery_window_minutes,
+                                    start_time=first_open // 1000, end_time=last_open // 1000)
+        if not candles:
+            self.logger(f"MEXC_FUT:{raw_symbol} recovery UNAVAILABLE returned=0")
+            return
+        returned = {}
+        for candle in candles:
+            open_ms = int(candle[0])
+            if open_ms < first_open or open_ms > last_open or open_ms % minute_ms or open_ms in returned:
+                raise ValueError("MEXC recovery candle identity invalid")
+            if int(candle[6]) != open_ms + minute_ms - 1:
+                raise ValueError("MEXC recovery close time invalid")
+            prices = tuple(float(x) for x in candle[1:6])
+            op, hi, lo, cl, vol = prices
+            if (len(candle) != 7 or not all(math.isfinite(x) for x in prices)
+                    or min(op, hi, lo, cl) <= 0 or vol < 0
+                    or lo > min(op, cl) or hi < max(op, cl)):
+                raise ValueError("MEXC recovery OHLCV invalid")
+            returned[open_ms] = (op, hi, lo, cl, vol)
+        storage_symbol = self.storage_symbol(raw_symbol)
+        present = self.storage.get_candle_open_times(storage_symbol, "1m", first_open, last_open)
+        missing = [
+            (storage_symbol, "1m", open_ms, open_ms + minute_ms - 1, *returned[open_ms])
+            for open_ms in sorted(returned) if open_ms not in present
+        ]
+        inserted = self.storage.insert_missing_candles(missing)
+        complete = len(returned) == self.recovery_window_minutes and set(returned) == set(
+            range(first_open, last_open + minute_ms, minute_ms))
+        state = "COMPLETE" if complete else "PARTIAL_API_COVERAGE"
+        not_returned = self.recovery_window_minutes - len(returned)
+        still_missing = max(0, len(missing) - inserted)
+        self.logger(f"MEXC_FUT:{raw_symbol} recovery {state} returned={len(returned)} "
+                    f"stored_before={len(present)} missing_local={len(missing)} "
+                    f"recovered={inserted} not_returned={not_returned} still_missing={still_missing}")
+        self._next_recovery_at[raw_symbol] = now + self.recovery_interval_seconds
 
     def bootstrap_symbol(self, raw_symbol: str, bootstrap_bars: int):
         cutoff_ms = int(time.time() * 1000) - self.closed_candle_grace_ms
@@ -347,6 +430,8 @@ class MexcFuturesCollector(BaseCollector):
         self.logger(
             f"{self.exchange_name}:{raw_symbol} updated ({inserted} rows, last={latest_close_price}, key={storage_symbol})"
         )
+
+        self.recover_recent_symbol(raw_symbol)
 
 
 def build_collectors(config: dict, storage: Storage, logger: Callable[[str], None]):

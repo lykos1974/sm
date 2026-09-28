@@ -83,6 +83,31 @@ class Storage:
                 """, (symbol, interval, open_time, close_time, open_price, high, low, close, volume))
                 conn.commit()
 
+    def get_candle_open_times(self, symbol: str, interval: str, first_open: int, last_open: int) -> set[int]:
+        with self._connect() as conn:
+            return {int(row[0]) for row in conn.execute(
+                "SELECT open_time FROM candles WHERE symbol=? AND interval=? "
+                "AND open_time>=? AND open_time<=?",
+                (symbol, interval, first_open, last_open),
+            )}
+
+    def insert_missing_candles(self, rows: list[tuple]) -> int:
+        """Insert verified missing candles together; never overwrite an existing row."""
+        if not rows:
+            return 0
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                before = conn.total_changes
+                conn.executemany(
+                    "INSERT INTO candles(symbol,interval,open_time,close_time,open,high,low,close,volume) "
+                    "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(symbol,interval,open_time) DO NOTHING",
+                    rows,
+                )
+                inserted = conn.total_changes - before
+                conn.commit()
+                return inserted
+
     def save_collector_state(
         self,
         symbol: str,
