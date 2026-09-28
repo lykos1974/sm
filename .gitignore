@@ -1,2 +1,5 @@
 
 mexc_credentials.json
+__pycache__/
+*.py[cod]
+market_collector/microstructure_btcusdt.db*

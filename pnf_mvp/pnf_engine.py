@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
@@ -57,7 +58,7 @@ class PnFEngine:
         return {
             "last_price": self.last_price,
             "columns": [asdict(c) for c in self.columns[-500:]],
-            "signals": self.signals[-100:],
+            "signals": copy.deepcopy(self.signals[-100:]),
         }
 
     def _current_column(self) -> Optional[PnFColumn]:

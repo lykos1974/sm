@@ -240,12 +240,16 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
             side TEXT NOT NULL,
             entry_time INTEGER NOT NULL,
             entry_price REAL NOT NULL,
+            signal_entry_price TEXT,
+            execution_entry_price TEXT,
             stop_price REAL NOT NULL,
             tp1_price REAL NOT NULL,
             tp2_price REAL NOT NULL,
             notional_usdt REAL NOT NULL,
             exchange_order_id TEXT,
             status TEXT NOT NULL,
+            confirmed_fill_ts INTEGER,
+            raw_fill_evidence TEXT,
             exit_time INTEGER,
             exit_price REAL,
             realized_r REAL,
@@ -264,6 +268,13 @@ def init_live_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    if "confirmed_fill_ts" not in {row[1] for row in conn.execute("PRAGMA table_info(live_trades)")}:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN confirmed_fill_ts INTEGER")
+    if "raw_fill_evidence" not in {row[1] for row in conn.execute("PRAGMA table_info(live_trades)")}:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN raw_fill_evidence TEXT")
+    for column in ("signal_entry_price", "execution_entry_price"):
+        if column not in {row[1] for row in conn.execute("PRAGMA table_info(live_trades)")}:
+            conn.execute(f"ALTER TABLE live_trades ADD COLUMN {column} TEXT")
     conn.commit()
 
 
@@ -561,16 +572,82 @@ def build_reduce_only_close_order(
     )
 
 
+def reconcile_exchange_fills(conn: sqlite3.Connection, adapter: Any, *, enabled: bool = False) -> int:
+    """Opt-in, offline-capable reconciliation; adapter supplies authoritative order status.
+
+    No exchange client is constructed here. An adapter must expose
+    get_order_status(exchange_order_id, native_symbol). Invalid evidence leaves
+    the submitted order pending for operator investigation.
+    """
+    if not enabled:
+        return 0
+    rows = conn.execute(
+        """SELECT id, symbol, side, exchange_order_id, raw_order_response, entry_price
+           FROM live_trades WHERE status = 'ORDER_SENT' AND confirmed_fill_ts IS NULL"""
+    ).fetchall()
+    updated = 0
+    for trade_id, symbol, side, order_id, raw_request, signal_price in rows:
+        try:
+            if not isinstance(order_id, str) or not order_id or side not in {'LONG', 'SHORT'}:
+                continue
+            request = json.loads(raw_request)['order_request']
+            native_symbol = mexc_contract_symbol(symbol)
+            expected_side = 1 if side == 'LONG' else 3
+            requested = _dec(request['vol'])
+            if (request['symbol'] != native_symbol or type(request['side']) is not int
+                    or request['side'] != expected_side or not requested.is_finite() or requested <= 0):
+                continue
+            response = adapter.get_order_status(order_id, native_symbol)
+            if not isinstance(response, dict) or response.get('success') is not True:
+                continue
+            data = response['data']
+            if not isinstance(data, dict) or data['status'] != 'FILLED':
+                continue
+            fill_ts = data['exchange_fill_timestamp']
+            price = _dec(data['average_fill_price'])
+            exchange_requested = _dec(data['requested_quantity'])
+            filled = _dec(data['cumulative_filled_quantity'])
+            if (data['exchange_order_id'] != order_id or data['symbol'] != native_symbol
+                    or type(data['side']) is not int or data['side'] != expected_side
+                    or not exchange_requested.is_finite() or exchange_requested != requested
+                    or not filled.is_finite() or filled != requested
+                    or not price.is_finite() or price <= 0
+                    or type(fill_ts) is not int or fill_ts <= 0):
+                continue
+            evidence = json.dumps(response, sort_keys=True, allow_nan=False)
+        except Exception:
+            # Includes adapter timeout/API errors and malformed/missing response fields.
+            continue
+        with conn:
+            cursor = conn.execute(
+                """UPDATE live_trades SET status = 'FILLED', confirmed_fill_ts = ?, raw_fill_evidence = ?,
+                     signal_entry_price = ?, execution_entry_price = ?, entry_price = ?
+                   WHERE id = ? AND status = 'ORDER_SENT' AND confirmed_fill_ts IS NULL
+                     AND raw_fill_evidence IS NULL AND execution_entry_price IS NULL""",
+                (fill_ts, evidence, str(signal_price), str(price), float(price), trade_id),
+            )
+        updated += cursor.rowcount
+    return updated
+
+
 def update_open_trade_exits(conn: sqlite3.Connection, client: MexcFuturesClient, *, live_enabled: bool) -> None:
     rows = conn.execute(
         """
-        SELECT id, symbol, side, entry_time, entry_price, stop_price, tp1_price, tp2_price, raw_order_response
+        SELECT id, symbol, side, confirmed_fill_ts, execution_entry_price, stop_price, tp1_price, tp2_price, raw_order_response, raw_fill_evidence
         FROM live_trades
-        WHERE status IN ('OPEN','ORDER_SENT','POSITION_OPEN','EXIT_PENDING')
+        WHERE status IN ('FILLED','OPEN_POSITION')
         """
     ).fetchall()
     for row in rows:
-        trade_id, symbol, side, entry_time, entry, stop, _tp1, tp2, raw_order_response = row
+        trade_id, symbol, side, fill_ts, entry, stop, _tp1, tp2, raw_order_response, fill_evidence = row
+        if type(fill_ts) is not int or fill_ts <= 0 or not fill_evidence:
+            continue
+        try:
+            entry_decimal = Decimal(entry)
+            if not entry_decimal.is_finite() or entry_decimal <= 0:
+                continue
+        except (TypeError, InvalidOperation):
+            continue
         candles = conn.execute(
             """
             SELECT close_time, high, low
@@ -578,27 +655,28 @@ def update_open_trade_exits(conn: sqlite3.Connection, client: MexcFuturesClient,
             WHERE symbol = ? AND interval = '1m' AND close_time > ?
             ORDER BY close_time ASC
             """,
-            (symbol, int(entry_time)),
+            (symbol, fill_ts + 60000),
         ).fetchall()
         for close_time, high, low in candles:
             exit_price = None
             if side == "LONG":
-                if float(low) <= float(stop):
+                if Decimal(str(low)) <= Decimal(str(stop)):
                     exit_price = Decimal(str(stop))
-                elif float(high) >= float(tp2):
+                elif Decimal(str(high)) >= Decimal(str(tp2)):
                     exit_price = Decimal(str(tp2))
             else:
-                if float(high) >= float(stop):
+                if Decimal(str(high)) >= Decimal(str(stop)):
                     exit_price = Decimal(str(stop))
-                elif float(low) <= float(tp2):
+                elif Decimal(str(low)) <= Decimal(str(tp2)):
                     exit_price = Decimal(str(tp2))
             if exit_price is None:
                 continue
 
-            denom = abs(float(entry) - float(stop))
-            realized_r = 0.0 if denom == 0 else (
-                (float(exit_price) - float(entry)) / denom if side == "LONG" else (float(entry) - float(exit_price)) / denom
-            )
+            denominator = abs(entry_decimal - Decimal(str(stop)))
+            if denominator == 0:
+                continue
+            realized_r = float((exit_price - entry_decimal) / denominator if side == "LONG"
+                               else (entry_decimal - exit_price) / denominator)
             if not live_enabled:
                 conn.execute(
                     """
