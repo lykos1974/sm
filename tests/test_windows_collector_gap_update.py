@@ -31,6 +31,14 @@ class CollectorPackageManifestTests(unittest.TestCase):
         for marker in ("Assert-Package $source", "Hash-File (Join-Path $target $name)", "manifest.json", "-ConfirmServicesStopped"):
             self.assertIn(marker, content)
 
+    def test_documented_app_launch_is_detected(self):
+        content = SCRIPT.read_text(encoding="utf-8")
+        expression = re.search(r"\$_\.CommandLine -match '([^']+)'", content).group(1)
+        self.assertIsNotNone(re.search(expression, r'C:\Python311\python.exe app.py'))
+        self.assertIsNotNone(re.search(expression, r'python "H:\pnf screener\market_collector\app.py"'))
+        self.assertIsNone(re.search(expression, 'python another_app.py'))
+        self.assertIn('$null -eq $_.CommandLine', content)
+
 
 @unittest.skipUnless(PS, "PowerShell unavailable; Windows mode tests require PowerShell")
 class CollectorPackageModeTests(unittest.TestCase):

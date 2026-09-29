@@ -57,10 +57,15 @@ function Replace-File([string]$Staged, [string]$Destination, [string]$BackupDire
 
 function Assert-Idle {
     if (-not $ConfirmServicesStopped) { throw 'Stop collector and scanner first; pass -ConfirmServicesStopped.' }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
+        -not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        throw 'Cannot verify collector processes.'
+    }
     if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         $active = @(Get-CimInstance Win32_Process | Where-Object {
-            $_.Name -match '^(python|pythonw)(\.exe)?$' -and
-            $_.CommandLine -match 'market_collector[\\/](collector|app)\.py'
+            $_.Name -match '^(python|pythonw|py)(\.exe)?$' -and
+            ($null -eq $_.CommandLine -or
+             $_.CommandLine -match '(?i)(?:^|[^A-Za-z0-9_])(?:app|collector)\.py(?:$|[^A-Za-z0-9_.])')
         })
         if ($active.Count -gt 0) { throw 'Collector process is running.' }
     }
