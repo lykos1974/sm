@@ -63,10 +63,12 @@ if (-not $TargetRoot) { throw 'TargetRoot is required.' }
 $target = [IO.Path]::GetFullPath($TargetRoot)
 if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw 'Target directory missing.' }
 
-if (-not $SourceRoot) { throw 'SourceRoot is required.' }
-$source = [IO.Path]::GetFullPath($SourceRoot)
-if ($source -eq $target) { throw 'Source and target must differ.' }
-Assert-Package $source
+if ($Mode -ne 'Rollback') {
+    if (-not $SourceRoot) { throw 'SourceRoot is required.' }
+    $source = [IO.Path]::GetFullPath($SourceRoot)
+    if ($source -eq $target) { throw 'Source and target must differ.' }
+    Assert-Package $source
+}
 
 if ($Mode -eq 'Validate') { Write-Output 'PACKAGE_VALID'; return }
 Assert-Idle
@@ -85,7 +87,6 @@ if ($Mode -eq 'Apply') {
     }
     $backup = Join-Path $backupRoot ((Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss_fffffff') + '_' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $backup -ErrorAction Stop | Out-Null
-    $installed = @()
     try {
         foreach ($name in $Expected.Keys) {
             [IO.File]::Copy((Join-Path $target $name), (Join-Path $backup $name), $false)
@@ -95,15 +96,23 @@ if ($Mode -eq 'Apply') {
         $manifestText = ConvertTo-Json -InputObject $manifest -Depth 5
         [IO.File]::WriteAllText((Join-Path $backup 'manifest.json'), $manifestText, [Text.UTF8Encoding]::new($false))
         foreach ($name in $Expected.Keys) {
-            $installed += $name
-            [IO.File]::WriteAllBytes((Join-Path $target $name), (Canonical-Bytes (Join-Path $source $name)))
+            $staged = Join-Path $backup ("package_" + $name)
+            [IO.File]::WriteAllBytes($staged, (Canonical-Bytes (Join-Path $source $name)))
+            if ((Hash-File $staged) -ne $Expected[$name]) { throw "Staged hash mismatch: $name" }
+        }
+        foreach ($name in $Expected.Keys) {
+            [IO.File]::Replace((Join-Path $backup ("package_" + $name)), (Join-Path $target $name), $null)
             if ((Hash-File (Join-Path $target $name)) -ne $Expected[$name]) { throw "Installed hash mismatch: $name" }
         }
     }
     catch {
-        foreach ($name in $installed) {
-            [IO.File]::Copy((Join-Path $backup $name), (Join-Path $target $name), $true)
-            if ((Hash-File (Join-Path $target $name)) -ne $before[$name]) { throw 'Apply failed and automatic restore failed.' }
+        foreach ($name in $Expected.Keys) {
+            if ((Hash-File (Join-Path $target $name)) -ne $before[$name]) {
+                $restore = Join-Path $backup ("restore_" + $name)
+                [IO.File]::Copy((Join-Path $backup $name), $restore, $true)
+                [IO.File]::Replace($restore, (Join-Path $target $name), $null)
+                if ((Hash-File (Join-Path $target $name)) -ne $before[$name]) { throw 'Apply failed and automatic restore failed.' }
+            }
         }
         throw
     }
@@ -122,21 +131,17 @@ foreach ($name in $Expected.Keys) {
     Assert-RegularFile (Join-Path $backup $name)
     Assert-RegularFile (Join-Path $target $name)
     if ((Hash-File (Join-Path $backup $name)) -ne $manifest.original.$name) { throw 'Backup bytes mismatch.' }
-    if ((Hash-File (Join-Path $target $name)) -ne $Expected[$name]) { throw 'Installed bytes changed since Apply.' }
+    $currentHash = Hash-File (Join-Path $target $name)
+    if ($currentHash -ne $Expected[$name] -and $currentHash -ne $manifest.original.$name) {
+        throw 'Installed bytes changed outside Apply/Rollback.'
+    }
 }
-$restored = @()
-try {
-    foreach ($name in $Expected.Keys) {
-        $restored += $name
-        [IO.File]::Copy((Join-Path $backup $name), (Join-Path $target $name), $true)
+foreach ($name in $Expected.Keys) {
+    if ((Hash-File (Join-Path $target $name)) -ne $manifest.original.$name) {
+        $restore = Join-Path $backup ("restore_" + $name)
+        [IO.File]::Copy((Join-Path $backup $name), $restore, $true)
+        [IO.File]::Replace($restore, (Join-Path $target $name), $null)
         if ((Hash-File (Join-Path $target $name)) -ne $manifest.original.$name) { throw 'Rollback verification failed.' }
     }
-}
-catch {
-    foreach ($name in $restored) {
-        [IO.File]::WriteAllBytes((Join-Path $target $name), (Canonical-Bytes (Join-Path $source $name)))
-        if ((Hash-File (Join-Path $target $name)) -ne $Expected[$name]) { throw 'Rollback failed and installed-byte restoration failed.' }
-    }
-    throw
 }
 Write-Output 'ROLLED_BACK'

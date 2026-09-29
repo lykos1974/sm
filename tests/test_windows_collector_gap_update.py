@@ -93,6 +93,25 @@ class CollectorPackageModeTests(unittest.TestCase):
         self.run_mode("Apply", success=False)
         self.assertEqual((self.target / "collector.py").read_bytes(), b"old collector.py")
 
+    def test_rollback_without_source_after_interrupted_two_file_apply(self):
+        output = self.run_mode("Apply", "-ConfirmServicesStopped")
+        backup = output.strip().split("BACKUP=", 1)[1]
+        # Atomic per-file replacement can be interrupted between the two files.
+        (self.target / "storage.py").write_bytes(b"old storage.py")
+        shutil.rmtree(self.source)
+        self.run_mode("Rollback", "-BackupPath", backup, "-ConfirmServicesStopped")
+        self.assertEqual((self.target / "collector.py").read_bytes(), b"old collector.py")
+        self.assertEqual((self.target / "storage.py").read_bytes(), b"old storage.py")
+        self.check_operator_bytes()
+
+    def test_rollback_refuses_unrelated_target_edit(self):
+        output = self.run_mode("Apply", "-ConfirmServicesStopped")
+        backup = output.strip().split("BACKUP=", 1)[1]
+        (self.target / "collector.py").write_bytes(b"operator edit")
+        self.run_mode("Rollback", "-BackupPath", backup, "-ConfirmServicesStopped", success=False)
+        self.assertEqual((self.target / "collector.py").read_bytes(), b"operator edit")
+        self.check_operator_bytes()
+
 
 if __name__ == "__main__":
     unittest.main()
