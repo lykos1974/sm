@@ -18,6 +18,21 @@ function Hash-File([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Canonical-Bytes([string]$Path) {
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $content = $utf8.GetString([IO.File]::ReadAllBytes($Path))
+    if ($content.Contains("`r") -and -not $content.Contains("`r`n")) { throw 'Unsupported line endings.' }
+    $normalized = $content.Replace("`r`n", "`n")
+    if ($normalized.Contains("`r")) { throw 'Unsupported line endings.' }
+    return ,$utf8.GetBytes($normalized)
+}
+
+function Hash-Bytes([byte[]]$Bytes) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hasher.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+}
+
 function Assert-RegularFile([string]$Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -29,7 +44,7 @@ function Assert-Package([string]$Root) {
     foreach ($entry in $Expected.GetEnumerator()) {
         $path = Join-Path $Root $entry.Key
         Assert-RegularFile $path
-        if ((Hash-File $path) -ne $entry.Value) { throw "Package hash mismatch: $($entry.Key)" }
+        if ((Hash-Bytes (Canonical-Bytes $path)) -ne $entry.Value) { throw "Package hash mismatch: $($entry.Key)" }
     }
 }
 
@@ -81,7 +96,7 @@ if ($Mode -eq 'Apply') {
         [IO.File]::WriteAllText((Join-Path $backup 'manifest.json'), $manifestText, [Text.UTF8Encoding]::new($false))
         foreach ($name in $Expected.Keys) {
             $installed += $name
-            [IO.File]::Copy((Join-Path $source $name), (Join-Path $target $name), $true)
+            [IO.File]::WriteAllBytes((Join-Path $target $name), (Canonical-Bytes (Join-Path $source $name)))
             if ((Hash-File (Join-Path $target $name)) -ne $Expected[$name]) { throw "Installed hash mismatch: $name" }
         }
     }
@@ -119,7 +134,7 @@ try {
 }
 catch {
     foreach ($name in $restored) {
-        [IO.File]::Copy((Join-Path $source $name), (Join-Path $target $name), $true)
+        [IO.File]::WriteAllBytes((Join-Path $target $name), (Canonical-Bytes (Join-Path $source $name)))
         if ((Hash-File (Join-Path $target $name)) -ne $Expected[$name]) { throw 'Rollback failed and installed-byte restoration failed.' }
     }
     throw

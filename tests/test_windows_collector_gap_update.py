@@ -22,8 +22,7 @@ class CollectorPackageManifestTests(unittest.TestCase):
         self.assertEqual(set(pins), {"collector.py", "storage.py"})
         for name, expected in pins.items():
             raw = (PACKAGE / name).read_bytes()
-            self.assertNotIn(b"\r", raw)
-            self.assertEqual(hashlib.sha256(raw).hexdigest(), expected)
+            self.assertEqual(hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest(), expected)
 
     def test_scope_and_no_process_start(self):
         content = SCRIPT.read_text(encoding="utf-8")
@@ -43,7 +42,8 @@ class CollectorPackageModeTests(unittest.TestCase):
         self.source.mkdir()
         self.target.mkdir()
         for name in ("collector.py", "storage.py"):
-            (self.source / name).write_bytes((PACKAGE / name).read_bytes())
+            canonical = (PACKAGE / name).read_bytes().replace(b"\r\n", b"\n")
+            (self.source / name).write_bytes(canonical.replace(b"\n", b"\r\n"))
             (self.target / name).write_bytes(("old " + name).encode())
         self.operator = {
             "settings.json": b'{"operator":true}',
@@ -75,7 +75,7 @@ class CollectorPackageModeTests(unittest.TestCase):
         output = self.run_mode("Apply", "-ConfirmServicesStopped")
         backup = output.strip().split("BACKUP=", 1)[1]
         for name in originals:
-            self.assertEqual((self.target / name).read_bytes(), (self.source / name).read_bytes())
+            self.assertEqual((self.target / name).read_bytes(), (self.source / name).read_bytes().replace(b"\r\n", b"\n"))
         self.check_operator_bytes()
         self.run_mode("Rollback", "-BackupPath", backup, "-ConfirmServicesStopped")
         for name, data in originals.items():
