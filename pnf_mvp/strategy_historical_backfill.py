@@ -30,6 +30,24 @@ if TYPE_CHECKING:
     from research_v2.structure_validation.incremental_structure_state import IncrementalStructureState
 
 VALIDATION_ELIGIBLE_STATUSES = {"CANDIDATE", "WATCH"}
+
+
+def research_long_baseline_eligible(setup: Dict[str, Any], structure: Dict[str, Any]) -> bool:
+    """Fail-closed research gate, evaluated before any validation registration."""
+    if not isinstance(setup, dict) or not isinstance(structure, dict):
+        return False
+    return (
+        setup.get("side") == "LONG"
+        and setup.get("status") == "CANDIDATE"
+        and type(setup.get("is_baseline_profile_match")) is int
+        and setup["is_baseline_profile_match"] == 1
+        and setup.get("pullback_quality") == "HEALTHY"
+        and structure.get("breakout_context") == "POST_BREAKOUT_PULLBACK"
+        and type(structure.get("active_leg_boxes")) is int
+        and structure["active_leg_boxes"] == 2
+        and structure.get("is_extended_move") in (False, 0)
+        and type(structure.get("is_extended_move")) in (bool, int)
+    )
 OPTIONAL_DIAGNOSTIC_SETUP_FIELDS = {
     "continuation_strength_v1",
     "cs_geometry_component",
@@ -785,6 +803,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Historical validation backfill for strategy_validation.db")
     parser.add_argument("--settings", default="settings.json")
     parser.add_argument("--symbols", default=None)
+    parser.add_argument(
+        "--research-long-baseline-only", action="store_true",
+        help="Research-only: register only protected-profile LONG candidates before validation state is touched",
+    )
     parser.add_argument("--reset-validation-db", action="store_true")
     parser.add_argument(
         "--funnel-csv",
@@ -1140,6 +1162,8 @@ def main() -> None:
 
             setups = [s for s in (setup_map.get("LONG"), setup_map.get("SHORT")) if s]
             symbol_perf["setups_evaluated"] += len(setups)
+            if args.research_long_baseline_only:
+                setups = [s for s in setups if research_long_baseline_eligible(s, structure)]
 
             for setup in setups:
                 status = str(setup.get("status") or "").upper()
