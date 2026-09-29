@@ -48,6 +48,13 @@ function Assert-Package([string]$Root) {
     }
 }
 
+function Replace-File([string]$Staged, [string]$Destination, [string]$BackupDirectory) {
+    # Windows PowerShell/.NET may reject a null backup path for File.Replace.
+    $displaced = Join-Path $BackupDirectory ('displaced_' + [guid]::NewGuid().ToString('N'))
+    [IO.File]::Replace($Staged, $Destination, $displaced)
+    try { [IO.File]::Delete($displaced) } catch { } # A leftover remains inside the backup only.
+}
+
 function Assert-Idle {
     if (-not $ConfirmServicesStopped) { throw 'Stop collector and scanner first; pass -ConfirmServicesStopped.' }
     if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
@@ -101,7 +108,7 @@ if ($Mode -eq 'Apply') {
             if ((Hash-File $staged) -ne $Expected[$name]) { throw "Staged hash mismatch: $name" }
         }
         foreach ($name in $Expected.Keys) {
-            [IO.File]::Replace((Join-Path $backup ("package_" + $name)), (Join-Path $target $name), $null)
+            Replace-File (Join-Path $backup ("package_" + $name)) (Join-Path $target $name) $backup
             if ((Hash-File (Join-Path $target $name)) -ne $Expected[$name]) { throw "Installed hash mismatch: $name" }
         }
     }
@@ -110,7 +117,7 @@ if ($Mode -eq 'Apply') {
             if ((Hash-File (Join-Path $target $name)) -ne $before[$name]) {
                 $restore = Join-Path $backup ("restore_" + $name)
                 [IO.File]::Copy((Join-Path $backup $name), $restore, $true)
-                [IO.File]::Replace($restore, (Join-Path $target $name), $null)
+                Replace-File $restore (Join-Path $target $name) $backup
                 if ((Hash-File (Join-Path $target $name)) -ne $before[$name]) { throw 'Apply failed and automatic restore failed.' }
             }
         }
@@ -140,7 +147,7 @@ foreach ($name in $Expected.Keys) {
     if ((Hash-File (Join-Path $target $name)) -ne $manifest.original.$name) {
         $restore = Join-Path $backup ("restore_" + $name)
         [IO.File]::Copy((Join-Path $backup $name), $restore, $true)
-        [IO.File]::Replace($restore, (Join-Path $target $name), $null)
+        Replace-File $restore (Join-Path $target $name) $backup
         if ((Hash-File (Join-Path $target $name)) -ne $manifest.original.$name) { throw 'Rollback verification failed.' }
     }
 }
