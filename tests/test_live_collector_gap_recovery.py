@@ -75,6 +75,30 @@ class GapRecoveryTests(unittest.TestCase):
             second.recover_recent_symbol('BTCUSDT')
         self.assertEqual(len(self.rows()), 1)
 
+    def test_unavailable_and_error_respect_five_minute_retry_budget(self):
+        calls = []
+        def empty(*args, **kwargs):
+            calls.append('empty')
+            return []
+        self.c.fetch_klines = empty
+        with patch.object(collector.time, 'time', return_value=self.now):
+            self.c.recover_recent_symbol('BTCUSDT')
+            self.c.recover_recent_symbol('BTCUSDT')
+        self.assertEqual(calls, ['empty'])
+        def timeout(*args, **kwargs):
+            calls.append('timeout')
+            raise TimeoutError('offline synthetic timeout')
+        self.c.fetch_klines = timeout
+        with patch.object(collector.time, 'time', return_value=self.now+300):
+            with self.assertRaises(TimeoutError):
+                self.c.recover_recent_symbol('BTCUSDT')
+            self.c.recover_recent_symbol('BTCUSDT')
+        self.assertEqual(calls, ['empty', 'timeout'])
+        with patch.object(collector.time, 'time', return_value=self.now+600):
+            with self.assertRaises(TimeoutError):
+                self.c.recover_recent_symbol('BTCUSDT')
+        self.assertEqual(calls, ['empty', 'timeout', 'timeout'])
+
     def test_invalid_or_failed_batch_is_atomic(self):
         first = self.end - 60000
         self.c.fetch_klines = lambda *a, **kw: [bar(first), bar(self.end, -1)]
@@ -86,7 +110,7 @@ class GapRecoveryTests(unittest.TestCase):
         with self.store._connect() as conn:
             conn.execute('CREATE TRIGGER fail_second BEFORE INSERT ON candles '
                          f'WHEN NEW.open_time={self.end} BEGIN SELECT RAISE(ABORT, "injected"); END')
-        with patch.object(collector.time, 'time', return_value=self.now):
+        with patch.object(collector.time, 'time', return_value=self.now+300):
             with self.assertRaises(sqlite3.Error):
                 self.c.recover_recent_symbol('BTCUSDT')
         self.assertFalse(self.rows())

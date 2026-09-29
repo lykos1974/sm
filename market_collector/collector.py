@@ -308,6 +308,9 @@ class MexcFuturesCollector(BaseCollector):
         last_open = ((cutoff_ms + 1) // minute_ms) * minute_ms - minute_ms
         if last_open < (self.recovery_window_minutes - 1) * minute_ms:
             return
+        # An empty response or transport/schema failure must consume the same
+        # bounded request budget as a successful recovery attempt.
+        self._next_recovery_at[raw_symbol] = now + self.recovery_interval_seconds
         first_open = last_open - (self.recovery_window_minutes - 1) * minute_ms
         candles = self.fetch_klines(raw_symbol, limit=self.recovery_window_minutes,
                                     start_time=first_open // 1000, end_time=last_open // 1000)
@@ -344,7 +347,6 @@ class MexcFuturesCollector(BaseCollector):
         self.logger(f"MEXC_FUT:{raw_symbol} recovery {state} returned={len(returned)} "
                     f"stored_before={len(present)} missing_local={len(missing)} "
                     f"recovered={inserted} not_returned={not_returned} still_missing={still_missing}")
-        self._next_recovery_at[raw_symbol] = now + self.recovery_interval_seconds
 
     def bootstrap_symbol(self, raw_symbol: str, bootstrap_bars: int):
         cutoff_ms = int(time.time() * 1000) - self.closed_candle_grace_ms
