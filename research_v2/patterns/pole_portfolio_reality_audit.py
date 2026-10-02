@@ -1366,8 +1366,9 @@ def run(
     fee_bps: float | None = None,
     slippage_bps: float | None = None,
     debug_overlap_trace: bool = False,
+    observation_loader=None,
 ) -> None:
-    symbols, observations, candles_by_symbol = _load_observations(
+    symbols, observations, candles_by_symbol = (observation_loader or _load_observations)(
         symbol_inputs, columns_inputs, candles_inputs, candle_symbols or {}
     )
     money_config = _money_config(initial_capital_usdt, fixed_position_size_usdt)

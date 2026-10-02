@@ -10,6 +10,17 @@ This repository is a **trading research system**, not a generic coding sandbox. 
 - Prefer minimal, reversible changes.
 - If a change degrades results, mark it **DISCARD** and preserve baseline behavior.
 
+## GitHub Continuity
+- GitHub is the durable record for project implementation decisions, code,
+  reproducible commands, test results, limitations, and next gates.
+- Do not describe local-only research files as published. Before handing work
+  to another chat or agent, record the relevant result and provenance in the
+  repository and publish an authorized branch/PR; otherwise state clearly
+  that publication is still pending.
+- Keep large market data and local operator settings out of Git. Commit
+  manifests and hashes rather than credentials, operational DBs, or raw data.
+- Read the relevant research handoff/documentation before extending a stage.
+
 ## Stability and Interface Protection
 - Do not silently rename public files or public functions.
 - Do not change database schema unless explicitly required.
