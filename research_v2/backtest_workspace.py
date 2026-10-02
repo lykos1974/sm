@@ -14,6 +14,9 @@ SCHEMA = "research-backtest-job-v1"
 FIELDS = {"schema", "strategy_id", "columns_csv", "columns_sha256",
           "candles_csv", "candles_sha256", "minimum_entry_ts", "output_root"}
 EXECUTABLE = frozenset({"causal_long_pole"})
+BTC_2024_COLUMNS_SHA = "ed263ac77c3b2ed7169006d669ee1c9d21382ac02a2b37f107f2bcb635e47a45"
+BTC_2024_CANDLES_SHA = "8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f"
+BTC_2024_MINIMUM_ENTRY_TS = 1704240000000
 CSV_HEADERS = {
     "columns": frozenset({"symbol", "profile_name", "idx", "kind", "top", "bottom", "start_ts", "end_ts"}),
     "candles": frozenset({"close_time", "open", "high", "low", "close"}),
@@ -96,6 +99,24 @@ def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
         json.dump(job, stream, indent=2, sort_keys=True)
         stream.write("\n")
     return job
+
+
+def prepare_btc_2024_job(dataset: Path) -> Path:
+    """One-folder GUI workflow for the hash-pinned BTC 2024 reference."""
+    if not dataset.is_dir():
+        raise ValueError("choose the frozen BTC 2024 results folder")
+    columns = dataset / "columns.csv"
+    candles = dataset / "candles_1m.csv"
+    if not columns.is_file() or not candles.is_file():
+        raise ValueError("BTC 2024 frozen files missing in selected folder")
+    _check_csv_header(columns, "columns")
+    _check_csv_header(candles, "candles")
+    if _sha(columns) != BTC_2024_COLUMNS_SHA or _sha(candles) != BTC_2024_CANDLES_SHA:
+        raise ValueError("BTC 2024 frozen input hash mismatch")
+    output = suggest_output_directory(dataset.parent.parent)
+    job_file = output.with_suffix(".job.json")
+    create_job(columns, candles, BTC_2024_MINIMUM_ENTRY_TS, output, job_file)
+    return job_file
 
 
 def run_job(path: Path) -> dict:

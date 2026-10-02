@@ -97,6 +97,24 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(proposed.with_suffix(".job.json").exists())
         self.assertNotEqual(proposed, workspace.suggest_output_directory(self.root))
 
+    def test_one_folder_reference_workflow_rejects_wrong_bytes_and_runs(self):
+        dataset = self.root / "frozen" / "results"
+        dataset.mkdir(parents=True)
+        self.cols.rename(dataset / "columns.csv")
+        self.cands.rename(dataset / "candles_1m.csv")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            workspace.prepare_btc_2024_job(dataset)
+        self.assertEqual(list(self.root.glob("*.job.json")), [])
+        with patch.object(workspace, "BTC_2024_COLUMNS_SHA", workspace._sha(dataset / "columns.csv")), \
+             patch.object(workspace, "BTC_2024_CANDLES_SHA", workspace._sha(dataset / "candles_1m.csv")), \
+             patch.object(workspace, "BTC_2024_MINIMUM_ENTRY_TS", START):
+            job_file = workspace.prepare_btc_2024_job(dataset)
+        job = workspace.load_job(job_file)
+        self.assertEqual(Path(job["columns_csv"]).name, "columns.csv")
+        self.assertEqual(Path(job["candles_csv"]).name, "candles_1m.csv")
+        self.assertEqual(Path(job["output_root"]).parent, self.root)
+        self.assertEqual(workspace.run_job(job_file)["result"]["decision_count"], 1)
+
     def test_duplicate_fields_relative_paths_and_bool_timestamp_fail_closed(self):
         self.path.write_text('{"schema":"research-backtest-job-v1","schema":"research-backtest-job-v1"}')
         with self.assertRaises(ValueError):

@@ -25,16 +25,12 @@ Run from the repository root:
 python -B -m research_v2.backtest_app
 ```
 
-Select the frozen PnF `columns.csv`, frozen `candles.csv`, an **unused** absolute
-results directory, and the earliest eligible entry candle close in Unix
-milliseconds. The default `1704240000000` belongs to the earlier BTC 2024
-research example; verify the intended warm-up before running. The folder picker proposes
-a unique new child directory when selecting an existing results parent with
-the folder picker. It checks CSV headers before creating a job or launching
-the worker; `columns.csv` must contain `idx` and `candles_1m.csv` must contain
-`close_time`. The verified BTC 2024 frozen input filename is `candles_1m.csv`.
-It creates a `.job.json` beside the results directory and records SHA-256 hashes of both
-inputs. It writes a `.run.log` beside the job. The results directory contains
+In the window, select only the frozen BTC 2024 `results` folder and click
+"Run backtest". The application finds `columns.csv` and `candles_1m.csv`,
+validates their CSV roles and exact audited SHA-256 values, and uses the frozen
+warm-up boundary `1704240000000`. It creates a unique research output folder
+under `research_snapshots` with a `.job.json` and `.run.log` next to it. It
+never overwrites the earlier failed attempt. The results directory contains
 `causal_manifest.json`, `causal_decisions.csv`, the portfolio outputs, and
 `research_job_manifest.json` only on successful completion. Existing output
 directories are never overwritten. Source files are hashed before and after
