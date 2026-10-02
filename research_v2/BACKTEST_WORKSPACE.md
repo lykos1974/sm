@@ -43,6 +43,22 @@ absolute new output path. Only explicitly allowlisted adapters execute.
 
 ## Verification and next gate
 
+### Windows operator run — 2026-10-02
+
+The operator selected the frozen BTC 2024 `results` directory in the simplified
+window. The completion screenshot reported 468 causal decisions, 431 resolved
+portfolio trades, and +49.0 gross R, matching the three previously recorded
+reference totals. The displayed output directory was
+`H:\pnf screener\research_snapshots\BTC_2024_backtest_20261002_101157_613242_7f1141f7`.
+This is screenshot evidence of summary parity. The result files and their
+hashes have not been independently inspected here; gross R does not include
+exchange fills, fees, slippage, or funding.
+
+Next gate: independently inspect the local job manifest, causal manifest,
+trade ledger, input hashes, and output integrity before treating the Windows
+run as an audited reference. Keep the operational scanner and protected
+baseline outside this research stage.
+
 Targeted synthetic offline tests:
 
 ```powershell
