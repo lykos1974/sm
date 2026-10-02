@@ -8,7 +8,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from research_v2.backtest_workspace import _sha, create_job, load_job
+from research_v2.backtest_workspace import _check_csv_header, _sha, create_job, load_job, suggest_output_directory
 
 
 class ResearchApp(tk.Tk):
@@ -56,7 +56,7 @@ class ResearchApp(tk.Tk):
         selected = filedialog.askdirectory() if directory else filedialog.askopenfilename(
             filetypes=[("CSV", "*.csv")])
         if selected:
-            variable.set(selected)
+            variable.set(str(suggest_output_directory(Path(selected))) if directory else selected)
 
     def create_and_start(self):
         try:
@@ -92,6 +92,7 @@ class ResearchApp(tk.Tk):
                 source = Path(job[name + "_csv"]).resolve(strict=True)
                 if not source.is_file() or _sha(source) != job[name + "_sha256"]:
                     raise ValueError("Ασυμφωνία frozen input: " + name)
+                _check_csv_header(source, name)
             # The worker runs in its own process and imports no scanner module.
             self.log_path = job_file.with_suffix(".run.log")
             with self.log_path.open("x", encoding="utf-8") as log:

@@ -2,15 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 
 SCHEMA = "research-backtest-job-v1"
 FIELDS = {"schema", "strategy_id", "columns_csv", "columns_sha256",
           "candles_csv", "candles_sha256", "minimum_entry_ts", "output_root"}
 EXECUTABLE = frozenset({"causal_long_pole"})
+CSV_HEADERS = {
+    "columns": frozenset({"symbol", "profile_name", "idx", "kind", "top", "bottom", "start_ts", "end_ts"}),
+    "candles": frozenset({"close_time", "open", "high", "low", "close"}),
+}
 
 
 def _sha(path: Path) -> str:
@@ -19,6 +26,24 @@ def _sha(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _check_csv_header(path: Path, kind: str) -> None:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        fields = next(csv.reader(stream), [])
+    if len(fields) != len(set(fields)) or not CSV_HEADERS[kind].issubset(fields):
+        raise ValueError(f"wrong {kind} CSV format")
+
+
+def suggest_output_directory(parent: Path) -> Path:
+    if not parent.is_dir():
+        raise ValueError("existing output parent required")
+    for _ in range(10):
+        name = datetime.now(timezone.utc).strftime("BTC_2024_backtest_%Y%m%d_%H%M%S_%f")
+        candidate = parent / f"{name}_{uuid4().hex[:8]}"
+        if not candidate.exists() and not candidate.with_suffix(".job.json").exists():
+            return candidate
+    raise FileExistsError("could not allocate output name")
 
 
 def load_job(path: Path) -> dict:
@@ -57,6 +82,8 @@ def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
         raise ValueError("distinct existing research CSV inputs required")
     if columns.suffix.lower() != ".csv" or candles.suffix.lower() != ".csv":
         raise ValueError("CSV research inputs required")
+    _check_csv_header(columns, "columns")
+    _check_csv_header(candles, "candles")
     if type(minimum_entry_ts) is not int or minimum_entry_ts < 10**12:
         raise ValueError("invalid warm-up boundary")
     if output.exists() or job_file.exists() or not output.parent.is_dir() or not job_file.parent.is_dir():
@@ -82,6 +109,8 @@ def run_job(path: Path) -> dict:
         raise FileExistsError("new research output directory required")
     if _sha(columns) != job["columns_sha256"] or _sha(candles) != job["candles_sha256"]:
         raise ValueError("frozen input hash mismatch")
+    _check_csv_header(columns, "columns")
+    _check_csv_header(candles, "candles")
 
     # Import only after validation. This explicit dispatch is not a dynamic
     # import of an unreviewed strategy from the inventory JSON.

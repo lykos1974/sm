@@ -75,6 +75,28 @@ class WorkspaceTests(unittest.TestCase):
             workspace.run_job(self.path)
         self.assertFalse((self.root / "results").exists())
 
+    def test_swapped_csv_fields_fail_before_job_or_output(self):
+        with self.assertRaisesRegex(ValueError, "wrong columns CSV format"):
+            workspace.create_job(self.cands, self.cols, START,
+                                 self.root / "results", self.path)
+        self.assertFalse(self.path.exists())
+        self.assertFalse((self.root / "results").exists())
+        self.job["columns_csv"] = str(self.cands)
+        self.job["columns_sha256"] = workspace._sha(self.cands)
+        self.job["candles_csv"] = str(self.cols)
+        self.job["candles_sha256"] = workspace._sha(self.cols)
+        self.write()
+        with self.assertRaisesRegex(ValueError, "wrong columns CSV format"):
+            workspace.run_job(self.path)
+        self.assertFalse((self.root / "results").exists())
+
+    def test_output_picker_proposes_new_child_below_existing_parent(self):
+        proposed = workspace.suggest_output_directory(self.root)
+        self.assertEqual(proposed.parent, self.root)
+        self.assertFalse(proposed.exists())
+        self.assertFalse(proposed.with_suffix(".job.json").exists())
+        self.assertNotEqual(proposed, workspace.suggest_output_directory(self.root))
+
     def test_duplicate_fields_relative_paths_and_bool_timestamp_fail_closed(self):
         self.path.write_text('{"schema":"research-backtest-job-v1","schema":"research-backtest-job-v1"}')
         with self.assertRaises(ValueError):
