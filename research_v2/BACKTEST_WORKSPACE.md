@@ -199,6 +199,17 @@ adds about 0.0136 USDT, before slippage, funding, liquidation, or fee changes.
 This is about 0.0436 USDT, over 1% of a 4 USDT balance. These are illustrative
 public-rule calculations, not account-specific tradability or a guarantee.
 
+At the same illustrative 85,000 USDT BTC price and fixed 300 USDT stop,
+two 0.08% taker fees consume about 0.453R per minimum-contract trade.
+The existing BTC 2024 sweep reports gross 49R/431 trades (0.114R/trade)
+at 2.5R, and gross 101R/405 trades (0.249R/trade) at 10R. Applying these
+*current, fixed-price* fees as a rough sensitivity gives respectively
+1.47 - 5.86 = -4.39 USDT and 3.03 - 5.51 = -2.48 USDT, before slippage
+or funding. This is **not** an exact historical net backtest: 2024 prices,
+venue, fees and fills differ. It demonstrates a decisive cost gate that
+leverage cannot remove, because fixed-contract P&L and fees are unchanged
+by the margin multiple. No target from the in-sample sweep is live-approved.
+
 Sources (rules and fees must be rechecked at execution time):
 
 - https://www.mexc.com/futures/BTC_USDT
