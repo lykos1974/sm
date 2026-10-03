@@ -53,6 +53,51 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             workspace.run_job(self.path)
 
+    def test_period_job_excludes_entry_at_end_without_truncating_exit_candles(self):
+        self.job['schema'] = workspace.PERIOD_SCHEMA
+        self.job['maximum_entry_ts'] = START + 6 * 60_000 + 1
+        self.write()
+        result = workspace.run_job(self.path)
+        self.assertEqual(result['result']['resolved_portfolio_trades'], 1)
+        self.assertEqual(result['job']['maximum_entry_ts'], self.job['maximum_entry_ts'])
+        self.assertEqual(result['job']['entry_cohort_policy'],
+                         'UTC start inclusive, end exclusive; later exits allowed')
+        self.assertEqual(result['result']['gross_total_R'], 2.5)
+        self.assertEqual(len(trade_chart.load_trades(self.root / 'results')), 1)
+
+    def test_period_job_empty_cohort_and_invalid_bounds(self):
+        self.job['schema'] = workspace.PERIOD_SCHEMA
+        self.job['maximum_entry_ts'] = START + 60_000
+        self.write()
+        self.assertEqual(workspace.run_job(self.path)['result']['decision_count'], 0)
+        with self.assertRaisesRegex(ValueError, 'no resolved trades'):
+            trade_chart.load_trades(self.root / 'results')
+        self.job['output_root'] = str(self.root / 'other')
+        for bad in (START, True, '1704067200001'):
+            self.job['maximum_entry_ts'] = bad
+            self.write()
+            with self.assertRaises(ValueError):
+                workspace.run_job(self.path)
+        self.assertFalse((self.root / 'other').exists())
+
+    def test_gui_utc_dates_are_bounded_and_failed_input_writes_no_job(self):
+        dataset = self.root / 'frozen' / 'results'
+        dataset.mkdir(parents=True)
+        self.cols.rename(dataset / 'columns.csv')
+        self.cands.rename(dataset / 'candles_1m.csv')
+        with patch.object(workspace, 'BTC_2024_COLUMNS_SHA', workspace._sha(dataset / 'columns.csv')), \
+             patch.object(workspace, 'BTC_2024_CANDLES_SHA', workspace._sha(dataset / 'candles_1m.csv')):
+            for first, last in [('2024-01-02','2024-01-03'), ('2024-05-02','2024-05-01'),
+                                ('2024-02-30','2024-03-01'), ('2024-01-03','2025-01-01'),
+                                ('2024-1-3','2024-01-04')]:
+                with self.assertRaises(ValueError):
+                    workspace.prepare_btc_2024_job(dataset, first, last)
+            self.assertFalse(list(self.root.glob('*.job.json')))
+            job = workspace.load_job(workspace.prepare_btc_2024_job(dataset,
+                                                                     '2024-07-01','2024-07-31'))
+        self.assertEqual(job['minimum_entry_ts'], 1719792000000)
+        self.assertEqual(job['maximum_entry_ts'], 1722470400000)
+
     def test_gui_job_creation_and_cli_use_same_runner(self):
         job = workspace.create_job(self.cols, self.cands, START,
                                    self.root / "results", self.path)

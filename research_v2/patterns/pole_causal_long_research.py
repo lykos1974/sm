@@ -33,10 +33,14 @@ def _sha256(path: Path) -> str:
 
 
 def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float,
-                        candles: list[Candle], minimum_entry_ts: int | None = None
+                        candles: list[Candle], minimum_entry_ts: int | None = None,
+                        maximum_entry_ts: int | None = None
                         ) -> list[EntryTimingObservation]:
     if not math.isfinite(box_size) or box_size <= 0:
         raise ValueError('invalid box size')
+    if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
+            or (minimum_entry_ts is not None and maximum_entry_ts <= minimum_entry_ts)):
+        raise ValueError('invalid entry period')
     if any(column.idx != index for index, column in enumerate(columns)):
         raise ValueError('unordered or missing PnF columns')
     if any(not math.isfinite(value) for column in columns
@@ -85,6 +89,8 @@ def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float
             raise ValueError('entry candle opened before the signal was known')
         if minimum_entry_ts is not None and eligible < minimum_entry_ts:
             continue
+        if maximum_entry_ts is not None and eligible >= maximum_entry_ts:
+            continue
         observation = _candidate_observation(
             symbol, len(decisions) + 2, 'LONG', ENTRY_CANDIDATE,
             pole, reversal, confirmation, box_size, candles,
@@ -97,7 +103,7 @@ def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float
 
 def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         minimum_entry_ts: int, expected_columns_sha256: str,
-        expected_candles_sha256: str) -> dict:
+        expected_candles_sha256: str, maximum_entry_ts: int | None = None) -> dict:
     if output_root.exists():
         raise FileExistsError('new isolated output directory required')
     if not columns_csv.is_file() or not candles_csv.is_file() or candles_csv.suffix.lower() != '.csv':
@@ -107,6 +113,9 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         raise ValueError('frozen input hash mismatch')
     if type(minimum_entry_ts) is not int or minimum_entry_ts < 10**12:
         raise ValueError('invalid warm-up boundary')
+    if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
+                                          or maximum_entry_ts <= minimum_entry_ts):
+        raise ValueError('invalid entry period')
     with columns_csv.open(newline='', encoding='utf-8') as stream:
         raw_indices = [row['idx'] for row in csv.DictReader(stream)]
     if len(raw_indices) != len(set(raw_indices)):
@@ -116,9 +125,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         raise ValueError('missing PnF profile')
     candles = _load_candles(candles_csv, 'BTCUSDT')
     columns = [columns_by_idx[index] for index in sorted(columns_by_idx)]
-    decisions = causal_observations('BTC', columns, box_size, candles, minimum_entry_ts)
-    if not decisions:
-        raise ValueError('no causally eligible LONG pole decisions')
+    decisions = causal_observations('BTC', columns, box_size, candles,
+                                    minimum_entry_ts, maximum_entry_ts)
 
     # Use the audited portfolio simulator with its existing assumptions. The
     # injected loader changes signal generation only; the default loader stays
@@ -165,6 +173,9 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         'gross_total_R': portfolio['summary_metrics']['total_R'],
         'execution_limitations': '1m OHLC, gross R; no exchange fill, fees, slippage or funding',
     }
+    if maximum_entry_ts is not None:
+        report['maximum_entry_ts'] = maximum_entry_ts
+        report['entry_cohort_policy'] = 'UTC start inclusive, end exclusive; later exits allowed'
     with (output_root / 'causal_manifest.json').open('x', encoding='utf-8') as stream:
         json.dump(report, stream, indent=2, sort_keys=True)
         stream.write('\n')

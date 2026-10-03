@@ -16,9 +16,11 @@ class ResearchApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Research Backtests")
-        self.geometry("670x245")
+        self.geometry("670x330")
         self.dataset = tk.StringVar(value="Δεν έχει επιλεγεί dataset")
         self.status = tk.StringVar(value="Επίλεξε τον φάκελο results του BTC 2024.")
+        self.start_date = tk.StringVar(value="2024-01-03")
+        self.end_date = tk.StringVar(value="2024-12-31")
         self.process = None
         self.job_path = None
         self.output_path = None
@@ -27,6 +29,14 @@ class ResearchApp(tk.Tk):
         ttk.Label(self, text="BTCUSDT 2024 — causal LONG pole", font=("TkDefaultFont", 12, "bold")).pack(pady=12)
         ttk.Button(self, text="Επιλογή dataset", command=self.choose).pack(pady=3)
         ttk.Label(self, textvariable=self.dataset, wraplength=620).pack(padx=15, pady=4)
+        period = ttk.Frame(self)
+        period.pack(pady=6)
+        ttk.Label(period, text="Σήματα από (UTC)").grid(row=0, column=0, padx=5)
+        ttk.Entry(period, textvariable=self.start_date, width=12).grid(row=0, column=1, padx=5)
+        ttk.Label(period, text="έως και (UTC)").grid(row=0, column=2, padx=5)
+        ttk.Entry(period, textvariable=self.end_date, width=12).grid(row=0, column=3, padx=5)
+        ttk.Label(self, text="Η περίοδος ορίζει νέα επιλέξιμα σήματα. Όλο το frozen ιστορικό δίνει warm-up και μεταγενέστερες εξόδους.",
+                  wraplength=620).pack()
         self.run_button = ttk.Button(self, text="Εκτέλεση backtest", command=self.start)
         self.run_button.pack(pady=8)
         ttk.Button(self, text="Προβολή trades από προηγούμενο run",
@@ -43,7 +53,8 @@ class ResearchApp(tk.Tk):
         if self.process is not None:
             return
         try:
-            self.job_path = prepare_btc_2024_job(Path(self.dataset.get()))
+            self.job_path = prepare_btc_2024_job(Path(self.dataset.get()),
+                                                 self.start_date.get(), self.end_date.get())
             self.output_path = Path(json.loads(self.job_path.read_text(encoding="utf-8"))["output_root"])
             self.log_path = self.job_path.with_suffix(".run.log")
             with self.log_path.open("x", encoding="utf-8") as log:

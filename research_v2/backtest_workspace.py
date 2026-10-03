@@ -11,8 +11,10 @@ from uuid import uuid4
 
 
 SCHEMA = "research-backtest-job-v1"
+PERIOD_SCHEMA = "research-backtest-job-v2"
 FIELDS = {"schema", "strategy_id", "columns_csv", "columns_sha256",
           "candles_csv", "candles_sha256", "minimum_entry_ts", "output_root"}
+PERIOD_FIELDS = FIELDS | {"maximum_entry_ts"}
 EXECUTABLE = frozenset({"causal_long_pole"})
 BTC_2024_COLUMNS_SHA = "ed263ac77c3b2ed7169006d669ee1c9d21382ac02a2b37f107f2bcb635e47a45"
 BTC_2024_CANDLES_SHA = "8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f"
@@ -60,7 +62,9 @@ def load_job(path: Path) -> dict:
 
     with path.open(encoding="utf-8") as stream:
         job = json.load(stream, object_pairs_hook=unique)
-    if type(job) is not dict or set(job) != FIELDS or job["schema"] != SCHEMA:
+    if (type(job) is not dict or
+            (job.get("schema"), set(job)) not in
+            ((SCHEMA, FIELDS), (PERIOD_SCHEMA, PERIOD_FIELDS))):
         raise ValueError("unsupported job schema")
     if job["strategy_id"] not in EXECUTABLE:
         raise ValueError("strategy has no reviewed execution adapter")
@@ -74,11 +78,14 @@ def load_job(path: Path) -> dict:
             raise ValueError("canonical SHA-256 required")
     if type(job["minimum_entry_ts"]) is not int or job["minimum_entry_ts"] < 10**12:
         raise ValueError("invalid warm-up boundary")
+    if job["schema"] == PERIOD_SCHEMA and (type(job["maximum_entry_ts"]) is not int
+            or job["maximum_entry_ts"] <= job["minimum_entry_ts"]):
+        raise ValueError("invalid entry period")
     return job
 
 
 def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
-               output: Path, job_file: Path) -> dict:
+               output: Path, job_file: Path, maximum_entry_ts: int | None = None) -> dict:
     """Freeze user-selected inputs into an exclusive, portable job record."""
     columns, candles, output, job_file = (p.resolve() for p in (columns, candles, output, job_file))
     if not columns.is_file() or not candles.is_file() or columns == candles:
@@ -89,19 +96,26 @@ def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
     _check_csv_header(candles, "candles")
     if type(minimum_entry_ts) is not int or minimum_entry_ts < 10**12:
         raise ValueError("invalid warm-up boundary")
+    if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
+                                          or maximum_entry_ts <= minimum_entry_ts):
+        raise ValueError("invalid entry period")
     if output.exists() or job_file.exists() or not output.parent.is_dir() or not job_file.parent.is_dir():
         raise ValueError("new output and job paths required")
-    job = {"schema": SCHEMA, "strategy_id": "causal_long_pole",
+    job = {"schema": PERIOD_SCHEMA if maximum_entry_ts is not None else SCHEMA,
+           "strategy_id": "causal_long_pole",
            "columns_csv": str(columns), "columns_sha256": _sha(columns),
            "candles_csv": str(candles), "candles_sha256": _sha(candles),
            "minimum_entry_ts": minimum_entry_ts, "output_root": str(output)}
+    if maximum_entry_ts is not None:
+        job["maximum_entry_ts"] = maximum_entry_ts
     with job_file.open("x", encoding="utf-8") as stream:
         json.dump(job, stream, indent=2, sort_keys=True)
         stream.write("\n")
     return job
 
 
-def prepare_btc_2024_job(dataset: Path) -> Path:
+def prepare_btc_2024_job(dataset: Path, start_date: str | None = None,
+                         end_date: str | None = None) -> Path:
     """One-folder GUI workflow for the hash-pinned BTC 2024 reference."""
     if not dataset.is_dir():
         raise ValueError("choose the frozen BTC 2024 results folder")
@@ -113,9 +127,29 @@ def prepare_btc_2024_job(dataset: Path) -> Path:
     _check_csv_header(candles, "candles")
     if _sha(columns) != BTC_2024_COLUMNS_SHA or _sha(candles) != BTC_2024_CANDLES_SHA:
         raise ValueError("BTC 2024 frozen input hash mismatch")
+    if (start_date is None) != (end_date is None):
+        raise ValueError("both UTC dates required")
+    minimum = BTC_2024_MINIMUM_ENTRY_TS
+    maximum = None
+    if start_date is not None:
+        from datetime import date, timedelta
+        def parse_date(value):
+            if type(value) is not str or len(value) != 10:
+                raise ValueError("UTC dates must be YYYY-MM-DD")
+            parsed = date.fromisoformat(value)
+            if parsed.isoformat() != value:
+                raise ValueError("UTC dates must be YYYY-MM-DD")
+            return parsed
+        first, last = parse_date(start_date), parse_date(end_date)
+        if not (date(2024, 1, 3) <= first <= last <= date(2024, 12, 31)):
+            raise ValueError("period outside frozen BTC 2024 entry window")
+        minimum = int(datetime(first.year, first.month, first.day, tzinfo=timezone.utc).timestamp() * 1000)
+        maximum_date = last + timedelta(days=1)
+        maximum = int(datetime(maximum_date.year, maximum_date.month, maximum_date.day,
+                               tzinfo=timezone.utc).timestamp() * 1000)
     output = suggest_output_directory(dataset.parent.parent)
     job_file = output.with_suffix(".job.json")
-    create_job(columns, candles, BTC_2024_MINIMUM_ENTRY_TS, output, job_file)
+    create_job(columns, candles, minimum, output, job_file, maximum)
     return job_file
 
 
@@ -138,14 +172,18 @@ def run_job(path: Path) -> dict:
     from research_v2.patterns.pole_causal_long_research import run
 
     result = run(columns, candles, output, job["minimum_entry_ts"],
-                 job["columns_sha256"], job["candles_sha256"])
+                 job["columns_sha256"], job["candles_sha256"],
+                 maximum_entry_ts=job.get("maximum_entry_ts"))
     if _sha(columns) != job["columns_sha256"] or _sha(candles) != job["candles_sha256"]:
         raise ValueError("frozen input changed during run")
-    provenance = {"schema": SCHEMA, "strategy_id": job["strategy_id"],
+    provenance = {"schema": job["schema"], "strategy_id": job["strategy_id"],
                   "job_sha256": _sha(path), "columns_sha256": job["columns_sha256"],
                   "candles_sha256": job["candles_sha256"],
                   "minimum_entry_ts": job["minimum_entry_ts"],
                   "research_only": True, "result_manifest": "causal_manifest.json"}
+    if job["schema"] == PERIOD_SCHEMA:
+        provenance["maximum_entry_ts"] = job["maximum_entry_ts"]
+        provenance["entry_cohort_policy"] = "UTC start inclusive, end exclusive; later exits allowed"
     with (output / "research_job_manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(provenance, stream, sort_keys=True, indent=2)
         stream.write("\n")

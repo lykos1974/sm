@@ -78,6 +78,38 @@ class CausalLongTests(unittest.TestCase):
         later[-1] = Candle(later[-1].ts, 50, 60, 40, 50)
         self.assertEqual(causal.causal_observations('BTC', columns()[:6], 1, later)[0], base)
 
+    def test_entry_cohort_boundaries_preserve_full_history_and_exits(self):
+        first = START + 6 * 60_000
+        self.assertEqual(len(causal.causal_observations('BTC', columns(), 1, candles(),
+                                                        first, first + 1)), 1)
+        self.assertEqual(causal.causal_observations('BTC', columns(), 1, candles(),
+                                                     first + 1, first + 2), [])
+        self.assertEqual(causal.causal_observations('BTC', columns(), 1, candles(),
+                                                     START, first), [])
+        with self.assertRaisesRegex(ValueError, 'period'):
+            causal.causal_observations('BTC', columns(), 1, candles(), first, first)
+
+    def test_selected_period_can_have_zero_decisions(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            cols = root / 'columns.csv'
+            cands = root / 'candles.csv'
+            with cols.open('w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['symbol','profile_name','idx','kind','top','bottom','start_ts','end_ts'])
+                for c in columns()[:6]:
+                    w.writerow(['BTC','BTC_bs1_rev3',c.idx,c.kind,c.top,c.bottom,c.start_ts,c.end_ts])
+            with cands.open('w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['close_time','open','high','low','close'])
+                for c in candles():
+                    w.writerow([c.ts,c.open,c.high,c.low,c.close])
+            digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+            result = causal.run(cols, cands, root / 'out', START,
+                                digest(cols), digest(cands), START + 60_000)
+            self.assertEqual(result['decision_count'], 0)
+            self.assertEqual(result['resolved_portfolio_trades'], 0)
+
     def test_portfolio_injection_preserves_default_loader(self):
         from research_v2.patterns import pole_portfolio_reality_audit as portfolio
         with tempfile.TemporaryDirectory() as root:

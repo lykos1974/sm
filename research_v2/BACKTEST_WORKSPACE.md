@@ -113,3 +113,27 @@ integration separately before adding a Research tab. Extend the strategy
 catalog as a versioned execution registry only after each adapter passes
 causality, restart, execution, and cost checks. The protected baseline and
 all runtime services remain untouched.
+
+## Selected UTC entry period
+
+The desktop app accepts inclusive UTC dates from 2024-01-03 through
+2024-12-31; the default covers the full eligible BTC 2024 period. Dates
+select the eligibility time of **new causal decisions**. The same pinned
+`columns.csv` and `candles_1m.csv` supply the complete prior PnF context
+and later candles for pending fills and exits. A selected signal can exit
+after the chosen end date. This is an entry cohort, not calendar P&L.
+Each period starts without a simulated open position. Results from separate
+periods need not sum to the full-year portfolio because the one-position
+constraint differs at period boundaries. The job and result manifests record
+the exclusive end timestamp and policy. Old v1 jobs remain readable; jobs
+with an end boundary use v2. The target remains 2.5R and the existing BE
+trigger remains 2R. Results are gross OHLC research.
+
+The earlier `research_v2/patterns/pole_core_motif_r_targets.py` explored
+fixed-stop excursions at 1, 1.25, 1.5, 2, 2.5, 3 and 4R. It used labeled
+column paths and a stop-first approximation when event ordering was
+unavailable. It was **not** a causal executable re-simulation of this BTC
+2024 portfolio; its conclusions cannot establish that 3R or 4R improves
+net performance here. A future target comparison needs independent pinned
+replays with identical decisions, entry/stop rules, costs and intrabar
+uncertainty. This change does not alter the target.
