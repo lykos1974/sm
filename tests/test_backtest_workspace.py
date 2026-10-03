@@ -302,6 +302,18 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outcome"):
             trade_chart.exit_timeline(claimed, [fill, target, later_be], 2.0)
 
+    def test_trade_navigation_forward_back_and_boundaries(self):
+        ids = ["TRADE-000001", "TRADE-000002", "TRADE-000003"]
+        self.assertEqual(trade_chart.adjacent_trade_id(ids, ids[0], -1), ids[0])
+        self.assertEqual(trade_chart.adjacent_trade_id(ids, ids[0], 1), ids[1])
+        self.assertEqual(trade_chart.adjacent_trade_id(ids, ids[1], 1), ids[2])
+        self.assertEqual(trade_chart.adjacent_trade_id(ids, ids[2], -1), ids[1])
+        self.assertEqual(trade_chart.adjacent_trade_id(ids, ids[2], 1), ids[2])
+        with self.assertRaises(ValueError):
+            trade_chart.adjacent_trade_id(ids, "UNKNOWN", 1)
+        with self.assertRaises(ValueError):
+            trade_chart.adjacent_trade_id(ids, ids[1], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

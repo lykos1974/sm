@@ -221,6 +221,13 @@ def _utc(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def adjacent_trade_id(ids: list[str], selected: str, step: int) -> str:
+    """Navigate the ledger order without wrapping past its first or last row."""
+    if step not in (-1, 1) or not ids or len(ids) != len(set(ids)) or selected not in ids:
+        raise ValueError("invalid trade navigation")
+    return ids[min(max(ids.index(selected) + step, 0), len(ids) - 1)]
+
+
 def exit_timeline(trade: Trade, candles: list[Candle], trigger_r: float
                   ) -> list[tuple[str, str, str]]:
     """Check the simulator's exit chronology on the bounded fill-to-exit slice."""
@@ -385,6 +392,7 @@ class TradeChartWindow(tk.Toplevel):
         self.pnf_starts, self.pnf_columns, self.box_size = load_pnf_columns(columns_path)
         self.explanations = build_trade_explanations(result_root, self.trades,
             self.pnf_columns, self.box_size, self.times, self.candles)
+        self.trade_ids = [trade.trade_id for trade in self.trades]
         self.selected = tk.StringVar(value=self.trades[0].trade_id)
         self.focus = tk.StringVar(value="entry")
         self.view = tk.StringVar(value="candles")
@@ -392,9 +400,17 @@ class TradeChartWindow(tk.Toplevel):
         top.pack(fill="x", padx=10, pady=8)
         ttk.Label(top, text="Trade:").pack(side="left")
         picker = ttk.Combobox(top, state="readonly", textvariable=self.selected,
-                              values=[item.trade_id for item in self.trades], width=18)
+                              values=self.trade_ids, width=18)
         picker.pack(side="left", padx=8)
         picker.bind("<<ComboboxSelected>>", lambda _: self.draw())
+        self.prev_button = ttk.Button(top, text="◀ Προηγούμενο",
+                                      command=lambda: self.move_trade(-1))
+        self.prev_button.pack(side="left", padx=2)
+        self.next_button = ttk.Button(top, text="Επόμενο ▶",
+                                      command=lambda: self.move_trade(1))
+        self.next_button.pack(side="left", padx=2)
+        self.position = ttk.Label(top, text="")
+        self.position.pack(side="left", padx=5)
         ttk.Radiobutton(top, text="Κεριά", variable=self.view,
                         value="candles", command=self.draw).pack(side="left", padx=8)
         ttk.Radiobutton(top, text="PnF", variable=self.view,
@@ -435,8 +451,16 @@ class TradeChartWindow(tk.Toplevel):
         self.canvas.bind("<Configure>", lambda _: self.draw())
         self.draw()
 
+    def move_trade(self, step: int):
+        self.selected.set(adjacent_trade_id(self.trade_ids, self.selected.get(), step))
+        self.draw()
+
     def draw(self):
         trade = next(item for item in self.trades if item.trade_id == self.selected.get())
+        index = self.trade_ids.index(trade.trade_id)
+        self.position.configure(text=f"{index+1} / {len(self.trade_ids)}")
+        self.prev_button.state(["disabled"] if index == 0 else ["!disabled"])
+        self.next_button.state(["disabled"] if index == len(self.trade_ids)-1 else ["!disabled"])
         focus = self.focus.get()
         pnf = self.view.get() == "pnf"
         if pnf:

@@ -42,6 +42,9 @@ plots each trade over the frozen 1m candles, with selectable windows around
 entry or exit. The signal's entry, stop, and 2.5R target appear as horizontal
 levels. The trade ledger records exit time and R, but no exchange exit fill
 price; the chart marks exit **time only** and never guesses the fill price.
+The previous/next arrow buttons traverse the ledger in its recorded order,
+show the current position, and stop at the first/last trade. The dropdown
+remains available for jumping to a specific ID.
 The viewer checks the job and causal manifests, decision ledger hash, and
 frozen input hashes. It does not run a backtest or alter the source files.
 
