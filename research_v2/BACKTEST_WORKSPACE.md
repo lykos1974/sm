@@ -167,8 +167,9 @@ shows only these two result measures for each target. If the CSV, manifest,
 target grid or completed-job binding is changed or missing, it refuses to
 render. The operator can choose the result folder after restarting the app.
 
-The same window also offers **Εξέλιξη μπάνκας**. Select a single target R or
-**Όλα** to overlay all nine exit-ordered curves with distinct colors and a
+The same window also offers **Εξέλιξη μπάνκας**. Tick any combination of
+targets R to overlay their exit-ordered curves with distinct colors; **Όλα**
+checks all nine targets. At least one target remains selected. The curves use a
 shared UTC time/USDT scale. Enter an explicit starting balance and fixed USDT
 risk per trade (the displayed 1000/10 values are editable examples). The
 research visualization computes `balance = initial + fixed_risk * cumulative_R`,

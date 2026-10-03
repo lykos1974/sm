@@ -147,14 +147,14 @@ def load_equity(output_root: Path, results: list[TargetResult]) -> dict[Decimal,
     return series
 
 
-def bank_lines(series: dict[Decimal, list[EquityPoint]], selected: Decimal | None,
+def bank_lines(series: dict[Decimal, list[EquityPoint]], selected: set[Decimal],
                initial: Decimal, risk: Decimal) -> dict[Decimal, list[tuple[int, Decimal]]]:
     if (not initial.is_finite() or not risk.is_finite() or initial <= 0 or risk <= 0
             or initial > 1_000_000_000 or risk > initial):
         raise ValueError("positive initial capital and risk up to initial capital required")
-    if selected is not None and selected not in series:
-        raise ValueError("unknown target")
-    chosen = series if selected is None else {selected: series[selected]}
+    if not selected or not selected <= series.keys():
+        raise ValueError("select at least one available target")
+    chosen = {target: points for target, points in series.items() if target in selected}
     return {target: [(point.timestamp, initial + risk * point.cumulative) for point in points]
             for target, points in chosen.items()}
 
@@ -243,18 +243,21 @@ class TargetComparisonWindow(tk.Toplevel):
         controls.pack(pady=8)
         ttk.Button(controls, text="Profit / Drawdown", command=self.show_comparison).pack(side="left", padx=5)
         ttk.Button(controls, text="Εξέλιξη μπάνκας", command=self.show_bank).pack(side="left", padx=5)
-        self.selection = tk.StringVar(value="Όλα")
-        ttk.Label(controls, text="Στόχος:").pack(side="left", padx=(15, 3))
-        self.selector = ttk.Combobox(controls, textvariable=self.selection, state="readonly", width=9,
-                                     values=["Όλα", *(f"{_fmt(item.target)}R" for item in results)])
-        self.selector.pack(side="left")
-        self.selector.bind("<<ComboboxSelected>>", lambda _event: self.show_bank())
         self.initial = tk.StringVar(value="1000")
         self.risk = tk.StringVar(value="10")
         ttk.Label(controls, text="Αρχική μπάνκα USDT:").pack(side="left", padx=(15, 3))
         ttk.Entry(controls, textvariable=self.initial, width=10).pack(side="left")
         ttk.Label(controls, text="Ρίσκο / trade USDT:").pack(side="left", padx=(12, 3))
         ttk.Entry(controls, textvariable=self.risk, width=9).pack(side="left")
+        choices = ttk.Frame(self)
+        choices.pack(pady=4)
+        ttk.Label(choices, text="Στόχοι:").pack(side="left", padx=6)
+        self.target_checks = {item.target: tk.BooleanVar(value=True) for item in results}
+        for index, item in enumerate(results):
+            ttk.Checkbutton(choices, text=f"{_fmt(item.target)}R",
+                            variable=self.target_checks[item.target],
+                            command=lambda target=item.target: self.toggle_target(target)).pack(side="left", padx=4)
+        ttk.Button(choices, text="Όλα", command=self.select_all).pack(side="left", padx=12)
         self.caption = ttk.Label(self, font=("TkDefaultFont", 12, "bold"))
         self.caption.pack(pady=9)
         self.canvas = tk.Canvas(self, width=1050, height=490, bg="white", highlightthickness=0)
@@ -268,14 +271,23 @@ class TargetComparisonWindow(tk.Toplevel):
         self.canvas.delete("all")
         draw_comparison(self.canvas, self.results)
 
+    def select_all(self):
+        for variable in self.target_checks.values():
+            variable.set(True)
+        self.show_bank()
+
+    def toggle_target(self, target: Decimal):
+        if not any(variable.get() for variable in self.target_checks.values()):
+            self.target_checks[target].set(True)
+        self.show_bank()
+
     def show_bank(self):
         try:
             initial = _decimal(self.initial.get())
             risk = _decimal(self.risk.get())
             if self.series is None:
                 self.series = load_equity(self.output_root, self.results)
-            selected = (None if self.selection.get() == "Όλα" else
-                        _decimal(self.selection.get().removesuffix("R")))
+            selected = {target for target, variable in self.target_checks.items() if variable.get()}
             lines = bank_lines(self.series, selected, initial, risk)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             messagebox.showerror("Εξέλιξη μπάνκας", str(exc), parent=self)

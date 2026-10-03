@@ -113,16 +113,22 @@ class TargetComparisonTests(unittest.TestCase):
         summary = load_comparison(self.root)
         series = load_equity(self.root, summary)
         self.assertEqual(set(series), {item.target for item in summary})
-        all_lines = bank_lines(series, None, Decimal('1000'), Decimal('10'))
+        all_lines = bank_lines(series, set(series), Decimal('1000'), Decimal('10'))
         self.assertEqual(len(all_lines), 9)
         self.assertEqual(all_lines[Decimal('2.5')][-1][1], Decimal('1025'))
-        chosen = bank_lines(series, Decimal('2.5'), Decimal('1000'), Decimal('10'))
-        self.assertEqual(len(chosen), 1)
+        chosen = bank_lines(series, {Decimal('2.5'), Decimal('6'), Decimal('10')},
+                            Decimal('1000'), Decimal('10'))
+        self.assertEqual(list(chosen), [Decimal('2.5'), Decimal('6'), Decimal('10')])
+        self.assertEqual(chosen[Decimal('6')][-1][1], Decimal('1000') + 10 * series[Decimal('6')][-1].cumulative)
         canvas = FakeCanvas()
         draw_bank(canvas, all_lines, Decimal('1000'), {target: '#123456' for target in series})
         self.assertTrue(canvas.labels)
         with self.assertRaises(ValueError):
-            bank_lines(series, None, Decimal('1000'), Decimal('1001'))
+            bank_lines(series, set(series), Decimal('1000'), Decimal('1001'))
+        with self.assertRaisesRegex(ValueError, 'select at least one'):
+            bank_lines(series, set(), Decimal('1000'), Decimal('10'))
+        with self.assertRaisesRegex(ValueError, 'available target'):
+            bank_lines(series, {Decimal('11')}, Decimal('1000'), Decimal('10'))
 
     def test_bank_chart_rejects_altered_ledger_and_wrong_manifest(self):
         summary = load_comparison(self.root)
