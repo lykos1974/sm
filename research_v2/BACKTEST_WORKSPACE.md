@@ -45,6 +45,15 @@ price; the chart marks exit **time only** and never guesses the fill price.
 The viewer checks the job and causal manifests, decision ledger hash, and
 frozen input hashes. It does not run a backtest or alter the source files.
 
+The same viewer offers **Candles / PnF** and entry/exit focus. PnF renders
+the pinned `columns.csv` with the frozen box size, X/O boxes, and trade entry
+and exit time markers. Entry is marked at its simulated level; the ledger has
+no exit fill price, so the exit has a time marker only. Event-to-column mapping
+uses the latest column start at or before the event. Completed PnF columns
+are retrospective: their final boxes may have formed after the marked event;
+do not read them as the live PnF state at entry or exit. This chart is for
+inspection and does not change strategy decisions or results.
+
 The job schema is `research-backtest-job-v1`. It requires `strategy_id`,
 absolute paths and SHA-256 for both CSV inputs, `minimum_entry_ts`, and an
 absolute new output path. Only explicitly allowlisted adapters execute.

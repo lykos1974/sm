@@ -67,10 +67,10 @@ class ResearchApp(tk.Tk):
         if not selected:
             return
         try:
-            from research_v2.trade_chart import TradeChartWindow, completed_run_inputs
+            from research_v2.trade_chart import TradeChartWindow, completed_run_sources
             root = Path(selected)
-            candles = completed_run_inputs(root)
-            TradeChartWindow(self, root, candles)
+            columns, candles = completed_run_sources(root)
+            TradeChartWindow(self, root, candles, columns)
         except (OSError, ValueError, KeyError) as exc:
             messagebox.showerror("Research chart", str(exc))
 

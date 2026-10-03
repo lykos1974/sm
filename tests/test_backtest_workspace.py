@@ -167,6 +167,44 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "provenance"):
                 trade_chart.completed_run_inputs(root)
 
+    def test_pnf_view_maps_entry_and_exit_to_frozen_columns(self):
+        self.write()
+        workspace.run_job(self.path)
+        trade = trade_chart.load_trades(self.root / "results")[0]
+        starts, pnf, box = trade_chart.load_pnf_columns(self.cols)
+        self.assertEqual(box, 1)
+        around, entry, exit = trade_chart.pnf_window(starts, pnf, trade, "entry", 2)
+        self.assertEqual(around[entry].idx, 5)
+        self.assertTrue(0 <= exit < len(around))
+        self.assertEqual(around[exit].kind, "O")
+        around, entry, exit = trade_chart.pnf_window(starts, pnf, trade, "exit", 1)
+        self.assertEqual(around[exit].idx, 5)
+        self.assertEqual(around[entry].idx, 5)
+
+    def test_pnf_view_rejects_changed_profile_and_unmappable_event(self):
+        starts, pnf, box = trade_chart.load_pnf_columns(self.cols)
+        self.assertEqual(len(pnf), 6)
+        trade = trade_chart.Trade("T", "O", START - 1, START, "STOP_FIRST", -1,
+                                  100, 99, 102.5)
+        with self.assertRaisesRegex(ValueError, "precedes"):
+            trade_chart.pnf_window(starts, pnf, trade, "entry")
+        data = self.cols.read_text()
+        self.cols.write_text(data.replace("BTC_bs1_rev3", "BTC_bs1_rev4", 1))
+        with self.assertRaisesRegex(ValueError, "profile"):
+            trade_chart.load_pnf_columns(self.cols)
+
+    def test_pnf_input_is_pinned_to_the_completed_job(self):
+        job_file = self.root / "results.job.json"
+        workspace.create_job(self.cols, self.cands, START, self.root / "results", job_file)
+        workspace.run_job(job_file)
+        with patch.object(trade_chart, "BTC_2024_COLUMNS_SHA", workspace._sha(self.cols)), \
+             patch.object(trade_chart, "BTC_2024_CANDLES_SHA", workspace._sha(self.cands)):
+            self.assertEqual(trade_chart.completed_run_sources(self.root / "results"),
+                             (self.cols, self.cands))
+            self.cols.write_bytes(self.cols.read_bytes() + b"\n")
+            with self.assertRaisesRegex(ValueError, "frozen input"):
+                trade_chart.completed_run_sources(self.root / "results")
+
 
 if __name__ == "__main__":
     unittest.main()
