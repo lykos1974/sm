@@ -205,6 +205,45 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frozen input"):
                 trade_chart.completed_run_sources(self.root / "results")
 
+    def test_trade_conditions_replay_only_recorded_decision_and_fill(self):
+        self.write()
+        workspace.run_job(self.path)
+        root = self.root / "results"
+        trade = trade_chart.load_trades(root)[0]
+        _, pnf, box = trade_chart.load_pnf_columns(self.cols)
+        times, candles = trade_chart.load_candles(self.cands)
+        rows = trade_chart.build_trade_explanations(root, [trade], pnf, box,
+                                                     times, candles)[trade.trade_id]
+        self.assertEqual(rows[0], ("Στρατηγική", "LOW_POLE LONG", "γνωστό στο σήμα"))
+        self.assertIn(("Μοτίβο PnF", "O → X → O", "γνωστό στο σήμα"), rows)
+        self.assertIn(("Pole", "20 boxes", "> 5"), rows)
+        self.assertTrue(any(name == "Εκτέλεση limit" and "1/3" in value
+                            for name, value, _ in rows))
+        self.assertTrue(any(name == "Έξοδος" and value == "TARGET_FIRST, +2.5 R"
+                            for name, value, _ in rows))
+
+    def test_trade_conditions_reject_mismatched_decision_or_fill_evidence(self):
+        self.write()
+        workspace.run_job(self.path)
+        root = self.root / "results"
+        trade = trade_chart.load_trades(root)[0]
+        _, pnf, box = trade_chart.load_pnf_columns(self.cols)
+        times, candles = trade_chart.load_candles(self.cands)
+        ledger = root / "causal_decisions.csv"
+        source = ledger.read_text()
+        ledger.write_text(source.replace(",LONG,", ",SHORT,", 1))
+        with self.assertRaises(ValueError):
+            trade_chart.build_trade_explanations(root, [trade], pnf, box,
+                                                 times, candles)
+        ledger.write_text(source)
+        wrong = trade_chart.Trade(trade.trade_id, trade.opportunity_id,
+                                  trade.entry_ms - 60_000, trade.exit_ms,
+                                  trade.classification, trade.result_r, trade.entry,
+                                  trade.stop, trade.target)
+        with self.assertRaisesRegex(ValueError, "fill"):
+            trade_chart.build_trade_explanations(root, [wrong], pnf, box,
+                                                 times, candles)
+
 
 if __name__ == "__main__":
     unittest.main()

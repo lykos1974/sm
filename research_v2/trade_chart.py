@@ -1,4 +1,4 @@
-"""Read-only candle chart for completed causal LONG pole research trades."""
+"""Read-only candle/PnF chart and evidence table for completed research trades."""
 from __future__ import annotations
 
 import bisect
@@ -221,17 +221,106 @@ def _utc(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def build_trade_explanations(result_root: Path, trades: list[Trade],
+                             columns: list[PnfColumn], box: float,
+                             times: list[int], candles: list[Candle]
+                             ) -> dict[str, list[tuple[str, str, str]]]:
+    """Explain existing evidence; reject disagreement instead of recreating a signal."""
+    from pnf_mvp.patterns.poles import _box_count
+    from research_v2.patterns.pole_portfolio_reality_audit import (
+        BREAK_EVEN_TRIGGER_R, LIMIT_EXPIRY_CANDLES, TARGET_R,
+    )
+
+    if not columns or not math.isfinite(box) or box <= 0:
+        raise ValueError("missing PnF evidence")
+    source = _rows(result_root / "causal_decisions.csv", {
+        "decision_id", "pole_column_index", "reversal_column_index",
+        "confirmation_column_index", "decision_known_at_ms",
+        "entry_candle_open_ms", "entry_candle_close_ms", "direction",
+        "entry_price", "stop_price",
+    })
+    by_id = {}
+    for row in source:
+        if row["decision_id"] in by_id:
+            raise ValueError("duplicate decision evidence")
+        by_id[row["decision_id"]] = row
+    explanations = {}
+    for trade in trades:
+        decision = by_id.get("DEC-" + trade.opportunity_id[4:])
+        if decision is None or decision["direction"] != "LONG":
+            raise ValueError("trade decision identity mismatch")
+        pole_idx, reversal_idx, confirmation_idx = (int(decision[key]) for key in (
+            "pole_column_index", "reversal_column_index", "confirmation_column_index"))
+        if (pole_idx < 1 or confirmation_idx != reversal_idx + 1
+                or reversal_idx != pole_idx + 1 or confirmation_idx >= len(columns)):
+            raise ValueError("trade decision column mismatch")
+        pole, reversal, confirmation = columns[pole_idx:confirmation_idx + 1]
+        previous = next((col for col in reversed(columns[:pole_idx])
+                         if col.kind == "O"), None)
+        if previous is None or (pole.kind, reversal.kind, confirmation.kind) != ("O", "X", "O"):
+            raise ValueError("trade PnF motif mismatch")
+        pole_boxes = _box_count(pole.top, pole.bottom, box)
+        retrace_boxes = _box_count(reversal.top, reversal.bottom, box)
+        breakout = _box_count(previous.bottom, pole.bottom, box) - 1
+        retrace_ratio = retrace_boxes / pole_boxes
+        if pole_boxes <= 5 or breakout < 3 or retrace_ratio <= 0.5:
+            raise ValueError("trade motif thresholds mismatch")
+        known = int(decision["decision_known_at_ms"])
+        eligible = int(decision["entry_candle_close_ms"])
+        candle_idx = bisect.bisect_left(times, eligible)
+        if (known != confirmation.start_ms or candle_idx == len(times)
+                or times[candle_idx] != eligible
+                or int(decision["entry_candle_open_ms"]) != eligible - 59_999
+                or known >= eligible - 59_999):
+            raise ValueError("trade causal chronology mismatch")
+        entry, stop = _number(decision["entry_price"]), _number(decision["stop_price"])
+        if (not math.isclose(entry, candles[candle_idx].open, abs_tol=1e-7)
+                or not math.isclose(entry, trade.entry, abs_tol=1e-7)
+                or not math.isclose(stop, trade.stop, abs_tol=1e-7)
+                or not math.isclose(stop, entry - 3 * box, abs_tol=1e-7)
+                or not math.isclose(trade.target, entry + TARGET_R * (entry-stop), abs_tol=1e-7)):
+            raise ValueError("trade entry geometry mismatch")
+        fill_idx = bisect.bisect_left(times, trade.entry_ms)
+        elapsed = fill_idx - candle_idx
+        if (fill_idx >= len(times) or times[fill_idx] != trade.entry_ms
+                or elapsed < 0 or elapsed >= LIMIT_EXPIRY_CANDLES
+                or not candles[fill_idx].low < entry):
+            raise ValueError("trade fill evidence mismatch")
+        explanations[trade.trade_id] = [
+            ("Στρατηγική", "LOW_POLE LONG", "γνωστό στο σήμα"),
+            ("Μοτίβο PnF", "O → X → O", "γνωστό στο σήμα"),
+            ("Στήλες", f"{pole_idx} → {reversal_idx} → {confirmation_idx}", "γνωστό στο σήμα"),
+            ("Pole", f"{pole_boxes} boxes", "> 5"),
+            ("Breakout excess", f"{breakout} boxes", "≥ 3"),
+            ("Retrace / pole", f"{retrace_boxes}/{pole_boxes} = {retrace_ratio:.2f}", "> 0.50"),
+            ("Σήμα γνωστό", _utc(known), "start confirmation"),
+            ("Επιλέξιμο κερί", _utc(eligible), "μετά το σήμα"),
+            ("Limit entry", f"{entry:g}", "open επιλέξιμου κεριού"),
+            ("Stop", f"{stop:g}", "entry − 3 boxes"),
+            ("Target", f"{trade.target:g}", f"{TARGET_R:g} R"),
+            ("Εκτέλεση limit", f"κερί {elapsed+1}/{LIMIT_EXPIRY_CANDLES}", "low < entry (OHLC)"),
+            ("Χρόνος fill", _utc(trade.entry_ms), "προσομοίωση"),
+            ("BE trigger", f"{BREAK_EVEN_TRIGGER_R:g} R", "πολιτική simulator"),
+            ("Έξοδος", f"{trade.classification}, {trade.result_r:+g} R", "μεταγενέστερο αποτέλεσμα"),
+            ("Χρόνος εξόδου", _utc(trade.exit_ms), "τιμή μη διαθέσιμη"),
+            ("Κόστη", "δεν περιλαμβάνονται", "gross R"),
+        ]
+    return explanations
+
+
 class TradeChartWindow(tk.Toplevel):
     def __init__(self, master: tk.Misc, result_root: Path, candles_path: Path,
                  columns_path: Path | None = None):
         super().__init__(master)
         self.title("BTC 2024 — research trades")
-        self.geometry("1000x610")
+        self.geometry("1560x720")
         self.trades = load_trades(result_root)
         self.times, self.candles = load_candles(candles_path)
         if columns_path is None:
             columns_path = completed_run_sources(result_root)[0]
         self.pnf_starts, self.pnf_columns, self.box_size = load_pnf_columns(columns_path)
+        self.explanations = build_trade_explanations(result_root, self.trades,
+            self.pnf_columns, self.box_size, self.times, self.candles)
         self.selected = tk.StringVar(value=self.trades[0].trade_id)
         self.focus = tk.StringVar(value="entry")
         self.view = tk.StringVar(value="candles")
@@ -252,8 +341,33 @@ class TradeChartWindow(tk.Toplevel):
                         value="exit", command=self.draw).pack(side="left", padx=8)
         self.caption = ttk.Label(self, text="")
         self.caption.pack(fill="x", padx=10)
-        self.canvas = tk.Canvas(self, bg="white", height=510)
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=8)
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=8)
+        self.canvas = tk.Canvas(body, bg="white", height=510)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        details = ttk.Frame(body, width=510)
+        details.pack(side="right", fill="y", padx=(10, 0))
+        details.pack_propagate(False)
+        ttk.Label(details, text="Γιατί εκτελέστηκε το trade",
+                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        table_frame = ttk.Frame(details)
+        table_frame.pack(fill="both", expand=True)
+        self.evidence = ttk.Treeview(table_frame, columns=("value", "rule"),
+                                     show="tree headings", height=17)
+        self.evidence.heading("#0", text="Συνθήκη")
+        self.evidence.heading("value", text="Τιμή")
+        self.evidence.heading("rule", text="Κριτήριο / πηγή")
+        self.evidence.column("#0", width=145, stretch=False)
+        self.evidence.column("value", width=205, stretch=False)
+        self.evidence.column("rule", width=145, stretch=False)
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.evidence.yview)
+        self.evidence.configure(yscrollcommand=scroll.set)
+        self.evidence.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        ttk.Label(details, text=("Οι κανόνες ήταν γνωστοί στο σήμα. "
+                  "Fill/έξοδος προκύπτουν από την προσομοίωση 1m OHLC. "
+                  "Η τελική PnF στήλη μπορεί να περιλαμβάνει μεταγενέστερα boxes."),
+                  wraplength=490, justify="left").pack(fill="x", pady=(9, 0))
         self.canvas.bind("<Configure>", lambda _: self.draw())
         self.draw()
 
@@ -268,6 +382,9 @@ class TradeChartWindow(tk.Toplevel):
         note = " | PnF τελικές στήλες: αναδρομική εικόνα, όχι κατάσταση κατά το trade" if pnf else ""
         self.caption.configure(text=(f"{trade.trade_id}: {trade.classification}, {trade.result_r:g} R | "
                                      f"entry {_utc(trade.entry_ms)} | exit {_utc(trade.exit_ms)}{note}"))
+        self.evidence.delete(*self.evidence.get_children())
+        for name, value, rule in self.explanations[trade.trade_id]:
+            self.evidence.insert("", "end", text=name, values=(value, rule))
         canvas = self.canvas
         canvas.delete("all")
         width, height = max(canvas.winfo_width(), 600), max(canvas.winfo_height(), 400)

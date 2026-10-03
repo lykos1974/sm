@@ -54,6 +54,16 @@ are retrospective: their final boxes may have formed after the marked event;
 do not read them as the live PnF state at entry or exit. This chart is for
 inspection and does not change strategy decisions or results.
 
+A read-only table beside either chart explains each selected trade. It derives
+the LOW_POLE LONG O/X/O motif, pole size, breakout excess, retrace ratio, and
+signal knowledge time from the pinned PnF columns and causal decision ledger.
+It separately identifies the eligible candle, simulated three-candle limit
+fill, stop/target/BE policy, and later exit result. If the ledger disagrees
+with the frozen columns or the 1m candle touched by the simulated fill, the
+viewer fails closed. Exit fill price is unavailable; the table does not infer
+one. This explanation is historical gross OHLC research, not a live-order or
+net-profitability claim.
+
 The job schema is `research-backtest-job-v1`. It requires `strategy_id`,
 absolute paths and SHA-256 for both CSV inputs, `minimum_entry_ts`, and an
 absolute new output path. Only explicitly allowlisted adapters execute.
