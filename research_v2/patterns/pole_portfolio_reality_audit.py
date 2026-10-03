@@ -217,7 +217,8 @@ def _safe_median(values: list[float]) -> float | str:
 
 
 def _pending_limit_be_classify(
-    rep: Any, candles: list[Any], expiry_candles: int
+    rep: Any, candles: list[Any], expiry_candles: int,
+    target_r: float = TARGET_R,
 ) -> tuple[str, float | None, int | None, int | None, str]:
     if expiry_candles <= 0:
         raise ValueError("expiry_candles must be positive")
@@ -260,7 +261,7 @@ def _pending_limit_be_classify(
             first_fill.ts,
             "fill candle also contains the stop level; conservative same-candle handling records a stop",
         )
-    if _target_touched(first_fill, rep, TARGET_R):
+    if _target_touched(first_fill, rep, target_r):
         return (
             "SAME_CANDLE_FILL_TARGET_AMBIGUOUS",
             None,
@@ -271,7 +272,7 @@ def _pending_limit_be_classify(
 
     post_fill = _post_fill_observation(rep, first_fill.ts, candles)
     classification, result_r, exit_ts, details = _be_classify(
-        post_fill, candles, BREAK_EVEN_TRIGGER_R
+        post_fill, candles, BREAK_EVEN_TRIGGER_R, target_r
     )
     return classification, result_r, first_fill.ts, exit_ts, details
 
@@ -320,6 +321,7 @@ def _resolved_outcomes(
     opportunities: list[Opportunity],
     candles_by_symbol: dict[str, Any],
     expiry_candles: int = LIMIT_EXPIRY_CANDLES,
+    target_r: float = TARGET_R,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     outcomes: list[dict[str, Any]] = []
     flags: list[dict[str, str]] = []
@@ -327,7 +329,7 @@ def _resolved_outcomes(
         rep = opportunity.representative
         classification, result_r, entry_ts, exit_ts, details = (
             _pending_limit_be_classify(
-                rep, candles_by_symbol[rep.symbol], expiry_candles
+                rep, candles_by_symbol[rep.symbol], expiry_candles, target_r
             )
         )
         if result_r is None or exit_ts is None or entry_ts is None:
@@ -1367,7 +1369,11 @@ def run(
     slippage_bps: float | None = None,
     debug_overlap_trace: bool = False,
     observation_loader=None,
+    target_r: float = TARGET_R,
 ) -> None:
+    if (type(target_r) not in (int, float) or not math.isfinite(target_r)
+            or not 2.5 <= target_r <= 10):
+        raise ValueError("invalid research target R")
     symbols, observations, candles_by_symbol = (observation_loader or _load_observations)(
         symbol_inputs, columns_inputs, candles_inputs, candle_symbols or {}
     )
@@ -1394,7 +1400,8 @@ def run(
         )
 
     opportunities = _build_portfolio_opportunities(observations)
-    outcomes, unresolved_flags = _resolved_outcomes(opportunities, candles_by_symbol)
+    outcomes, unresolved_flags = _resolved_outcomes(opportunities, candles_by_symbol,
+                                                    target_r=target_r)
     trades, overlap_flags, overlap_trace_rows = (
         _apply_one_position_per_symbol_with_trace(outcomes)
     )
@@ -1456,7 +1463,7 @@ def run(
             f"- Entry: `{LIMIT_FILL_MODEL}` at the intended `{ENTRY_CANDIDATE}` price\n"
             f"- Limit expiry: {LIMIT_EXPIRY_CANDLES} candle(s)\n"
             "- Stop: fixed 3-box stop\n"
-            "- Target: fixed 2.5R\n"
+            f"- Target: fixed {target_r:g}R\n"
             "- Management: move stop to break-even after +2R after the limit fill\n"
             "- No TP1, TP2, trailing, scaling, or pyramiding\n\n"
         )
@@ -1522,7 +1529,7 @@ def run(
         "execution_model": LIMIT_FILL_MODEL,
         "limit_expiry_candles": LIMIT_EXPIRY_CANDLES,
         "stop": "fixed_3_box_stop",
-        "target_R": TARGET_R,
+        "target_R": target_r,
         "break_even_after_R": BREAK_EVEN_TRIGGER_R,
         "risk_assumption": "1R fixed fractional per trade; no compounding; R-based equity curve",
         "notional_sizing_validation": {

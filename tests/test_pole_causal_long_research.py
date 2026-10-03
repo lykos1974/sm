@@ -110,6 +110,41 @@ class CausalLongTests(unittest.TestCase):
             self.assertEqual(result['decision_count'], 0)
             self.assertEqual(result['resolved_portfolio_trades'], 0)
 
+    def test_target_rerun_preserves_be_and_handles_ten_r_with_ambiguous_candle(self):
+        from research_v2.patterns.pole_be_research_audit import _be_classify
+        rep = causal.causal_observations('BTC', columns()[:6], 1, candles())[0]
+        fill = rep.observable_entry_ts
+        # Construct a post-fill replay with separate BE arming and target candles.
+        from dataclasses import replace
+        rep = replace(rep, entry=100, stop=97, observable_entry_ts=fill,
+                      replay_includes_anchor=False)
+        replay = [Candle(fill + 60_000, 101, 106, 101, 106),
+                  Candle(fill + 120_000, 106, 130, 106, 130)]
+        self.assertEqual(_be_classify(rep, replay, 2, 10)[:2], ('TARGET_FIRST', 10))
+        self.assertEqual(_be_classify(rep, replay, 2, 2.5)[:2], ('TARGET_FIRST', 2.5))
+        ambiguous = [Candle(fill + 60_000, 100, 130, 96, 101)]
+        self.assertEqual(_be_classify(rep, ambiguous, 2, 10)[0], 'SAME_CANDLE_AMBIGUOUS')
+        for bad in (True, float('nan'), float('inf'), 2, 10.1):
+            with self.assertRaises(ValueError):
+                _be_classify(rep, replay, 2, bad)
+
+    def test_pending_limit_target_sweep_replays_fill_and_later_exit(self):
+        from dataclasses import replace
+        from research_v2.patterns.pole_portfolio_reality_audit import _pending_limit_be_classify
+        rep = causal.causal_observations('BTC', columns()[:6], 1, candles())[0]
+        rep = replace(rep, entry=100, stop=97, observable_entry_ts=START)
+        sequence = [Candle(START, 102, 103, 99, 101),
+                    Candle(START + 60_000, 101, 106, 101, 105),
+                    Candle(START + 120_000, 106, 108, 101, 105),
+                    Candle(START + 180_000, 105, 130, 105, 130)]
+        small = _pending_limit_be_classify(rep, sequence, 3, 2.5)
+        large = _pending_limit_be_classify(rep, sequence, 3, 10)
+        self.assertEqual(small[:4], ('TARGET_FIRST', 2.5, START, START + 120_000))
+        self.assertEqual(large[:4], ('TARGET_FIRST', 10, START, START + 180_000))
+        self.assertEqual(_pending_limit_be_classify(rep,
+            [Candle(START, 102, 130, 99, 101)], 3, 10)[0],
+            'SAME_CANDLE_FILL_TARGET_AMBIGUOUS')
+
     def test_portfolio_injection_preserves_default_loader(self):
         from research_v2.patterns import pole_portfolio_reality_audit as portfolio
         with tempfile.TemporaryDirectory() as root:

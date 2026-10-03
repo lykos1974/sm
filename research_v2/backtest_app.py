@@ -16,11 +16,12 @@ class ResearchApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Research Backtests")
-        self.geometry("670x330")
+        self.geometry("670x375")
         self.dataset = tk.StringVar(value="Δεν έχει επιλεγεί dataset")
         self.status = tk.StringVar(value="Επίλεξε τον φάκελο results του BTC 2024.")
         self.start_date = tk.StringVar(value="2024-01-03")
         self.end_date = tk.StringVar(value="2024-12-31")
+        self.target_sweep = tk.BooleanVar(value=True)
         self.process = None
         self.job_path = None
         self.output_path = None
@@ -37,6 +38,8 @@ class ResearchApp(tk.Tk):
         ttk.Entry(period, textvariable=self.end_date, width=12).grid(row=0, column=3, padx=5)
         ttk.Label(self, text="Η περίοδος ορίζει νέα επιλέξιμα σήματα. Όλο το frozen ιστορικό δίνει warm-up και μεταγενέστερες εξόδους.",
                   wraplength=620).pack()
+        ttk.Checkbutton(self, text="Σύγκριση στόχων 2,5R, 3R έως 10R (επιπλέον προσομοιώσεις)",
+                        variable=self.target_sweep).pack(pady=3)
         self.run_button = ttk.Button(self, text="Εκτέλεση backtest", command=self.start)
         self.run_button.pack(pady=8)
         ttk.Button(self, text="Προβολή trades από προηγούμενο run",
@@ -54,7 +57,8 @@ class ResearchApp(tk.Tk):
             return
         try:
             self.job_path = prepare_btc_2024_job(Path(self.dataset.get()),
-                                                 self.start_date.get(), self.end_date.get())
+                                                 self.start_date.get(), self.end_date.get(),
+                                                 self.target_sweep.get())
             self.output_path = Path(json.loads(self.job_path.read_text(encoding="utf-8"))["output_root"])
             self.log_path = self.job_path.with_suffix(".run.log")
             with self.log_path.open("x", encoding="utf-8") as log:
@@ -97,7 +101,8 @@ class ResearchApp(tk.Tk):
                         self.status.set(
                             f"Ολοκληρώθηκε: {result['decision_count']} decisions, "
                             f"{result['resolved_portfolio_trades']} trades, "
-                            f"{result['gross_total_R']} gross R. Αποτελέσματα: {self.output_path}"
+                            f"{result['gross_total_R']} gross R στο 2,5R. "
+                            f"{'Σύγκριση: ' + str(self.output_path / 'target_sweep' / 'comparison.csv') if result.get('target_sweep_manifest') else 'Αποτελέσματα: ' + str(self.output_path)}"
                         )
                     except (OSError, ValueError, KeyError):
                         self.status.set(f"Ολοκληρώθηκε. Αποτελέσματα: {self.output_path}")

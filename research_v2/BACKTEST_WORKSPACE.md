@@ -137,3 +137,23 @@ unavailable. It was **not** a causal executable re-simulation of this BTC
 net performance here. A future target comparison needs independent pinned
 replays with identical decisions, entry/stop rules, costs and intrabar
 uncertainty. This change does not alter the target.
+
+## Target sweep to 10R
+
+The optional checkbox performs independent portfolio replays for 2.5R,
+3R, 4R, 5R, 6R, 7R, 8R, 9R and 10R. It reuses the **same selected causal
+decisions and pinned CSVs**, a three-candle pending limit, three-box stop,
+and BE trigger at 2R. The 2.5R replay remains the ordinary chartable run.
+Each other target has its own isolated `target_sweep/target_*R/` portfolio
+ledger and manifest. Different exit times can change later one-position
+admission; comparing only target touches on the original 2.5R trades would
+miss that effect.
+
+`target_sweep/comparison.csv` lists each variant's resolved trades, target,
+stop and BE exits, gross R, mean R, drawdown, losing streak, and the hash of
+its underlying portfolio manifest. The adjacent manifest pins the target
+grid, input hashes, period, BE rule and comparison-file hash. The research
+job uses schema v3; v1 and v2 jobs remain readable. Running all variants
+can take substantially longer than the single-target backtest. These are
+in-sample gross 1m OHLC results without exchange fills, fees, slippage or
+funding. No target is selected automatically or promoted to live trading.

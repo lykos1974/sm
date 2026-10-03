@@ -23,6 +23,8 @@ from research_v2.patterns.pole_core_motif_sl_c_candle_chronology import (
 from research_v2.patterns.pole_core_motif_next_open_expectancy_audit import ENTRY_CANDIDATE
 from research_v2.patterns.pole_portfolio_reality_audit import run as run_portfolio
 
+TARGET_SWEEP_R = (2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -103,7 +105,8 @@ def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float
 
 def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         minimum_entry_ts: int, expected_columns_sha256: str,
-        expected_candles_sha256: str, maximum_entry_ts: int | None = None) -> dict:
+        expected_candles_sha256: str, maximum_entry_ts: int | None = None,
+        target_sweep: bool = False) -> dict:
     if output_root.exists():
         raise FileExistsError('new isolated output directory required')
     if not columns_csv.is_file() or not candles_csv.is_file() or candles_csv.suffix.lower() != '.csv':
@@ -116,6 +119,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
                                           or maximum_entry_ts <= minimum_entry_ts):
         raise ValueError('invalid entry period')
+    if type(target_sweep) is not bool:
+        raise ValueError('invalid target sweep')
     with columns_csv.open(newline='', encoding='utf-8') as stream:
         raw_indices = [row['idx'] for row in csv.DictReader(stream)]
     if len(raw_indices) != len(set(raw_indices)):
@@ -141,6 +146,54 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     run_portfolio({'BTC': columns_csv}, {'BTC': columns_csv},
                   {'BTC': candles_csv}, output_root / 'portfolio',
                   {'BTC': 'BTCUSDT'}, observation_loader=loader)
+    if target_sweep:
+        sweep_root = output_root / 'target_sweep'
+        rows = []
+        for target_r in TARGET_SWEEP_R:
+            directory = (output_root / 'portfolio' if target_r == 2.5 else
+                         sweep_root / f'target_{target_r:g}R')
+            if target_r != 2.5:
+                run_portfolio({'BTC': columns_csv}, {'BTC': columns_csv},
+                              {'BTC': candles_csv}, directory, {'BTC': 'BTCUSDT'},
+                              observation_loader=loader, target_r=target_r)
+            manifest_path = directory / 'portfolio_reality_manifest.json'
+            with manifest_path.open(encoding='utf-8') as stream:
+                variant = json.load(stream)
+            with (directory / 'portfolio_reality_trade_sequence.csv').open(newline='', encoding='utf-8') as stream:
+                trades = list(csv.DictReader(stream))
+            with (directory / 'portfolio_reality_quarterly.csv').open(newline='', encoding='utf-8') as stream:
+                quarters = list(csv.DictReader(stream))
+            counts = {name: sum(trade['classification'] == name for trade in trades)
+                      for name in ('TARGET_FIRST', 'STOP_FIRST', 'BREAK_EVEN_EXIT')}
+            if (variant['target_R'] != target_r or
+                    sum(counts.values()) != variant['resolved_portfolio_trades']):
+                raise ValueError('target comparison evidence mismatch')
+            rows.append({'target_R': target_r, 'decisions': len(decisions),
+                         'resolved_trades': len(trades), **counts,
+                         'gross_total_R': variant['summary_metrics']['total_R'],
+                         'gross_average_R': variant['summary_metrics']['average_R_per_trade'],
+                         'max_drawdown_R': variant['summary_metrics']['max_drawdown_R'],
+                         'quarters_with_trades': len(quarters),
+                         'worst_quarter_R': min((float(q['total_R']) for q in quarters),
+                                                default=''),
+                         'longest_losing_streak': variant['summary_metrics']['longest_losing_streak'],
+                         'portfolio_manifest_sha256': _sha256(manifest_path)})
+        sweep_root.mkdir(parents=True, exist_ok=True)
+        with (sweep_root / 'comparison.csv').open('x', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        with (sweep_root / 'comparison_manifest.json').open('x', encoding='utf-8') as stream:
+            json.dump({'schema': 'causal-pole-target-sweep-v1', 'research_only': True,
+                       'targets_R': list(TARGET_SWEEP_R), 'baseline_target_R': 2.5,
+                       'break_even_trigger_R': 2.0, 'minimum_entry_ts': minimum_entry_ts,
+                       'maximum_entry_ts': maximum_entry_ts,
+                       'columns_sha256': expected_columns_sha256.lower(),
+                       'candles_sha256': expected_candles_sha256.lower(),
+                       'comparison_sha256': _sha256(sweep_root / 'comparison.csv'),
+                       'interpretation': 'gross OHLC, same causal decisions, independent portfolio replay per target; no fees, slippage, funding or exchange fills'},
+                      stream, indent=2, sort_keys=True)
+            stream.write('\n')
     if (_sha256(columns_csv) != expected_columns_sha256.lower()
             or _sha256(candles_csv) != expected_candles_sha256.lower()):
         raise ValueError('frozen input changed during research run')
@@ -176,6 +229,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     if maximum_entry_ts is not None:
         report['maximum_entry_ts'] = maximum_entry_ts
         report['entry_cohort_policy'] = 'UTC start inclusive, end exclusive; later exits allowed'
+    if target_sweep:
+        report['target_sweep_manifest'] = 'target_sweep/comparison_manifest.json'
     with (output_root / 'causal_manifest.json').open('x', encoding='utf-8') as stream:
         json.dump(report, stream, indent=2, sort_keys=True)
         stream.write('\n')

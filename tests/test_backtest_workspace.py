@@ -65,6 +65,53 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(result['result']['gross_total_R'], 2.5)
         self.assertEqual(len(trade_chart.load_trades(self.root / 'results')), 1)
 
+    def test_target_sweep_replays_same_decisions_with_independent_target_outcomes(self):
+        self.job['schema'] = workspace.SWEEP_SCHEMA
+        self.job['maximum_entry_ts'] = START + 16 * 60_000
+        self.job['target_sweep'] = True
+        self.write()
+        report = workspace.run_job(self.path)
+        self.assertEqual(report['result']['gross_total_R'], 2.5)
+        self.assertEqual(report['result']['decision_count'], 1)
+        comparison = self.root / 'results/target_sweep/comparison.csv'
+        with comparison.open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual([float(row['target_R']) for row in rows],
+                         [2.5, 3, 4, 5, 6, 7, 8, 9, 10])
+        self.assertTrue(all(row['decisions'] == '1' for row in rows))
+        self.assertEqual(rows[0]['gross_total_R'], '2.5')
+        self.assertEqual(rows[0]['TARGET_FIRST'], '1')
+        self.assertEqual(rows[-1]['TARGET_FIRST'], '0')
+        self.assertEqual(report['job']['target_sweep_manifest'],
+                         'target_sweep/comparison_manifest.json')
+        manifest = json.loads((self.root / 'results/target_sweep/comparison_manifest.json').read_text())
+        self.assertEqual(manifest['comparison_sha256'], workspace._sha(comparison))
+        self.assertEqual(json.loads((self.root / 'results/target_sweep/target_10R/portfolio_reality_manifest.json').read_text())['target_R'], 10)
+
+    def test_sweep_schema_rejects_false_or_malformed_flag(self):
+        self.job['schema'] = workspace.SWEEP_SCHEMA
+        self.job['maximum_entry_ts'] = START + 600_000
+        for bad in (False, 1, 'true', None):
+            self.job['target_sweep'] = bad
+            self.write()
+            with self.assertRaisesRegex(ValueError, 'sweep'):
+                workspace.run_job(self.path)
+        self.assertFalse((self.root / 'results').exists())
+
+    def test_gui_creates_pinned_sweep_job_for_selected_period(self):
+        dataset = self.root / 'frozen' / 'results'
+        dataset.mkdir(parents=True)
+        self.cols.rename(dataset / 'columns.csv')
+        self.cands.rename(dataset / 'candles_1m.csv')
+        with patch.object(workspace, 'BTC_2024_COLUMNS_SHA', workspace._sha(dataset / 'columns.csv')), \
+             patch.object(workspace, 'BTC_2024_CANDLES_SHA', workspace._sha(dataset / 'candles_1m.csv')):
+            path = workspace.prepare_btc_2024_job(dataset, '2024-04-01', '2024-04-30', True)
+        job = workspace.load_job(path)
+        self.assertEqual(job['schema'], workspace.SWEEP_SCHEMA)
+        self.assertIs(job['target_sweep'], True)
+        self.assertEqual(job['minimum_entry_ts'], 1711929600000)
+        self.assertEqual(job['maximum_entry_ts'], 1714521600000)
+
     def test_period_job_empty_cohort_and_invalid_bounds(self):
         self.job['schema'] = workspace.PERIOD_SCHEMA
         self.job['maximum_entry_ts'] = START + 60_000

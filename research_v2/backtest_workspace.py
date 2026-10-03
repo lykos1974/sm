@@ -12,9 +12,11 @@ from uuid import uuid4
 
 SCHEMA = "research-backtest-job-v1"
 PERIOD_SCHEMA = "research-backtest-job-v2"
+SWEEP_SCHEMA = "research-backtest-job-v3"
 FIELDS = {"schema", "strategy_id", "columns_csv", "columns_sha256",
           "candles_csv", "candles_sha256", "minimum_entry_ts", "output_root"}
 PERIOD_FIELDS = FIELDS | {"maximum_entry_ts"}
+SWEEP_FIELDS = PERIOD_FIELDS | {"target_sweep"}
 EXECUTABLE = frozenset({"causal_long_pole"})
 BTC_2024_COLUMNS_SHA = "ed263ac77c3b2ed7169006d669ee1c9d21382ac02a2b37f107f2bcb635e47a45"
 BTC_2024_CANDLES_SHA = "8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f"
@@ -64,7 +66,7 @@ def load_job(path: Path) -> dict:
         job = json.load(stream, object_pairs_hook=unique)
     if (type(job) is not dict or
             (job.get("schema"), set(job)) not in
-            ((SCHEMA, FIELDS), (PERIOD_SCHEMA, PERIOD_FIELDS))):
+            ((SCHEMA, FIELDS), (PERIOD_SCHEMA, PERIOD_FIELDS), (SWEEP_SCHEMA, SWEEP_FIELDS))):
         raise ValueError("unsupported job schema")
     if job["strategy_id"] not in EXECUTABLE:
         raise ValueError("strategy has no reviewed execution adapter")
@@ -78,14 +80,17 @@ def load_job(path: Path) -> dict:
             raise ValueError("canonical SHA-256 required")
     if type(job["minimum_entry_ts"]) is not int or job["minimum_entry_ts"] < 10**12:
         raise ValueError("invalid warm-up boundary")
-    if job["schema"] == PERIOD_SCHEMA and (type(job["maximum_entry_ts"]) is not int
+    if job["schema"] in (PERIOD_SCHEMA, SWEEP_SCHEMA) and (type(job["maximum_entry_ts"]) is not int
             or job["maximum_entry_ts"] <= job["minimum_entry_ts"]):
         raise ValueError("invalid entry period")
+    if job["schema"] == SWEEP_SCHEMA and job["target_sweep"] is not True:
+        raise ValueError("invalid target sweep")
     return job
 
 
 def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
-               output: Path, job_file: Path, maximum_entry_ts: int | None = None) -> dict:
+               output: Path, job_file: Path, maximum_entry_ts: int | None = None,
+               target_sweep: bool = False) -> dict:
     """Freeze user-selected inputs into an exclusive, portable job record."""
     columns, candles, output, job_file = (p.resolve() for p in (columns, candles, output, job_file))
     if not columns.is_file() or not candles.is_file() or columns == candles:
@@ -99,15 +104,20 @@ def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
     if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
                                           or maximum_entry_ts <= minimum_entry_ts):
         raise ValueError("invalid entry period")
+    if type(target_sweep) is not bool or (target_sweep and maximum_entry_ts is None):
+        raise ValueError("target sweep requires a selected period")
     if output.exists() or job_file.exists() or not output.parent.is_dir() or not job_file.parent.is_dir():
         raise ValueError("new output and job paths required")
-    job = {"schema": PERIOD_SCHEMA if maximum_entry_ts is not None else SCHEMA,
+    job = {"schema": SWEEP_SCHEMA if target_sweep else
+           PERIOD_SCHEMA if maximum_entry_ts is not None else SCHEMA,
            "strategy_id": "causal_long_pole",
            "columns_csv": str(columns), "columns_sha256": _sha(columns),
            "candles_csv": str(candles), "candles_sha256": _sha(candles),
            "minimum_entry_ts": minimum_entry_ts, "output_root": str(output)}
     if maximum_entry_ts is not None:
         job["maximum_entry_ts"] = maximum_entry_ts
+    if target_sweep:
+        job["target_sweep"] = True
     with job_file.open("x", encoding="utf-8") as stream:
         json.dump(job, stream, indent=2, sort_keys=True)
         stream.write("\n")
@@ -115,7 +125,7 @@ def create_job(columns: Path, candles: Path, minimum_entry_ts: int,
 
 
 def prepare_btc_2024_job(dataset: Path, start_date: str | None = None,
-                         end_date: str | None = None) -> Path:
+                         end_date: str | None = None, target_sweep: bool = False) -> Path:
     """One-folder GUI workflow for the hash-pinned BTC 2024 reference."""
     if not dataset.is_dir():
         raise ValueError("choose the frozen BTC 2024 results folder")
@@ -149,7 +159,7 @@ def prepare_btc_2024_job(dataset: Path, start_date: str | None = None,
                                tzinfo=timezone.utc).timestamp() * 1000)
     output = suggest_output_directory(dataset.parent.parent)
     job_file = output.with_suffix(".job.json")
-    create_job(columns, candles, minimum, output, job_file, maximum)
+    create_job(columns, candles, minimum, output, job_file, maximum, target_sweep)
     return job_file
 
 
@@ -173,7 +183,8 @@ def run_job(path: Path) -> dict:
 
     result = run(columns, candles, output, job["minimum_entry_ts"],
                  job["columns_sha256"], job["candles_sha256"],
-                 maximum_entry_ts=job.get("maximum_entry_ts"))
+                 maximum_entry_ts=job.get("maximum_entry_ts"),
+                 target_sweep=job.get("target_sweep", False))
     if _sha(columns) != job["columns_sha256"] or _sha(candles) != job["candles_sha256"]:
         raise ValueError("frozen input changed during run")
     provenance = {"schema": job["schema"], "strategy_id": job["strategy_id"],
@@ -181,9 +192,12 @@ def run_job(path: Path) -> dict:
                   "candles_sha256": job["candles_sha256"],
                   "minimum_entry_ts": job["minimum_entry_ts"],
                   "research_only": True, "result_manifest": "causal_manifest.json"}
-    if job["schema"] == PERIOD_SCHEMA:
+    if job["schema"] in (PERIOD_SCHEMA, SWEEP_SCHEMA):
         provenance["maximum_entry_ts"] = job["maximum_entry_ts"]
         provenance["entry_cohort_policy"] = "UTC start inclusive, end exclusive; later exits allowed"
+    if job["schema"] == SWEEP_SCHEMA:
+        provenance["target_sweep"] = True
+        provenance["target_sweep_manifest"] = "target_sweep/comparison_manifest.json"
     with (output / "research_job_manifest.json").open("x", encoding="utf-8") as stream:
         json.dump(provenance, stream, sort_keys=True, indent=2)
         stream.write("\n")
