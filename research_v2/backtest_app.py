@@ -16,7 +16,7 @@ class ResearchApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Research Backtests")
-        self.geometry("670x375")
+        self.geometry("670x420")
         self.dataset = tk.StringVar(value="Δεν έχει επιλεγεί dataset")
         self.status = tk.StringVar(value="Επίλεξε τον φάκελο results του BTC 2024.")
         self.start_date = tk.StringVar(value="2024-01-03")
@@ -44,6 +44,8 @@ class ResearchApp(tk.Tk):
         self.run_button.pack(pady=8)
         ttk.Button(self, text="Προβολή trades από προηγούμενο run",
                    command=self.open_trades).pack(pady=2)
+        ttk.Button(self, text="Συγκριτικό chart Profit / Drawdown",
+                   command=self.open_comparison).pack(pady=2)
         ttk.Label(self, textvariable=self.status, wraplength=620).pack(padx=15, pady=6)
         self.after(300, self.poll)
 
@@ -88,6 +90,19 @@ class ResearchApp(tk.Tk):
             TradeChartWindow(self, root, candles, columns)
         except (OSError, ValueError, KeyError) as exc:
             messagebox.showerror("Research chart", str(exc))
+
+    def open_comparison(self):
+        selected = (str(self.output_path) if self.output_path is not None
+                    and (self.output_path / "target_sweep/comparison_manifest.json").is_file()
+                    and (self.output_path / "research_job_manifest.json").is_file()
+                    else filedialog.askdirectory(title="Επίλεξε τον φάκελο αποτελεσμάτων του backtest"))
+        if not selected:
+            return
+        try:
+            from research_v2.target_comparison_chart import TargetComparisonWindow
+            TargetComparisonWindow(self, Path(selected))
+        except (OSError, ValueError, KeyError) as exc:
+            messagebox.showerror("Target comparison", str(exc))
 
     def poll(self):
         if self.process is not None:

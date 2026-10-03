@@ -158,3 +158,11 @@ job uses schema v3; v1 and v2 jobs remain readable. Running all variants
 can take substantially longer than the single-target backtest. These are
 in-sample gross 1m OHLC results without exchange fills, fees, slippage or
 funding. No target is selected automatically or promoted to live trading.
+
+The **Συγκριτικό chart Profit / Drawdown** button opens an existing completed
+target-sweep run without recalculation. It reads the SHA-checked comparison
+and matching research job manifest. Blue profit bars extend above zero and
+red maximum-drawdown bars below zero, both on the same R scale. The chart
+shows only these two result measures for each target. If the CSV, manifest,
+target grid or completed-job binding is changed or missing, it refuses to
+render. The operator can choose the result folder after restarting the app.
