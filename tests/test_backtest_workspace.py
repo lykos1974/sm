@@ -88,6 +88,28 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(manifest['comparison_sha256'], workspace._sha(comparison))
         self.assertEqual(json.loads((self.root / 'results/target_sweep/target_10R/portfolio_reality_manifest.json').read_text())['target_R'], 10)
 
+    def test_sweep_counts_conservative_stop_on_fill_candle(self):
+        source = self.cands.read_text()
+        self.cands.write_text(source.replace(
+            f'{START + 6 * 60_000},100,101,99,100',
+            f'{START + 6 * 60_000},100,101,96,100'))
+        self.job['candles_sha256'] = workspace._sha(self.cands)
+        self.job['schema'] = workspace.SWEEP_SCHEMA
+        self.job['maximum_entry_ts'] = START + 16 * 60_000
+        self.job['target_sweep'] = True
+        self.write()
+        report = workspace.run_job(self.path)
+        comparison = self.root / 'results/target_sweep/comparison.csv'
+        with comparison.open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 9)
+        self.assertEqual(report['result']['gross_total_R'], -1)
+        for row in rows:
+            self.assertEqual(row['resolved_trades'], '1')
+            self.assertEqual(row['SAME_CANDLE_FILL_STOP_CONSERVATIVE'], '1')
+            self.assertEqual(row['STOP_FIRST'], '0')
+            self.assertEqual(row['gross_total_R'], '-1.0')
+
     def test_sweep_schema_rejects_false_or_malformed_flag(self):
         self.job['schema'] = workspace.SWEEP_SCHEMA
         self.job['maximum_entry_ts'] = START + 600_000

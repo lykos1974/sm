@@ -163,8 +163,12 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
                 trades = list(csv.DictReader(stream))
             with (directory / 'portfolio_reality_quarterly.csv').open(newline='', encoding='utf-8') as stream:
                 quarters = list(csv.DictReader(stream))
+            # A stop in the fill candle is a resolved -1R trade, not an
+            # unclassified observation. Keep it separate from later stops.
             counts = {name: sum(trade['classification'] == name for trade in trades)
-                      for name in ('TARGET_FIRST', 'STOP_FIRST', 'BREAK_EVEN_EXIT')}
+                      for name in ('TARGET_FIRST', 'STOP_FIRST',
+                                   'SAME_CANDLE_FILL_STOP_CONSERVATIVE',
+                                   'BREAK_EVEN_EXIT')}
             if (variant['target_R'] != target_r or
                     sum(counts.values()) != variant['resolved_portfolio_trades']):
                 raise ValueError('target comparison evidence mismatch')

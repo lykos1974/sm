@@ -150,7 +150,8 @@ admission; comparing only target touches on the original 2.5R trades would
 miss that effect.
 
 `target_sweep/comparison.csv` lists each variant's resolved trades, target,
-stop and BE exits, gross R, mean R, drawdown, losing streak, and the hash of
+stop and BE exits (including conservative same-candle fill/stop as its own
+resolved -1R category), gross R, mean R, drawdown, losing streak, and the hash of
 its underlying portfolio manifest. The adjacent manifest pins the target
 grid, input hashes, period, BE rule and comparison-file hash. The research
 job uses schema v3; v1 and v2 jobs remain readable. Running all variants
