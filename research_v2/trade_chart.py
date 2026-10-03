@@ -221,6 +221,64 @@ def _utc(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def exit_timeline(trade: Trade, candles: list[Candle], trigger_r: float
+                  ) -> list[tuple[str, str, str]]:
+    """Check the simulator's exit chronology on the bounded fill-to-exit slice."""
+    from types import SimpleNamespace
+    from research_v2.patterns.pole_be_research_audit import _be_classify
+
+    if (not candles or candles[0].close_ms != trade.entry_ms
+            or candles[-1].close_ms != trade.exit_ms
+            or any(b.close_ms - a.close_ms != 60_000
+                   for a, b in zip(candles, candles[1:]))):
+        raise ValueError("trade exit chronology mismatch")
+    fill = candles[0]
+    if fill.low >= trade.entry:
+        raise ValueError("trade fill candle mismatch")
+    trigger = trade.entry + trigger_r * (trade.entry - trade.stop)
+    if trade.classification == "SAME_CANDLE_FILL_STOP_CONSERVATIVE":
+        if (len(candles) != 1 or fill.low > trade.stop
+                or not math.isclose(trade.result_r, -1.0)):
+            raise ValueError("trade fill-candle outcome mismatch")
+        return [("Fill + stop ίδιο κερί", _utc(fill.close_ms),
+                 f"low ≤ {trade.stop:g}; συντηρητικά"),
+                ("Κερί εξόδου H/L", f"{fill.high:g} / {fill.low:g}", "1m OHLC")]
+    if fill.low <= trade.stop or fill.high >= trade.target:
+        raise ValueError("trade fill-candle outcome mismatch")
+    rep = SimpleNamespace(geometry_status="OBSERVABLE", direction="LONG",
+                          entry=trade.entry, stop=trade.stop,
+                          observable_entry_ts=trade.entry_ms, replay_includes_anchor=False)
+    replay = [SimpleNamespace(ts=c.close_ms, high=c.high, low=c.low)
+              for c in candles]
+    classification, result_r, exit_ms, _ = _be_classify(rep, replay, trigger_r)
+    if classification == "SAME_CANDLE_AMBIGUOUS":
+        raise ValueError("trade OHLC exit ambiguity")
+    if (classification != trade.classification or exit_ms != trade.exit_ms
+            or result_r is None or not math.isclose(result_r, trade.result_r,
+                                                     abs_tol=1e-9)):
+        raise ValueError("trade exit outcome mismatch")
+    armed_at = None
+    for candle in candles[1:]:
+        if candle.close_ms == trade.exit_ms:
+            break
+        if armed_at is None and candle.high >= trigger:
+            armed_at = candle.close_ms
+    if trade.classification == "BREAK_EVEN_EXIT" and armed_at is None:
+        raise ValueError("trade BE chronology mismatch")
+    timeline = [("BE επίπεδο", f"{trigger:g}", f"entry + {trigger_r:g} R")]
+    timeline.append(("BE ενεργό", _utc(armed_at) if armed_at is not None else "όχι",
+                     f"high ≥ {trigger:g}" if armed_at is not None else "πριν από έξοδο"))
+    label, rule = {
+        "BREAK_EVEN_EXIT": ("BE έξοδος", f"low ≤ {trade.entry:g}"),
+        "TARGET_FIRST": ("Target έξοδος", f"high ≥ {trade.target:g}"),
+        "STOP_FIRST": ("Stop έξοδος", f"low ≤ {trade.stop:g}"),
+    }[trade.classification]
+    timeline.append((label, _utc(trade.exit_ms), rule))
+    timeline.append(("Κερί εξόδου H/L",
+                     f"{candles[-1].high:g} / {candles[-1].low:g}", "1m OHLC"))
+    return timeline
+
+
 def build_trade_explanations(result_root: Path, trades: list[Trade],
                              columns: list[PnfColumn], box: float,
                              times: list[int], candles: list[Candle]
@@ -286,6 +344,11 @@ def build_trade_explanations(result_root: Path, trades: list[Trade],
                 or elapsed < 0 or elapsed >= LIMIT_EXPIRY_CANDLES
                 or not candles[fill_idx].low < entry):
             raise ValueError("trade fill evidence mismatch")
+        exit_idx = bisect.bisect_left(times, trade.exit_ms)
+        if exit_idx >= len(times) or times[exit_idx] != trade.exit_ms:
+            raise ValueError("trade exit candle unavailable")
+        timeline = exit_timeline(trade, candles[fill_idx:exit_idx + 1],
+                                 BREAK_EVEN_TRIGGER_R)
         explanations[trade.trade_id] = [
             ("Στρατηγική", "LOW_POLE LONG", "γνωστό στο σήμα"),
             ("Μοτίβο PnF", "O → X → O", "γνωστό στο σήμα"),
@@ -301,6 +364,7 @@ def build_trade_explanations(result_root: Path, trades: list[Trade],
             ("Εκτέλεση limit", f"κερί {elapsed+1}/{LIMIT_EXPIRY_CANDLES}", "low < entry (OHLC)"),
             ("Χρόνος fill", _utc(trade.entry_ms), "προσομοίωση"),
             ("BE trigger", f"{BREAK_EVEN_TRIGGER_R:g} R", "πολιτική simulator"),
+            *timeline,
             ("Έξοδος", f"{trade.classification}, {trade.result_r:+g} R", "μεταγενέστερο αποτέλεσμα"),
             ("Χρόνος εξόδου", _utc(trade.exit_ms), "τιμή μη διαθέσιμη"),
             ("Κόστη", "δεν περιλαμβάνονται", "gross R"),

@@ -221,6 +221,9 @@ class WorkspaceTests(unittest.TestCase):
                             for name, value, _ in rows))
         self.assertTrue(any(name == "Έξοδος" and value == "TARGET_FIRST, +2.5 R"
                             for name, value, _ in rows))
+        self.assertTrue(any(name == "Target έξοδος" and value ==
+                            trade_chart._utc(trade.exit_ms) for name, value, _ in rows))
+        self.assertTrue(any(name == "Κερί εξόδου H/L" for name, _, _ in rows))
 
     def test_trade_conditions_reject_mismatched_decision_or_fill_evidence(self):
         self.write()
@@ -243,6 +246,61 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fill"):
             trade_chart.build_trade_explanations(root, [wrong], pnf, box,
                                                  times, candles)
+
+    def test_exit_timeline_shows_be_arm_then_later_exit(self):
+        first = START
+        rows = [trade_chart.Candle(first, 100, 101, 99, 100),
+                trade_chart.Candle(first+60_000, 102, 106.5, 101, 104),
+                trade_chart.Candle(first+120_000, 104, 106, 99.5, 100)]
+        trade = trade_chart.Trade("T", "O", first, first+120_000,
+                                  "BREAK_EVEN_EXIT", 0, 100, 97, 107.5)
+        evidence = trade_chart.exit_timeline(trade, rows, 2.0)
+        self.assertIn(("BE ενεργό", trade_chart._utc(first+60_000), "high ≥ 106"), evidence)
+        self.assertIn(("BE έξοδος", trade_chart._utc(first+120_000), "low ≤ 100"), evidence)
+
+    def test_exit_timeline_target_stop_fill_candle_and_tampering(self):
+        first = START
+        fill = trade_chart.Candle(first, 100, 101, 99, 100)
+        target = trade_chart.Candle(first+60_000, 101, 108, 100.5, 107)
+        win = trade_chart.Trade("T", "O", first, first+60_000,
+                                "TARGET_FIRST", 2.5, 100, 97, 107.5)
+        self.assertIn(("Target έξοδος", trade_chart._utc(first+60_000), "high ≥ 107.5"),
+                      trade_chart.exit_timeline(win, [fill, target], 2.0))
+        stop = trade_chart.Candle(first+60_000, 100, 101, 96, 97)
+        loss = trade_chart.Trade("T", "O", first, first+60_000,
+                                 "STOP_FIRST", -1, 100, 97, 107.5)
+        self.assertIn(("Stop έξοδος", trade_chart._utc(first+60_000), "low ≤ 97"),
+                      trade_chart.exit_timeline(loss, [fill, stop], 2.0))
+        conservative = trade_chart.Trade("T", "O", first, first,
+                                         "SAME_CANDLE_FILL_STOP_CONSERVATIVE", -1,
+                                         100, 97, 107.5)
+        self.assertTrue(any(name == "Fill + stop ίδιο κερί" for name, _, _ in
+                            trade_chart.exit_timeline(conservative,
+                                [trade_chart.Candle(first, 100, 101, 96, 100)], 2.0)))
+        with self.assertRaisesRegex(ValueError, "outcome"):
+            trade_chart.exit_timeline(win, [fill, stop], 2.0)
+        with self.assertRaisesRegex(ValueError, "chronology"):
+            trade_chart.exit_timeline(win, [fill, target,
+                trade_chart.Candle(first+120_000, 107, 108, 106, 107)], 2.0)
+
+    def test_exit_timeline_rejects_same_candle_be_ambiguity(self):
+        first = START
+        fill = trade_chart.Candle(first, 100, 101, 99, 100)
+        ambiguous = trade_chart.Candle(first+60_000, 100, 106.5, 99, 105)
+        claimed = trade_chart.Trade("T", "O", first, first+60_000,
+                                    "BREAK_EVEN_EXIT", 0, 100, 97, 107.5)
+        with self.assertRaisesRegex(ValueError, "ambiguity"):
+            trade_chart.exit_timeline(claimed, [fill, ambiguous], 2.0)
+
+    def test_exit_timeline_rejects_prior_target_before_claimed_be(self):
+        first = START
+        fill = trade_chart.Candle(first, 100, 101, 99, 100)
+        target = trade_chart.Candle(first+60_000, 101, 108, 100.5, 107)
+        later_be = trade_chart.Candle(first+120_000, 101, 102, 99, 100)
+        claimed = trade_chart.Trade("T", "O", first, first+120_000,
+                                    "BREAK_EVEN_EXIT", 0, 100, 97, 107.5)
+        with self.assertRaisesRegex(ValueError, "outcome"):
+            trade_chart.exit_timeline(claimed, [fill, target, later_be], 2.0)
 
 
 if __name__ == "__main__":

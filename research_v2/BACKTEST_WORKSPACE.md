@@ -64,6 +64,14 @@ viewer fails closed. Exit fill price is unavailable; the table does not infer
 one. This explanation is historical gross OHLC research, not a live-order or
 net-profitability claim.
 
+The panel now verifies the bounded fill-to-exit 1m candle sequence against
+the existing simulator's BE/stop/target classifier. It shows the 2R trigger
+level, the candle that armed BE (when applicable), the later exit candle,
+its high/low, and the reason for stop/target/BE resolution. A same-candle
+OHLC ordering ambiguity or a trade ledger contradiction fails closed. These
+times are candle-close timestamps; no intraminute fill order or exchange
+execution price is claimed. No historical run or strategy result is changed.
+
 The job schema is `research-backtest-job-v1`. It requires `strategy_id`,
 absolute paths and SHA-256 for both CSV inputs, `minimum_entry_ts`, and an
 absolute new output path. Only explicitly allowlisted adapters execute.
