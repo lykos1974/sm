@@ -215,6 +215,19 @@ Sources (rules and fees must be rechecked at execution time):
 - https://www.mexc.com/futures/BTC_USDT
 - https://www.mexc.com/announcements/article/updates-to-api-futures-trading-fees-jun-1-2026-17827791535742
 
+Zero-fee check (2026-10-03): MEXC's 0-Fee Fest announced 0% maker and taker
+for certain *website/app* Futures pairs, including QNTUSDT and ARBUSDT/
+ARBUSDC, conditional on account and region. Their announcements explicitly
+exclude API trading. The separate published Futures API schedule overrides
+promotional 0-fee rates; no Futures pair with verified 0% maker **and** taker
+fees for this automated API workflow was identified. Confirm the actual
+account-specific API rates and eligibility before any cost model, and never
+substitute a promotional UI quote for an API execution fee. Even a genuine
+0-fee pair would need fresh venue-specific causal strategy evidence.
+
+- https://www.mexc.com/announcements/article/0-fee-fest-17827791538872
+- https://www.mexc.com/announcements/article/0-fee-fest-17827791538957
+
 The next separate gate is an audited MEXC-data causal forward observer and
 account-specific minimum-order, fee, margin, and liquidation preflight. Exact
 signal chronology, sizing, exchange-confirmed entry/exit, protective stops,
