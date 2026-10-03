@@ -160,10 +160,10 @@ def bank_lines(series: dict[Decimal, list[EquityPoint]], selected: set[Decimal],
 
 
 def draw_bank(canvas: tk.Canvas, lines: dict[Decimal, list[tuple[int, Decimal]]],
-              initial: Decimal, colors: dict[Decimal, str]) -> None:
+              initial: Decimal, colors: dict[Decimal, str],
+              width: int = 1050, height: int = 490) -> None:
     """Shared UTC and currency axes; each target keeps its own exit timestamps."""
     canvas.delete("all")
-    width, height = 1050, 490
     left, right, top, bottom = 95, width - 30, 35, height - 75
     values = [initial, *(value for points in lines.values() for _, value in points)]
     low, high = min(values), max(values)
@@ -199,7 +199,7 @@ def draw_bank(canvas: tk.Canvas, lines: dict[Decimal, list[tuple[int, Decimal]]]
         canvas.create_oval(coords[-1][0]-3, coords[-1][1]-3,
                            coords[-1][0]+3, coords[-1][1]+3, fill=colors[target], outline="")
     for index, target in enumerate(lines):
-        x = left + index * 104
+        x = left + index * min(104, (right-left) / max(1, len(lines)))
         canvas.create_line(x, height-16, x+20, height-16, fill=colors[target], width=3)
         canvas.create_text(x+25, height-16, anchor="w", text=f"{_fmt(target)}R", fill="#293345")
 
@@ -208,15 +208,16 @@ def _fmt(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
 
-def draw_comparison(canvas: tk.Canvas, results: list[TargetResult]) -> None:
+def draw_comparison(canvas: tk.Canvas, results: list[TargetResult],
+                    width: int = 1050, height: int = 490) -> None:
     """Use a single R scale for both series; drawdown extends below zero."""
-    baseline = 235
-    scale = 185 / max(1.0, *(float(abs(item.profit)) for item in results),
+    baseline = height * .49
+    scale = min(baseline - 50, height - baseline - 95) / max(1.0, *(float(abs(item.profit)) for item in results),
                       *(float(item.drawdown) for item in results))
-    canvas.create_line(40, baseline, 925, baseline, fill="#48556a", width=2)
+    canvas.create_line(40, baseline, width - 35, baseline, fill="#48556a", width=2)
     canvas.create_text(25, baseline, text="0", fill="#48556a")
     for index, item in enumerate(results):
-        center = 95 + index * 95
+        center = 90 + index * (width - 165) / max(1, len(results)-1)
         profit_y = baseline - float(item.profit) * scale
         drawdown_y = baseline + float(item.drawdown) * scale
         canvas.create_rectangle(center - 27, min(baseline, profit_y), center - 5,
@@ -227,7 +228,7 @@ def draw_comparison(canvas: tk.Canvas, results: list[TargetResult]) -> None:
                            text=_fmt(item.profit), fill="#174b91")
         canvas.create_text(center + 16, drawdown_y + 12,
                            text=_fmt(item.drawdown), fill="#982727")
-        canvas.create_text(center, 463, text=f"{_fmt(item.target)}R", fill="#293345")
+        canvas.create_text(center, height - 27, text=f"{_fmt(item.target)}R", fill="#293345")
 
 
 class TargetComparisonWindow(tk.Toplevel):
@@ -237,8 +238,11 @@ class TargetComparisonWindow(tk.Toplevel):
         self.output_root = output_root
         self.results = results
         self.series = None
+        self.mode = "comparison"
+        self.last_bank = None
         self.title("Σύγκριση στόχων — Profit / Drawdown")
         self.geometry("1120x680")
+        self.minsize(1000, 560)
         controls = ttk.Frame(self)
         controls.pack(pady=8)
         ttk.Button(controls, text="Profit / Drawdown", command=self.show_comparison).pack(side="left", padx=5)
@@ -261,15 +265,27 @@ class TargetComparisonWindow(tk.Toplevel):
         self.caption = ttk.Label(self, font=("TkDefaultFont", 12, "bold"))
         self.caption.pack(pady=9)
         self.canvas = tk.Canvas(self, width=1050, height=490, bg="white", highlightthickness=0)
-        self.canvas.pack(padx=15, pady=8)
+        self.canvas.pack(fill="both", expand=True, padx=15, pady=8)
+        self.canvas.bind("<Configure>", self._redraw)
         ttk.Label(self, text="Υποθετικό σταθερό ρίσκο ανά trade, χωρίς ανατοκισμό. Gross 1m OHLC: χωρίς fees, slippage, funding ή επιβεβαιωμένα fills.",
                   wraplength=1000).pack(pady=5)
         self.show_comparison()
 
     def show_comparison(self):
+        self.mode = "comparison"
         self.caption.config(text="BTCUSDT 2024 — gross profit και μέγιστο drawdown ανά στόχο (R)")
+        self._redraw()
+
+    def _redraw(self, _event=None):
+        width, height = max(540, self.canvas.winfo_width()), max(280, self.canvas.winfo_height())
         self.canvas.delete("all")
-        draw_comparison(self.canvas, self.results)
+        if self.mode == "comparison":
+            draw_comparison(self.canvas, self.results, width, height)
+        elif self.last_bank is not None:
+            lines, initial = self.last_bank
+            draw_bank(self.canvas, lines, initial,
+                      {item.target: COLORS[index] for index, item in enumerate(self.results)},
+                      width, height)
 
     def select_all(self):
         for variable in self.target_checks.values():
@@ -293,5 +309,6 @@ class TargetComparisonWindow(tk.Toplevel):
             messagebox.showerror("Εξέλιξη μπάνκας", str(exc), parent=self)
             return
         self.caption.config(text="Υποθετική μπάνκα ανά έξοδο trade — UTC / USDT")
-        draw_bank(self.canvas, lines, initial,
-                  {item.target: COLORS[index] for index, item in enumerate(self.results)})
+        self.last_bank = (lines, initial)
+        self.mode = "bank"
+        self._redraw()

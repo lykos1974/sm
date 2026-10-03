@@ -72,8 +72,8 @@ class TargetComparisonTests(unittest.TestCase):
         draw_comparison(canvas, rows)
         self.assertEqual(len(canvas.bars), 18)
         self.assertEqual(len([label for _, label in canvas.labels if str(label.get('text', '')).endswith('R')]), 9)
-        self.assertLess(canvas.bars[0][0][1], 235)  # profit above zero
-        self.assertGreaterEqual(canvas.bars[1][0][3], 235)  # drawdown below zero
+        self.assertLess(canvas.bars[0][0][1], 490 * .49)  # profit above zero
+        self.assertGreaterEqual(canvas.bars[1][0][3], 490 * .49)  # drawdown below zero
 
     def test_tampered_report_and_manifest_fail_closed(self):
         report = self.root / 'target_sweep/comparison.csv'
@@ -92,8 +92,8 @@ class TargetComparisonTests(unittest.TestCase):
     def test_negative_profit_draws_below_zero_and_rejects_invalid_numeric(self):
         canvas = FakeCanvas()
         draw_comparison(canvas, [TargetResult(Decimal('2.5'), Decimal('-5'), Decimal('20'))])
-        self.assertEqual(canvas.bars[0][0][1], 235)
-        self.assertGreater(canvas.bars[0][0][3], 235)
+        self.assertEqual(canvas.bars[0][0][1], 490 * .49)
+        self.assertGreater(canvas.bars[0][0][3], 490 * .49)
         report = self.root / 'target_sweep/comparison.csv'
         with report.open(newline='') as stream:
             rows = list(csv.DictReader(stream))
@@ -123,6 +123,13 @@ class TargetComparisonTests(unittest.TestCase):
         canvas = FakeCanvas()
         draw_bank(canvas, all_lines, Decimal('1000'), {target: '#123456' for target in series})
         self.assertTrue(canvas.labels)
+        draw_bank(canvas, chosen, Decimal('1000'), {target: '#123456' for target in chosen},
+                  width=1800, height=950)
+        self.assertTrue(any(line[0][0] > 1600 for line in canvas.lines))
+        canvas.delete('all')
+        draw_comparison(canvas, summary, width=1800, height=950)
+        self.assertGreater(canvas.bars[-1][0][2], 1600)
+        self.assertGreater(canvas.labels[-1][0][1], 900)
         with self.assertRaises(ValueError):
             bank_lines(series, set(series), Decimal('1000'), Decimal('1001'))
         with self.assertRaisesRegex(ValueError, 'select at least one'):

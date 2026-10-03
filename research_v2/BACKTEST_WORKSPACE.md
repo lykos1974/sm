@@ -178,3 +178,5 @@ hash and reconciles the recorded trade count, cumulative R and drawdown before
 drawing. It reads the completed sweep without another backtest or any database
 access. This hypothetical gross balance excludes fees, slippage, funding,
 exchange fills and capital/margin constraints; it is not an account statement.
+Both chart views resize with the window, including when maximized; the axes,
+target bars, curves and legend are redrawn from the same loaded research data.
