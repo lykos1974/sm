@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from research_v2 import backtest_workspace as workspace
+from research_v2 import trade_chart
 from tests.test_pole_causal_long_research import START, candles, columns
 
 
@@ -137,6 +138,34 @@ class WorkspaceTests(unittest.TestCase):
                 workspace.run_job(self.path)
         self.assertFalse(any(call.args[0].startswith("pnf_mvp.app") for call in importer.call_args_list))
         self.assertFalse((self.root / "results").exists())
+
+    def test_chart_links_real_trade_to_causal_decision_and_closed_candles(self):
+        self.write()
+        workspace.run_job(self.path)
+        root = self.root / "results"
+        trades = trade_chart.load_trades(root)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].opportunity_id, "OPP-000001")
+        self.assertEqual(trades[0].entry - trades[0].stop, 3)
+        self.assertEqual(trades[0].target - trades[0].entry, 7.5)
+        times, candles = trade_chart.load_candles(self.cands)
+        around, marker = trade_chart.chart_window(times, candles, trades[0], "entry", 2)
+        self.assertEqual(around[marker].close_ms, trades[0].entry_ms)
+        around, marker = trade_chart.chart_window(times, candles, trades[0], "exit", 2)
+        self.assertEqual(around[marker].close_ms, trades[0].exit_ms)
+
+    def test_chart_rejects_unfinished_or_changed_decision_evidence(self):
+        job_file = self.root / "results.job.json"
+        workspace.create_job(self.cols, self.cands, START, self.root / "results", job_file)
+        workspace.run_job(job_file)
+        root = self.root / "results"
+        with patch.object(trade_chart, "BTC_2024_COLUMNS_SHA", workspace._sha(self.cols)), \
+             patch.object(trade_chart, "BTC_2024_CANDLES_SHA", workspace._sha(self.cands)):
+            self.assertEqual(trade_chart.completed_run_inputs(root), self.cands)
+            ledger = root / "causal_decisions.csv"
+            ledger.write_bytes(ledger.read_bytes() + b"\n")
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                trade_chart.completed_run_inputs(root)
 
 
 if __name__ == "__main__":

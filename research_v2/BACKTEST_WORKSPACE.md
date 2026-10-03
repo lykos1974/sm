@@ -37,6 +37,14 @@ directories are never overwritten. Source files are hashed before and after
 the run. A failed run may leave a partial results directory; treat it as
 invalid unless the final job manifest is present and all evidence checks pass.
 
+"View trades from a previous run" opens a completed results directory and
+plots each trade over the frozen 1m candles, with selectable windows around
+entry or exit. The signal's entry, stop, and 2.5R target appear as horizontal
+levels. The trade ledger records exit time and R, but no exchange exit fill
+price; the chart marks exit **time only** and never guesses the fill price.
+The viewer checks the job and causal manifests, decision ledger hash, and
+frozen input hashes. It does not run a backtest or alter the source files.
+
 The job schema is `research-backtest-job-v1`. It requires `strategy_id`,
 absolute paths and SHA-256 for both CSV inputs, `minimum_entry_ts`, and an
 absolute new output path. Only explicitly allowlisted adapters execute.

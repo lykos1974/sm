@@ -29,6 +29,8 @@ class ResearchApp(tk.Tk):
         ttk.Label(self, textvariable=self.dataset, wraplength=620).pack(padx=15, pady=4)
         self.run_button = ttk.Button(self, text="Εκτέλεση backtest", command=self.start)
         self.run_button.pack(pady=8)
+        ttk.Button(self, text="Προβολή trades από προηγούμενο run",
+                   command=self.open_trades).pack(pady=2)
         ttk.Label(self, textvariable=self.status, wraplength=620).pack(padx=15, pady=6)
         self.after(300, self.poll)
 
@@ -57,6 +59,20 @@ class ResearchApp(tk.Tk):
         except (OSError, ValueError) as exc:
             self.status.set("Δεν ξεκίνησε backtest.")
             messagebox.showerror("Research Backtests", str(exc))
+
+    def open_trades(self):
+        selected = (str(self.output_path) if self.output_path is not None
+                    and (self.output_path / "research_job_manifest.json").is_file()
+                    else filedialog.askdirectory(title="Επίλεξε τον φάκελο αποτελεσμάτων του backtest"))
+        if not selected:
+            return
+        try:
+            from research_v2.trade_chart import TradeChartWindow, completed_run_inputs
+            root = Path(selected)
+            candles = completed_run_inputs(root)
+            TradeChartWindow(self, root, candles)
+        except (OSError, ValueError, KeyError) as exc:
+            messagebox.showerror("Research chart", str(exc))
 
     def poll(self):
         if self.process is not None:
