@@ -8,7 +8,7 @@ from pathlib import Path
 
 from research_v2 import backtest_workspace as workspace
 from research_v2.target_comparison_chart import (
-    TargetResult, draw_comparison, load_comparison,
+    TargetResult, bank_lines, draw_bank, draw_comparison, load_comparison, load_equity,
 )
 from tests.test_pole_causal_long_research import START, columns
 
@@ -17,8 +17,17 @@ class FakeCanvas:
     def __init__(self):
         self.bars = []
         self.labels = []
+        self.lines = []
 
     def create_line(self, *args, **kwargs):
+        self.lines.append((args, kwargs))
+
+    def delete(self, *args, **kwargs):
+        self.bars.clear()
+        self.labels.clear()
+        self.lines.clear()
+
+    def create_oval(self, *args, **kwargs):
         pass
 
     def create_rectangle(self, *args, **kwargs):
@@ -99,6 +108,39 @@ class TargetComparisonTests(unittest.TestCase):
         manifest.write_text(json.dumps(data))
         with self.assertRaisesRegex(ValueError, 'target mismatch'):
             load_comparison(self.root)
+
+    def test_bank_chart_single_and_all_targets_use_exit_sequence(self):
+        summary = load_comparison(self.root)
+        series = load_equity(self.root, summary)
+        self.assertEqual(set(series), {item.target for item in summary})
+        all_lines = bank_lines(series, None, Decimal('1000'), Decimal('10'))
+        self.assertEqual(len(all_lines), 9)
+        self.assertEqual(all_lines[Decimal('2.5')][-1][1], Decimal('1025'))
+        chosen = bank_lines(series, Decimal('2.5'), Decimal('1000'), Decimal('10'))
+        self.assertEqual(len(chosen), 1)
+        canvas = FakeCanvas()
+        draw_bank(canvas, all_lines, Decimal('1000'), {target: '#123456' for target in series})
+        self.assertTrue(canvas.labels)
+        with self.assertRaises(ValueError):
+            bank_lines(series, None, Decimal('1000'), Decimal('1001'))
+
+    def test_bank_chart_rejects_altered_ledger_and_wrong_manifest(self):
+        summary = load_comparison(self.root)
+        ledger = self.root / 'portfolio/portfolio_reality_equity_curve.csv'
+        original = ledger.read_bytes()
+        ledger.write_bytes(original.replace(b'2.5', b'9.5'))
+        with self.assertRaisesRegex(ValueError, 'equity'):
+            load_equity(self.root, summary)
+        ledger.write_bytes(original)
+        report = self.root / 'target_sweep/comparison.csv'
+        original = report.read_bytes()
+        report.write_bytes(original.replace(b'portfolio_manifest_sha256', b'other_manifest_sha256'))
+        manifest = self.root / 'target_sweep/comparison_manifest.json'
+        data = json.loads(manifest.read_text())
+        data['comparison_sha256'] = workspace._sha(report)
+        manifest.write_text(json.dumps(data))
+        with self.assertRaises((ValueError, KeyError)):
+            load_equity(self.root, load_comparison(self.root))
 
 
 if __name__ == '__main__':

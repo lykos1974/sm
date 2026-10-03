@@ -166,3 +166,14 @@ red maximum-drawdown bars below zero, both on the same R scale. The chart
 shows only these two result measures for each target. If the CSV, manifest,
 target grid or completed-job binding is changed or missing, it refuses to
 render. The operator can choose the result folder after restarting the app.
+
+The same window also offers **Εξέλιξη μπάνκας**. Select a single target R or
+**Όλα** to overlay all nine exit-ordered curves with distinct colors and a
+shared UTC time/USDT scale. Enter an explicit starting balance and fixed USDT
+risk per trade (the displayed 1000/10 values are editable examples). The
+research visualization computes `balance = initial + fixed_risk * cumulative_R`,
+without compounding. It checks each portfolio manifest against the comparison
+hash and reconciles the recorded trade count, cumulative R and drawdown before
+drawing. It reads the completed sweep without another backtest or any database
+access. This hypothetical gross balance excludes fees, slippage, funding,
+exchange fills and capital/margin constraints; it is not an account statement.
