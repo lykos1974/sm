@@ -180,3 +180,33 @@ access. This hypothetical gross balance excludes fees, slippage, funding,
 exchange fills and capital/margin constraints; it is not an account statement.
 Both chart views resize with the window, including when maximized; the axes,
 target bars, curves and legend are redrawn from the same loaded research data.
+
+## MEXC live-money readiness — 2026-10-03
+
+An operator proposed 4 USDT for live MEXC BTC_USDT Futures. **Do not activate
+orders from this research stage.** The BTC 2024 causal pole run uses Binance
+USD-M 1m OHLC and gross simulated fills. The research job cannot consume live
+MEXC candles or submit, reconcile, stop, or close exchange orders. The target
+sweep is in-sample and provides no MEXC net expectancy.
+
+MEXC's public BTC_USDT trading rules displayed a minimum contract size of
+0.0001 BTC (approximately 8.5 USDT notional at the inspected price), exceeding
+4 USDT without leverage. MEXC's June 2026 API futures fee notice lists
+maker 0.06% and taker 0.08%, independently of promotional UI rates. For one
+minimum contract and the existing three-box, 100 USDT/box stop, the indicative
+price risk is 0.03 USDT; a taker entry plus taker exit near 8.5 USDT notional
+adds about 0.0136 USDT, before slippage, funding, liquidation, or fee changes.
+This is about 0.0436 USDT, over 1% of a 4 USDT balance. These are illustrative
+public-rule calculations, not account-specific tradability or a guarantee.
+
+Sources (rules and fees must be rechecked at execution time):
+
+- https://www.mexc.com/futures/BTC_USDT
+- https://www.mexc.com/announcements/article/updates-to-api-futures-trading-fees-jun-1-2026-17827791535742
+
+The next separate gate is an audited MEXC-data causal forward observer and
+account-specific minimum-order, fee, margin, and liquidation preflight. Exact
+signal chronology, sizing, exchange-confirmed entry/exit, protective stops,
+restart reconciliation, and maximum-loss halt require independent verification
+before any live-order capability. No credential or order access is part of this
+research application.
