@@ -287,3 +287,18 @@ actual exchange fills, slippage and funding. Changing the stop changes target,
 BE, exits, size and subsequent trade admission. No best 2024 row is promoted;
 an untouched period and measured execution cost remain separate gates. This
 command never opens an operational database or starts a service.
+
+## One 20R target check (research only)
+
+The separate `--target-20-only` switch independently replays **20R** and the
+original **2.5R** baseline on the same BTCUSDT 2024 causal decisions. The
+three-box stop, +2R break-even, three-candle pending limit, conservative OHLC
+ordering and one-position portfolio policy are unchanged. It writes into a
+new output root only: `target_20/comparison.csv`, its hash manifest and the
+20R trade ledger. The original target sweep's nine-target chart is unchanged.
+Use the same pinned paths, hashes and minimum entry timestamp shown above,
+replace `--stop-sweep` with `--target-20-only`, and use a different fresh
+output root. Verify baseline parity first: **431 trades, +49 gross R** for
+2.5R. The 20R result is a single in-sample sensitivity, not a promoted target.
+Break-even fee estimates approximate entry notional on both sides and do not
+include actual fills, slippage, funding or real execution feasibility.

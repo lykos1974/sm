@@ -110,7 +110,7 @@ def _baseline_classify(rep: Any, candles: list[Candle]) -> tuple[str, float | No
 def _be_classify(rep: Any, candles: list[Candle], trigger_r: float,
                  target_r: float = TARGET_R) -> tuple[str, float | None, int | None, str]:
     if (type(target_r) not in (int, float) or not math.isfinite(target_r)
-            or target_r <= trigger_r or target_r > 10):
+            or target_r <= trigger_r or target_r > 20):
         raise ValueError("invalid research target R")
     if rep.geometry_status != "OBSERVABLE":
         return rep.geometry_status, None, None, rep.geometry_details

@@ -129,6 +129,71 @@ def _stop_sweep(output_root: Path, columns_csv: Path, candles_csv: Path,
         stream.write('\n')
 
 
+def _twenty_r_check(output_root: Path, columns_csv: Path, candles_csv: Path,
+                    decisions: list[EntryTimingObservation], candles: list[Candle],
+                    columns_hash: str, candles_hash: str) -> None:
+    """One independent 20R portfolio replay against the original 2.5R run."""
+    def loader(symbol_inputs, columns_inputs, candles_inputs, candle_symbols):
+        if (set(symbol_inputs) != {'BTC'} or set(columns_inputs) != {'BTC'}
+                or set(candles_inputs) != {'BTC'}
+                or candle_symbols != {'BTC': 'BTCUSDT'}):
+            raise ValueError('20R check accepts BTCUSDT only')
+        return ['BTC'], decisions, {'BTC': candles}
+
+    directory = output_root / 'target_20' / 'portfolio'
+    run_portfolio({'BTC': columns_csv}, {'BTC': columns_csv},
+                  {'BTC': candles_csv}, directory, {'BTC': 'BTCUSDT'},
+                  observation_loader=loader, target_r=20)
+    summaries = []
+    for target, location in ((2.5, output_root / 'portfolio'), (20, directory)):
+        manifest_file = location / 'portfolio_reality_manifest.json'
+        with manifest_file.open(encoding='utf-8') as stream:
+            manifest = json.load(stream)
+        with (location / 'portfolio_reality_trade_sequence.csv').open(newline='', encoding='utf-8') as stream:
+            trades = list(csv.DictReader(stream))
+        with (location / 'portfolio_reality_quarterly.csv').open(newline='', encoding='utf-8') as stream:
+            quarters = list(csv.DictReader(stream))
+        if manifest['target_R'] != target or manifest['resolved_portfolio_trades'] != len(trades):
+            raise ValueError('20R portfolio evidence mismatch')
+        ordered = sorted(decisions, key=lambda item: (
+            item.symbol, item.row_number, item.direction,
+            -1 if item.observable_entry_ts is None else item.observable_entry_ts))
+        by_id = {f'OPP-{i:06d}': row for i, row in enumerate(ordered, 1)}
+        cost_per_bps = Decimal(0)
+        for trade in trades:
+            row = by_id[trade['opportunity_id']]
+            entry = Decimal(str(row.entry))
+            risk = entry - Decimal(str(row.stop))
+            if risk <= 0:
+                raise ValueError('invalid 20R cost geometry')
+            cost_per_bps += Decimal(2) * entry / (Decimal(10000) * risk)
+        gross = Decimal(str(manifest['summary_metrics']['total_R']))
+        summaries.append({
+            'target_R': target, 'decisions': len(decisions),
+            'resolved_trades': len(trades), 'gross_total_R': str(gross),
+            'gross_max_drawdown_R': manifest['summary_metrics']['max_drawdown_R'],
+            'worst_quarter_gross_R': min((float(q['total_R']) for q in quarters), default=''),
+            'break_even_symmetric_bps_per_side': str(gross / cost_per_bps)
+                if cost_per_bps and gross > 0 else '',
+            'estimated_R_at_10bps_per_side': str(gross - 10 * cost_per_bps),
+            'portfolio_manifest_sha256': _sha256(manifest_file),
+        })
+    comparison = output_root / 'target_20/comparison.csv'
+    with comparison.open('x', newline='', encoding='utf-8') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(summaries[0]))
+        writer.writeheader()
+        writer.writerows(summaries)
+    with (output_root / 'target_20/comparison_manifest.json').open('x', encoding='utf-8') as stream:
+        json.dump({'schema': 'causal-pole-target-20-check-v1', 'research_only': True,
+                   'targets_R': [2.5, 20], 'stop_boxes': 3,
+                   'break_even_trigger_R': 2, 'columns_sha256': columns_hash,
+                   'candles_sha256': candles_hash,
+                   'comparison_sha256': _sha256(comparison),
+                   'interpretation': 'independent 1m OHLC portfolio replay, approximate entry-notional fee stress, no exchange fills'},
+                  stream, indent=2, sort_keys=True)
+        stream.write('\n')
+
+
 def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float,
                         candles: list[Candle], minimum_entry_ts: int | None = None,
                         maximum_entry_ts: int | None = None
@@ -201,7 +266,8 @@ def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float
 def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         minimum_entry_ts: int, expected_columns_sha256: str,
         expected_candles_sha256: str, maximum_entry_ts: int | None = None,
-        target_sweep: bool = False, stop_sweep: bool = False) -> dict:
+        target_sweep: bool = False, stop_sweep: bool = False,
+        target_20_only: bool = False) -> dict:
     if output_root.exists():
         raise FileExistsError('new isolated output directory required')
     if not columns_csv.is_file() or not candles_csv.is_file() or candles_csv.suffix.lower() != '.csv':
@@ -214,7 +280,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
                                           or maximum_entry_ts <= minimum_entry_ts):
         raise ValueError('invalid entry period')
-    if type(target_sweep) is not bool or type(stop_sweep) is not bool or (target_sweep and stop_sweep):
+    if (any(type(flag) is not bool for flag in (target_sweep, stop_sweep, target_20_only))
+            or sum((target_sweep, stop_sweep, target_20_only)) > 1):
         raise ValueError('select at most one bounded sweep')
     with columns_csv.open(newline='', encoding='utf-8') as stream:
         raw_indices = [row['idx'] for row in csv.DictReader(stream)]
@@ -244,6 +311,9 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     if stop_sweep:
         _stop_sweep(output_root, columns_csv, candles_csv, decisions, candles,
                     expected_columns_sha256.lower(), expected_candles_sha256.lower())
+    if target_20_only:
+        _twenty_r_check(output_root, columns_csv, candles_csv, decisions, candles,
+                        expected_columns_sha256.lower(), expected_candles_sha256.lower())
     if target_sweep:
         sweep_root = output_root / 'target_sweep'
         rows = []
@@ -335,6 +405,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         report['target_sweep_manifest'] = 'target_sweep/comparison_manifest.json'
     if stop_sweep:
         report['stop_sweep_manifest'] = 'stop_sweep/comparison_manifest.json'
+    if target_20_only:
+        report['target_20_manifest'] = 'target_20/comparison_manifest.json'
     with (output_root / 'causal_manifest.json').open('x', encoding='utf-8') as stream:
         json.dump(report, stream, indent=2, sort_keys=True)
         stream.write('\n')
@@ -350,11 +422,13 @@ def main() -> None:
     parser.add_argument('--columns-sha256', required=True)
     parser.add_argument('--candles-sha256', required=True)
     parser.add_argument('--stop-sweep', action='store_true', help='research-only 2/3/4/6 box stop comparison')
+    parser.add_argument('--target-20-only', action='store_true', help='one independent 20R research comparison')
     args = parser.parse_args()
     print(json.dumps(run(args.columns_csv.resolve(), args.candles_csv.resolve(),
                          args.output_root.resolve(), args.minimum_entry_ts,
                          args.columns_sha256, args.candles_sha256,
-                         stop_sweep=args.stop_sweep), indent=2))
+                         stop_sweep=args.stop_sweep,
+                         target_20_only=args.target_20_only), indent=2))
 
 
 if __name__ == '__main__':

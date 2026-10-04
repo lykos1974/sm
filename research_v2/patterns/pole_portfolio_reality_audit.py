@@ -1372,7 +1372,7 @@ def run(
     target_r: float = TARGET_R,
 ) -> None:
     if (type(target_r) not in (int, float) or not math.isfinite(target_r)
-            or not 2.5 <= target_r <= 10):
+            or not 2.5 <= target_r <= 20):
         raise ValueError("invalid research target R")
     symbols, observations, candles_by_symbol = (observation_loader or _load_observations)(
         symbol_inputs, columns_inputs, candles_inputs, candle_symbols or {}

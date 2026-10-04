@@ -89,6 +89,54 @@ class CausalLongTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 causal.run(cols, cands, output, START, sha(cols), sha(cands), stop_sweep=True)
 
+    def test_twenty_r_target_replays_and_keeps_three_box_stop(self):
+        from research_v2.patterns.pole_portfolio_reality_audit import _pending_limit_be_classify
+        from dataclasses import replace
+        rep = causal.causal_observations('BTC', columns()[:6], 1, candles())[0]
+        rep = replace(rep, entry=100, stop=97, observable_entry_ts=START)
+        sequence = [Candle(START, 101, 101, 99, 100),
+                    Candle(START+60_000, 101, 107, 101, 106),
+                    Candle(START+120_000, 106, 160, 106, 160)]
+        self.assertEqual(_pending_limit_be_classify(rep, sequence, 3, 20)[:2],
+                         ('TARGET_FIRST', 20))
+        with self.assertRaises(ValueError):
+            _pending_limit_be_classify(rep, sequence, 3, 20.1)
+
+    def test_twenty_r_isolated_output_preserves_baseline_portfolio(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            cols, cands = root / 'columns.csv', root / 'candles.csv'
+            with cols.open('w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(('symbol', 'profile_name', 'idx', 'kind', 'top', 'bottom', 'start_ts', 'end_ts'))
+                for col in columns()[:6]:
+                    writer.writerow(('BTC', 'BTC_bs1_rev3', col.idx, col.kind,
+                                     col.top, col.bottom, col.start_ts, col.end_ts))
+            with cands.open('w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(('close_time', 'open', 'high', 'low', 'close'))
+                for i in range(16):
+                    high = 161 if i == 10 else 108 if i == 8 else 106.5 if i == 7 else 101
+                    low = 101 if i in (7, 8, 10) else 99
+                    opened = 102 if i in (7, 8, 10) else 100
+                    writer.writerow((START + i*60_000, opened, high, low, opened))
+            sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+            output = root / 'out'
+            report = causal.run(cols, cands, output, START, sha(cols), sha(cands),
+                                target_20_only=True)
+            self.assertEqual(report['target_20_manifest'], 'target_20/comparison_manifest.json')
+            with (output / 'target_20/comparison.csv').open(newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual([float(row['target_R']) for row in rows], [2.5, 20])
+            self.assertEqual(rows[0]['portfolio_manifest_sha256'],
+                             sha(output / 'portfolio/portfolio_reality_manifest.json'))
+            self.assertEqual(rows[1]['portfolio_manifest_sha256'],
+                             sha(output / 'target_20/portfolio/portfolio_reality_manifest.json'))
+            self.assertEqual(rows[0]['resolved_trades'], '1')
+            with self.assertRaises(FileExistsError):
+                causal.run(cols, cands, output, START, sha(cols), sha(cands),
+                           target_20_only=True)
+
     def test_future_opposing_pole_cannot_create_or_change_earlier_signal(self):
         from pnf_mvp.patterns.poles import detect_pole_patterns
         cols = columns()
@@ -184,7 +232,7 @@ class CausalLongTests(unittest.TestCase):
         self.assertEqual(_be_classify(rep, replay, 2, 2.5)[:2], ('TARGET_FIRST', 2.5))
         ambiguous = [Candle(fill + 60_000, 100, 130, 96, 101)]
         self.assertEqual(_be_classify(rep, ambiguous, 2, 10)[0], 'SAME_CANDLE_AMBIGUOUS')
-        for bad in (True, float('nan'), float('inf'), 2, 10.1):
+        for bad in (True, float('nan'), float('inf'), 2, 20.1):
             with self.assertRaises(ValueError):
                 _be_classify(rep, replay, 2, bad)
 
