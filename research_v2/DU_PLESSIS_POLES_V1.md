@@ -30,3 +30,12 @@ If source history before that prefix is absent, no prior structural context is
 invented. The next research gate is an independently reviewed fill/position
 adapter and a chronology check on a small frozen prefix, without operational
 activation.
+
+## One-event chronology audit
+
+`python -B -m research_v2.du_plessis_poles_audit --candles <frozen research candles_1m.csv> --pole-index 28 --retrace-index 29 --box-size 100 --reversal-boxes 3`
+reads only the first 10,000 closed candles. It stops on the first qualifying
+28→29 decision, independently recomputes its box counts, and prints the
+previous and decision candle closes, UTC times, source bounds, threshold and
+status. A missing event fails; it never consults a database or infers a fill.
+The operator must compare the report with the UI row and frozen input hash.
