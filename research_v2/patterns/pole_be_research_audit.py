@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
@@ -64,8 +65,9 @@ class ManagedOutcome:
     details: str
 
 
-def _target_price(entry: float, risk: float, direction: str) -> float:
-    return entry + risk * TARGET_R if direction == "LONG" else entry - risk * TARGET_R
+def _target_price(entry: float, risk: float, direction: str,
+                  target_r: float = TARGET_R) -> float:
+    return entry + risk * target_r if direction == "LONG" else entry - risk * target_r
 
 
 def _trigger_price(entry: float, risk: float, direction: str, trigger_r: float) -> float:
@@ -105,7 +107,11 @@ def _baseline_classify(rep: Any, candles: list[Candle]) -> tuple[str, float | No
     return "NOT_REACHED", None, None, "neither target nor stop is reached by available replay candles"
 
 
-def _be_classify(rep: Any, candles: list[Candle], trigger_r: float) -> tuple[str, float | None, int | None, str]:
+def _be_classify(rep: Any, candles: list[Candle], trigger_r: float,
+                 target_r: float = TARGET_R) -> tuple[str, float | None, int | None, str]:
+    if (type(target_r) not in (int, float) or not math.isfinite(target_r)
+            or target_r <= trigger_r or target_r > 20):
+        raise ValueError("invalid research target R")
     if rep.geometry_status != "OBSERVABLE":
         return rep.geometry_status, None, None, rep.geometry_details
     replay = _replay(candles, rep.observable_entry_ts, rep.replay_includes_anchor)
@@ -113,7 +119,7 @@ def _be_classify(rep: Any, candles: list[Candle], trigger_r: float) -> tuple[str
         return "UNKNOWN_MISSING_CANDLES", None, None, "no replay candles are available after the observable entry anchor"
     assert rep.entry is not None and rep.stop is not None
     risk = abs(rep.entry - rep.stop)
-    target = _target_price(rep.entry, risk, rep.direction)
+    target = _target_price(rep.entry, risk, rep.direction, target_r)
     trigger = _trigger_price(rep.entry, risk, rep.direction, trigger_r)
     armed = False
     for candle in replay:
@@ -127,7 +133,7 @@ def _be_classify(rep: Any, candles: list[Candle], trigger_r: float) -> tuple[str
             if hit_target and hit_active_stop:
                 return "SAME_CANDLE_AMBIGUOUS", None, candle.ts, "target and armed break-even stop are both inside the first event OHLC candle"
             if hit_target:
-                return "TARGET_FIRST", TARGET_R, candle.ts, "target is reached after break-even was armed"
+                return "TARGET_FIRST", target_r, candle.ts, "target is reached after break-even was armed"
             if hit_active_stop:
                 return "BREAK_EVEN_EXIT", 0.0, candle.ts, "armed break-even stop is reached before target"
             continue
@@ -137,7 +143,7 @@ def _be_classify(rep: Any, candles: list[Candle], trigger_r: float) -> tuple[str
         if hit_target and hit_trigger and _hit_stop(candle, rep.entry, rep.direction):
             return "SAME_CANDLE_AMBIGUOUS", None, candle.ts, "target and newly armed entry-price stop are both inside the same OHLC candle"
         if hit_target:
-            return "TARGET_FIRST", TARGET_R, candle.ts, "target is reached before any stop or break-even exit"
+            return "TARGET_FIRST", target_r, candle.ts, "target is reached before any stop or break-even exit"
         if hit_trigger and hit_initial_stop:
             return "SAME_CANDLE_AMBIGUOUS", None, candle.ts, "break-even trigger and initial stop are both inside the same OHLC candle before stop order state is knowable"
         if hit_initial_stop:
