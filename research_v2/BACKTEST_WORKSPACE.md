@@ -181,6 +181,29 @@ exchange fills and capital/margin constraints; it is not an account statement.
 Both chart views resize with the window, including when maximized; the axes,
 target bars, curves and legend are redrawn from the same loaded research data.
 
+## One bounded cost stress on a completed target sweep
+
+From the repository root run `python -B -m research_v2.target_cost_gate` and
+select the completed BTC target-sweep **results** folder. The command reads the
+existing pinned job, comparison manifest, causal decisions and each portfolio
+ledger. It creates only `results/bounded_cost_gate/` with a CSV and hash
+manifest, refusing an existing folder. It does not replay candles, change a
+strategy parameter, touch SQLite, or contact an exchange. For scripted use,
+`--result-dir` and optional `--output-dir` are accepted.
+
+The nine existing targets each receive the same three illustrative all-in
+cost stresses: 0, 10 and 20 basis points **per side**. The stop distance and
+entry price determine the approximate notional per 1R risk unit; both entry
+and exit are charged on that *entry notional proxy*. The report lists gross R,
+proxy cost R, adjusted R, exit-to-exit drawdown and the worst trading quarter.
+Zero-cost gross R and drawdown must reconcile with the original manifests.
+The exit fill price, true notional, real spread, slippage, fees, funding,
+margin and intratrade drawdown are unknown. The adjusted values are a
+sensitivity check, **not verified net profitability or a target recommendation**.
+Do not select the 2024 target with the highest adjusted R as though it were
+out-of-sample evidence. A later, separate unseen-period test would be needed
+before considering any target for execution.
+
 ## MEXC live-money readiness — 2026-10-03
 
 An operator proposed 4 USDT for live MEXC BTC_USDT Futures. **Do not activate
