@@ -11,6 +11,8 @@ import csv
 import hashlib
 import json
 import math
+from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 from pnf_mvp.patterns.poles import _box_count
@@ -24,6 +26,7 @@ from research_v2.patterns.pole_core_motif_next_open_expectancy_audit import ENTR
 from research_v2.patterns.pole_portfolio_reality_audit import run as run_portfolio
 
 TARGET_SWEEP_R = (2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)
+STOP_SWEEP_BOXES = (2, 3, 4, 6)
 
 
 def _sha256(path: Path) -> str:
@@ -32,6 +35,98 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(block)
     return digest.hexdigest()
+
+
+def stop_variants(decisions: list[EntryTimingObservation],
+                  stop_boxes: tuple[int, ...] = STOP_SWEEP_BOXES
+                  ) -> dict[int, list[EntryTimingObservation]]:
+    """Change only the prospective stop; keep every causal decision and entry fixed."""
+    if (not stop_boxes or len(set(stop_boxes)) != len(stop_boxes)
+            or any(type(n) is not int or n < 1 or n > 10 for n in stop_boxes)):
+        raise ValueError('invalid bounded stop grid')
+    result = {}
+    for n in stop_boxes:
+        rows = []
+        for decision in decisions:
+            if (decision.direction != 'LONG' or decision.entry is None
+                    or decision.stop is None or not math.isfinite(decision.entry)
+                    or decision.entry - n * decision.box_size <= 0):
+                raise ValueError('invalid stop geometry')
+            rows.append(replace(decision, stop=decision.entry - n * decision.box_size))
+        result[n] = rows
+    return result
+
+
+def _stop_sweep(output_root: Path, columns_csv: Path, candles_csv: Path,
+                decisions: list[EntryTimingObservation], candles: list[Candle],
+                columns_hash: str, candles_hash: str) -> None:
+    """Independent portfolio replay per stop; no production execution changes."""
+    sweep = output_root / 'stop_sweep'
+    variants = stop_variants(decisions)
+    summaries = []
+    for boxes, observations in variants.items():
+        def loader(symbol_inputs, columns_inputs, candles_inputs, candle_symbols):
+            if (set(symbol_inputs) != {'BTC'} or set(columns_inputs) != {'BTC'}
+                    or set(candles_inputs) != {'BTC'}
+                    or candle_symbols != {'BTC': 'BTCUSDT'}):
+                raise ValueError('stop sweep accepts BTCUSDT only')
+            return ['BTC'], observations, {'BTC': candles}
+
+        directory = output_root / 'portfolio' if boxes == 3 else sweep / f'stop_{boxes}_boxes'
+        if boxes != 3:
+            run_portfolio({'BTC': columns_csv}, {'BTC': columns_csv},
+                          {'BTC': candles_csv}, directory, {'BTC': 'BTCUSDT'},
+                          observation_loader=loader, target_r=2.5)
+        manifest_path = directory / 'portfolio_reality_manifest.json'
+        with manifest_path.open(encoding='utf-8') as stream:
+            manifest = json.load(stream)
+        with (directory / 'portfolio_reality_trade_sequence.csv').open(newline='', encoding='utf-8') as stream:
+            trades = list(csv.DictReader(stream))
+        with (directory / 'portfolio_reality_quarterly.csv').open(newline='', encoding='utf-8') as stream:
+            quarters = list(csv.DictReader(stream))
+        if (manifest['resolved_portfolio_trades'] != len(trades)
+                or manifest['target_R'] != 2.5):
+            raise ValueError('stop sweep portfolio evidence mismatch')
+        # Opportunity IDs are assigned in sorted local-identity order by the
+        # portfolio runner; only validated, actually accepted trades incur cost.
+        ordered = sorted(observations, key=lambda item: (
+            item.symbol, item.row_number, item.direction,
+            -1 if item.observable_entry_ts is None else item.observable_entry_ts))
+        by_id = {f'OPP-{i:06d}': row for i, row in enumerate(ordered, 1)}
+        cost_per_bps = Decimal(0)
+        for trade in trades:
+            row = by_id[trade['opportunity_id']]
+            entry = Decimal(str(row.entry))
+            distance = entry - Decimal(str(row.stop))
+            if distance <= 0:
+                raise ValueError('invalid stop cost geometry')
+            cost_per_bps += Decimal(2) / Decimal(10000) * entry / distance
+        gross = Decimal(str(manifest['summary_metrics']['total_R']))
+        summaries.append({
+            'stop_boxes': boxes, 'decisions': len(decisions), 'resolved_trades': len(trades),
+            'gross_total_R': str(gross),
+            'gross_max_drawdown_R': manifest['summary_metrics']['max_drawdown_R'],
+            'worst_quarter_gross_R': min((float(q['total_R']) for q in quarters), default=''),
+            'break_even_symmetric_bps_per_side': str(gross / cost_per_bps)
+                if cost_per_bps and gross > 0 else '',
+            'estimated_R_at_10bps_per_side': str(gross - 10 * cost_per_bps),
+            'portfolio_manifest_sha256': _sha256(manifest_path),
+        })
+    sweep.mkdir(parents=True, exist_ok=True)
+    comparison = sweep / 'comparison.csv'
+    with comparison.open('x', newline='', encoding='utf-8') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(summaries[0]))
+        writer.writeheader()
+        writer.writerows(summaries)
+    with (sweep / 'comparison_manifest.json').open('x', encoding='utf-8') as stream:
+        json.dump({'schema': 'causal-pole-stop-sweep-v1', 'research_only': True,
+                   'stop_boxes': list(STOP_SWEEP_BOXES), 'baseline_stop_boxes': 3,
+                   'target_R': 2.5, 'break_even_trigger_R': 2.0,
+                   'columns_sha256': columns_hash, 'candles_sha256': candles_hash,
+                   'comparison_sha256': _sha256(comparison),
+                   'interpretation': 'independent 1m OHLC portfolio replays; cost is an entry-notional approximation, no verified exchange fills'},
+                  stream, indent=2, sort_keys=True)
+        stream.write('\n')
 
 
 def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float,
@@ -106,7 +201,7 @@ def causal_observations(symbol: str, columns: list[TimedColumn], box_size: float
 def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         minimum_entry_ts: int, expected_columns_sha256: str,
         expected_candles_sha256: str, maximum_entry_ts: int | None = None,
-        target_sweep: bool = False) -> dict:
+        target_sweep: bool = False, stop_sweep: bool = False) -> dict:
     if output_root.exists():
         raise FileExistsError('new isolated output directory required')
     if not columns_csv.is_file() or not candles_csv.is_file() or candles_csv.suffix.lower() != '.csv':
@@ -119,8 +214,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     if maximum_entry_ts is not None and (type(maximum_entry_ts) is not int
                                           or maximum_entry_ts <= minimum_entry_ts):
         raise ValueError('invalid entry period')
-    if type(target_sweep) is not bool:
-        raise ValueError('invalid target sweep')
+    if type(target_sweep) is not bool or type(stop_sweep) is not bool or (target_sweep and stop_sweep):
+        raise ValueError('select at most one bounded sweep')
     with columns_csv.open(newline='', encoding='utf-8') as stream:
         raw_indices = [row['idx'] for row in csv.DictReader(stream)]
     if len(raw_indices) != len(set(raw_indices)):
@@ -146,6 +241,9 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
     run_portfolio({'BTC': columns_csv}, {'BTC': columns_csv},
                   {'BTC': candles_csv}, output_root / 'portfolio',
                   {'BTC': 'BTCUSDT'}, observation_loader=loader)
+    if stop_sweep:
+        _stop_sweep(output_root, columns_csv, candles_csv, decisions, candles,
+                    expected_columns_sha256.lower(), expected_candles_sha256.lower())
     if target_sweep:
         sweep_root = output_root / 'target_sweep'
         rows = []
@@ -235,6 +333,8 @@ def run(columns_csv: Path, candles_csv: Path, output_root: Path,
         report['entry_cohort_policy'] = 'UTC start inclusive, end exclusive; later exits allowed'
     if target_sweep:
         report['target_sweep_manifest'] = 'target_sweep/comparison_manifest.json'
+    if stop_sweep:
+        report['stop_sweep_manifest'] = 'stop_sweep/comparison_manifest.json'
     with (output_root / 'causal_manifest.json').open('x', encoding='utf-8') as stream:
         json.dump(report, stream, indent=2, sort_keys=True)
         stream.write('\n')
@@ -249,10 +349,12 @@ def main() -> None:
     parser.add_argument('--minimum-entry-ts', type=int, required=True)
     parser.add_argument('--columns-sha256', required=True)
     parser.add_argument('--candles-sha256', required=True)
+    parser.add_argument('--stop-sweep', action='store_true', help='research-only 2/3/4/6 box stop comparison')
     args = parser.parse_args()
     print(json.dumps(run(args.columns_csv.resolve(), args.candles_csv.resolve(),
                          args.output_root.resolve(), args.minimum_entry_ts,
-                         args.columns_sha256, args.candles_sha256), indent=2))
+                         args.columns_sha256, args.candles_sha256,
+                         stop_sweep=args.stop_sweep), indent=2))
 
 
 if __name__ == '__main__':

@@ -29,6 +29,66 @@ def candles():
 
 
 class CausalLongTests(unittest.TestCase):
+    def test_stop_variants_freeze_decisions_and_preserve_three_box_baseline(self):
+        from dataclasses import replace
+        base = causal.causal_observations('BTC', columns()[:6], 1, candles())[0]
+        rows = causal.stop_variants([base], (2, 3, 4, 6))
+        self.assertEqual([rows[n][0].stop for n in (2, 3, 4, 6)],
+                         [base.entry - n for n in (2, 3, 4, 6)])
+        self.assertEqual(rows[3][0], base)
+        for n in (2, 4, 6):
+            self.assertEqual(replace(rows[n][0], stop=base.stop), base)
+        with self.assertRaises(ValueError):
+            causal.stop_variants([base], (0, 3))
+
+    def test_stop_changes_exit_and_risk_without_changing_signal_or_fill(self):
+        from dataclasses import replace
+        from research_v2.patterns.pole_portfolio_reality_audit import _pending_limit_be_classify
+        base = replace(causal.causal_observations('BTC', columns()[:6], 1, candles())[0],
+                       entry=100, stop=97, observable_entry_ts=START)
+        narrow, wide = (causal.stop_variants([base], (2, 6))[n][0] for n in (2, 6))
+        sequence = [Candle(START, 101, 101, 99, 100),
+                    Candle(START + 60_000, 100, 101, 97, 98)]
+        self.assertEqual(_pending_limit_be_classify(narrow, sequence, 3)[:2],
+                         ('STOP_FIRST', -1.0))
+        self.assertEqual(_pending_limit_be_classify(wide, sequence, 3)[0],
+                         'NOT_REACHED')
+
+    def test_bounded_stop_sweep_replays_independently_and_pins_baseline(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            cols, cands = root / 'columns.csv', root / 'candles.csv'
+            with cols.open('w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(('symbol', 'profile_name', 'idx', 'kind', 'top', 'bottom', 'start_ts', 'end_ts'))
+                for col in columns()[:6]:
+                    writer.writerow(('BTC', 'BTC_bs1_rev3', col.idx, col.kind,
+                                     col.top, col.bottom, col.start_ts, col.end_ts))
+            with cands.open('w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(('close_time', 'open', 'high', 'low', 'close'))
+                for i in range(16):
+                    writer.writerow((START + i*60_000, 100, 106 if i == 8 else 101,
+                                     99, 100))
+            sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            output = root / 'sweep'
+            result = causal.run(cols, cands, output, START, sha(cols), sha(cands),
+                                stop_sweep=True)
+            self.assertEqual(result['stop_sweep_manifest'], 'stop_sweep/comparison_manifest.json')
+            with (output / 'stop_sweep/comparison.csv').open(newline='') as stream:
+                rows = {int(row['stop_boxes']): row for row in csv.DictReader(stream)}
+            self.assertEqual(set(rows), {2, 3, 4, 6})
+            with (output / 'portfolio/portfolio_reality_manifest.json').open() as stream:
+                baseline = json.load(stream)
+            self.assertEqual(float(rows[3]['gross_total_R']),
+                             baseline['summary_metrics']['total_R'])
+            self.assertEqual(rows[3]['portfolio_manifest_sha256'],
+                             sha(output / 'portfolio/portfolio_reality_manifest.json'))
+            for n in (2, 4, 6):
+                self.assertTrue((output / f'stop_sweep/stop_{n}_boxes/portfolio_reality_manifest.json').is_file())
+            with self.assertRaises(FileExistsError):
+                causal.run(cols, cands, output, START, sha(cols), sha(cands), stop_sweep=True)
+
     def test_future_opposing_pole_cannot_create_or_change_earlier_signal(self):
         from pnf_mvp.patterns.poles import detect_pole_patterns
         cols = columns()

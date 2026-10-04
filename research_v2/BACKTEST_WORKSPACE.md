@@ -257,3 +257,33 @@ signal chronology, sizing, exchange-confirmed entry/exit, protective stops,
 restart reconciliation, and maximum-loss halt require independent verification
 before any live-order capability. No credential or order access is part of this
 research application.
+
+## Bounded stop-distance comparison (research only)
+
+The causal runner supports `--stop-sweep` with a fixed grid of **2, 3, 4,
+6 boxes**. It uses the same pinned 2024 BTCUSDT inputs and causal decisions.
+Each stop has its own independent portfolio replay at 2.5R target and +2R
+break-even, with the existing three-candle pending limit and conservative
+same-candle handling. The 3-box variant reuses the normal baseline portfolio.
+
+From the research checkout root, run this with a **new** output directory:
+
+```powershell
+python -B -m research_v2.patterns.pole_causal_long_research `
+  --columns-csv 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2024_frozen_20261001_040822_8874345\results\columns.csv' `
+  --candles-csv 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2024_frozen_20261001_040822_8874345\results\candles_1m.csv' `
+  --columns-sha256 ed263ac77c3b2ed7169006d669ee1c9d21382ac02a2b37f107f2bcb635e47a45 `
+  --candles-sha256 8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f `
+  --minimum-entry-ts 1704240000000 `
+  --output-root 'H:\pnf screener\research_snapshots\BTC_2024_stop_sweep_NEW_TIMESTAMP' `
+  --stop-sweep
+```
+
+Read `stop_sweep/comparison.csv` and `comparison_manifest.json` under that
+one output directory. The comparison shows trades, gross R, drawdown, worst
+quarter, estimated break-even symmetric fee, and an illustrative 10-bps-per-side
+adjustment using entry notional on both sides. These cost estimates exclude
+actual exchange fills, slippage and funding. Changing the stop changes target,
+BE, exits, size and subsequent trade admission. No best 2024 row is promoted;
+an untouched period and measured execution cost remain separate gates. This
+command never opens an operational database or starts a service.
