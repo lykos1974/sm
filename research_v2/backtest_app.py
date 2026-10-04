@@ -16,12 +16,17 @@ class ResearchApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Research Backtests")
-        self.geometry("670x420")
+        self.geometry("800x600")
         self.dataset = tk.StringVar(value="Δεν έχει επιλεγεί dataset")
         self.status = tk.StringVar(value="Επίλεξε τον φάκελο results του BTC 2024.")
         self.start_date = tk.StringVar(value="2024-01-03")
         self.end_date = tk.StringVar(value="2024-12-31")
         self.target_sweep = tk.BooleanVar(value=True)
+        self.pole_strategy = tk.BooleanVar(value=False)
+        self.pole_mode = tk.StringVar(value="EARLY_ENTRY")
+        self.pole_box = tk.StringVar(value="100")
+        self.pole_reversal = tk.StringVar(value="3")
+        self.pole_venue = tk.StringVar(value="FUTURES")
         self.process = None
         self.job_path = None
         self.output_path = None
@@ -40,6 +45,20 @@ class ResearchApp(tk.Tk):
                   wraplength=620).pack()
         ttk.Checkbutton(self, text="Σύγκριση στόχων 2,5R, 3R έως 10R (επιπλέον προσομοιώσεις)",
                         variable=self.target_sweep).pack(pady=3)
+        ttk.Checkbutton(self, text="du_plessis_poles_v1 (OFF): μόνο offline σήματα",
+                        variable=self.pole_strategy).pack(pady=2)
+        ttk.Combobox(self, textvariable=self.pole_mode, state="readonly", width=16,
+                     values=("EARLY_ENTRY", "EXIT_ONLY")).pack(pady=2)
+        pole_grid = ttk.Frame(self)
+        pole_grid.pack()
+        ttk.Label(pole_grid, text="Box (constant)").grid(row=0, column=0)
+        ttk.Entry(pole_grid, textvariable=self.pole_box, width=9).grid(row=0, column=1)
+        ttk.Label(pole_grid, text="Reversal").grid(row=0, column=2)
+        ttk.Entry(pole_grid, textvariable=self.pole_reversal, width=5).grid(row=0, column=3)
+        ttk.Combobox(pole_grid, textvariable=self.pole_venue, state="readonly",
+                     values=("SPOT", "FUTURES"), width=9).grid(row=0, column=4)
+        ttk.Button(self, text="Προβολή Du Plessis pole facts (χωρίς εκτέλεση)",
+                   command=self.preview_poles).pack(pady=2)
         self.run_button = ttk.Button(self, text="Εκτέλεση backtest", command=self.start)
         self.run_button.pack(pady=8)
         ttk.Button(self, text="Προβολή trades από προηγούμενο run",
@@ -53,6 +72,37 @@ class ResearchApp(tk.Tk):
         selected = filedialog.askdirectory(title="Επίλεξε τον φάκελο results του BTC 2024")
         if selected:
             self.dataset.set(selected)
+
+    def preview_poles(self):
+        if not self.pole_strategy.get():
+            self.status.set("du_plessis_poles_v1: OFF. Ενεργοποίησε το checkbox μόνο για offline preview.")
+            return
+        selected = filedialog.askopenfilename(title="Επίλεξε research candles CSV",
+                                              filetypes=[("CSV", "*.csv")])
+        if not selected:
+            return
+        try:
+            from research_v2.du_plessis_poles_preview import preview
+            result = preview(Path(selected), box_size=float(self.pole_box.get()),
+                             reversal_boxes=int(self.pole_reversal.get()),
+                             mode=self.pole_mode.get(), venue=self.pole_venue.get())
+            window = tk.Toplevel(self)
+            window.title("du_plessis_poles_v1 — offline decisions")
+            window.geometry("1080x540")
+            fields = ("event_id", "pole_type", "mode", "action", "pole_column_id",
+                      "retracement_column_id", "breakout_excess_boxes",
+                      "column_length_boxes", "retracement_boxes", "threshold_policy",
+                      "theoretical_trigger_level", "decision_ts", "status", "reason", "structural_label", "context")
+            table = ttk.Treeview(window, columns=fields, show="headings")
+            for field in fields:
+                table.heading(field, text=field)
+                table.column(field, width=125)
+            for event in result["events"]:
+                table.insert("", "end", values=[event[field] for field in fields])
+            table.pack(fill="both", expand=True)
+            self.status.set(f"Offline preview: {len(result['events'])} decisions / {result['candles_processed']} candles. Χωρίς fills ή orders.")
+        except (OSError, ValueError, KeyError) as exc:
+            messagebox.showerror("Pole preview", str(exc))
 
     def start(self):
         if self.process is not None:
