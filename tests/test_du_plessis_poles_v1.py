@@ -158,3 +158,10 @@ class PreviewTests(unittest.TestCase):
             assert result['events'][0]['action'] == 'SHORT'
             assert preview(path, box_size=1, reversal_boxes=3, mode='EARLY_ENTRY',
                            venue='FUTURES', max_candles=6)['events'] == []
+
+class ConsolidationExtremeTests(unittest.TestCase):
+    def test_older_extreme_within_consolidation_blocks_false_breakout(self):
+        c = high(top=13, retrace_bottom=10)
+        c[1].top = 12  # adjacent O's upper level exceeded nearest X high
+        c[1].bottom = 8
+        assert eval_(c) == ()

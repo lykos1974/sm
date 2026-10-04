@@ -88,10 +88,7 @@ def evaluate_prefix(columns: Sequence[Any], *, box_size: str | Decimal,
             continue
         if (pole.kind, retrace.kind) not in (("X", "O"), ("O", "X")):
             continue
-        previous = next((j for j in range(i - 2, -1, -1)
-                         if columns[j].kind == pole.kind), None)
-        if previous is None:
-            continue
+        prior_range = grid[i - 4:i - 1]
         low, high = grid[i - 1]
         rlow, rhigh = grid[i]
         length = high - low + 1
@@ -101,8 +98,8 @@ def evaluate_prefix(columns: Sequence[Any], *, box_size: str | Decimal,
                 (pole.kind == "O" and rlow != low + 1) or
                 type(retrace.end_ts) is not int or retrace.end_ts < pole.end_ts):
             continue
-        excess = (high - grid[previous][1] if pole.kind == "X"
-                  else grid[previous][0] - low)
+        excess = (high - max(top for _, top in prior_range) if pole.kind == "X"
+                  else min(bottom for bottom, _ in prior_range) - low)
         if excess < 3 or 2 * retraced < length:
             continue
         kind = "HIGH_POLE" if pole.kind == "X" else "LOW_POLE"

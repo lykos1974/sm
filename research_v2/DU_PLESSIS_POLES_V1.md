@@ -9,7 +9,7 @@ runs only `causal_long_pole`; checking this profile does not change that run.
 | Source | Rule | Implementation | Test |
 |---|---|---|---|
 | Poles, pp. 155–159 | Prior sideways consolidation | **v1 assumption**, overlap of at least one box across the three adjacent columns immediately before breakout; not a numerical rule supplied by Du Plessis | `test_breakout_boundary_and_consolidation` |
-| Poles | X/O breakout exceeds preceding same-side extreme by at least three boxes | Exact integer grid-index difference, inclusive 3; pole height is **not** a mandatory >5 filter | `test_breakout_boundary_and_consolidation` |
+| Poles | X/O breakout exceeds preceding same-side extreme by at least three boxes | Exact integer grid-index difference against the three-column consolidation extreme, inclusive 3; pole height is **not** a mandatory >5 filter | `test_breakout_boundary_and_consolidation` |
 | Poles | Immediately adjacent opposite column retraces pole | Consecutive column IDs and X→O/O→X; pole length and retracement count include both endpoint boxes | `test_off_and_exact_half_ten_five`, `test_low_symmetry_exit_only_and_spot` |
 | Trading strategy | Early action at 50%; elsewhere structural description says more than 50% | Early `2*retraced >= length`; structural diagnostic `2*retraced > length`. 10 X and 5 O passes early only | `test_off_and_exact_half_ten_five` |
 | Trading strategy | HIGH weakness, LOW strength; reversal closes a short | SHORT/LONG candidates; LONG management is explicit symmetric implementation; reversal candidate only after separately acknowledged fill, never a fixed stop | `test_live_prefix_dedupe_reversal_requires_fill_and_no_auto_entry` |
