@@ -64,9 +64,36 @@ link so an existing report cannot be overwritten; this needs a local volume
 that supports file hard links. A failure before publication leaves the final
 path absent when the OS permits temporary cleanup. It does not claim directory
 fsync. The operator's full input is not available in the repository, so the
-annual result has **not** been run or independently checked here. Disk usage
+annual result has **not** been independently checked here. Disk usage
 will be the JSON ledger plus temporary copy during publication; runtime
 depends on the Windows machine and may be several minutes because there are
 two full-year replays. Stop if source hash, contiguity or baseline consistency
 fails. A later genuinely filtered strategy replay and out-of-sample test
 remain separate stages.
+
+## Operator-reported pinned annual run (2026-10-06)
+
+The Windows operator ran the pinned wrapper from commit `b8390bb48e023f58bde24dfba59f600e6eb079a0`
+on the SHA-pinned 2024 CSV and supplied the console summary. This is
+**operator-provided output**; the full JSON ledger and report-file SHA-256
+were not received or independently replayed in this checkout. The run took
+1.52 minutes and processed all 527,040 contiguous candles. It reproduced
+the prior 574 completed baseline trades (210 positive, 364 negative), gross
+mean +3.127273459 bps/trade, and zero pending/skipped.
+
+| Existing baseline subset | Completed | Gross mean bps/trade | Gross sum bps, equal-notional proxy |
+|---|---:|---:|---:|
+| `CONTEXT_MATCH` | 3 | +36.940591921 | +110.821775762 |
+| `CONTEXT_UNAVAILABLE` | 571 | +2.949620298 | +1684.233189984 |
+
+Three of 574 signals matched, about 0.52%. These are **subsets of the unchanged
+baseline**, not executions of a filtered strategy. Their entry/exit
+assumptions are 1m OHLC next-open simulation; actual fills, fees, slippage
+and funding are unknown. The 2024 sample informed the design and the matched
+group has only three trades, so no net expectancy, statistical stability,
+improvement over baseline or live suitability can be inferred. No further
+parameter tuning on these three outcomes is justified.
+
+Decision: **INSUFFICIENT_SAMPLE / NO PROMOTION**. The report remains on the
+operator's Windows research path; raw event/trade verification and a
+predeclared independent period are required before another performance claim.
