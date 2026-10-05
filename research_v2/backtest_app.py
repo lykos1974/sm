@@ -59,6 +59,8 @@ class ResearchApp(tk.Tk):
                      values=("SPOT", "FUTURES"), width=9).grid(row=0, column=4)
         ttk.Button(self, text="Προβολή Du Plessis pole facts (χωρίς εκτέλεση)",
                    command=self.preview_poles).pack(pady=2)
+        ttk.Button(self, text="Du Plessis: offline next-open simulation (10k candles)",
+                   command=self.simulate_poles).pack(pady=2)
         self.run_button = ttk.Button(self, text="Εκτέλεση backtest", command=self.start)
         self.run_button.pack(pady=8)
         ttk.Button(self, text="Προβολή trades από προηγούμενο run",
@@ -103,6 +105,39 @@ class ResearchApp(tk.Tk):
             self.status.set(f"Offline preview: {len(result['events'])} decisions / {result['candles_processed']} candles. Χωρίς fills ή orders.")
         except (OSError, ValueError, KeyError) as exc:
             messagebox.showerror("Pole preview", str(exc))
+
+    def simulate_poles(self):
+        if not self.pole_strategy.get():
+            self.status.set("du_plessis_poles_v1: OFF.")
+            return
+        selected = filedialog.askopenfilename(title="Επίλεξε research candles CSV",
+                                              filetypes=[("CSV", "*.csv")])
+        if not selected:
+            return
+        try:
+            from research_v2.du_plessis_poles_forward_sim import simulate
+            result = simulate(Path(selected), box_size=float(self.pole_box.get()),
+                              reversal_boxes=int(self.pole_reversal.get()),
+                              venue=self.pole_venue.get())
+            window = tk.Toplevel(self)
+            window.title("Du Plessis — OFFLINE simulated opens; no R or fees")
+            window.geometry("1050x500")
+            fields = ("event_id", "direction", "signal_ts", "theoretical_trigger_level",
+                      "entry_simulated_open_ts", "entry_simulated_open_price",
+                      "exit_signal_ts", "exit_simulated_open_ts",
+                      "exit_simulated_open_price", "gross_price_delta", "status")
+            table = ttk.Treeview(window, columns=fields, show="headings")
+            for field in fields:
+                table.heading(field, text=field)
+                table.column(field, width=145)
+            for trade in result["trades"]:
+                table.insert("", "end", values=[trade.get(field, "") for field in fields])
+            table.pack(fill="both", expand=True)
+            self.status.set(f"Offline only: {len(result['trades'])} simulated positions; "
+                            f"{len(result['skipped'])} blocked/skipped. "
+                            "Gross price delta only, no fees or R.")
+        except (OSError, ValueError, KeyError) as exc:
+            messagebox.showerror("Offline pole simulation", str(exc))
 
     def start(self):
         if self.process is not None:

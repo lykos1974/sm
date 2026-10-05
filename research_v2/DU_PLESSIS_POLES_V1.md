@@ -39,3 +39,19 @@ reads only the first 10,000 closed candles. It stops on the first qualifying
 previous and decision candle closes, UTC times, source bounds, threshold and
 status. A missing event fails; it never consults a database or infers a fill.
 The operator must compare the report with the UI row and frozen input hash.
+
+## Explicit, offline next-open simulation
+
+The separate `du_plessis_poles_forward_sim.py` consumes at most the first
+10,000 contiguous, closed 1m research candles. A candidate at candle close
+may be *simulated* at the **next candle's open**, never at the theoretical
+threshold. A filled SHORT/LONG receives an exit candidate only on the next
+valid O→X/X→O P&F reversal at a later close; the simulated exit is the
+following candle's open. Gaps fail closed, spot SHORT is blocked, and no
+trade is filled without a next contiguous candle. A second candidate is
+skipped while a position or pending fill exists. This next-open policy is
+**our research assumption**, not a Du Plessis fill rule. The output is gross
+price difference, not R or net profit: no stops, position sizing, fees,
+slippage, funding, exchange fills or capital model are supplied. The app's
+separate offline button and the CLI expose this simulation; the operational
+trader, validation and original backtest remain untouched.
