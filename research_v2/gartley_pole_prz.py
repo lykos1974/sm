@@ -140,6 +140,7 @@ class CausalPrzLedger:
         self.sequence = 0
         self.confirmed_fingerprints: dict[int, tuple] = {}
         self.seen_pole_events: set[str] = set()
+        self.active_candidates: set[str] = set()
 
     def ingest(self, columns: Sequence[Any], *, close_ts: int, close: Any,
                pole_events: Sequence[Any] = ()) -> list[dict]:
@@ -148,16 +149,21 @@ class CausalPrzLedger:
         price = number(close)
         if price <= 0:
             raise ValueError("positive close required")
-        fingerprint = (close_ts, price, tuple((c.idx, c.kind, str(number(c.top)),
-                       str(number(c.bottom)), c.start_ts, c.end_ts) for c in columns),
+        def column_fingerprint(c: Any) -> tuple:
+            if (type(c.idx) is not int or c.kind not in ("X", "O")
+                    or type(c.end_ts) is not int or c.end_ts > close_ts):
+                raise ValueError("invalid PnF column")
+            return (c.idx, c.kind, str(number(c.top)), str(number(c.bottom)),
+                    c.start_ts, c.end_ts)
+        active = column_fingerprint(columns[-1])
+        recent_confirmed = column_fingerprint(columns[-2]) if len(columns) > 1 else None
+        fingerprint = (close_ts, price, len(columns), active, recent_confirmed,
                        tuple((e.event_id, e.decision_ts) for e in pole_events))
         if close_ts == self.last_ts and fingerprint == self.last_fingerprint:
             return []
         if close_ts <= self.last_ts:
             raise ValueError("nonmonotonic or conflicting close update")
-        if any(type(c.idx) is not int or c.idx != n or c.kind not in ("X", "O")
-               or type(c.end_ts) is not int or c.end_ts > close_ts
-               for n, c in enumerate(columns)):
+        if active[0] != len(columns)-1 or (recent_confirmed and recent_confirmed[0] != len(columns)-2):
             raise ValueError("invalid PnF sequence")
         if ((not self.closes and len(columns) != 1)
                 or len(columns)-1 > len(self.pivots)+1
@@ -167,8 +173,17 @@ class CausalPrzLedger:
             if (type(event.decision_ts) is not int or event.decision_ts != close_ts
                     or event.event_id in self.seen_pole_events):
                 raise ValueError("duplicate or mistimed pole decision")
-        for idx, original in self.confirmed_fingerprints.items():
-            if idx >= len(columns) or original != fingerprint[2][idx]:
+        # Check the last frozen column on every close. Verify the entire
+        # immutable prefix only when a new PnF column appears; this avoids a
+        # quadratic scan of ~527,000 candle updates in the annual replay.
+        if len(columns)-1 > len(self.pivots):
+            check_ids = self.confirmed_fingerprints.keys()
+        else:
+            check_ids = (len(columns)-2,) if len(columns)>1 else ()
+        for idx in check_ids:
+            original = self.confirmed_fingerprints.get(idx)
+            if original is not None and (idx >= len(columns)
+                                         or original != column_fingerprint(columns[idx])):
                 raise ValueError("confirmed pivot changed retrospectively")
         self.sequence += 1
         self.last_ts, self.last_fingerprint = close_ts, fingerprint
@@ -181,7 +196,7 @@ class CausalPrzLedger:
                           number(col.top if col.kind == "X" else col.bottom),
                           col.end_ts, close_ts, self.sequence)
             self.pivots.append(pivot)
-            self.confirmed_fingerprints[col.idx] = fingerprint[2][col.idx]
+            self.confirmed_fingerprints[col.idx] = column_fingerprint(col)
             fresh.append({"type": "PIVOT_CONFIRMED", **_record(pivot)})
             if len(self.pivots) >= 4:
                 four = self.pivots[-4:]
@@ -193,22 +208,31 @@ class CausalPrzLedger:
                     self.candidates[candidate.candidate_id] = candidate
                     # At creation, the first close must still be on the approach side.
                     approach = (lambda p: p > candidate.upper) if candidate.direction == "LONG" else (lambda p: p < candidate.lower)
-                    side_ok = approach(price) and all(approach(old_price) for old_ts, old_price in self.closes
-                                                       if old_ts >= four[-1].extreme_at)
+                    side_ok = approach(price)
+                    if side_ok:
+                        for old_ts, old_price in reversed(self.closes):
+                            if old_ts < four[-1].extreme_at:
+                                break
+                            if not approach(old_price):
+                                side_ok = False
+                                break
                     state = {"phase": "WAITING" if side_ok else "UNAVAILABLE",
                              "reason": None if side_ok else "ZONE_TOUCHED_BEFORE_OR_AT_CREATION",
                              "first_zone_contact_at": None, "b_violated_at": None,
                              "full_zone_test_at": None,
                              "accepted_event_id": None}
                     self.states[candidate.candidate_id] = state
+                    if side_ok:
+                        self.active_candidates.add(candidate.candidate_id)
                     fresh.append({"type": "ZONE_CREATED", **_record(candidate),
                                   "state": state["phase"], "reason": state["reason"]})
                 else:
                     fresh.append({"type": "PATTERN_EXCLUDED", "pivot_ids": [p.pivot_id for p in four],
                                   "reason": reason, "at": close_ts})
         self.closes.append((close_ts, price))
-        for candidate in list(self.candidates.values()):
-            state = self.states[candidate.candidate_id]
+        for key in sorted(self.active_candidates):
+            candidate = self.candidates[key]
+            state = self.states[key]
             if state["phase"] in ("UNAVAILABLE", "EXPIRED", "INVALIDATED", "MATCHED"):
                 continue
             connected = candidate.connected_column_id
@@ -217,6 +241,7 @@ class CausalPrzLedger:
             invalid = price <= candidate.x if candidate.direction == "LONG" else price >= candidate.x
             if invalid:
                 state.update(phase="INVALIDATED", reason="X_CROSSED_BEFORE_SIGNAL")
+                self.active_candidates.remove(key)
                 fresh.append({"type": "ZONE_INVALIDATED", "candidate_id": candidate.candidate_id,
                               "at": close_ts, "reason": state["reason"]})
                 continue
@@ -274,13 +299,16 @@ class CausalPrzLedger:
                           "known_pole_extreme_distance_boxes": str(distance(extreme, chosen.lower, chosen.upper)/self.box_size) if chosen else None}
             if chosen:
                 self.states[chosen.candidate_id].update(phase="MATCHED", accepted_event_id=event.event_id)
+                self.active_candidates.discard(chosen.candidate_id)
             fresh.append(annotation)
         # An event on the close that starts the next column still belongs to
         # the just-completed connected leg. Retire only after evaluating it.
-        for candidate in self.candidates.values():
-            state = self.states[candidate.candidate_id]
+        for key in sorted(self.active_candidates):
+            candidate = self.candidates[key]
+            state = self.states[key]
             if len(columns)-1 > candidate.connected_column_id and state["phase"] in ("WAITING", "TESTED"):
                 state.update(phase="EXPIRED", reason="CONNECTED_LEG_ENDED")
+                self.active_candidates.discard(candidate.candidate_id)
                 fresh.append({"type": "ZONE_EXPIRED", "candidate_id": candidate.candidate_id,
                               "at": close_ts, "reason": state["reason"]})
         self.records.extend(fresh)

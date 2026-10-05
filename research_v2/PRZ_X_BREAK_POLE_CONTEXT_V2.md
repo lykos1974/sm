@@ -41,3 +41,32 @@ The full 2024 trade/event ledger remains unavailable locally in this repo.
 
 **Implementation gate:** targeted offline chronology and baseline-isolation
 tests. **Empirical gate:** BLOCKED; no net-profitability claim or live promotion.
+
+## One pinned exploratory 2024 ledger, optional local run
+
+`prz_x_break_pole_annual.py` is an offline research wrapper for the exact
+BTCUSDT Binance UM 2024 CSV already used in the pole annual replay. It accepts
+only SHA-256 `8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f`,
+527,040 contiguous 1m closes and the pinned UTC year endpoints. It makes one
+streaming causal annotation pass and one pass through the **unchanged**
+baseline simulator. The single new JSON report contains every v1 pivot/zone
+event, every v2 signal annotation, all simulated baseline trade outcomes,
+skipped signals, and pending identities. Outcomes are kept separate from
+decision facts. It compares completed *subsets of the unchanged baseline*
+using gross entry-normalized bps. Removing trades would change position
+availability, so these subset figures are explicitly **not** a filtered
+execution backtest, net returns or capital performance.
+
+No operational database, exchange network, optimizer, trader or service is
+used. Source hash is checked before and after both passes. Report creation
+uses a same-directory flushed/fsynced temporary file and an exclusive hard
+link so an existing report cannot be overwritten; this needs a local volume
+that supports file hard links. A failure before publication leaves the final
+path absent when the OS permits temporary cleanup. It does not claim directory
+fsync. The operator's full input is not available in the repository, so the
+annual result has **not** been run or independently checked here. Disk usage
+will be the JSON ledger plus temporary copy during publication; runtime
+depends on the Windows machine and may be several minutes because there are
+two full-year replays. Stop if source hash, contiguity or baseline consistency
+fails. A later genuinely filtered strategy replay and out-of-sample test
+remain separate stages.
