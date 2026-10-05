@@ -55,3 +55,11 @@ price difference, not R or net profit: no stops, position sizing, fees,
 slippage, funding, exchange fills or capital model are supplied. The app's
 separate offline button and the CLI expose this simulation; the operational
 trader, validation and original backtest remain untouched.
+
+## One simulated exit audit
+
+`python -B -m research_v2.du_plessis_poles_exit_audit --candles <frozen candles_1m.csv> --event-id du_plessis_poles_v1:EARLY_ENTRY:28:29 --box-size 100 --reversal-boxes 3`
+replays at most 10,000 closed candles and checks the first post-entry P&F
+reversal column independently, its close timestamp, then the very next
+contiguous candle open against the separate simulator ledger. It prints only
+one trace and makes no exchange or database request.
