@@ -202,6 +202,38 @@ class ChronologyTests(unittest.TestCase):
 
 
 class OfflineBoundaryTests(unittest.TestCase):
+    def test_real_pnf_engine_gartley_pole_conflict_both_directions(self):
+        """A valid zone/full test and real pole cannot survive X invalidation."""
+        from research_v2.du_plessis_poles_preview import PnFEngine, PnFProfile
+        from pnf_mvp.strategies.du_plessis_poles_v1 import PoleDecisionLedger
+        for direction, prices, action in (
+            ("bearish", (2700,3000,2000,2600,2100,2400,2800,3200,2600), "SHORT"),
+            ("bullish", (2300,2000,3000,2400,2900,2600,2200,1800,2400), "LONG"),
+        ):
+            with self.subTest(direction=direction):
+                engine = PnFEngine(PnFProfile("audit", 100, 3))
+                poles = PoleDecisionLedger()
+                ledger = CausalPrzLedger(box_size="100")
+                all_records = []
+                for n, price in enumerate(prices, 1):
+                    ts = n*60000-1
+                    engine.update_from_price(ts, price)
+                    pole_events = poles.ingest(engine.columns, box_size="100",
+                                               reversal_boxes=3, enabled=True)
+                    all_records += ledger.ingest(engine.columns, close_ts=ts, close=price,
+                                                 pole_events=[e for e in pole_events
+                                                              if e.status == "CANDIDATE"])
+                self.assertEqual(sum(r["type"] == "ZONE_CREATED" and r["state"] == "WAITING"
+                                     for r in all_records), 1)
+                self.assertEqual(sum(r["type"] == "ZONE_FULL_TEST" for r in all_records), 1)
+                self.assertEqual(sum(r["type"] == "ZONE_INVALIDATED" and
+                                     r["reason"] == "X_CROSSED_BEFORE_SIGNAL" for r in all_records), 1)
+                annotations = [r for r in all_records if r["type"] == "POLE_ANNOTATION"]
+                self.assertEqual(len(annotations), 1)
+                self.assertEqual(annotations[0]["reason"], "X_CROSSED_BEFORE_SIGNAL")
+                self.assertEqual(annotations[0]["category"], "PRZ_AVAILABLE_NONMATCH")
+                self.assertEqual(pole_events[0].action, action)
+
     def test_bounded_report_and_baseline_output_unchanged(self):
         from research_v2.gartley_pole_prz_smoke import run
         from research_v2.du_plessis_poles_forward_sim import simulate
@@ -215,6 +247,8 @@ class OfflineBoundaryTests(unittest.TestCase):
             output = Path(root) / "report.json"
             report = run(source, expected_sha256=expected, output=output, max_candles=8)
             self.assertEqual(report["execution"], "OFF")
+            self.assertEqual(report["design_gate"],
+                             "BLOCKED_X_INVALIDATION_VS_THREE_BOX_POLE_BREAKOUT")
             self.assertEqual(json.loads(output.read_text())["manifest"], report)
             content = json.loads(output.read_text())
             self.assertIn("decision_events", content)

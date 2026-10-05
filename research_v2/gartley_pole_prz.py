@@ -194,7 +194,7 @@ class CausalPrzLedger:
                     # At creation, the first close must still be on the approach side.
                     approach = (lambda p: p > candidate.upper) if candidate.direction == "LONG" else (lambda p: p < candidate.lower)
                     side_ok = approach(price) and all(approach(old_price) for old_ts, old_price in self.closes
-                                                       if old_ts >= four[0].extreme_at)
+                                                       if old_ts >= four[-1].extreme_at)
                     state = {"phase": "WAITING" if side_ok else "UNAVAILABLE",
                              "reason": None if side_ok else "ZONE_TOUCHED_BEFORE_OR_AT_CREATION",
                              "first_zone_contact_at": None, "b_violated_at": None,

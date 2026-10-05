@@ -59,6 +59,7 @@ def run(candles: Path, *, expected_sha256: str, output: Path,
             prz.ingest(engine.columns, close_ts=ts, close=close, pole_events=pole_events)
             count += 1
     manifest = {"schema": SCHEMA, "research_only": True, "execution": "OFF",
+                "design_gate": "BLOCKED_X_INVALIDATION_VS_THREE_BOX_POLE_BREAKOUT",
                 "source_path": str(candles), "source_sha256": actual,
                 "box_size": "100", "reversal_boxes": 3,
                 "candles_processed": count,

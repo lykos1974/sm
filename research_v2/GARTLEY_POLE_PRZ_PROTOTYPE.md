@@ -33,7 +33,7 @@ column exists. Its `extreme_at` is the final update of the closed column;
 `confirmed_at` and event sequence mark when that endpoint became usable.
 The four most recent consecutive confirmed pivots become X/A/B/C. The
 immutable zone is created when C is confirmed. At creation, prior recorded
-closes since X and the current close must still be on the approach side;
+closes since C's last extreme and the current close must still be on the approach side;
 otherwise the candidate is unavailable. Future closed closes determine
 first contact, strict B violation and full-zone test. A same-close full test
 and pole signal is excluded. Only the immediately connected D-direction PnF
@@ -70,7 +70,38 @@ the precise runtime depends on the local disk and PnF engine. The 2024 data
 were already observed and can only be exploratory. Before empirical claims,
 freeze a distinct out-of-sample interval, costs, metrics and pass criterion.
 
-**Implementation:** synthetic chronology/geometry check only, pending
-independent review and a bounded real-input smoke. **Empirical evaluation:**
-BLOCKED by missing annual ledger and future out-of-sample protocol. This
-document makes no performance PASS claim.
+**Implementation:** the mechanics pass synthetic chronology checks, but
+same-leg match feasibility fails for the combined rules, as shown below.
+**Empirical evaluation:** BLOCKED. The annual ledger and an out-of-sample
+protocol are also missing. This document makes no performance PASS claim.
+
+## Structural feasibility audit (2026-10-06)
+
+The Windows operator's 10,000-candle smoke at published commit `dc107360`
+returned 4 poles, all `NO_CAUSAL_ZONE`; 53 pivot groups failed geometry and
+9 failed the B ratio. Those counts alone are not evidence of rarity or edge.
+
+An audit found two separate problems:
+
+1. The original late-zone check scanned prior closes back to X. A standard
+   bearish X high (bullish X low) naturally lies beyond the later projected
+   zone, so it was incorrectly classified as a pre-creation touch. The check
+   now begins at C's last extreme. A full zone test is still required strictly
+   after C confirmation.
+2. More fundamentally, the **specified rules cannot produce a PRZ_MATCH**
+   on the connected pole leg under this PnF grid. For a bearish Gartley, X is
+   the initial high H; the next O column A starts one box below H. The pole
+   breakout X column D must exceed the prior three-column high by at least
+   three boxes. Those columns include A, so D must reach at least H+2 boxes.
+   The observed closed price necessarily crosses H before the ≥50% pole
+   retracement signal, which triggers the mandatory `X_CROSSED_BEFORE_SIGNAL`
+   invalidation. The bullish case mirrors this with D ≤ X−2 boxes. An exact
+   bearish/bullish PnF-engine test demonstrates a valid projected zone,
+   B violation, full-zone test, X invalidation and then a pole signal with
+   `PRZ_AVAILABLE_NONMATCH`.
+
+This is a **design FAIL for same-leg PRZ_MATCH feasibility**, not a negative
+performance result. Do not run the annual comparison or optimize parameters
+under this definition. The X invalidation is a declared prototype convention;
+removing it or changing the structural relationship would be a new versioned
+research hypothesis requiring an explicit source and chronology review.
