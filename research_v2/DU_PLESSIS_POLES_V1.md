@@ -63,3 +63,18 @@ replays at most 10,000 closed candles and checks the first post-entry P&F
 reversal column independently, its close timestamp, then the very next
 contiguous candle open against the separate simulator ledger. It prints only
 one trace and makes no exchange or database request.
+
+## Pinned full-year gross check (BTCUSDT Binance UM 2024 only)
+
+`python -B -m research_v2.du_plessis_poles_annual --candles <frozen BTCUSDT 2024 candles_1m.csv>`
+requires the exact SHA-256
+`8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f`,
+527,040 contiguous 1m closed candles, and exact UTC year boundaries. It
+streams one fixed profile (100-box, 3-box reversal) with no parameter search.
+The bounded 10k preview remains separate. Annual/quarterly figures are
+completed trade counts and gross entry-normalized basis points. The bps sum
+is an equal-notional *proxy*, not compounded capital return; final open and
+pending positions are excluded. Break-even per-side cost is just gross
+average bps divided by two, not a measured fee. No order book, exchange fill,
+fees, slippage, funding, liquidation, leverage, quantity, or live integration
+is modeled. Do not compare this directly with the protected 98/89 baseline.

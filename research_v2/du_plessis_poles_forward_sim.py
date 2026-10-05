@@ -12,9 +12,10 @@ from pnf_mvp.strategies.du_plessis_poles_v1 import PoleDecisionLedger
 
 
 def simulate(path: Path, *, box_size: float, reversal_boxes: int,
-             venue: str = 'FUTURES', max_candles: int = 10000) -> dict:
+             venue: str = 'FUTURES', max_candles: int = 10000,
+             full_year_verified: bool = False) -> dict:
     if (not path.is_file() or path.suffix.lower() != '.csv'
-            or type(max_candles) is not int or not 2 <= max_candles <= 10000
+            or type(max_candles) is not int or not 2 <= max_candles <= (527040 if full_year_verified else 10000)
             or type(reversal_boxes) is not int or reversal_boxes < 1
             or venue not in ('FUTURES', 'SPOT')):
         raise ValueError('invalid bounded research input')
@@ -26,6 +27,7 @@ def simulate(path: Path, *, box_size: float, reversal_boxes: int,
     pending_exit = None
     active = None
     previous_ts = None
+    first_ts = None
     processed = 0
     with path.open(newline='', encoding='utf-8-sig') as stream:
         reader = csv.DictReader(stream)
@@ -84,6 +86,8 @@ def simulate(path: Path, *, box_size: float, reversal_boxes: int,
                                         'reason': 'POSITION_OR_PENDING_EXISTS'})
                 elif event.status == 'BLOCKED_SPOT_SHORT':
                     skipped.append({'event_id': event.event_id, 'reason': event.status})
+            if first_ts is None:
+                first_ts = ts
             previous_ts = ts
             processed += 1
     if active is not None:
@@ -93,7 +97,8 @@ def simulate(path: Path, *, box_size: float, reversal_boxes: int,
             'exit_policy': 'NEXT_OPEN_AFTER_CLOSE_CONFIRMED_PNF_REVERSAL',
             'execution': 'OFFLINE_SIMULATION_ONLY',
             'limitations': 'gross price delta only; no exchange fills, fees, slippage, funding, R or capital model',
-            'candles_processed': processed, 'trades': trades, 'skipped': skipped,
+            'candles_processed': processed, 'first_close_ts': first_ts,
+            'last_close_ts': previous_ts, 'trades': trades, 'skipped': skipped,
             'pending_entry_event_id': None if pending_entry is None else pending_entry.event_id,
             'pending_exit_event_id': None if pending_exit is None else pending_exit.event_id}
 

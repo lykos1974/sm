@@ -141,6 +141,7 @@ class PoleDecisionLedger:
             raise ValueError("invalid prior event lineage")
         self.events: dict[str, PoleEvent] = {e.event_id: e for e in prior_events}
         self.filled: dict[str, tuple[str, int]] = {}
+        self.open_filled: set[str] = set()
 
     def ingest(self, columns: Sequence[Any], *, box_size: str | Decimal,
                reversal_boxes: int, enabled: bool = False,
@@ -148,7 +149,7 @@ class PoleDecisionLedger:
         if not enabled:
             return ()
         fresh = []
-        for candidate in evaluate_prefix(columns, box_size=box_size,
+        for candidate in evaluate_prefix(columns[-5:], box_size=box_size,
                                          reversal_boxes=reversal_boxes, mode=self.mode,
                                          enabled=True, venue=self.venue,
                                          owned_position=owned_position):
@@ -157,7 +158,8 @@ class PoleDecisionLedger:
                 fresh.append(candidate)
         if columns:
             active = columns[-1]
-            for event_id, (direction, fill_ts) in tuple(self.filled.items()):
+            for event_id in tuple(self.open_filled):
+                direction, fill_ts = self.filled[event_id]
                 original = self.events[event_id]
                 target = "X" if direction == "SHORT" else "O"
                 exit_id = event_id + ":REVERSAL_EXIT"
@@ -174,6 +176,7 @@ class PoleDecisionLedger:
                                            original.structural_label)
                     self.events[exit_id] = exit_event
                     fresh.append(exit_event)
+                    self.open_filled.remove(event_id)
         return tuple(fresh)
 
     def acknowledge_simulated_fill(self, event_id: str, *, direction: str,
@@ -188,3 +191,5 @@ class PoleDecisionLedger:
         if event_id in self.filled and self.filled[event_id] != value:
             raise ValueError("conflicting fill")
         self.filled[event_id] = value
+        if event_id + ":REVERSAL_EXIT" not in self.events:
+            self.open_filled.add(event_id)
