@@ -78,3 +78,30 @@ pending positions are excluded. Break-even per-side cost is just gross
 average bps divided by two, not a measured fee. No order book, exchange fill,
 fees, slippage, funding, liquidation, leverage, quantity, or live integration
 is modeled. Do not compare this directly with the protected 98/89 baseline.
+
+## Operator-reported pinned annual result (2026-10-05)
+
+The Windows operator ran the pinned annual CLI from branch HEAD
+`0ee33a1474f43b9e57efe0daa68b18bf02a379b1` and pasted the summary.
+This repository records that report as **operator-provided output**; the raw
+annual JSON and individual trade ledger were not independently received or
+replayed here. The CLI source pin and exact UTC-year check are described above.
+
+| Period | Completed | Positive | Negative | Gross average bps/trade | Gross sum bps, equal-notional proxy | Max loss streak |
+|---|---:|---:|---:|---:|---:|---:|
+| 2024 Q1 | 136 | 52 | 84 | +6.435615 | +875.243659 | 5 |
+| 2024 Q2 | 119 | 40 | 79 | -2.711869 | -322.712413 | 12 |
+| 2024 Q3 | 111 | 48 | 63 | +9.961188 | +1105.691822 | 13 |
+| 2024 Q4 | 208 | 70 | 138 | +0.657846 | +136.831898 | 8 |
+| **2024** | **574** | **210** | **364** | **+3.127273** | **+1795.054966** | **13** |
+
+No final open position was reported; zero candidates were skipped or blocked.
+The break-even **symmetric cost per side**, before funding or other effects,
+was 1.563637 bps. A hypothetical 2 bps per side would make the average
+3.127273 - 4 = **-0.872727 bps/trade**. This is arithmetic sensitivity,
+not an assertion of a user's actual fee tier or venue-specific costs.
+The sample is gross, has one negative quarter and a long loss streak, and
+cannot support a net profitability or live promotion claim. A frozen full
+JSON report/trade ledger, an independent decision/exit audit, and venue-specific
+fees/slippage/funding remain the next research gates. Operational components
+and the protected baseline remain unchanged and OFF where applicable.
