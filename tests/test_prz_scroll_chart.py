@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from research_v2 import prz_scroll_chart as chart
 from research_v2.pnf_multicolumn_sr import derive_zones
+from tests.test_pnf_multicolumn_harmonic import pivots as harmonic_pivots
 
 
 class PrzScrollChartTests(unittest.TestCase):
@@ -112,6 +113,21 @@ class PrzScrollChartTests(unittest.TestCase):
         self.assertIn('selectedSr=-1',page)
         self.assertIn('i===selectedSr',page)
         self.assertIn('id="prevSr"',page)
+
+    def test_nonconsecutive_harmonic_is_separate_selectable_layer(self):
+        facts = harmonic_pivots()
+        fine = [{"idx": i, "kind": "X" if i%2 else "O", "top": 11000,
+                 "bottom": 1000, "start": 900+i*100, "end": 999+i*100}
+                for i in range(12)]
+        mapped = chart.map_harmonic_zones(fine, facts)
+        chosen = next(z for z in mapped if z["coarse_pivot_columns"] == [0,3,6,9])
+        self.assertEqual(chosen["known_column"], 11)
+        page = chart.chart_html(fine, [], harmonic_zones=mapped,
+                                source_hash="a"*64, report_hash="b"*64)
+        for token in ('id="pickHarmonic"', 'selectedHarmonic=-1',
+                      'i===selectedHarmonic', '"coarse_pivot_columns":[0,3,6,9]',
+                      'μη διαδοχικές Fibonacci PRZ'):
+            self.assertIn(token, page)
 
     def test_atomic_publication_and_failure_cleanup(self):
         path = self.root / "report.json"

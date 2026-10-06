@@ -21,7 +21,8 @@ The input candle SHA-256 must equal
 the complete year and report schema/parameters are checked. An existing HTML
 file is never overwritten. The output embeds all P&F columns and projected
 zones; it is a static research artifact, with horizontal scrolling, month jump,
-PRZ selector, structural-zone selector, previous/next, zoom and LONG/SHORT visibility. X/A/B/C pivot
+PRZ selector, structural-zone selector, independent nonconsecutive Fibonacci
+selector, previous/next, zoom and LONG/SHORT visibility. X/A/B/C pivot
 connections and shaded D zones follow the report's already frozen decision
 facts. Contact, far-edge test and invalidation/expiry events are marked.
 The vertical scale adapts to the visible columns. The report SHA-256 appears
@@ -55,6 +56,31 @@ The original 28 Gartley PRZ stay visible and retain their exact meaning.
 No Fibonacci projection is required in the coarse S/R layer, so these zones
 are **not called harmonic PRZ**. A separate causal study can test Fibonacci
 confluence without silently changing either layer.
+
+## Nonconsecutive coarse harmonic projections (separate research convention)
+
+`pnf-multicolumn-gartley-v1` uses the same pinned close-confirmed 1000/3
+coarse P&F replay. At confirmation of C it enumerates alternating X/A/B/C
+pivots within a **24-column lookback**, requiring at least one skipped column.
+Intervening confirmed extremes must stay inside each selected leg's endpoint
+range; otherwise selecting distant endpoints would conceal a more extreme
+pivot. The chosen four pivots are mapped to logical consecutive indices solely
+to reuse the existing restricted Gartley ratio and D-projection routine:
+B/XA 0.588–0.648, C/AB 0.382–0.886, reciprocal BC 1.13–1.618,
+0.786 XA versus AB=CD, and projected zone width at most one coarse box.
+This is an explicitly versioned **implementation assumption**, not a claim
+that a textbook requires a 24-column horizon or this intermediate-extreme
+rule. The C confirmation close must still be on the approach side of D;
+later zone contacts and invalidation are **not** tracked in this layer.
+Projection time is C confirmation, never the earlier pivot extreme.
+
+These candidate projections appear in their own selector, initially with
+none selected. A selected candidate draws one cyan X/A/B/C path and a short
+shaded D zone. It neither changes the existing 28 consecutive Gartley PRZ
+nor the coarse structural S/R labels. A particular visible formation may
+still be excluded by geometry or ratios; annual count must be measured from
+the pinned operator input, not inferred from screenshots. No order, fill,
+trade or profitability is implied.
 
 ## Operator-reported full-year chart (2026-10-06)
 
