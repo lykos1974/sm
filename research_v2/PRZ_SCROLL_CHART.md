@@ -56,6 +56,23 @@ No Fibonacci projection is required in the coarse S/R layer, so these zones
 are **not called harmonic PRZ**. A separate causal study can test Fibonacci
 confluence without silently changing either layer.
 
+## Operator-reported full-year chart (2026-10-06)
+
+From commit `6f01f4f8f2c13ac5e31669990d6f41e9b8651219`, the Windows operator
+reported successful creation of
+`H:\pnf screener\research_snapshots\BTC_2024_zones_20261006_120726.html`.
+The console output reported 6,519 fine P&F columns, the unchanged 28
+Gartley PRZ, and **58** coarse structural zones, with execution OFF. The
+frozen candle SHA-256 was
+`8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f`;
+the input annual report SHA-256 was
+`d29f3924bb224d4ffca857de564478f61f6cc48ded0727b61e9e89e6f20c6e57`.
+This is operator-provided console evidence, not an independent inspection
+of the local HTML or 2024 candle file. The 58 zones are exploratory S/R
+labels, not confirmed harmonic PRZ, trades, or profitable opportunities.
+The marked late-February/early-March example has not yet been matched to
+an exact zone identity and decision time.
+
 The 28 zones, 14 contacts, 13 full tests, 8 invalidations and 20 expiries
 are **operator-reported event counts** for this pinned run. They are not
 independent trades and are not evidence of profitable execution. A standard
