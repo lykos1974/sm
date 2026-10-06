@@ -137,5 +137,27 @@ python -B -m research_v2.pole_harmonic_overlap `
 The output is created exclusively in that existing research directory;
 another name must be chosen for a retry. It records every signal's provenance
 and category, with execution OFF. Operator-reported annual inputs contained
-five nonconsecutive projections and 574 pole signals; the exact overlap
-counts remain unknown until the local read-only check runs.
+five nonconsecutive projections and 574 pole signals; at that point the
+exact overlap counts were not yet measured. The result follows below.
+
+### Operator-reported overlap result (2026-10-06)
+
+With the pinned 2024 source SHA-256 `8045aa135a611d4b4fc2ca0cde9a8fa68905ad4480054399f33ed77ab8f6851f`,
+report SHA-256 `d29f3924bb224d4ffca857de564478f61f6cc48ded0727b61e9e89e6f20c6e57`,
+and locally generated HTML SHA-256 `4fc50b1fda001a34fa211f855ea89a4a6caaab18e4d396652b60c844d6f1ebaa`,
+the operator reported five nonconsecutive projections and 574 existing
+completed simulated poles. The descriptive groups were: one `IN_ZONE`
+(-12.1870 gross bps), six `NEAR_1_COARSE_BOX` (+163.7454 gross bps in
+aggregate), 148 `FAR`, and 419 `NO_PRIOR_SAME_DIRECTION_ZONE`.
+
+A second local read-only inspection of the seven close or near signals
+reported dates 2024-10-15 through 2024-10-25, all SHORT, with zone ages
+**862.27 to 1103.33 hours**, approximately **36 to 46 days** at signal time.
+Their existing simulated gross outcomes were three positive and four negative.
+The printed zone IDs were truncated, so this evidence does not establish
+whether they refer to one or several identical-looking projections. Because
+this projection layer has no causal invalidation or expiry state, these
+seven historical price overlaps cannot be called contacts with active PRZ.
+No entry filter, causal strategy comparison, fill quality, fees, or net edge
+has been established. This stage is **insufficient for strategy promotion**;
+do not optimize an expiry threshold from these seven outcomes.
