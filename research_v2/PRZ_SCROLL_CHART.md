@@ -107,3 +107,35 @@ independent trades and are not evidence of profitable execution. A standard
 Gartley is invalid after an X crossing; the separate three pole-context
 matches describe historical context only. All live and validation features
 remain OFF.
+
+## Bounded existing-outcome overlap check
+
+`pole_harmonic_overlap.py` reads the existing annual context JSON, the
+standalone HTML with nonconsecutive harmonic projections, and the pinned
+closed-candle CSV. It verifies the source and report SHA-256 values and scans
+the candles once to obtain exact signal-close prices. It does **not** replay
+the strategy or generate new trades. For each signal it considers only a
+same-direction zone created **strictly before** that close. It reports the
+closest zone as `IN_ZONE`, `NEAR_1_COARSE_BOX` (positive price distance at
+most 1,000), `FAR`, or `NO_PRIOR_SAME_DIRECTION_ZONE`; gross bps from existing
+completed simulations are grouped descriptively. The 1,000-point near bin
+is a disclosed coarse-grid convention, not an optimized trading filter.
+The chart's nonconsecutive projections have no tracked expiry, so a historical
+overlap is **not** evidence of an active or tradeable PRZ. No net result or
+counterfactual filtered portfolio is inferred.
+
+On Windows, from the detached research checkout at the published commit:
+
+```powershell
+python -B -m research_v2.pole_harmonic_overlap `
+  --report 'H:\pnf screener\research_snapshots\PRZ_x_break_BTC2024_20261006.json' `
+  --chart 'H:\pnf screener\research_snapshots\BTC_2024_nonconsecutive_PRZ_fixed_20261006.html' `
+  --candles 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2024_frozen_20261001_040822_8874345\results\candles_1m.csv' `
+  --output 'H:\pnf screener\research_snapshots\BTC_2024_pole_harmonic_overlap_20261006.json'
+```
+
+The output is created exclusively in that existing research directory;
+another name must be chosen for a retry. It records every signal's provenance
+and category, with execution OFF. Operator-reported annual inputs contained
+five nonconsecutive projections and 574 pole signals; the exact overlap
+counts remain unknown until the local read-only check runs.
