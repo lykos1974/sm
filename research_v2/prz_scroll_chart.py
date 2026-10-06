@@ -6,6 +6,7 @@ Usage: python -B -m research_v2.prz_scroll_chart --report REPORT.json
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import hashlib
 import html
@@ -19,7 +20,7 @@ from research_v2.du_plessis_poles_annual import (
 )
 from research_v2.du_plessis_poles_preview import PnFEngine, PnFProfile
 from research_v2.gartley_pole_prz import number
-from research_v2.pnf_multicolumn_sr import derive_zones
+from research_v2.pnf_multicolumn_sr import derive_coarse_zones
 
 
 def sha256(path: Path) -> str:
@@ -84,10 +85,12 @@ def extract_zones(report: dict) -> list[dict]:
     return sorted(zones.values(), key=lambda z: (z["at"], z["id"]))
 
 
-def replay_columns(path: Path) -> list[dict]:
+def replay_multiscale(path: Path) -> tuple[list[dict], list[dict]]:
     if sha256(path) != SOURCE_SHA256:
         raise ValueError("pinned candle SHA-256 mismatch")
     engine = PnFEngine(PnFProfile("prz_scroll_chart_offline", 100, 3))
+    coarse = PnFEngine(PnFProfile("prz_structural_10x_offline", 1000, 3))
+    coarse_pivots = []
     first = previous = None
     count = 0
     with path.open(newline="", encoding="utf-8-sig") as stream:
@@ -102,6 +105,17 @@ def replay_columns(path: Path) -> list[dict]:
             if close <= 0:
                 raise ValueError("invalid candle close")
             engine.update_from_price(ts, float(close))
+            coarse.update_from_price(ts, float(close))
+            while len(coarse_pivots) < len(coarse.columns)-1:
+                column = coarse.columns[len(coarse_pivots)]
+                kind = "HIGH" if column.kind == "X" else "LOW"
+                coarse_pivots.append({"type": "PIVOT_CONFIRMED",
+                                      "pivot_id": f"pnf:{column.idx}:{column.kind}",
+                                      "column_id": column.idx, "kind": kind,
+                                      "price": str(number(str(column.top if kind == "HIGH" else column.bottom))),
+                                      "extreme_at": column.end_ts,
+                                      "confirmed_at": ts,
+                                      "confirmation_sequence": count+1})
             first = ts if first is None else first
             previous = ts
             count += 1
@@ -109,8 +123,35 @@ def replay_columns(path: Path) -> list[dict]:
                 raise ValueError("too many candles")
     if (first, previous, count) != (FIRST_CLOSE_MS, LAST_CLOSE_MS, SOURCE_MINUTES) or sha256(path) != SOURCE_SHA256:
         raise ValueError("incomplete or changed candle input")
-    return [{"idx": c.idx, "kind": c.kind, "top": c.top, "bottom": c.bottom,
-             "start": c.start_ts, "end": c.end_ts} for c in engine.columns]
+    return ([{"idx": c.idx, "kind": c.kind, "top": c.top, "bottom": c.bottom,
+              "start": c.start_ts, "end": c.end_ts} for c in engine.columns],
+            coarse_pivots)
+
+
+def replay_columns(path: Path) -> list[dict]:
+    """Compatibility helper for callers needing only the 100-box chart."""
+    return replay_multiscale(path)[0]
+
+
+def map_coarse_zones(columns: list[dict], pivots: list[dict]) -> list[dict]:
+    """Map coarse confirmed facts onto the frozen fine-chart time axis."""
+    starts = [c["start"] for c in columns]
+    def index(at: int) -> int:
+        i = bisect.bisect_right(starts, at)-1
+        if i < 0 or i >= len(columns):
+            raise ValueError("coarse pivot outside fine chart")
+        return i
+    mapped = []
+    for z in derive_coarse_zones(pivots):
+        row = dict(z)
+        row["coarse_first_column"], row["coarse_second_column"] = z["first_column"], z["second_column"]
+        row["first_column"] = index(z["first_extreme_at"])
+        row["second_column"] = index(z["second_extreme_at"])
+        row["known_column"] = index(z["known_at"])
+        if not row["first_column"] < row["second_column"] <= row["known_column"]:
+            raise ValueError("coarse/fine chronology mismatch")
+        mapped.append(row)
+    return mapped
 
 
 def chart_html(columns: list[dict], zones: list[dict], *, source_hash: str, report_hash: str,
@@ -122,9 +163,10 @@ def chart_html(columns: list[dict], zones: list[dict], *, source_hash: str, repo
         raise ValueError("zone outside P&F chart")
     for z in structural_zones:
         if (z["known_column"] >= len(columns)
-                or z["known_at"] != columns[z["known_column"]]["start"]
-                or z["first_column"] >= z["second_column"]
-                or z["second_column"] + 1 != z["known_column"]):
+                or not columns[z["known_column"]]["start"] <= z["known_at"]
+                or (z["known_column"]+1 < len(columns)
+                    and z["known_at"] >= columns[z["known_column"]+1]["start"])
+                or not z["first_column"] < z["second_column"] <= z["known_column"]):
             raise ValueError("structural zone chronology mismatch")
     data = json.dumps({"columns": columns, "zones": zones, "structural": structural_zones},
                       separators=(",", ":"), ensure_ascii=True).replace("<", "\\u003c")
@@ -141,14 +183,14 @@ h1{font-size:20px;margin:0 0 8px}button,select{background:#263952;color:white;bo
 <button id="prev">◀ Προηγούμενη PRZ</button><select id="pick" aria-label="Επιλογή PRZ"></select><button id="next">Επόμενη PRZ ▶</button>
 <button id="all">Αρχή χρονιάς</button><label>Μήνας <select id="month" aria-label="Μετάβαση σε μήνα"></select></label><label>Μεγέθυνση <input id="zoom" type="range" min="12" max="40" value="22"></label>
 <label><input id="showLong" type="checkbox" checked> Ανοδικές PRZ</label><label><input id="showShort" type="checkbox" checked> Καθοδικές PRZ</label>
-<label><input id="showSr" type="checkbox" checked> Δομικές ζώνες</label><select id="pickSr" aria-label="Επιλογή δομικής ζώνης"><option value="">Μετάβαση σε δομική ζώνη…</option></select></div></header>
+<label><input id="showSr" type="checkbox" checked> Επιλεγμένη δομική ζώνη</label><button id="prevSr">◀ Ζώνη</button><select id="pickSr" aria-label="Επιλογή δομικής ζώνης"><option value="">Επίλεξε δομική ζώνη…</option></select><button id="nextSr">Ζώνη ▶</button></div></header>
 <div class="summary"><b id="counts"></b><span class="key long"></span>LONG Gartley PRZ <span class="key short"></span>SHORT Gartley PRZ <span class="key sr"></span>δομική στήριξη/αντίσταση (όχι harmonic PRZ) · ◆: γεγονός · οριζόντια κύλιση<br><b id="window"></b></div>
 <div id="viewport" class="viewport"><div id="strip" class="strip"><canvas id="chart" aria-label="Κυλιόμενος P&F χάρτης με ζώνες PRZ"></canvas></div></div>
-<div id="detail" class="detail" aria-live="polite"></div><div class="summary muted">Έρευνα μόνο · οι ζώνες προβάλλονται όταν έγιναν γνωστές, χωρίς μελλοντικό look-ahead · η δομική ζώνη δεν είναι harmonic PRZ ούτε σήμα εκτέλεσης. Η οριζόντια επέκτασή της κατά 20 στήλες είναι μόνο για προβολή.<br>Κεριά SHA-256: SOURCE_HASH · Αναφορά SHA-256: REPORT_HASH</div>
+<div id="detail" class="detail" aria-live="polite"></div><div class="summary muted">Έρευνα μόνο · δομικές ζώνες από ξεχωριστή αδρή P&F κλίμακα 1000/3, μία κάθε φορά · δεν είναι harmonic PRZ ή σήμα εκτέλεσης. Η οριζόντια επέκταση κατά 20 λεπτές στήλες είναι μόνο για προβολή.<br>Κεριά SHA-256: SOURCE_HASH · Αναφορά SHA-256: REPORT_HASH</div>
 <script id="dataset" type="application/json">DATA_JSON</script><script>
 "use strict";const {columns:cols,zones,structural}=JSON.parse(document.getElementById('dataset').textContent);
 const box=100,view=document.getElementById('viewport'),strip=document.getElementById('strip'),canvas=document.getElementById('chart'),ctx=canvas.getContext('2d');
-const pick=document.getElementById('pick'),pickSr=document.getElementById('pickSr'),detail=document.getElementById('detail'),zoom=document.getElementById('zoom');let selected=0,unit=22;
+const pick=document.getElementById('pick'),pickSr=document.getElementById('pickSr'),detail=document.getElementById('detail'),zoom=document.getElementById('zoom');let selected=0,selectedSr=-1,unit=22;
 function colAt(ts){let lo=0,hi=cols.length;while(lo<hi){let mid=(lo+hi)>>1;if(cols[mid].start<=ts)lo=mid+1;else hi=mid}return Math.max(0,lo-1)}
 function utc(ts){return new Date(ts).toISOString().replace('T',' ').slice(0,16)+' UTC'}
 for(let i=0;i<zones.length;i++){let z=zones[i],o=document.createElement('option');o.value=i;o.textContent=`${i+1}. ${utc(z.at)} · ${z.direction} · ${z.lower}–${z.upper}`;pick.append(o)}
@@ -158,12 +200,12 @@ document.getElementById('counts').textContent=`${cols.length} P&F στήλες �
 function visible(z){return z.direction==='LONG'?document.getElementById('showLong').checked:document.getElementById('showShort').checked}
 function select(i){if(!zones.length)return;selected=(i+zones.length)%zones.length;pick.value=selected;let z=zones[selected];view.scrollLeft=Math.max(0,(z.column-12)*unit);showDetail();draw()}
 function showDetail(){if(!zones.length){detail.textContent='Δεν καταγράφηκαν PRZ.';return}let z=zones[selected],events=z.events.map(e=>`${e.type.replace('ZONE_','')} ${utc(e.at)}`).join(' · ')||'Κανένα μεταγενέστερο γεγονός';detail.textContent=`PRZ ${selected+1}/${zones.length} · ${z.direction} · ${z.state} κατά τη δημιουργία · ${utc(z.at)} · περιοχή ${z.lower}–${z.upper} · X/A/B/C στήλες ${z.pivots.map(p=>p.column).join('/')} · ${events}`}
-function selectSr(i){let z=structural[i];if(!z)return;pickSr.value=i;view.scrollLeft=Math.max(0,(z.first_column-5)*unit);detail.textContent=`Δομική ${z.type} ${i+1}/${structural.length} · ${z.lower}–${z.upper} · άκρα στηλών ${z.first_column}/${z.second_column} · γνωστή από ${utc(z.known_at)} · ενδιάμεση κίνηση ${z.excursion_boxes} boxes · ΧΩΡΙΣ Fibonacci επιβεβαίωση`;draw()}
+function selectSr(i){if(!structural.length)return;selectedSr=(i+structural.length)%structural.length;let z=structural[selectedSr];pickSr.value=selectedSr;view.scrollLeft=Math.max(0,(z.first_column-5)*unit);detail.textContent=`Δομική ${z.type} ${selectedSr+1}/${structural.length} · ${z.lower}–${z.upper} · αδρές στήλες ${z.coarse_first_column}/${z.coarse_second_column} · γνωστή από ${utc(z.known_at)} · ενδιάμεση κίνηση ${z.excursion_boxes} αδρά boxes · ΧΩΡΙΣ Fibonacci επιβεβαίωση`;draw()}
 function draw(){let w=view.clientWidth,h=640,dpr=window.devicePixelRatio||1;if(canvas.width!==Math.round(w*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);canvas.style.width=w+'px';canvas.style.height=h+'px'}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);ctx.fillStyle='#0d1420';ctx.fillRect(0,0,w,h);
 let offset=view.scrollLeft,start=Math.max(0,Math.floor(offset/unit)-3),end=Math.min(cols.length,Math.ceil((offset+w)/unit)+3);if(end<=start)return;
 document.getElementById('window').textContent=`Ορατό διάστημα: ${utc(cols[start].start)} έως ${utc(cols[end-1].end)} · η επιλεγμένη ζώνη μπορεί να βρίσκεται εκτός οθόνης`;
 let relevant=zones.filter(z=>visible(z)&&z.column<=end&&colAt((z.events.find(e=>e.type==='ZONE_INVALIDATED'||e.type==='ZONE_EXPIRED')||{at:cols.at(-1).end}).at)>=start);
-let srVisible=document.getElementById('showSr').checked?structural.filter(z=>z.first_column<=end&&z.known_column+20>=start):[];
+let srVisible=document.getElementById('showSr').checked&&selectedSr>=0?structural.filter((z,i)=>i===selectedSr&&z.first_column<=end&&z.known_column+20>=start):[];
 let values=[];for(let i=start;i<end;i++){values.push(cols[i].bottom,cols[i].top)}for(let z of relevant)values.push(Number(z.lower),Number(z.upper));for(let z of srVisible)values.push(Number(z.lower),Number(z.upper));
 let low=Math.floor((Math.min(...values)-box*2)/box)*box,high=Math.ceil((Math.max(...values)+box*2)/box)*box;
 let top=32,bottom=h-47,y=p=>bottom-(p-low)/(high-low)*(bottom-top),x=i=>i*unit-offset+unit/2;
@@ -178,7 +220,8 @@ ctx.font=`${Math.max(12,unit*.72)}px monospace`;ctx.textAlign='center';for(let i
 document.getElementById('prev').onclick=()=>select(selected-1);document.getElementById('next').onclick=()=>select(selected+1);document.getElementById('all').onclick=()=>{view.scrollLeft=0;draw()};pick.onchange=()=>select(Number(pick.value));zoom.oninput=()=>{let before=view.scrollLeft/unit;unit=Number(zoom.value);strip.style.width=cols.length*unit+'px';view.scrollLeft=before*unit;draw()};
 month.onchange=()=>{let ts=Date.UTC(2024,Number(month.value)-1,1);view.scrollLeft=colAt(ts)*unit;draw()};
 for(let id of ['showLong','showShort'])document.getElementById(id).onchange=draw;
-document.getElementById('showSr').onchange=draw;pickSr.onchange=()=>selectSr(Number(pickSr.value));
+document.getElementById('showSr').onchange=draw;pickSr.onchange=()=>{if(pickSr.value!=='')selectSr(Number(pickSr.value))};
+document.getElementById('prevSr').onclick=()=>selectSr(selectedSr<0?0:selectedSr-1);document.getElementById('nextSr').onclick=()=>selectSr(selectedSr+1);
 strip.style.width=cols.length*unit+'px';view.addEventListener('scroll',()=>requestAnimationFrame(draw));window.addEventListener('resize',draw);showDetail();draw();
 </script></html>'''
     return (template.replace("DATA_JSON", data)
@@ -192,7 +235,7 @@ def run(report_path: Path, candles: Path, output: Path) -> dict:
     report_hash = sha256(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     zones = extract_zones(report)
-    columns = replay_columns(candles)
+    columns, coarse_pivots = replay_multiscale(candles)
     pivots = [f for f in report["decision_facts"] if f.get("type") == "PIVOT_CONFIRMED"]
     for pivot in pivots:
         i = pivot["column_id"]
@@ -201,7 +244,7 @@ def run(report_path: Path, candles: Path, output: Path) -> dict:
                 or pivot["kind"] != ("HIGH" if columns[i]["kind"] == "X" else "LOW")
                 or number(pivot["price"]) != number(str(columns[i]["top" if pivot["kind"] == "HIGH" else "bottom"]))):
             raise ValueError("report pivot differs from pinned P&F replay")
-    structural = derive_zones(pivots)
+    structural = map_coarse_zones(columns, coarse_pivots)
     page = chart_html(columns, zones, structural_zones=structural,
                       source_hash=SOURCE_SHA256, report_hash=report_hash)
     temporary = None

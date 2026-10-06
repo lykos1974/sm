@@ -2,7 +2,7 @@
 import copy
 import unittest
 
-from research_v2.pnf_multicolumn_sr import derive_zones
+from research_v2.pnf_multicolumn_sr import derive_zones, derive_coarse_zones
 
 
 def pivot(i, kind, price):
@@ -51,6 +51,16 @@ class MultiColumnZones(unittest.TestCase):
                for i in range(85)]
         facts[-1]["price"]="60000"
         self.assertEqual(derive_zones(facts),[])
+
+    def test_coarse_profile_captures_large_multicolumn_level(self):
+        facts=[pivot(0,"LOW",60000),pivot(1,"HIGH",68000),
+               pivot(2,"LOW",65000),pivot(3,"HIGH",69000)]
+        self.assertEqual(derive_zones(facts),[])
+        zones=derive_coarse_zones(facts)
+        self.assertEqual(len(zones),1)
+        self.assertEqual((zones[0]["type"],zones[0]["lower"],zones[0]["upper"]),
+                         ("RESISTANCE","68000","69000"))
+        self.assertEqual(zones,derive_coarse_zones(facts+[pivot(4,"LOW",59000)])[:1])
 
 
 if __name__ == "__main__":unittest.main()

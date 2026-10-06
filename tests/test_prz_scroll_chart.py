@@ -91,19 +91,41 @@ class PrzScrollChartTests(unittest.TestCase):
             chart.chart_html(self.columns[:-3], [], structural_zones=zones,
                              source_hash="a"*64, report_hash="b"*64)
 
+    def test_coarse_replay_emits_single_selected_zone_not_fine_clutter(self):
+        candles = self.root / "candles.csv"
+        first = 1704067259999
+        prices = (60000,68000,65000,69000,65900)
+        candles.write_text("close_time,close\n"+"".join(
+            f"{first+i*60000},{p}\n" for i,p in enumerate(prices)))
+        import hashlib
+        digest=hashlib.sha256(candles.read_bytes()).hexdigest()
+        with (patch.object(chart,"SOURCE_SHA256",digest),
+              patch.object(chart,"SOURCE_MINUTES",len(prices)),
+              patch.object(chart,"FIRST_CLOSE_MS",first),
+              patch.object(chart,"LAST_CLOSE_MS",first+(len(prices)-1)*60000)):
+            fine, coarse = chart.replay_multiscale(candles)
+        zones=chart.map_coarse_zones(fine,coarse)
+        self.assertEqual(len(zones),1)
+        self.assertEqual(zones[0]["type"],"RESISTANCE")
+        page=chart.chart_html(fine,[],structural_zones=zones,
+                              source_hash=digest,report_hash="b"*64)
+        self.assertIn('selectedSr=-1',page)
+        self.assertIn('i===selectedSr',page)
+        self.assertIn('id="prevSr"',page)
+
     def test_atomic_publication_and_failure_cleanup(self):
         path = self.root / "report.json"
         path.write_text(json.dumps(self.report))
         candles = self.root / "candles.csv"
         candles.write_text("synthetic")
         output = self.root / "chart.html"
-        with (patch.object(chart, "replay_columns", return_value=self.columns),
+        with (patch.object(chart, "replay_multiscale", return_value=(self.columns, [])),
               patch.object(chart.os, "link", side_effect=PermissionError("synthetic"))):
             with self.assertRaises(PermissionError):
                 chart.run(path, candles, output)
         self.assertFalse(output.exists())
         self.assertEqual(list(self.root.glob(".prz_chart_*.tmp")), [])
-        with patch.object(chart, "replay_columns", return_value=self.columns):
+        with patch.object(chart, "replay_multiscale", return_value=(self.columns, [])):
             result = chart.run(path, candles, output)
         self.assertEqual(result["gartley_prz"], 1)
         self.assertEqual(result["structural_zones"], 0)

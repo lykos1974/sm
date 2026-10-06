@@ -29,24 +29,32 @@ in the page for traceability.
 
 ## Separate multi-column structural S/R layer
 
-`pnf_multicolumn_sr.py` reads only append-ordered confirmed P&F pivots from
-the same annual decision ledger. A zone is emitted **on the confirmation of
-the second like-kind pivot**, after an intervening opposite pivot. A HIGH
-pair creates RESISTANCE; a LOW pair creates SUPPORT. The two levels must be
-at most 3 boxes (300 price units) apart, the intervening excursion at least
-6 boxes (600 price units), and the pair at most 80 columns apart. The most
-recent qualifying prior pivot is selected per new confirmation. These fixed
-numbers are explicit research assumptions, not Du Plessis or Carney rules,
-and were not chosen by testing trade performance. No earlier zone is
-changed by a future pivot. Exact pivot identities, prices and confirmation
-timestamps are checked against the replayed P&F columns before publication.
+The initial fine-grid structural proposal was **rejected for visualization**:
+the Windows operator reported 5,039 overlapping labels and an unreadable
+chart. That count came from nearly every 100-point pivot; it must not be
+called a set of significant levels. The historical fine-grid prototype
+remains in code for reproducibility but is never used by the chart.
 
-This structural layer is colored amber/violet and can be hidden independently
-of Gartley PRZ. The pair is marked and its level is extended visually 20
-columns; that extension is only a drawing convention, not evidence that a
-level remained active. No Fibonacci projection is required, so structural
-zones are **not called harmonic PRZ**. A later, separate causal study may
-test Fibonacci confluence without changing either existing layer.
+The revised `pnf-multicolumn-sr-v2-coarse` profile replays the **same frozen
+closes** in a separate 1,000-point/3-reversal P&F chart. It reads only
+confirmed pivots. A zone is emitted **on confirmation of the second like-kind
+pivot**, after an intervening opposite pivot. A HIGH pair gives RESISTANCE;
+a LOW pair gives SUPPORT. The two levels must be within one coarse box,
+the intervening excursion at least three coarse boxes, and the two pivots
+at most 24 coarse columns apart. The most recent qualifying prior pivot is
+selected per confirmation. All settings are explicit exploratory research
+conventions, not Du Plessis or Carney rules or fitted to trade outcomes.
+Replaying the complete frozen input fixes the coarse column sequence and
+timestamps; no future pivot can change an already emitted zone. The original
+fine-grid Gartley pivots are checked against the replayed 100-point chart.
+
+This structural layer is colored amber/violet and is initially **not drawn**;
+select a zone to show only that zone at a time. The two pivot marks and level
+extension (20 fine columns) are display aids, not assertions of live validity.
+The original 28 Gartley PRZ stay visible and retain their exact meaning.
+No Fibonacci projection is required in the coarse S/R layer, so these zones
+are **not called harmonic PRZ**. A separate causal study can test Fibonacci
+confluence without silently changing either layer.
 
 The 28 zones, 14 contacts, 13 full tests, 8 invalidations and 20 expiries
 are **operator-reported event counts** for this pinned run. They are not
