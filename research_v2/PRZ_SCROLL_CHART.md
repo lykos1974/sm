@@ -161,3 +161,34 @@ seven historical price overlaps cannot be called contacts with active PRZ.
 No entry filter, causal strategy comparison, fill quality, fees, or net edge
 has been established. This stage is **insufficient for strategy promotion**;
 do not optimize an expiry threshold from these seven outcomes.
+
+## Independent H1 view of the same five projections
+
+`pole_harmonic_h1_chart.py` builds one complete, self-contained H1 chart from
+the same SHA-pinned 527,040 1m OHLC rows. Every UTC H1 bar requires 60
+contiguous closed minutes; open is the first 1m open, high/low the extrema,
+and close the final 1m close, all parsed exactly as Decimal. It accepts only
+the previously generated PRZ HTML and overlap JSON with matching source/chart
+hashes. Five zones can be selected individually. The view spans 72 hours
+before each confirmation and up to 60 days after; this is a **display window**,
+not an expiry rule. A vertical line uses the exact original confirmation
+timestamp, which may fall inside an H1 bar. That mixed hour contains minutes
+from both sides of the decision and cannot establish a post-creation touch.
+Only the previously identified seven inside/near pole signals get diamonds;
+these are signal closes, never exchange fills. A horizontal shaded band from
+confirmation forward is just a projection, not an active-zones claim.
+
+From the published research checkout on Windows, with the existing local
+research files and a **new** output filename:
+
+```powershell
+python -B -m research_v2.pole_harmonic_h1_chart `
+  --candles 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2024_frozen_20261001_040822_8874345\results\candles_1m.csv' `
+  --chart 'H:\pnf screener\research_snapshots\BTC_2024_nonconsecutive_PRZ_fixed_20261006.html' `
+  --overlap 'H:\pnf screener\research_snapshots\BTC_2024_pole_harmonic_overlap_20261006.json' `
+  --output 'H:\pnf screener\research_snapshots\BTC_2024_five_PRZ_H1_20261006.html'
+```
+
+The chart does not recalculate X/A/B/C, pole signals, execution, P&L or
+profitability. Its historical H1 display is research only; runtime remains
+OFF. No operator result from this H1 view is recorded yet.
