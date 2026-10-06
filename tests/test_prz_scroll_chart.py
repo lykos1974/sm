@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from research_v2 import prz_scroll_chart as chart
+from research_v2.pnf_multicolumn_sr import derive_zones
 
 
 class PrzScrollChartTests(unittest.TestCase):
@@ -17,7 +18,10 @@ class PrzScrollChartTests(unittest.TestCase):
                        "source_sha256": chart.SOURCE_SHA256, "box_size": "100",
                        "reversal_boxes": 3, "research_only": True, "execution": "OFF",
                        "decision_facts": [
-                           *({"type": "PIVOT_CONFIRMED", "pivot_id": f"pnf:{i}:{kind}", "price": price}
+                           *({"type": "PIVOT_CONFIRMED", "pivot_id": f"pnf:{i}:{kind}",
+                              "column_id": i, "kind": "HIGH" if kind == "X" else "LOW",
+                              "price": price, "extreme_at": 1050+i*100,
+                              "confirmed_at": 1100+i*100, "confirmation_sequence": i+1}
                              for i, kind, price in ((0, "O", "1000"), (1, "X", "1500"),
                                                     (2, "O", "1200"), (3, "X", "1400"))),
                            {"type": "ZONE_CREATED", "candidate_id": "zone-1", "direction": "LONG",
@@ -27,8 +31,10 @@ class PrzScrollChartTests(unittest.TestCase):
                            {"type": "ZONE_CONTACT", "candidate_id": "zone-1", "at": 1600},
                            {"type": "ZONE_FULL_TEST", "candidate_id": "zone-1", "at": 1700},
                            {"type": "ZONE_INVALIDATED", "candidate_id": "zone-1", "at": 1800} ]}
-        self.columns = [{"idx": i, "kind": "X" if i%2 else "O", "top": 1500,
-                         "bottom": 1000, "start": 1000+i*100, "end": 1099+i*100}
+        self.columns = [{"idx": i, "kind": "X" if i%2 else "O",
+                         "top": 1400 if i==3 else 1500,
+                         "bottom": 1200 if i==2 else 1000,
+                         "start": 1000+i*100, "end": 1099+i*100}
                         for i in range(7)]
 
     def test_zone_lifecycle_geometry_and_browser_controls(self):
@@ -65,6 +71,26 @@ class PrzScrollChartTests(unittest.TestCase):
             chart.run(path, candles, output)
         self.assertEqual(output.read_bytes(), b"operator file")
 
+    def test_independent_multicolumn_layer_and_strict_column_binding(self):
+        facts = self.report["decision_facts"][:4]
+        facts[1]["price"] = "6800"
+        facts[2]["price"] = "6400"
+        facts[3]["price"] = "6900"
+        zones = derive_zones(facts)
+        self.assertEqual(zones, [])  # 500-point excursion is below six boxes.
+        facts[2]["price"] = "6200"
+        zones = derive_zones(facts)
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0]["type"], "RESISTANCE")
+        page = chart.chart_html(self.columns, [], structural_zones=zones,
+                                source_hash="a"*64, report_hash="b"*64)
+        self.assertIn("δομικές ζώνες", page)
+        self.assertIn('id="pickSr"', page)
+        self.assertIn('id="window"', page)
+        with self.assertRaisesRegex(ValueError, "chronology"):
+            chart.chart_html(self.columns[:-3], [], structural_zones=zones,
+                             source_hash="a"*64, report_hash="b"*64)
+
     def test_atomic_publication_and_failure_cleanup(self):
         path = self.root / "report.json"
         path.write_text(json.dumps(self.report))
@@ -79,7 +105,8 @@ class PrzScrollChartTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob(".prz_chart_*.tmp")), [])
         with patch.object(chart, "replay_columns", return_value=self.columns):
             result = chart.run(path, candles, output)
-        self.assertEqual(result["zones"], 1)
+        self.assertEqual(result["gartley_prz"], 1)
+        self.assertEqual(result["structural_zones"], 0)
         self.assertIn("ZONE_CONTACT", output.read_text())
 
 

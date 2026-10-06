@@ -19,6 +19,7 @@ from research_v2.du_plessis_poles_annual import (
 )
 from research_v2.du_plessis_poles_preview import PnFEngine, PnFProfile
 from research_v2.gartley_pole_prz import number
+from research_v2.pnf_multicolumn_sr import derive_zones
 
 
 def sha256(path: Path) -> str:
@@ -112,12 +113,21 @@ def replay_columns(path: Path) -> list[dict]:
              "start": c.start_ts, "end": c.end_ts} for c in engine.columns]
 
 
-def chart_html(columns: list[dict], zones: list[dict], *, source_hash: str, report_hash: str) -> str:
+def chart_html(columns: list[dict], zones: list[dict], *, source_hash: str, report_hash: str,
+               structural_zones: list[dict] | None = None) -> str:
+    structural_zones = structural_zones or []
     if not columns or any(c["idx"] != i or c["kind"] not in ("X", "O") for i, c in enumerate(columns)):
         raise ValueError("invalid P&F columns")
     if any(z["column"] >= len(columns) or any(p["column"] >= len(columns) for p in z["pivots"]) for z in zones):
         raise ValueError("zone outside P&F chart")
-    data = json.dumps({"columns": columns, "zones": zones}, separators=(",", ":"), ensure_ascii=True).replace("<", "\\u003c")
+    for z in structural_zones:
+        if (z["known_column"] >= len(columns)
+                or z["known_at"] != columns[z["known_column"]]["start"]
+                or z["first_column"] >= z["second_column"]
+                or z["second_column"] + 1 != z["known_column"]):
+            raise ValueError("structural zone chronology mismatch")
+    data = json.dumps({"columns": columns, "zones": zones, "structural": structural_zones},
+                      separators=(",", ":"), ensure_ascii=True).replace("<", "\\u003c")
     template = r'''<!doctype html><html lang="el"><meta charset="utf-8">
 <title>BTCUSDT 2024 · PRZ στον P&amp;F χάρτη</title>
 <style>
@@ -125,34 +135,42 @@ body{margin:0;background:#0d1420;color:#e9eff9;font:14px system-ui,Segoe UI,sans
 h1{font-size:20px;margin:0 0 8px}button,select{background:#263952;color:white;border:1px solid #55708e;border-radius:5px;padding:7px;margin-right:5px}
 .row{display:flex;flex-wrap:wrap;gap:9px;align-items:center}.muted{color:#aebed1}.summary{padding:10px 18px}.viewport{overflow-x:auto;overflow-y:hidden;border-top:1px solid #40556e;border-bottom:1px solid #40556e}
 .strip{height:640px;position:relative}.strip canvas{position:sticky;left:0;display:block}.detail{min-height:62px;padding:8px 18px;line-height:1.5}
-.key{display:inline-block;width:10px;height:10px;margin:0 5px 0 12px}.long{background:#3bd6aa}.short{background:#fb8d83}
+.key{display:inline-block;width:10px;height:10px;margin:0 5px 0 12px}.long{background:#3bd6aa}.short{background:#fb8d83}.sr{background:#e6bd55}
 </style>
 <header><h1>BTCUSDT · όλες οι PRZ στο P&amp;F του 2024</h1><div class="row">
 <button id="prev">◀ Προηγούμενη PRZ</button><select id="pick" aria-label="Επιλογή PRZ"></select><button id="next">Επόμενη PRZ ▶</button>
 <button id="all">Αρχή χρονιάς</button><label>Μήνας <select id="month" aria-label="Μετάβαση σε μήνα"></select></label><label>Μεγέθυνση <input id="zoom" type="range" min="12" max="40" value="22"></label>
-<label><input id="showLong" type="checkbox" checked> Ανοδικές</label><label><input id="showShort" type="checkbox" checked> Καθοδικές</label></div></header>
-<div class="summary"><b id="counts"></b><span class="key long"></span>LONG PRZ <span class="key short"></span>SHORT PRZ · X/A/B/C: γνωστές κορυφές · σκίαση: προβλεπόμενη ζώνη · ◆: γεγονός · Κύλιση οριζόντια ή Shift+ροδέλα</div>
+<label><input id="showLong" type="checkbox" checked> Ανοδικές PRZ</label><label><input id="showShort" type="checkbox" checked> Καθοδικές PRZ</label>
+<label><input id="showSr" type="checkbox" checked> Δομικές ζώνες</label><select id="pickSr" aria-label="Επιλογή δομικής ζώνης"><option value="">Μετάβαση σε δομική ζώνη…</option></select></div></header>
+<div class="summary"><b id="counts"></b><span class="key long"></span>LONG Gartley PRZ <span class="key short"></span>SHORT Gartley PRZ <span class="key sr"></span>δομική στήριξη/αντίσταση (όχι harmonic PRZ) · ◆: γεγονός · οριζόντια κύλιση<br><b id="window"></b></div>
 <div id="viewport" class="viewport"><div id="strip" class="strip"><canvas id="chart" aria-label="Κυλιόμενος P&F χάρτης με ζώνες PRZ"></canvas></div></div>
-<div id="detail" class="detail" aria-live="polite"></div><div class="summary muted">Έρευνα μόνο · οι ζώνες προβάλλονται όταν έγιναν γνωστές, χωρίς μελλοντικό look-ahead · όχι σήματα εκτέλεσης ή απόδειξη κερδοφορίας.<br>Κεριά SHA-256: SOURCE_HASH · Αναφορά SHA-256: REPORT_HASH</div>
+<div id="detail" class="detail" aria-live="polite"></div><div class="summary muted">Έρευνα μόνο · οι ζώνες προβάλλονται όταν έγιναν γνωστές, χωρίς μελλοντικό look-ahead · η δομική ζώνη δεν είναι harmonic PRZ ούτε σήμα εκτέλεσης. Η οριζόντια επέκτασή της κατά 20 στήλες είναι μόνο για προβολή.<br>Κεριά SHA-256: SOURCE_HASH · Αναφορά SHA-256: REPORT_HASH</div>
 <script id="dataset" type="application/json">DATA_JSON</script><script>
-"use strict";const {columns:cols,zones}=JSON.parse(document.getElementById('dataset').textContent);
+"use strict";const {columns:cols,zones,structural}=JSON.parse(document.getElementById('dataset').textContent);
 const box=100,view=document.getElementById('viewport'),strip=document.getElementById('strip'),canvas=document.getElementById('chart'),ctx=canvas.getContext('2d');
-const pick=document.getElementById('pick'),detail=document.getElementById('detail'),zoom=document.getElementById('zoom');let selected=0,unit=22;
+const pick=document.getElementById('pick'),pickSr=document.getElementById('pickSr'),detail=document.getElementById('detail'),zoom=document.getElementById('zoom');let selected=0,unit=22;
 function colAt(ts){let lo=0,hi=cols.length;while(lo<hi){let mid=(lo+hi)>>1;if(cols[mid].start<=ts)lo=mid+1;else hi=mid}return Math.max(0,lo-1)}
 function utc(ts){return new Date(ts).toISOString().replace('T',' ').slice(0,16)+' UTC'}
 for(let i=0;i<zones.length;i++){let z=zones[i],o=document.createElement('option');o.value=i;o.textContent=`${i+1}. ${utc(z.at)} · ${z.direction} · ${z.lower}–${z.upper}`;pick.append(o)}
+for(let i=0;i<structural.length;i++){let z=structural[i],o=document.createElement('option');o.value=i;o.textContent=`${i+1}. ${utc(z.known_at)} · ${z.type} · ${z.lower}–${z.upper}`;pickSr.append(o)}
 const month=document.getElementById('month');for(let m=1;m<=12;m++){let o=document.createElement('option');o.value=m;o.textContent=`2024-${String(m).padStart(2,'0')}`;month.append(o)}
-document.getElementById('counts').textContent=`${cols.length} P&F στήλες · ${zones.length} υποψήφιες PRZ · 2024 UTC`;
+document.getElementById('counts').textContent=`${cols.length} P&F στήλες · ${zones.length} Gartley PRZ · ${structural.length} δομικές ζώνες · 2024 UTC`;
 function visible(z){return z.direction==='LONG'?document.getElementById('showLong').checked:document.getElementById('showShort').checked}
 function select(i){if(!zones.length)return;selected=(i+zones.length)%zones.length;pick.value=selected;let z=zones[selected];view.scrollLeft=Math.max(0,(z.column-12)*unit);showDetail();draw()}
 function showDetail(){if(!zones.length){detail.textContent='Δεν καταγράφηκαν PRZ.';return}let z=zones[selected],events=z.events.map(e=>`${e.type.replace('ZONE_','')} ${utc(e.at)}`).join(' · ')||'Κανένα μεταγενέστερο γεγονός';detail.textContent=`PRZ ${selected+1}/${zones.length} · ${z.direction} · ${z.state} κατά τη δημιουργία · ${utc(z.at)} · περιοχή ${z.lower}–${z.upper} · X/A/B/C στήλες ${z.pivots.map(p=>p.column).join('/')} · ${events}`}
+function selectSr(i){let z=structural[i];if(!z)return;pickSr.value=i;view.scrollLeft=Math.max(0,(z.first_column-5)*unit);detail.textContent=`Δομική ${z.type} ${i+1}/${structural.length} · ${z.lower}–${z.upper} · άκρα στηλών ${z.first_column}/${z.second_column} · γνωστή από ${utc(z.known_at)} · ενδιάμεση κίνηση ${z.excursion_boxes} boxes · ΧΩΡΙΣ Fibonacci επιβεβαίωση`;draw()}
 function draw(){let w=view.clientWidth,h=640,dpr=window.devicePixelRatio||1;if(canvas.width!==Math.round(w*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);canvas.style.width=w+'px';canvas.style.height=h+'px'}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);ctx.fillStyle='#0d1420';ctx.fillRect(0,0,w,h);
 let offset=view.scrollLeft,start=Math.max(0,Math.floor(offset/unit)-3),end=Math.min(cols.length,Math.ceil((offset+w)/unit)+3);if(end<=start)return;
+document.getElementById('window').textContent=`Ορατό διάστημα: ${utc(cols[start].start)} έως ${utc(cols[end-1].end)} · η επιλεγμένη ζώνη μπορεί να βρίσκεται εκτός οθόνης`;
 let relevant=zones.filter(z=>visible(z)&&z.column<=end&&colAt((z.events.find(e=>e.type==='ZONE_INVALIDATED'||e.type==='ZONE_EXPIRED')||{at:cols.at(-1).end}).at)>=start);
-let values=[];for(let i=start;i<end;i++){values.push(cols[i].bottom,cols[i].top)}for(let z of relevant)values.push(Number(z.lower),Number(z.upper));
+let srVisible=document.getElementById('showSr').checked?structural.filter(z=>z.first_column<=end&&z.known_column+20>=start):[];
+let values=[];for(let i=start;i<end;i++){values.push(cols[i].bottom,cols[i].top)}for(let z of relevant)values.push(Number(z.lower),Number(z.upper));for(let z of srVisible)values.push(Number(z.lower),Number(z.upper));
 let low=Math.floor((Math.min(...values)-box*2)/box)*box,high=Math.ceil((Math.max(...values)+box*2)/box)*box;
 let top=32,bottom=h-47,y=p=>bottom-(p-low)/(high-low)*(bottom-top),x=i=>i*unit-offset+unit/2;
 ctx.strokeStyle='#26364a';ctx.fillStyle='#94a9c1';ctx.font='11px system-ui';let skip=Math.max(1,Math.ceil((high-low)/box/24));for(let p=low,n=0;p<=high;p+=box,n++)if(n%skip===0){let yy=y(p);ctx.beginPath();ctx.moveTo(45,yy);ctx.lineTo(w,yy);ctx.stroke();ctx.fillText(String(p),3,yy-3)}
+for(let z of srVisible){let px=x(z.known_column),py=y((Number(z.lower)+Number(z.upper))/2),left=Math.max(45,px),right=Math.min(w,x(Math.min(cols.length-1,z.known_column+20)));let color=z.type==='SUPPORT'?'#e6bd55':'#ac90ff';
+if(right>=left){ctx.fillStyle=z.type==='SUPPORT'?'#e6bd552a':'#ac90ff2a';ctx.fillRect(left,y(Number(z.upper))-3,Math.max(2,right-left),Math.max(7,y(Number(z.lower))-y(Number(z.upper))+6));ctx.setLineDash([3,5]);ctx.strokeStyle=color;ctx.strokeRect(left,y(Number(z.upper))-3,Math.max(2,right-left),Math.max(7,y(Number(z.lower))-y(Number(z.upper))+6));ctx.setLineDash([])}
+for(let col of [z.first_column,z.second_column]){let xx=x(col);if(xx>=45&&xx<w){ctx.beginPath();ctx.arc(xx,py,4,0,2*Math.PI);ctx.fillStyle=color;ctx.fill()}}if(px>=45&&px<w){ctx.fillStyle=color;ctx.font='bold 12px system-ui';ctx.fillText(z.type==='SUPPORT'?'S':'R',px+5,py-8)}}
 for(let z of relevant){let termination=z.events.find(e=>e.type==='ZONE_INVALIDATED'||e.type==='ZONE_EXPIRED');let last=termination?colAt(termination.at):Math.max(z.column,colAt(z.at));let x1=x(z.column)-unit/2,x2=x(Math.max(z.column,last))+unit/2;let l=Math.max(45,x1),r=Math.min(w,x2);if(r>=l){ctx.fillStyle=z.direction==='LONG'?'#2cc29a44':'#ee827844';ctx.fillRect(l,y(Number(z.upper)),Math.max(2,r-l),Math.max(3,y(Number(z.lower))-y(Number(z.upper))));ctx.setLineDash([4,4]);ctx.strokeStyle=z.direction==='LONG'?'#35d7ad':'#ff9e8e';ctx.strokeRect(l,y(Number(z.upper)),Math.max(2,r-l),Math.max(3,y(Number(z.lower))-y(Number(z.upper))));ctx.setLineDash([])}
 let pts=z.pivots.map(p=>[x(p.column),y(Number(p.price))]);ctx.strokeStyle=z.direction==='LONG'?'#4fd6ac':'#fa9f93';ctx.lineWidth=1.5;ctx.beginPath();pts.forEach(([px,py],j)=>j?ctx.lineTo(px,py):ctx.moveTo(px,py));ctx.stroke();ctx.font='bold 12px system-ui';pts.forEach(([px,py],j)=>{if(px>=47&&px<w){ctx.fillStyle=ctx.strokeStyle;ctx.fillText('XABC'[j],px-4,py-8)}});
 for(let e of z.events){let px=x(colAt(e.at)),py=y((Number(z.lower)+Number(z.upper))/2);if(px<47||px>w)continue;ctx.fillStyle=e.type==='ZONE_FULL_TEST'?'#fff1a6':e.type==='ZONE_CONTACT'?'#fff':'#fdba85';ctx.beginPath();ctx.moveTo(px,py-6);ctx.lineTo(px+6,py);ctx.lineTo(px,py+6);ctx.lineTo(px-6,py);ctx.fill()}}
@@ -160,6 +178,7 @@ ctx.font=`${Math.max(12,unit*.72)}px monospace`;ctx.textAlign='center';for(let i
 document.getElementById('prev').onclick=()=>select(selected-1);document.getElementById('next').onclick=()=>select(selected+1);document.getElementById('all').onclick=()=>{view.scrollLeft=0;draw()};pick.onchange=()=>select(Number(pick.value));zoom.oninput=()=>{let before=view.scrollLeft/unit;unit=Number(zoom.value);strip.style.width=cols.length*unit+'px';view.scrollLeft=before*unit;draw()};
 month.onchange=()=>{let ts=Date.UTC(2024,Number(month.value)-1,1);view.scrollLeft=colAt(ts)*unit;draw()};
 for(let id of ['showLong','showShort'])document.getElementById(id).onchange=draw;
+document.getElementById('showSr').onchange=draw;pickSr.onchange=()=>selectSr(Number(pickSr.value));
 strip.style.width=cols.length*unit+'px';view.addEventListener('scroll',()=>requestAnimationFrame(draw));window.addEventListener('resize',draw);showDetail();draw();
 </script></html>'''
     return (template.replace("DATA_JSON", data)
@@ -174,7 +193,17 @@ def run(report_path: Path, candles: Path, output: Path) -> dict:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     zones = extract_zones(report)
     columns = replay_columns(candles)
-    page = chart_html(columns, zones, source_hash=SOURCE_SHA256, report_hash=report_hash)
+    pivots = [f for f in report["decision_facts"] if f.get("type") == "PIVOT_CONFIRMED"]
+    for pivot in pivots:
+        i = pivot["column_id"]
+        if (type(i) is not int or not 0 <= i < len(columns)-1
+                or pivot["confirmed_at"] != columns[i+1]["start"]
+                or pivot["kind"] != ("HIGH" if columns[i]["kind"] == "X" else "LOW")
+                or number(pivot["price"]) != number(str(columns[i]["top" if pivot["kind"] == "HIGH" else "bottom"]))):
+            raise ValueError("report pivot differs from pinned P&F replay")
+    structural = derive_zones(pivots)
+    page = chart_html(columns, zones, structural_zones=structural,
+                      source_hash=SOURCE_SHA256, report_hash=report_hash)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=output.parent,
@@ -187,7 +216,8 @@ def run(report_path: Path, candles: Path, output: Path) -> dict:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return {"output": str(output), "zones": len(zones), "pnf_columns": len(columns),
+    return {"output": str(output), "gartley_prz": len(zones),
+            "structural_zones": len(structural), "pnf_columns": len(columns),
             "source_sha256": SOURCE_SHA256, "report_sha256": report_hash,
             "execution": "OFF"}
 
