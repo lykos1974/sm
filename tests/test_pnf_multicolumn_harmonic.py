@@ -14,6 +14,17 @@ def pivots():
 
 
 class MultiColumnHarmonicTests(unittest.TestCase):
+    def test_valid_coarse_replay_may_start_with_x(self):
+        facts=pivots()
+        for fact in facts:
+            kind="O" if fact["kind"]=="HIGH" else "X"
+            fact["kind"]="HIGH" if kind=="X" else "LOW"
+            fact["pivot_id"]=f"pnf:{fact['column_id']}:{kind}"
+        self.assertIsInstance(project_multicolumn(facts),list)
+        facts[4]["kind"]="LOW"  # invalid repeated O column
+        with self.assertRaises(ValueError):
+            project_multicolumn(facts)
+
     def test_nonconsecutive_xabc_projection_and_prefix(self):
         facts=pivots()
         found=project_multicolumn(facts)

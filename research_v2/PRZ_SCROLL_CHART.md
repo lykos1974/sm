@@ -62,6 +62,8 @@ confluence without silently changing either layer.
 `pnf-multicolumn-gartley-v1` uses the same pinned close-confirmed 1000/3
 coarse P&F replay. At confirmation of C it enumerates alternating X/A/B/C
 pivots within a **24-column lookback**, requiring at least one skipped column.
+The first coarse column may be X or O; the chronology check uses its actual
+kind and verifies every following reversal instead of imposing an O start.
 Intervening confirmed extremes must stay inside each selected leg's endpoint
 range; otherwise selecting distant endpoints would conceal a more extreme
 pivot. The chosen four pivots are mapped to logical consecutive indices solely

@@ -27,8 +27,9 @@ def project_multicolumn(facts: list[dict]) -> list[dict]:
                 or not 0 <= fact["extreme_at"] <= fact["confirmed_at"]
                 or (parsed and (fact["confirmed_at"] <= parsed[-1]["confirmed_at"]
                                 or fact["confirmation_sequence"] <= parsed[-1]["sequence"]))
-                or fact.get("kind") != ("HIGH" if i % 2 else "LOW")
-                or fact.get("pivot_id") != f"pnf:{i}:{'X' if i%2 else 'O'}"):
+                or fact.get("kind") not in ("HIGH", "LOW")
+                or (parsed and fact["kind"] == parsed[-1]["kind"])
+                or fact.get("pivot_id") != f"pnf:{i}:{'X' if fact.get('kind') == 'HIGH' else 'O'}"):
             raise ValueError("invalid coarse pivot chronology")
         price, close = number(fact.get("price")), number(fact.get("confirmation_close"))
         if price <= 0 or close <= 0 or price % BOX != 0:

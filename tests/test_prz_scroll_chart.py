@@ -106,6 +106,8 @@ class PrzScrollChartTests(unittest.TestCase):
               patch.object(chart,"LAST_CLOSE_MS",first+(len(prices)-1)*60000)):
             fine, coarse = chart.replay_multiscale(candles)
         zones=chart.map_coarse_zones(fine,coarse)
+        self.assertEqual(coarse[0]["kind"], "HIGH")
+        self.assertIsInstance(chart.map_harmonic_zones(fine,coarse), list)
         self.assertEqual(len(zones),1)
         self.assertEqual(zones[0]["type"],"RESISTANCE")
         page=chart.chart_html(fine,[],structural_zones=zones,
