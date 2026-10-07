@@ -143,3 +143,48 @@ The output path must be new. To verify the offline module:
 python -B -m unittest -q tests.test_pole_hypothesis_miner tests.test_pole_miner_btc_preflight tests.test_pole_miner_btc_cost_scenario
 python -B -m py_compile research_v2\patterns\pole_hypothesis_miner.py tests\test_pole_hypothesis_miner.py research_v2\patterns\pole_miner_btc_preflight.py tests\test_pole_miner_btc_preflight.py research_v2\patterns\pole_miner_btc_cost_scenario.py tests\test_pole_miner_btc_cost_scenario.py
 ```
+
+## Separate 2025 Binance USD-M BTC archive preflight
+
+This is a **data acquisition gate**, not a strategy backtest or a miner input.
+The 2024 outcomes have been examined repeatedly. Keep 2025 separate; earlier
+unrelated January 2025 experiments mean the year must not be described as
+universally untouched. Do not select rules using the 2025 results and then
+call the same year a holdout.
+
+The offline-tested `binance_um_2025_archive_preflight.py` downloads, only when
+`--fetch` is explicit, twelve official monthly USD-M BTCUSDT 1m ZIPs and their
+`.CHECKSUM` files. It verifies their SHA-256, sole CSV member, exact millisecond
+open/close chronology, complete month coverage, finite positive OHLC and
+nonnegative volume. It writes only to the operator-selected **new** research
+directory. Existing ZIPs are reverified. A failed month prevents a PASS
+manifest; it does not fabricate missing candles. No database, trader, strategy,
+credentials or operational services are accessed. Binance archives may later
+be revised; preserve the original ZIP/checksum pairs and report hashes.
+
+From `H:\pnf screener\research_snapshots\PRZ_pole_code_20261006`, after
+fast-forwarding that detached research checkout to the branch commit containing
+this module, paste this one PowerShell block (new directory each time):
+
+```powershell
+$code = 'H:\pnf screener\research_snapshots\PRZ_pole_code_20261006'
+$run = 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2025_official_' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss_fffffff')
+New-Item -ItemType Directory -Path $run -ErrorAction Stop | Out-Null
+Push-Location $code
+try {
+    python -B -m unittest -q tests.test_binance_um_2025_archive_preflight
+    if ($LASTEXITCODE -ne 0) { throw 'Offline tests failed' }
+    python -B -m research_v2.patterns.binance_um_2025_archive_preflight --archive-dir $run --fetch
+    if ($LASTEXITCODE -ne 0) { throw "Archive verification failed; inspect $run" }
+    Get-FileHash -LiteralPath (Join-Path $run 'binance_um_btc_2025_preflight.json') -Algorithm SHA256
+    Write-Host "VERIFIED_ARCHIVES: $run"
+} finally { Pop-Location }
+```
+
+The expected complete-year count is 525,600 consecutive 1m rows. Treat any
+other count as a blocker. This is venue-matched historical OHLC, but it does
+not contain tick chronology or actual fills/fees/funding. Audit execution
+and produce a genuinely independent net-outcome ledger before using the
+hypothesis miner. The `--fetch` run needs only access to Binance's public
+data host; its archive size and download duration depend on the remote files
+and connection. Data ZIPs stay local; only code, tests and protocol go to GitHub.
