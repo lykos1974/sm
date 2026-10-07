@@ -239,3 +239,21 @@ Check `candles=525600`, hashes, and the two CSV paths in the new folder. Stop
 if anything disagrees; the module removes its own incomplete output directory
 on failure. This remains data preparation. Do not infer actual net returns
 from 1m candles or tune rules on 2025 and call them out-of-sample.
+
+### Operator frozen-input result — 2026-10-08 Athens time
+
+The operator reported successful isolated conversion in
+`H:\\pnf screener\\research_snapshots\\BINANCE_UM_BTC_2025_frozen_20261007_221948_5274615`:
+525,600 1m candles, 9,056 P&F columns, closed 1m close, absolute box 100,
+reversal 3; candle SHA-256
+`4e33b5c2a549b1eac26adfec022aab4cadce92261c13526a268f079225d16cab`;
+column SHA-256
+`de4a51d35b88e8666d6a0b007dd48d634b0a849ccc8c52e4773bbc23cf68b74f`.
+This is operator-reported provenance, not independent inspection of local CSVs.
+The source archive manifest hash was
+`7f3e45c173e896654447030cdf152df4ca0b2e34aae2fb70237a2c8c39d3bba2`.
+Freeze the files. The next single comparison is the existing causal LONG pole
+runner with the 2024 research assumptions, 48-hour 2025 warm-up and no
+parameter sweep. Report gross outcomes by quarter, opportunity count and
+cost sensitivity separately. It remains unsuitable for an actual net or
+untouched-test claim.
