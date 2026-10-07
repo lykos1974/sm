@@ -31,9 +31,9 @@ class PreflightTests(unittest.TestCase):
         with self.trades.open("w", newline="") as f:
             w = csv.writer(f)
             w.writerow(("trade_id", "opportunity_id", "symbol", "direction",
-                        "entry_timestamp", "exit_timestamp", "result_R"))
+                        "entry_timestamp", "exit_timestamp", "result_R", "classification"))
             w.writerow(("TRADE-000001", "OPP-000002", "BTC", "LONG",
-                        1700000180000, 1700000300000, "2.5"))
+                        1700000240000, 1700000300000, "2.5", "TARGET_FIRST"))
         self.causal.write_text(json.dumps({"stage": "causal_long_pole_research_v1",
             "research_only": True, "symbol": "BTCUSDT", "decision_count": 3,
             "resolved_portfolio_trades": 1, "gross_total_R": 2.5,
@@ -69,11 +69,11 @@ class PreflightTests(unittest.TestCase):
             self.run_check()
 
     def test_temporal_violation_and_duplicate_fail(self):
-        raw = self.trades.read_text().replace("1700000180000", "1700000000000")
+        raw = self.trades.read_text().replace("1700000240000", "1700000000000")
         self.trades.write_text(raw)
         with self.assertRaisesRegex(ValueError, "chronology"):
             self.run_check()
-        self.trades.write_text(raw.replace("1700000000000", "1700000180000"))
+        self.trades.write_text(raw.replace("1700000000000", "1700000240000"))
         self.trades.write_text(self.trades.read_text() + self.trades.read_text().splitlines()[-1] + "\n")
         cm = json.loads(self.causal.read_text())
         cm["resolved_portfolio_trades"] = 2
@@ -97,6 +97,21 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.run_check()
         self.assertEqual(self.output.read_bytes(), b"existing")
+
+    def test_conservative_same_candle_stop_is_legal_only_with_minus_one_r(self):
+        self.trades.write_text(self.trades.read_text().replace(
+            "1700000300000,2.5,TARGET_FIRST",
+            "1700000240000,-1,SAME_CANDLE_FILL_STOP_CONSERVATIVE"))
+        cm = json.loads(self.causal.read_text())
+        cm["gross_total_R"] = -1
+        self.causal.write_text(json.dumps(cm))
+        self.portfolio.write_text(json.dumps({"resolved_portfolio_trades": 1,
+            "summary_metrics": {"total_R": -1}}))
+        self.assertEqual(self.run_check()["same_candle_conservative_stops"], 1)
+        self.output.unlink()
+        self.trades.write_text(self.trades.read_text().replace("SAME_CANDLE_FILL_STOP_CONSERVATIVE", "STOP_FIRST"))
+        with self.assertRaisesRegex(ValueError, "chronology"):
+            self.run_check()
 
 
 if __name__ == "__main__":
