@@ -96,6 +96,30 @@ The model assumes symmetric notional at entry and exit and excludes funding;
 its result is an illustrative sensitivity, never audited net profitability.
 It cannot establish an untouched 2024 test set or supply `net_r` to the miner.
 
+### Windows operator result — 2026-10-08
+
+The operator ran the pinned four-file preflight: 468 decisions, 431 linked
+accepted trades, +49.0 gross R, and 8 conservative same-candle fill/stop
+resolutions. Its report SHA-256 was
+`db1d426bf42aa03419170cc927e8aa3f8da3acc41d12a5c7a14156865c993751`.
+The subsequent hypothetical symmetric-cost scenarios on the same cohort were:
+
+| Cost per side | Modeled total R | Modeled max drawdown R | Positive trades |
+|---:|---:|---:|---:|
+| 0 bps | +49 | 20.5 | 130/431 |
+| 2 bps | +7.8944342667 | 36.6558764 | 130/431 |
+| 5 bps | -53.7639143333 | 87.546138 | 130/431 |
+| 10 bps | -156.5278286667 | 179.336888 | 130/431 |
+
+The zero-total threshold under this **specific** planned-entry model is
+2.384105369957962189158422217 bps per side before funding. These numbers
+are operator-reported outputs of the scenario tool, not independently
+inspected local artifacts or actual exchange fee/fill measurements. No
+strategy selection or net profitability claim follows. The already inspected
+2024 cohort is unsuitable as a fresh untouched test; the next gate is a new,
+venue-matched forward cohort with audited execution costs and causal feature
+provenance. Do not optimize the same 2024 trades to force a 75% win rate.
+
 ```powershell
 $run = 'H:\pnf screener\research_snapshots\BTC_causal_2024_20261001_075402_5906621'
 python -B -m research_v2.patterns.pole_miner_btc_cost_scenario `
