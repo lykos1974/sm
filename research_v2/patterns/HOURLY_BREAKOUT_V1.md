@@ -76,3 +76,31 @@ Six synthetic offline tests cover a close-confirmed breakout, next-minute
 entry, same-minute double-barrier stop priority, no future signal, prefix
 invariance, deterministic restart, incomplete-hour rejection, source SHA
 and exclusive report. They do not prove live fill quality. Compilation passes.
+
+## Operator comparison result — 2026-10-08 Athens time
+
+The operator reported a completed offline run at
+`H:\pnf screener\research_snapshots\BTC_hourly_breakout_20261007_225406_6780992`.
+The 2024/2025 JSON report file hashes were not supplied; these are
+operator-reported summaries, not independently inspected raw trade ledgers.
+Both years had no open or pending position at year end.
+
+| Year | Signals/resolved | Positive | Gross R | Gross max drawdown R | Longest losing streak | 2 bps/side | 5 bps/side | 10 bps/side |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2024 | 183/183 | 68 | +27.3580170085 | 14.3500024966 | 8 | +21.5525588908 | +12.8443717143 | -1.6692735798 |
+| 2025 | 181/181 | 57 | -13.1708430033 | 17.7126007842 | 13 | -20.4534869530 | -31.3774528777 | -49.5840627522 |
+
+UTC quarter gross R: 2024 Q1 +13.1846830948, Q2 -2.3925520007,
+Q3 +1.3177245513, Q4 +15.2481613630; 2025 Q1 -4.1180994437,
+Q2 +3.3745619938, Q3 -6.4182752921, Q4 -6.0090302613.
+The reported quarterly totals reconcile to each reported annual total.
+The source candle hashes matched the previously pinned 2024 and 2025 inputs.
+
+**Decision: REJECT FOR PROMOTION.** The 2025 gross result is negative,
+so any positive realized execution cost worsens it. No net profitability
+claim follows from the hypothetical scenarios. Do not tune lookback, ATR,
+stop, target, timeout or 2025 eligibility filters to retroactively repair
+this period and call it out of sample. Keep both years as examined research
+and preserve the protected baseline. The only future efficacy gate for a
+new, independently justified hypothesis is a prospective, independently
+recorded cohort with realistic fills and costs. No runtime integration.
