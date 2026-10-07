@@ -54,6 +54,33 @@ observations are required before any strategy claim. Never tune thresholds
 against the printed test score or interpret a high win rate without net R
 and drawdown. The code does not automatically promote any candidate.
 
+## Frozen BTC 2024 provenance preflight
+
+`pole_miner_btc_preflight.py` checks the four operator-reported SHA-256 values
+for the frozen causal decisions, causal manifest, accepted portfolio trades,
+and portfolio manifest. It checks the 468 decision IDs against the 431 accepted
+OPP IDs, decision/entry/exit chronology, duplicate ownership, LONG/BTC
+identity, and gross-R reconciliation. It reads only those four files and
+writes one new report. It does **not** produce miner input: this run is gross
+OHLC evidence and its 2024 results have already been inspected. The preflight
+does not infer exchange fills, costs, or a fresh out-of-sample cohort.
+
+From the repository root on the operator's Windows PC:
+
+```powershell
+$run = 'H:\pnf screener\research_snapshots\BTC_causal_2024_20261001_075402_5906621'
+python -B -m research_v2.patterns.pole_miner_btc_preflight `
+  --decisions (Join-Path $run 'causal_decisions.csv') `
+  --causal (Join-Path $run 'causal_manifest.json') `
+  --trades (Join-Path $run 'portfolio\portfolio_reality_trade_sequence.csv') `
+  --portfolio (Join-Path $run 'portfolio\portfolio_reality_manifest.json') `
+  --output (Join-Path $run 'pole_miner_preflight.json')
+```
+
+Only use a new output path. If hashes or relationships disagree, stop before
+any cost model or hypothesis search. A separate audited cost model and a new
+forward period are required for a net-performance claim.
+
 ## Run after input audit
 
 ```powershell
@@ -65,6 +92,6 @@ python -B -m research_v2.patterns.pole_hypothesis_miner `
 The output path must be new. To verify the offline module:
 
 ```powershell
-python -B -m unittest -q tests.test_pole_hypothesis_miner
-python -B -m py_compile research_v2\patterns\pole_hypothesis_miner.py tests\test_pole_hypothesis_miner.py
+python -B -m unittest -q tests.test_pole_hypothesis_miner tests.test_pole_miner_btc_preflight
+python -B -m py_compile research_v2\patterns\pole_hypothesis_miner.py tests\test_pole_hypothesis_miner.py research_v2\patterns\pole_miner_btc_preflight.py tests\test_pole_miner_btc_preflight.py
 ```
