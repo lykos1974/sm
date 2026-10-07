@@ -20,7 +20,7 @@ DECISION_HEADER = ("decision_id", "pole_column_index", "reversal_column_index",
                    "entry_candle_open_ms", "entry_candle_close_ms", "direction",
                    "entry_price", "stop_price")
 TRADE_REQUIRED = ("trade_id", "opportunity_id", "symbol", "direction",
-                  "entry_timestamp", "exit_timestamp", "result_R")
+                  "entry_timestamp", "exit_timestamp", "result_R", "classification")
 
 
 def _sha(path: Path) -> str:
@@ -109,7 +109,7 @@ def inspect(decisions: Path, causal: Path, trades: Path, portfolio: Path,
         entry, stop = _num(row["entry_price"]), _num(row["stop_price"])
         if not (10**12 <= known < opened <= closed and entry > stop > 0):
             raise ValueError("decision chronology or geometry mismatch")
-    seen_trades, seen_opportunities, gross = set(), set(), Decimal(0)
+    seen_trades, seen_opportunities, gross, same_candle = set(), set(), Decimal(0), 0
     for row in trade_rows:
         trade_id, opportunity_id = row["trade_id"], row["opportunity_id"]
         if trade_id in seen_trades or opportunity_id in seen_opportunities:
@@ -125,9 +125,16 @@ def inspect(decisions: Path, causal: Path, trades: Path, portfolio: Path,
             raise ValueError("trade identity mismatch")
         decision = decision_rows[ordinal - 1]
         entered, exited = _int(row["entry_timestamp"]), _int(row["exit_timestamp"])
-        if (entered < _int(decision["entry_candle_open_ms"]) or exited <= entered):
+        result = _num(row["result_R"])
+        conservative_stop = (row["classification"] == "SAME_CANDLE_FILL_STOP_CONSERVATIVE"
+                             and result == Decimal(-1))
+        if (entered < _int(decision["entry_candle_close_ms"]) or exited < entered
+                or (exited == entered and not conservative_stop)
+                or (row["classification"] == "SAME_CANDLE_FILL_STOP_CONSERVATIVE"
+                    and (exited != entered or not conservative_stop))):
             raise ValueError("trade chronology mismatch")
-        gross += _num(row["result_R"])
+        same_candle += exited == entered
+        gross += result
     if (abs(gross - _num(cm.get("gross_total_R"))) > Decimal("0.000001")
             or abs(gross - _num(pm.get("summary_metrics", {}).get("total_R")))
             > Decimal("0.000001")):
@@ -136,7 +143,8 @@ def inspect(decisions: Path, causal: Path, trades: Path, portfolio: Path,
               "source_sha256": dict(zip(("decisions", "causal_manifest", "trades",
                                          "portfolio_manifest"), hashes)),
               "decisions": len(decision_rows), "linked_trades": len(trade_rows),
-              "gross_total_R": str(gross), "execution": "OFF",
+              "gross_total_R": str(gross),
+              "same_candle_conservative_stops": same_candle, "execution": "OFF",
               "limitations": "No exchange fills or audited net R; historical BTC 2024 was previously inspected; no untouched test claim"}
     with output.open("x", encoding="utf-8") as f:
         json.dump(report, f, indent=2, sort_keys=True)
