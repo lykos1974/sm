@@ -203,3 +203,39 @@ alone does not authorize a 2025 run. Next: build and audit an isolated,
 versioned 2025 CSV/P&F conversion against the verified manifest; preserve
 causal settings and run a single frozen comparison before considering net
 execution modeling. No 2025 profitability claim is made here.
+
+## Freeze 2025 research CSV inputs (no backtest)
+
+`binance_um_2025_frozen_inputs.py` checks the pinned preflight manifest hash,
+revalidates every monthly ZIP against that manifest, streams their 1m candles
+into `candles_1m.csv`, and constructs `columns.csv` with the existing
+`PnFEngine` using closed 1m close, absolute box size 100 and reversal 3. It
+writes both hashes to `frozen_inputs_manifest.json` in a new sibling directory
+and checks the sources again. No database or strategy runner is invoked. The
+column schema matches the existing causal research runner. This reuses the
+existing float-based PnF engine and does not claim tick-accurate formation.
+
+From PowerShell, in any directory, paste this complete block after updating
+the isolated code checkout to the commit containing this module:
+
+```powershell
+$code = 'H:\pnf screener\research_snapshots\PRZ_pole_code_20261006'
+$source = 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2025_official_20261007_221357_1633430'
+$out = 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2025_frozen_' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss_fffffff')
+Push-Location $code
+try {
+    python -B -m unittest -q tests.test_binance_um_2025_frozen_inputs tests.test_binance_um_2025_archive_preflight
+    if ($LASTEXITCODE -ne 0) { throw 'Offline tests failed' }
+    python -B -m research_v2.patterns.binance_um_2025_frozen_inputs `
+      --archive-dir $source `
+      --manifest-sha256 7f3e45c173e896654447030cdf152df4ca0b2e34aae2fb70237a2c8c39d3bba2 `
+      --output-dir $out
+    if ($LASTEXITCODE -ne 0) { throw 'Frozen input conversion failed' }
+    Write-Host "FROZEN_INPUT_DIR: $out"
+} finally { Pop-Location }
+```
+
+Check `candles=525600`, hashes, and the two CSV paths in the new folder. Stop
+if anything disagrees; the module removes its own incomplete output directory
+on failure. This remains data preparation. Do not infer actual net returns
+from 1m candles or tune rules on 2025 and call them out-of-sample.
