@@ -257,3 +257,56 @@ runner with the 2024 research assumptions, 48-hour 2025 warm-up and no
 parameter sweep. Report gross outcomes by quarter, opportunity count and
 cost sensitivity separately. It remains unsuitable for an actual net or
 untouched-test claim.
+
+### One local 2025 causal LONG pole comparison (gross only)
+
+The existing `backtest_workspace.create_job` and `run_job` accept a new
+isolated output and pinned CSV inputs. The operator runs this only after
+verifying that the current code includes the tests and two source hashes
+above. Entry cohort starts 2025-01-03 00:00 UTC after 48 hours of candles;
+last entry strictly before 2026-01-01 00:00 UTC; later exits may be evaluated.
+The same existing portfolio assumptions as the BTC 2024 causal run apply;
+no target/stop sweep, PRZ filter or newly optimized entry is enabled. The
+entire annual OHLC input is read from local research CSV, not an operational
+DB. The code records a new job manifest and gross research outputs; actual
+fills, fees, slippage and funding are still absent. Before interpreting
+results, compare settings and limitations to the 2024 frozen manifest.
+
+```powershell
+$code = 'H:\pnf screener\research_snapshots\PRZ_pole_code_20261006'
+$env:BTC25_INPUT = 'H:\pnf screener\research_snapshots\BINANCE_UM_BTC_2025_frozen_20261007_221948_5274615'
+$env:BTC25_OUT = 'H:\pnf screener\research_snapshots\BTC_2025_causal_single_' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss_fffffff')
+Push-Location $code
+try {
+    python -B -m unittest -q tests.test_backtest_workspace tests.test_pole_causal_long_research
+    if ($LASTEXITCODE -ne 0) { throw 'Targeted tests failed; no run' }
+    @'
+import hashlib, os
+from pathlib import Path
+from research_v2.backtest_workspace import create_job, run_job
+root = Path(os.environ['BTC25_INPUT'])
+columns, candles = root / 'columns.csv', root / 'candles_1m.csv'
+def sha(path):
+    h = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+if sha(columns) != 'de4a51d35b88e8666d6a0b007dd48d634b0a849ccc8c52e4773bbc23cf68b74f':
+    raise SystemExit('Column hash mismatch')
+if sha(candles) != '4e33b5c2a549b1eac26adfec022aab4cadce92261c13526a268f079225d16cab':
+    raise SystemExit('Candle hash mismatch')
+output = Path(os.environ['BTC25_OUT'])
+job = output.with_suffix('.job.json')
+create_job(columns, candles, 1735862400000, output, job, 1767225600000)
+result = run_job(job)
+print('RESULT_DIR:', result['output_root'])
+print('JOB_FILE:', job)
+'@ | python -B -
+    if ($LASTEXITCODE -ne 0) { throw 'Research comparison stopped; inspect isolated output' }
+} finally { Pop-Location }
+```
+
+Only one annual comparison. Freeze the run outputs and report the manifest,
+number of decisions and trades, quarterly gross R and execution limitations.
+Do not select a new rule on this year then reuse it as an untouched test.
