@@ -85,6 +85,26 @@ Only use a new output path. If hashes or relationships disagree, stop before
 any cost model or hypothesis search. A separate audited cost model and a new
 forward period are required for a net-performance claim.
 
+## Illustrative cost sensitivity after PASS
+
+`pole_miner_btc_cost_scenario.py` reads the same pinned decision/trade bytes
+plus a successful preflight. It reconciles the accepted cohort again, then
+reports 0, 2, 5 and 10 basis points **per side** using exact Decimal math:
+`modeled_R = gross_R - 2 * bps/10000 * planned_entry / abs(planned_entry-stop)`.
+The entry/stop are theoretical decision levels, not exchange fill prices.
+The model assumes symmetric notional at entry and exit and excludes funding;
+its result is an illustrative sensitivity, never audited net profitability.
+It cannot establish an untouched 2024 test set or supply `net_r` to the miner.
+
+```powershell
+$run = 'H:\pnf screener\research_snapshots\BTC_causal_2024_20261001_075402_5906621'
+python -B -m research_v2.patterns.pole_miner_btc_cost_scenario `
+  --decisions (Join-Path $run 'causal_decisions.csv') `
+  --trades (Join-Path $run 'portfolio\portfolio_reality_trade_sequence.csv') `
+  --preflight (Join-Path $run 'pole_miner_preflight.json') `
+  --output (Join-Path $run 'pole_miner_cost_scenario.json')
+```
+
 ## Run after input audit
 
 ```powershell
@@ -96,6 +116,6 @@ python -B -m research_v2.patterns.pole_hypothesis_miner `
 The output path must be new. To verify the offline module:
 
 ```powershell
-python -B -m unittest -q tests.test_pole_hypothesis_miner tests.test_pole_miner_btc_preflight
-python -B -m py_compile research_v2\patterns\pole_hypothesis_miner.py tests\test_pole_hypothesis_miner.py research_v2\patterns\pole_miner_btc_preflight.py tests\test_pole_miner_btc_preflight.py
+python -B -m unittest -q tests.test_pole_hypothesis_miner tests.test_pole_miner_btc_preflight tests.test_pole_miner_btc_cost_scenario
+python -B -m py_compile research_v2\patterns\pole_hypothesis_miner.py tests\test_pole_hypothesis_miner.py research_v2\patterns\pole_miner_btc_preflight.py tests\test_pole_miner_btc_preflight.py research_v2\patterns\pole_miner_btc_cost_scenario.py tests\test_pole_miner_btc_cost_scenario.py
 ```
