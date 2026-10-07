@@ -310,3 +310,34 @@ print('JOB_FILE:', job)
 Only one annual comparison. Freeze the run outputs and report the manifest,
 number of decisions and trades, quarterly gross R and execution limitations.
 Do not select a new rule on this year then reuse it as an untouched test.
+
+### Operator single 2025 causal comparison — 2026-10-08 Athens time
+
+The operator reported a completed single annual run under
+`H:\\pnf screener\\research_snapshots\\BTC_2025_causal_single_20261007_222234_1638708`.
+The reported `causal_manifest.json` SHA-256 is
+`2514a65efa27dbe3328eb747351edf814f15d851570bef9c52e5d28508709f0b8`.
+The targeted workspace/causal runner tests passed (43). Operator-provided
+portfolio metrics: 626 resolved trades, **-67.5 gross R**, average
+-0.107827 R/trade, median -1 R, 77.5 R maximum drawdown, 19 consecutive
+losses, and 29 consecutive non-wins. The decision count was not supplied.
+
+| UTC quarter | Trades | Gross R | Win rate | Max losing streak |
+|---|---:|---:|---:|---:|
+| 2025 Q1 | 230 | -58.5 | 0.195652 | 19 |
+| 2025 Q2 | 132 | +5.0 | 0.287879 | 10 |
+| 2025 Q3 | 108 | -6.5 | 0.25 | 7 |
+| 2025 Q4 | 156 | -7.5 | 0.262821 | 12 |
+
+Quarter counts sum to 626 and gross R to -67.5. This is operator-reported
+output, not independently inspected local evidence. The previously reported
+BTC 2024 causal run had 431 resolved trades and +49 gross R; the 2025
+single-run sign reversal invalidates a robust positive-expectancy claim for
+this existing causal LONG pole setup even **before** fees, slippage and
+funding. The 2025 sample has been viewed and is no longer a fresh test set.
+Do not optimize the entry, stop, target, PRZ filter or cost assumption against
+this loss and present the same year as out of sample. Mark the current
+hypothesis **REJECT FOR PROMOTION**; preserve protected baseline unchanged.
+The next research gate is an independently specified hypothesis with a new
+prospective cohort and audited execution costs, not another parameter sweep
+on 2025. No runtime strategy is enabled.
