@@ -64,6 +64,10 @@ identity, and gross-R reconciliation. It reads only those four files and
 writes one new report. It does **not** produce miner input: this run is gross
 OHLC evidence and its 2024 results have already been inspected. The preflight
 does not infer exchange fills, costs, or a fresh out-of-sample cohort.
+The portfolio simulator can record entry and exit at the same closed-candle
+timestamp for `SAME_CANDLE_FILL_STOP_CONSERVATIVE`, with exactly -1R. This is
+the sole permitted equality in the preflight; other equal or reversed times
+remain invalid. The report counts these conservative same-candle stops.
 
 From the repository root on the operator's Windows PC:
 
