@@ -1,8 +1,12 @@
 # Bounded pole hypothesis miner v1
 
-Research only. This is the first executable stage of
-`pole_genetic_hypothesis_miner_design.md`, using a fixed set of 21 simple
-rules instead of an LLM or genetic search. It does not produce signals,
+Research only. This is a separate chronological split checker using a fixed
+set of 21 simple rules instead of an LLM or genetic search. An earlier
+executable `pole_p2_candidate_sampler.py` already enumerates P+2 rule
+intersections over seven symbols. Its 4,023-trade `UNIVERSE_MATCH` and
++251.5R are historical **gross simulation** evidence, not the audited net-R
+input required here; its ranked candidates have already been exposed to that
+history. This checker does not produce signals,
 simulate fills, connect to an exchange, or change the protected baseline.
 
 ## Input contract
@@ -20,7 +24,10 @@ availability time of **every** selection feature in the row; it must be no
 later than `decision_ts`. `net_r` is the validated, realized result after
 fees, slippage, funding where applicable, and the actual execution policy.
 The miner cannot prove the origin or completeness of these values from CSV
-alone. Do not feed it a gross-only pole ledger, a retrospective completed
+alone. The older P+2 candidate sampler manifest does not record all source
+paths/hashes or a cost model, and its results CSV is an aggregate candidate
+table, not one row per independent net trade. Do not feed it that table, a
+gross-only pole ledger, a retrospective completed
 column, duplicated opportunities, an operational DB, or a current-year result
 already inspected during rule development. Preparing this audited input is
 the next gate; no such annual net-R dataset has been verified in this stage.
