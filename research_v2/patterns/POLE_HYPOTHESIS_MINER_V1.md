@@ -188,3 +188,18 @@ and produce a genuinely independent net-outcome ledger before using the
 hypothesis miner. The `--fetch` run needs only access to Binance's public
 data host; its archive size and download duration depend on the remote files
 and connection. Data ZIPs stay local; only code, tests and protocol go to GitHub.
+
+### Operator preflight result — 2026-10-08 Athens time
+
+Operator reported `PASS`, 12 monthly archives and 525,600 rows, in
+`H:\\pnf screener\\research_snapshots\\BINANCE_UM_BTC_2025_official_20261007_221357_1633430`.
+The reported SHA-256 of `binance_um_btc_2025_preflight.json` is
+`7f3e45c173e896654447030cdf152df4ca0b2e34aae2fb70237a2c8c39d3bba2`.
+This is a reported local result; the raw monthly archives and manifest were
+not transferred for independent inspection. Freeze that directory and do not
+rerun into it. The archive integrity gate is complete. The existing causal
+runner requires P&F `columns.csv` and `candles_1m.csv`, so ZIP verification
+alone does not authorize a 2025 run. Next: build and audit an isolated,
+versioned 2025 CSV/P&F conversion against the verified manifest; preserve
+causal settings and run a single frozen comparison before considering net
+execution modeling. No 2025 profitability claim is made here.
